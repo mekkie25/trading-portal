@@ -271,6 +271,25 @@ async function startServer() {
     });
   });
 
+  // 2. Journal and Analysis API Endpoints
+app.get('/api/journal', async (req, res) => {
+    try {
+        const trades = []; 
+        res.status(200).json(trades);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch journal entries" });
+    }
+});
+
+app.post('/api/analysis', async (req, res) => {
+    try {
+        const analysisResult = { status: "success", message: "Live analysis executed." };
+        res.status(200).json(analysisResult);
+    } catch (error) {
+        res.status(500).json({ error: "Analysis execution failed" });
+    }
+});
+
   // 2. Get Bot Configuration
   app.get('/api/bot/config', (req, res) => {
     res.json({

@@ -75,23 +75,8 @@ export const INITIAL_ADVANCED_LIMITS: AdvancedLimits = {
   activeTripScope: 'NONE',
 };
 
-export const INITIAL_TRADES: TradeRecord[] = [
-  {
-    id: 'tr-1',
-    ticket: '#8924011',
-    asset: 'DERIV:R_10',
-    type: 'BUY',
-    lots: 0.80,
-    openPrice: 6245.20,
-    closePrice: 6388.90,
-    pnl: 1149.60,
-    pnlPct: 2.30,
-    openTime: '2026-09-20 14:15:22',
-    closeTime: '2026-09-20 16:42:10',
-    duration: '2h 26m',
-    status: 'WIN',
-    source: 'MT5 Bridge',
-  },
+  // Open data/mockTradingData.ts and replace its contents with:
+export const INITIAL_TRADES = [];
   {
     id: 'tr-2',
     ticket: '#8923985',
