@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import WebSocket from 'ws';
 
 // In-memory shared state between web dashboard, trading bot (VS Code), and broker
 interface BotGatewayConfig {
@@ -59,48 +60,24 @@ let activeBotConfig: BotGatewayConfig = {
 };
 
 let activeBrokerTelemetry: BrokerTelemetry = {
-  connected: true,
-  provider: 'MetaTrader 5',
-  accountNumber: '8849102',
-  server: 'Deriv-Server-02',
+  connected: false,
+  provider: 'Deriv API',
+  accountNumber: 'Connecting...',
+  server: 'Deriv WebSocket',
   currency: 'USD',
-  balance: 157340.00,
-  equity: 159820.50,
-  floatingPnL: 2480.50,
-  netProfit: 34820.50,
-  winRate: 68.4,
-  totalTrades: 142,
-  winningTrades: 97,
-  losingTrades: 45,
-  lastPingMs: 14,
+  balance: 0.00,
+  equity: 0.00,
+  floatingPnL: 0.00,
+  netProfit: 0.00,
+  winRate: 0.0,
+  totalTrades: 0,
+  winningTrades: 0,
+  losingTrades: 0,
+  lastPingMs: 0,
   lastSyncTime: new Date().toISOString(),
   lastHeartbeat: new Date().toISOString(),
-  openPositions: [
-    {
-      ticket: '994821',
-      symbol: 'EURUSD',
-      type: 'BUY',
-      lots: 2.5,
-      openPrice: 1.08450,
-      currentPrice: 1.08620,
-      pnl: 425.00,
-      stopLoss: 1.08200,
-      takeProfit: 1.09100,
-    },
-    {
-      ticket: '994822',
-      symbol: 'XAUUSD',
-      type: 'BUY',
-      lots: 1.0,
-      openPrice: 2632.40,
-      currentPrice: 2652.95,
-      pnl: 2055.50,
-      stopLoss: 2615.00,
-      takeProfit: 2680.00,
-    },
-  ],
+  openPositions: [],
 };
-import WebSocket from 'ws';
 
 // Connects server directly to Deriv API using Railway Environment Variables
 function initDerivConnection() {
@@ -127,6 +104,16 @@ function initDerivConnection() {
       // 1. Successful Authorization
       if (res.msg_type === 'authorize' && res.authorize) {
         console.log(`✅ Authorized Deriv Account: ${res.authorize.loginid}`);
+        activeBrokerTelemetry = {
+          ...activeBrokerTelemetry,
+          connected: true,
+          accountNumber: res.authorize.loginid,
+          currency: res.authorize.currency || 'USD',
+          balance: res.authorize.balance || activeBrokerTelemetry.balance,
+          equity: res.authorize.balance || activeBrokerTelemetry.equity,
+          lastSyncTime: new Date().toISOString(),
+          lastHeartbeat: new Date().toISOString(),
+        };
         // Subscribe to live balance updates
         ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
       }
@@ -135,12 +122,13 @@ function initDerivConnection() {
       if (res.msg_type === 'balance' && res.balance) {
         activeBrokerTelemetry = {
           ...activeBrokerTelemetry,
+          connected: true,
           balance: res.balance.balance,
           equity: res.balance.balance,
           currency: res.balance.currency,
-          account: res.balance.loginid,
-          status: 'connected',
-          updatedAt: new Date().toISOString()
+          accountNumber: res.balance.loginid || activeBrokerTelemetry.accountNumber,
+          lastSyncTime: new Date().toISOString(),
+          lastHeartbeat: new Date().toISOString(),
         };
         console.log(`💰 Live Deriv Telemetry Updated: ${res.balance.currency} ${res.balance.balance}`);
       }
@@ -152,13 +140,14 @@ function initDerivConnection() {
   ws.on('error', (err) => console.error('Deriv WS Error:', err.message));
   ws.on('close', () => {
     console.log('Deriv WS disconnected. Reconnecting in 5s...');
+    activeBrokerTelemetry.connected = false;
     setTimeout(initDerivConnection, 5000);
   });
 }
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   app.use(express.json());
 
@@ -172,6 +161,9 @@ async function startServer() {
     }
     next();
   });
+
+  // Start live Deriv connection
+  initDerivConnection();
 
   // 1. Health check
   app.get('/api/health', (req, res) => {
