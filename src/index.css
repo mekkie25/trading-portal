@@ -1,0 +1,148 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-main: #ffffff;
+    --bg-card: #ffffff;
+    --bg-subtle: #ffffff;
+    --border-color: #cbd5e1;
+    --text-main: #000000;
+    --text-muted: #1e293b;
+  }
+
+  .dark {
+    /* Refined dark-grayish sweet spot between black and charcoal gray like 2GS ecosystem */
+    --bg-main: #10131a;
+    --bg-card: #151922;
+    --bg-subtle: #0d1017;
+    --border-color: #212838;
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+  }
+
+  /* Universal font application: DM Sans for all numbers, metrics, inputs, and clean body text; Oswald for display titles */
+  html,
+  body,
+  button,
+  input,
+  select,
+  textarea,
+  p,
+  span,
+  a,
+  div,
+  table,
+  th,
+  td,
+  label {
+    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  /* Display headers & branded titles retain crisp Oswald styling */
+  h1,
+  h2,
+  h3,
+  .font-display,
+  .font-heading {
+    font-family: 'Oswald', 'DM Sans', -apple-system, sans-serif;
+  }
+
+  /* ALL NUMBERS, STATS, PRICES, PERCENTAGES, TIMESTAMPS, RATIOS, INPUTS USE DM SANS (Image 1 Font) */
+  .font-mono,
+  .font-numeric,
+  .font-numbers,
+  .tabular-nums,
+  input,
+  input[type="number"],
+  input[type="range"],
+  select,
+  code,
+  pre,
+  kbd {
+    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  body {
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+}
+
+/* User's explicit rule: In light mode, everything must turn white (background, side panels, headers, information bubbles) except borders, and all text must be black so nothing vanishes */
+html:not(.dark),
+html:not(.dark) body,
+html:not(.dark) #root,
+html:not(.dark) main,
+html:not(.dark) aside,
+html:not(.dark) header {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+}
+
+/* In light mode, make information bubbles, cards, tiles, and containers white with clear borders */
+html:not(.dark) .bg-white,
+html:not(.dark) .bg-slate-50,
+html:not(.dark) .bg-slate-100 {
+  background-color: #ffffff;
+}
+
+/* Ensure borders in light mode remain distinct and visible so users can see borders of information and components */
+html:not(.dark) [class*="border-slate-"],
+html:not(.dark) [class*="dark:border-"] {
+  border-color: #cbd5e1;
+}
+
+/* Universal text contrast rule for light mode: any muted gray text becomes solid black */
+html:not(.dark) .text-slate-400,
+html:not(.dark) .text-slate-500,
+html:not(.dark) .text-slate-600,
+html:not(.dark) .text-slate-700,
+html:not(.dark) .text-slate-800,
+html:not(.dark) .text-slate-900,
+html:not(.dark) .text-gray-400,
+html:not(.dark) .text-gray-500,
+html:not(.dark) .text-gray-600 {
+  color: #000000 !important;
+}
+
+/* In light mode, input backgrounds white and text black */
+html:not(.dark) input,
+html:not(.dark) select,
+html:not(.dark) textarea {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+  border-color: #cbd5e1 !important;
+}
+
+html:not(.dark) input::placeholder,
+html:not(.dark) textarea::placeholder {
+  color: #475569 !important;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.dark ::-webkit-scrollbar-track {
+  background: #10131a;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #212838;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #2563eb;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
