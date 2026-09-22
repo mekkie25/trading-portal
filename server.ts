@@ -80,13 +80,7 @@ let activeBrokerTelemetry: BrokerTelemetry = {
 };
 
 let pingInterval: NodeJS.Timeout | null = null;
-
-// Failover hosts for Deriv WebSocket gateways
-const DERIV_HOSTS = [
-  'wss://ws.binaryws.com/websockets/v3?app_id=',
-  'wss://ws.derivws.com/websockets/v3?app_id=',
-];
-let currentHostIndex = 0;
+let reconnectDelay = 5000;
 
 // Connects server directly to Deriv API using Railway Environment Variables
 function initDerivConnection() {
@@ -98,26 +92,17 @@ function initDerivConnection() {
     return;
   }
 
-  const hostBase = DERIV_HOSTS[currentHostIndex % DERIV_HOSTS.length];
-  const wsUrl = `${hostBase}${appId}`;
+  const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
+  console.log('🔌 Connecting to Deriv WebSocket gateway...');
 
-  console.log(`🔌 Connecting to Deriv WebSocket gateway (${hostBase.split('/')[2]})...`);
-
-  // perMessageDeflate: false fixes Cloudflare 520 websocket compression error
-  const ws = new WebSocket(wsUrl, {
-    perMessageDeflate: false,
-    headers: {
-      'Origin': 'https://app.deriv.com',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  });
+  // Standard clean WebSocket request without conflicting TLS fingerprint headers
+  const ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
     console.log('🔑 Authenticating with Deriv API Token...');
+    reconnectDelay = 5000; // Reset backoff delay on successful open
     ws.send(JSON.stringify({ authorize: token }));
 
-    // Send a ping every 30 seconds to keep connection alive
     if (pingInterval) clearInterval(pingInterval);
     pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -167,15 +152,17 @@ function initDerivConnection() {
   });
 
   ws.on('error', (err) => {
-    console.error('Deriv WS Error:', err.message);
+    console.error('Deriv WS Handshake Status:', err.message);
   });
 
   ws.on('close', () => {
     if (pingInterval) clearInterval(pingInterval);
-    currentHostIndex++; // Switch host on failover
-    console.log('Deriv WS disconnected. Switching host and reconnecting in 5s...');
     activeBrokerTelemetry.connected = false;
-    setTimeout(initDerivConnection, 5000);
+    
+    // Exponential backoff to avoid hammering Cloudflare rate limits
+    console.log(`Deriv WS disconnected. Retrying in ${reconnectDelay / 1000}s...`);
+    setTimeout(initDerivConnection, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.5, 60000);
   });
 }
 
@@ -196,7 +183,7 @@ async function startServer() {
     next();
   });
 
-  // Start live Deriv connection
+  // Start Deriv connection
   initDerivConnection();
 
   // 1. Health check
