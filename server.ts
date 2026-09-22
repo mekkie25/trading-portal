@@ -93,7 +93,12 @@ function startDerivGateway() {
   let reconnectAttempts = 0;
 
   function connect() {
-    ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
+   ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`, {
+  headers: {
+    'Origin': 'trading-portal-production.up.railway.app',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  },
+});
 
     ws.on('open', () => {
       console.log('✅ Connected to Deriv API');
