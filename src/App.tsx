@@ -8,7 +8,7 @@ import { EconomicCalendarView } from './components/views/EconomicCalendarView';
 import { LiveFeedView } from './components/views/LiveFeedView';
 import { SettingsView } from './components/views/SettingsView';
 import { BrokerVsCodeBridgeModal } from './components/BrokerVsCodeBridgeModal';
-import { useDerivSync } from './hooks/useDerivSync';
+
 
 
 
@@ -55,24 +55,6 @@ const safeStorage = {
 
 export default function App() {
 
-    // Use Vite environment variable or pass your Deriv API token here
-  const derivToken = import.meta.env.VITE_DERIV_API_TOKEN || ''; 
-
-  const [telemetry, setTelemetry] = useState({
-  balance: 0,
-  equity: 0,
-  accountNumber: '---',
-  connected: false,
-});
-
-  // Initialize browser-direct sync
-  useDerivSync({
-      appId: import.meta.env.VITE_DERIV_APP_ID || '1089',
-      apiToken: derivToken,
-      onTelemetryUpdate: (data) => {
-      setTelemetry((prev) => ({ ...prev, ...data }));
-      },
-  });
 
   const [currentTab, setCurrentTab] = useState<TabId>('dashboard');
   const [isBridgeOpen, setIsBridgeOpen] = useState(false);
