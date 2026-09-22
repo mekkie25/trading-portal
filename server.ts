@@ -202,20 +202,22 @@ async function startServer() {
   });
 
   // Serve static UI or Vite development server
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.join(process.cwd(), 'dist');
+  const isProduction = fs.existsSync(path.join(distPath, 'index.html'));
+
+  if (isProduction) {
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
     const vite = await createViteServer({
       server: { middlewareMode: true, host: '0.0.0.0' },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
   }
-
+  
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Trading Portal & API Gateway active on port ${PORT}`);
   });
