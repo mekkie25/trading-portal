@@ -11,26 +11,9 @@ import { BrokerVsCodeBridgeModal } from './components/BrokerVsCodeBridgeModal';
 import { useState } from 'react';
 import { useDerivSync } from './hooks/useDerivSync';
 
-export default function App() {
-  // Use Vite environment variable or pass your Deriv API token here
-  const derivToken = import.meta.env.VITE_DERIV_API_TOKEN || ''; 
 
-  // Initialize browser-direct sync
-  useDerivSync({
-    appId: import.meta.env.VITE_DERIV_APP_ID || '1089',
-    apiToken: derivToken,
-    onTelemetryUpdate: (data) => {
-      console.log('Dashboard received live telemetry:', data);
-    },
-  });
 
-  return (
-    <div className="p-6">
-      <h1 className="text-2xl font-bold">Trading Portal Dashboard</h1>
-      {/* Your dashboard UI components */}
-    </div>
-  );
-}
+
 import { 
   INITIAL_METRICS, 
   INITIAL_BOT_SETTINGS, 
@@ -72,6 +55,19 @@ const safeStorage = {
 };
 
 export default function App() {
+
+    // Use Vite environment variable or pass your Deriv API token here
+  const derivToken = import.meta.env.VITE_DERIV_API_TOKEN || ''; 
+
+  // Initialize browser-direct sync
+  useDerivSync({
+    appId: import.meta.env.VITE_DERIV_APP_ID || '1089',
+    apiToken: derivToken,
+    onTelemetryUpdate: (data) => {
+      console.log('Dashboard received live telemetry:', data);
+    },
+  });
+  
   const [currentTab, setCurrentTab] = useState<TabId>('dashboard');
   const [isBridgeOpen, setIsBridgeOpen] = useState(false);
 
