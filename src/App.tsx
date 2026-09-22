@@ -8,7 +8,6 @@ import { EconomicCalendarView } from './components/views/EconomicCalendarView';
 import { LiveFeedView } from './components/views/LiveFeedView';
 import { SettingsView } from './components/views/SettingsView';
 import { BrokerVsCodeBridgeModal } from './components/BrokerVsCodeBridgeModal';
-import { useState } from 'react';
 import { useDerivSync } from './hooks/useDerivSync';
 
 
@@ -67,7 +66,7 @@ export default function App() {
       console.log('Dashboard received live telemetry:', data);
     },
   });
-  
+
   const [currentTab, setCurrentTab] = useState<TabId>('dashboard');
   const [isBridgeOpen, setIsBridgeOpen] = useState(false);
 
