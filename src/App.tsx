@@ -165,18 +165,24 @@ export default function App() {
             return next;
           });
 
+                    // Replace mock trade journal data with real Deriv trade history
+          if (Array.isArray(d.trades) && d.trades.length > 0) {
+            setTrades(d.trades);
+            safeStorage.setItem('2gs_trades', d.trades);
+          }
+
           // Update metrics
           setMetrics((prev) => {
             const next: TopMetrics = {
               ...prev,
-              currentBalance: d.balance ?? prev.currentBalance,
-              currentEquity: d.equity ?? prev.currentEquity,
               netProfit: d.netProfit ?? prev.netProfit,
-              unrealizedPnL: d.floatingPnL ?? prev.unrealizedPnL,
               winRate: d.winRate ?? prev.winRate,
               totalTrades: d.totalTrades ?? prev.totalTrades,
               winningTrades: d.winningTrades ?? prev.winningTrades,
               losingTrades: d.losingTrades ?? prev.losingTrades,
+              currentEquity: d.equity ?? prev.currentEquity,
+              currentBalance: d.balance ?? prev.currentBalance,
+              unrealizedPnL: d.floatingPnL ?? prev.unrealizedPnL,
             };
             safeStorage.setItem('2gs_metrics', next);
             return next;

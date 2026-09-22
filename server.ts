@@ -20,6 +20,7 @@ interface BotGatewayConfig {
 interface BrokerTelemetry {
   connected: boolean;
   provider: string;
+  trades: any[];
   accountNumber: string;
   server: string;
   currency: string;
@@ -78,11 +79,12 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   lastSyncTime: new Date().toISOString(),
   lastHeartbeat: new Date().toISOString(),
   openPositions: [],
+  trades: [],
 };
 
 async function startDerivGateway() {
-  const DERIV_APP_ID = process.env.DERIV_APP_ID;
-  const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN;
+ const DERIV_APP_ID = process.env.DERIV_APP_ID!;
+const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
   const API_BASE = 'https://api.derivws.com';
 
   if (!DERIV_APP_ID || !DERIV_API_TOKEN) {
@@ -145,6 +147,7 @@ async function startDerivGateway() {
         ws!.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: 1 }));
         ws!.send(JSON.stringify({ portfolio: 1, req_id: 2 }));
         ws!.send(JSON.stringify({ statement: 1, limit: 100, req_id: 3 }));
+        ws!.send(JSON.stringify({ profit_table: 1, limit: 50, sort: 'DESC', req_id: 4 }));
       });
 
       ws.on('message', (raw) => {
@@ -155,11 +158,42 @@ async function startDerivGateway() {
           return;
         }
 
-        if (data.msg_type === 'balance') {
+                if (data.msg_type === 'balance') {
           activeBrokerTelemetry.balance = data.balance.balance;
+          // Approximation: equity = balance for now. Once we subscribe to live
+          // open-contract pricing (proposal_open_contract), this should become
+          // balance + sum of floating P&L on open positions instead.
+          activeBrokerTelemetry.equity = data.balance.balance;
           activeBrokerTelemetry.currency = data.balance.currency || activeBrokerTelemetry.currency;
           activeBrokerTelemetry.lastSyncTime = new Date().toISOString();
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
+        }
+
+        if (data.msg_type === 'profit_table') {
+          const txs = data.profit_table?.transactions || [];
+          activeBrokerTelemetry.trades = txs.map((t: any) => {
+            const pnl = (t.sell_price ?? 0) - (t.buy_price ?? 0);
+            const openMs = (t.purchase_time ?? 0) * 1000;
+            const closeMs = (t.sell_time ?? 0) * 1000;
+            const durationMin = Math.max(0, Math.round((closeMs - openMs) / 60000));
+            return {
+              id: String(t.transaction_id ?? t.contract_id),
+              ticket: String(t.contract_id ?? t.transaction_id),
+              asset: t.shortcode || t.longcode || 'Unknown',
+              type: 'BUY',
+              lots: t.payout || 0,
+              openPrice: t.buy_price ?? 0,
+              closePrice: t.sell_price ?? 0,
+              pnl: Number(pnl.toFixed(2)),
+              pnlPct: t.buy_price ? Number(((pnl / t.buy_price) * 100).toFixed(2)) : 0,
+              openTime: t.purchase_time ? new Date(openMs).toISOString() : '',
+              closeTime: t.sell_time ? new Date(closeMs).toISOString() : '',
+              duration: `${durationMin}m`,
+              status: pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN',
+              source: 'Deriv Live',
+            };
+          });
+          console.log(`📒 Loaded ${activeBrokerTelemetry.trades.length} real trades from Deriv profit_table`);
         }
 
         if (data.msg_type === 'portfolio') {
