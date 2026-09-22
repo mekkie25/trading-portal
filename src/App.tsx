@@ -58,13 +58,20 @@ export default function App() {
     // Use Vite environment variable or pass your Deriv API token here
   const derivToken = import.meta.env.VITE_DERIV_API_TOKEN || ''; 
 
+  const [telemetry, setTelemetry] = useState({
+  balance: 0,
+  equity: 0,
+  accountNumber: '---',
+  connected: false,
+});
+
   // Initialize browser-direct sync
   useDerivSync({
-    appId: import.meta.env.VITE_DERIV_APP_ID || '1089',
-    apiToken: derivToken,
-    onTelemetryUpdate: (data) => {
-      console.log('Dashboard received live telemetry:', data);
-    },
+      appId: import.meta.env.VITE_DERIV_APP_ID || '1089',
+      apiToken: derivToken,
+      onTelemetryUpdate: (data) => {
+      setTelemetry((prev) => ({ ...prev, ...data }));
+      },
   });
 
   const [currentTab, setCurrentTab] = useState<TabId>('dashboard');
