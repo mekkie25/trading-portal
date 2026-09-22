@@ -79,6 +79,8 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   openPositions: [],
 };
 
+let pingInterval: NodeJS.Timeout | null = null;
+
 // Connects server directly to Deriv API using Railway Environment Variables
 function initDerivConnection() {
   const appId = process.env.DERIV_APP_ID || '1089';
@@ -90,11 +92,26 @@ function initDerivConnection() {
   }
 
   console.log('🔌 Connecting to Deriv WebSocket gateway...');
-  const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`);
+
+  // Browser headers bypass Cloudflare 520 blocks when connecting from cloud hosts
+  const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`, {
+    headers: {
+      'Origin': 'https://app.deriv.com',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
+  });
 
   ws.on('open', () => {
     console.log('🔑 Authenticating with Deriv API Token...');
     ws.send(JSON.stringify({ authorize: token }));
+
+    // Send a ping every 30 seconds to keep the Cloudflare connection alive
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ ping: 1 }));
+      }
+    }, 30000);
   });
 
   ws.on('message', (data: WebSocket.Data) => {
@@ -138,7 +155,9 @@ function initDerivConnection() {
   });
 
   ws.on('error', (err) => console.error('Deriv WS Error:', err.message));
+
   ws.on('close', () => {
+    if (pingInterval) clearInterval(pingInterval);
     console.log('Deriv WS disconnected. Reconnecting in 5s...');
     activeBrokerTelemetry.connected = false;
     setTimeout(initDerivConnection, 5000);
