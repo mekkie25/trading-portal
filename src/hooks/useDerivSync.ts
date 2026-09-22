@@ -1,106 +1,110 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 
-interface DerivSyncConfig {
+interface DerivSyncProps {
   appId?: string;
-  apiToken?: string;
-  onTelemetryUpdate?: (telemetry: any) => void;
+  token?: string;
+  onTelemetryData?: (data: any) => void;
 }
 
-export function useDerivSync({ appId = '1089', apiToken, onTelemetryUpdate }: DerivSyncConfig) {
+export const useDerivSync = ({
+  appId = import.meta.env.VITE_DERIV_APP_ID || '1080',
+  token = import.meta.env.VITE_DERIV_TOKEN || '',
+  onTelemetryData,
+}: DerivSyncProps = {}) => {
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectCountRef = useRef(0);
 
-  useEffect(() => {
-    if (!apiToken) return;
+  const connect = useCallback(() => {
+    if (
+      wsRef.current &&
+      (wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
 
-    let reconnectTimer: NodeJS.Timeout;
-    let pingInterval: NodeJS.Timeout;
-
-    const connect = () => {
+    try {
+      // Use the numeric App ID from Railway env or fallback
       const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
-      console.log('🔌 Connecting to Deriv WebSocket from Browser...');
-
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('🔑 Authenticating with Deriv API Token...');
-        ws.send(JSON.stringify({ authorize: apiToken }));
+        setIsConnected(true);
+        setConnectionError(null);
+        reconnectCountRef.current = 0;
 
-        pingInterval = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ ping: 1 }));
-          }
-        }, 30000);
-      };
-
-      ws.onmessage = async (event) => {
-        try {
-          const res = JSON.parse(event.data);
-
-          if (res.msg_type === 'authorize' && res.authorize) {
-            console.log(`✅ Connected Deriv Account: ${res.authorize.loginid}`);
-
-            const initialTelemetry = {
-              connected: true,
-              provider: 'Deriv API (Browser)',
-              accountNumber: res.authorize.loginid,
-              currency: res.authorize.currency || 'USD',
-              balance: res.authorize.balance || 0,
-              equity: res.authorize.balance || 0,
-            };
-
-            ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-            await syncTelemetryToServer(initialTelemetry);
-            if (onTelemetryUpdate) onTelemetryUpdate(initialTelemetry);
-          }
-
-          if (res.msg_type === 'balance' && res.balance) {
-            console.log(`💰 Live Balance Updated: ${res.balance.currency} ${res.balance.balance}`);
-
-            const updatedTelemetry = {
-              connected: true,
-              balance: res.balance.balance,
-              equity: res.balance.balance,
-              currency: res.balance.currency,
-              accountNumber: res.balance.loginid,
-            };
-
-            await syncTelemetryToServer(updatedTelemetry);
-            if (onTelemetryUpdate) onTelemetryUpdate(updatedTelemetry);
-          }
-        } catch (err) {
-          console.error('Error parsing Deriv WebSocket message:', err);
+        // Authorize using the PAT... token from Railway env
+        if (token) {
+          ws.send(JSON.stringify({ authorize: token }));
         }
       };
 
-      ws.onerror = (err) => console.error('Deriv WS Error:', err);
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          // Once authorized, request account balance updates
+          if (data.msg_type === 'authorize') {
+            ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+          }
+
+          // Relay telemetry frame to backend
+          fetch('/api/broker/telemetry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+          }).catch((err) => console.error('Telemetry post failed:', err));
+
+          if (onTelemetryData) {
+            onTelemetryData(data);
+          }
+        } catch (e) {
+          console.error('Failed to parse WebSocket message:', e);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket Error:', err);
+        setConnectionError('WebSocket connection error.');
+      };
 
       ws.onclose = () => {
-        console.log('Deriv WS disconnected. Retrying connection in 5s...');
-        clearInterval(pingInterval);
-        syncTelemetryToServer({ connected: false });
-        reconnectTimer = setTimeout(connect, 5000);
-      };
-    };
+        setIsConnected(false);
+        wsRef.current = null;
 
+        if (reconnectCountRef.current < 5) {
+          const timeout = Math.min(
+            1000 * Math.pow(2, reconnectCountRef.current),
+            30000
+          );
+          reconnectCountRef.current += 1;
+
+          reconnectTimerRef.current = setTimeout(() => {
+            connect();
+          }, timeout);
+        }
+      };
+    } catch (err: any) {
+      setConnectionError(err.message || 'Failed to initialize WebSocket');
+    }
+  }, [appId, token, onTelemetryData]);
+
+  useEffect(() => {
     connect();
 
     return () => {
-      clearInterval(pingInterval);
-      clearTimeout(reconnectTimer);
-      if (wsRef.current) wsRef.current.close();
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+      }
     };
-  }, [appId, apiToken]);
-}
+  }, [connect]);
 
-async function syncTelemetryToServer(data: Record<string, any>) {
-  try {
-    await fetch('/api/broker/telemetry', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-  } catch (err) {
-    console.error('Failed to sync telemetry to Railway gateway:', err);
-  }
-}
+  return { isConnected, connectionError, reconnect: connect };
+};
