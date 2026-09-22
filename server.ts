@@ -100,6 +100,61 @@ let activeBrokerTelemetry: BrokerTelemetry = {
     },
   ],
 };
+import WebSocket from 'ws';
+
+// Connects server directly to Deriv API using Railway Environment Variables
+function initDerivConnection() {
+  const appId = process.env.DERIV_APP_ID || '1089';
+  const token = process.env.DERIV_API_TOKEN;
+
+  if (!token) {
+    console.log('⚠️ No DERIV_API_TOKEN provided. Telemetry running in mock mode.');
+    return;
+  }
+
+  console.log('🔌 Connecting to Deriv WebSocket gateway...');
+  const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`);
+
+  ws.on('open', () => {
+    console.log('🔑 Authenticating with Deriv API Token...');
+    ws.send(JSON.stringify({ authorize: token }));
+  });
+
+  ws.on('message', (data: WebSocket.Data) => {
+    try {
+      const res = JSON.parse(data.toString());
+
+      // 1. Successful Authorization
+      if (res.msg_type === 'authorize' && res.authorize) {
+        console.log(`✅ Authorized Deriv Account: ${res.authorize.loginid}`);
+        // Subscribe to live balance updates
+        ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+      }
+
+      // 2. Real-time Balance/Equity Update
+      if (res.msg_type === 'balance' && res.balance) {
+        activeBrokerTelemetry = {
+          ...activeBrokerTelemetry,
+          balance: res.balance.balance,
+          equity: res.balance.balance,
+          currency: res.balance.currency,
+          account: res.balance.loginid,
+          status: 'connected',
+          updatedAt: new Date().toISOString()
+        };
+        console.log(`💰 Live Deriv Telemetry Updated: ${res.balance.currency} ${res.balance.balance}`);
+      }
+    } catch (err) {
+      console.error('Error parsing Deriv response:', err);
+    }
+  });
+
+  ws.on('error', (err) => console.error('Deriv WS Error:', err.message));
+  ws.on('close', () => {
+    console.log('Deriv WS disconnected. Reconnecting in 5s...');
+    setTimeout(initDerivConnection, 5000);
+  });
+}
 
 async function startServer() {
   const app = express();
