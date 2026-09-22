@@ -1,9 +1,8 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import WebSocket from 'ws';
 
-// In-memory shared state between web dashboard, trading bot (VS Code), and broker
+// In-memory shared state between web dashboard, trading bot, and broker
 interface BotGatewayConfig {
   masterExecution: boolean;
   riskPerTradePct: number;
@@ -46,7 +45,7 @@ interface BrokerTelemetry {
   }>;
 }
 
-// Current live state
+// Default state
 let activeBotConfig: BotGatewayConfig = {
   masterExecution: true,
   riskPerTradePct: 1.25,
@@ -62,8 +61,8 @@ let activeBotConfig: BotGatewayConfig = {
 let activeBrokerTelemetry: BrokerTelemetry = {
   connected: false,
   provider: 'Deriv API',
-  accountNumber: 'Connecting...',
-  server: 'Deriv WebSocket',
+  accountNumber: 'Awaiting Connection',
+  server: 'Deriv Gateway',
   currency: 'USD',
   balance: 0.00,
   equity: 0.00,
@@ -79,100 +78,13 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   openPositions: [],
 };
 
-let pingInterval: NodeJS.Timeout | null = null;
-let reconnectDelay = 5000;
-
-// Connects server directly to Deriv API using Railway Environment Variables
-function initDerivConnection() {
-  const appId = process.env.DERIV_APP_ID || '1089';
-  const token = process.env.DERIV_API_TOKEN;
-
-  if (!token) {
-    console.log('⚠️ No DERIV_API_TOKEN provided. Telemetry running in mock mode.');
-    return;
-  }
-
-  const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
-  console.log('🔌 Connecting to Deriv WebSocket gateway...');
-
-  // Standard clean WebSocket request without conflicting TLS fingerprint headers
-  const ws = new WebSocket(wsUrl);
-
-  ws.on('open', () => {
-    console.log('🔑 Authenticating with Deriv API Token...');
-    reconnectDelay = 5000; // Reset backoff delay on successful open
-    ws.send(JSON.stringify({ authorize: token }));
-
-    if (pingInterval) clearInterval(pingInterval);
-    pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ ping: 1 }));
-      }
-    }, 30000);
-  });
-
-  ws.on('message', (data: WebSocket.Data) => {
-    try {
-      const res = JSON.parse(data.toString());
-
-      // 1. Successful Authorization
-      if (res.msg_type === 'authorize' && res.authorize) {
-        console.log(`✅ Authorized Deriv Account: ${res.authorize.loginid}`);
-        activeBrokerTelemetry = {
-          ...activeBrokerTelemetry,
-          connected: true,
-          accountNumber: res.authorize.loginid,
-          currency: res.authorize.currency || 'USD',
-          balance: res.authorize.balance || activeBrokerTelemetry.balance,
-          equity: res.authorize.balance || activeBrokerTelemetry.equity,
-          lastSyncTime: new Date().toISOString(),
-          lastHeartbeat: new Date().toISOString(),
-        };
-        // Subscribe to live balance updates
-        ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-      }
-
-      // 2. Real-time Balance/Equity Update
-      if (res.msg_type === 'balance' && res.balance) {
-        activeBrokerTelemetry = {
-          ...activeBrokerTelemetry,
-          connected: true,
-          balance: res.balance.balance,
-          equity: res.balance.balance,
-          currency: res.balance.currency,
-          accountNumber: res.balance.loginid || activeBrokerTelemetry.accountNumber,
-          lastSyncTime: new Date().toISOString(),
-          lastHeartbeat: new Date().toISOString(),
-        };
-        console.log(`💰 Live Deriv Telemetry Updated: ${res.balance.currency} ${res.balance.balance}`);
-      }
-    } catch (err) {
-      console.error('Error parsing Deriv response:', err);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error('Deriv WS Handshake Status:', err.message);
-  });
-
-  ws.on('close', () => {
-    if (pingInterval) clearInterval(pingInterval);
-    activeBrokerTelemetry.connected = false;
-    
-    // Exponential backoff to avoid hammering Cloudflare rate limits
-    console.log(`Deriv WS disconnected. Retrying in ${reconnectDelay / 1000}s...`);
-    setTimeout(initDerivConnection, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 1.5, 60000);
-  });
-}
-
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   app.use(express.json());
 
-  // CORS middleware for external bots / VS Code scripts
+  // CORS middleware for web browsers & local scripts
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -183,20 +95,17 @@ async function startServer() {
     next();
   });
 
-  // Start Deriv connection
-  initDerivConnection();
-
   // 1. Health check
   app.get('/api/health', (req, res) => {
     res.json({
       status: 'ok',
-      service: 'Trading Portal Bot & Broker Gateway',
+      service: 'Trading Portal Gateway',
       time: new Date().toISOString(),
       botVersion: activeBotConfig.version,
     });
   });
 
-  // 2. Bot Target Controls: GET (used by VS Code Python Bot, MT5 EA, or Web Portal)
+  // 2. Get Bot Configuration
   app.get('/api/bot/config', (req, res) => {
     res.json({
       status: 'success',
@@ -204,7 +113,7 @@ async function startServer() {
     });
   });
 
-  // 3. Bot Target Controls: POST (updates active parameters from Web Dashboard or external bot)
+  // 3. Update Bot Configuration
   app.post('/api/bot/config', (req, res) => {
     const {
       masterExecution,
@@ -227,16 +136,14 @@ async function startServer() {
     activeBotConfig.updatedAt = new Date().toISOString();
     activeBotConfig.version += 1;
 
-    console.log(`[BOT GATEWAY] Updated config v${activeBotConfig.version}: Risk ${activeBotConfig.riskPerTradePct}%, R:R 1:${activeBotConfig.riskToReward}, MaxTrades ${activeBotConfig.maxDailyTrades}, Master: ${activeBotConfig.masterExecution}`);
-
     res.json({
       status: 'success',
-      message: 'Bot parameters updated and active on gateway',
+      message: 'Bot parameters updated',
       data: activeBotConfig,
     });
   });
 
-  // 4. Broker Telemetry: GET (returns real account values for the portal)
+  // 4. Get Live Telemetry
   app.get('/api/broker/telemetry', (req, res) => {
     res.json({
       status: 'success',
@@ -244,7 +151,7 @@ async function startServer() {
     });
   });
 
-  // 5. Broker Telemetry: POST (endpoint where VS Code bot or MT5 EA pushes real live broker values)
+  // 5. Receive Live Telemetry (Pushed from Browser or Local Bot Script)
   app.post('/api/broker/telemetry', (req, res) => {
     const {
       provider,
@@ -286,29 +193,15 @@ async function startServer() {
     activeBrokerTelemetry.lastSyncTime = new Date().toISOString();
     activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
 
-    console.log(`[BROKER TELEMETRY] Received live push: Equity ${activeBrokerTelemetry.equity} ${activeBrokerTelemetry.currency}, Balance ${activeBrokerTelemetry.balance}, NetProfit ${activeBrokerTelemetry.netProfit}`);
-
     res.json({
       status: 'success',
-      message: 'Broker telemetry synced successfully',
+      message: 'Telemetry updated',
       data: activeBrokerTelemetry,
       activeBotConfig,
     });
   });
 
-  // 6. Connect / Disconnect simulation or manual trigger
-  app.post('/api/broker/connect', (req, res) => {
-    activeBrokerTelemetry.connected = true;
-    activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-    res.json({ status: 'success', message: 'Broker connected', data: activeBrokerTelemetry });
-  });
-
-  app.post('/api/broker/disconnect', (req, res) => {
-    activeBrokerTelemetry.connected = false;
-    res.json({ status: 'success', message: 'Broker disconnected', data: activeBrokerTelemetry });
-  });
-
-  // Vite middleware for development or static serve in production
+  // Serve static UI or Vite development server
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true, host: '0.0.0.0' },
@@ -324,11 +217,11 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Trading Portal & Bot Gateway running on http://0.0.0.0:${PORT}`);
+    console.log(`🚀 Trading Portal & API Gateway active on port ${PORT}`);
   });
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start server:', err);
+  console.error('Server startup error:', err);
   process.exit(1);
 });
