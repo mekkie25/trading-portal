@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 
 // In-memory shared state between web dashboard, trading bot, and broker
@@ -217,7 +218,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   }
-  
+
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Trading Portal & API Gateway active on port ${PORT}`);
   });
