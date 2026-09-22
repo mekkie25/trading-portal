@@ -80,92 +80,130 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   openPositions: [],
 };
 
-function startDerivGateway() {
-  const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
+async function startDerivGateway() {
+  const DERIV_APP_ID = process.env.DERIV_APP_ID;
   const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN;
+  const API_BASE = 'https://api.derivws.com';
 
-  if (!DERIV_API_TOKEN) {
-    console.warn('⚠️ DERIV_API_TOKEN not set on Railway — telemetry stays at placeholder values.');
+  if (!DERIV_APP_ID || !DERIV_API_TOKEN) {
+    console.warn('⚠️ DERIV_APP_ID or DERIV_API_TOKEN not set — telemetry stays at placeholder values.');
     return;
   }
 
   let ws: WebSocket | null = null;
   let reconnectAttempts = 0;
 
-  function connect() {
-   ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`, {
-  headers: {
-    'Origin': 'trading-portal-production.up.railway.app',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-  },
-});
-
-    ws.on('open', () => {
-      console.log('✅ Connected to Deriv API');
-      reconnectAttempts = 0;
-      ws!.send(JSON.stringify({ authorize: DERIV_API_TOKEN }));
+  async function getAuthenticatedWsUrl(): Promise<string> {
+    // Step 1: Get the account ID for the demo account
+    const accountsRes = await fetch(`${API_BASE}/trading/v1/options/accounts`, {
+      headers: {
+        'Authorization': `Bearer ${DERIV_API_TOKEN}`,
+        'Deriv-App-ID': DERIV_APP_ID,
+      },
     });
+    if (!accountsRes.ok) {
+      throw new Error(`Failed to fetch accounts: ${accountsRes.status} ${await accountsRes.text()}`);
+    }
+    const accountsData = await accountsRes.json();
+    const accounts = accountsData.data || [];
+    const demoAccount = accounts.find((a: any) => a.account_type === 'demo') || accounts[0];
 
-    ws.on('message', (raw) => {
-      const data = JSON.parse(raw.toString());
+    if (!demoAccount) {
+      throw new Error('No Deriv accounts found for this token.');
+    }
 
-      if (data.error) {
-        console.error('Deriv API error:', data.error.message);
-        return;
-      }
+    const accountId = demoAccount.account_id || demoAccount.loginid || demoAccount.id;
+    activeBrokerTelemetry.accountNumber = accountId;
+    activeBrokerTelemetry.currency = demoAccount.currency || activeBrokerTelemetry.currency;
+    activeBotConfig.currency = demoAccount.currency || activeBotConfig.currency;
 
-      if (data.msg_type === 'authorize') {
+    // Step 2: Get a one-time authenticated WebSocket URL for that account
+    const otpRes = await fetch(`${API_BASE}/trading/v1/options/accounts/${accountId}/otp`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${DERIV_API_TOKEN}`,
+        'Deriv-App-ID': DERIV_APP_ID,
+      },
+    });
+    if (!otpRes.ok) {
+      throw new Error(`Failed to fetch OTP: ${otpRes.status} ${await otpRes.text()}`);
+    }
+    const otpData = await otpRes.json();
+    return otpData.data.url;
+  }
+
+  async function connect() {
+    try {
+      const wsUrl = await getAuthenticatedWsUrl();
+      ws = new WebSocket(wsUrl);
+
+      ws.on('open', () => {
+        console.log('✅ Connected to Deriv API (new options endpoint)');
+        reconnectAttempts = 0;
         activeBrokerTelemetry.connected = true;
-        activeBrokerTelemetry.accountNumber = data.authorize.loginid;
-        activeBrokerTelemetry.currency = data.authorize.currency;
-        activeBotConfig.currency = data.authorize.currency;
 
-        ws!.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-        ws!.send(JSON.stringify({ portfolio: 1 }));
-        ws!.send(JSON.stringify({ statement: 1, limit: 100 }));
-      }
+        ws!.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: 1 }));
+        ws!.send(JSON.stringify({ portfolio: 1, req_id: 2 }));
+        ws!.send(JSON.stringify({ statement: 1, limit: 100, req_id: 3 }));
+      });
 
-      if (data.msg_type === 'balance') {
-        activeBrokerTelemetry.balance = data.balance.balance;
-        activeBrokerTelemetry.lastSyncTime = new Date().toISOString();
-        activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-      }
+      ws.on('message', (raw) => {
+        const data = JSON.parse(raw.toString());
 
-      if (data.msg_type === 'portfolio') {
-        const contracts = data.portfolio?.contracts || [];
-        activeBrokerTelemetry.openPositions = contracts.map((c: any) => ({
-          ticket: String(c.contract_id),
-          symbol: c.symbol,
-          type: c.contract_type?.includes('PUT') ? 'SELL' : 'BUY',
-          lots: c.payout || 0,
-          openPrice: c.buy_price,
-          currentPrice: c.buy_price,
-          pnl: 0,
-        }));
-      }
+        if (data.error) {
+          console.error('Deriv API error:', data.error.message);
+          return;
+        }
 
-      if (data.msg_type === 'statement') {
-        const txs = data.statement?.transactions || [];
-        const closed = txs.filter((t: any) => t.action_type === 'sell');
-        const wins = closed.filter((t: any) => t.amount > 0).length;
-        activeBrokerTelemetry.totalTrades = closed.length;
-        activeBrokerTelemetry.winningTrades = wins;
-        activeBrokerTelemetry.losingTrades = closed.length - wins;
-        activeBrokerTelemetry.winRate = closed.length ? Number(((wins / closed.length) * 100).toFixed(1)) : 0;
-        activeBrokerTelemetry.netProfit = closed.reduce((sum: number, t: any) => sum + t.amount, 0);
-      }
-    });
+        if (data.msg_type === 'balance') {
+          activeBrokerTelemetry.balance = data.balance.balance;
+          activeBrokerTelemetry.currency = data.balance.currency || activeBrokerTelemetry.currency;
+          activeBrokerTelemetry.lastSyncTime = new Date().toISOString();
+          activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
+        }
 
-    ws.on('close', () => {
-      activeBrokerTelemetry.connected = false;
+        if (data.msg_type === 'portfolio') {
+          const contracts = data.portfolio?.contracts || [];
+          activeBrokerTelemetry.openPositions = contracts.map((c: any) => ({
+            ticket: String(c.contract_id),
+            symbol: c.symbol,
+            type: c.contract_type?.includes('PUT') || c.contract_type?.includes('DOWN') ? 'SELL' : 'BUY',
+            lots: c.payout || 0,
+            openPrice: c.buy_price,
+            currentPrice: c.buy_price,
+            pnl: 0,
+          }));
+        }
+
+        if (data.msg_type === 'statement') {
+          const txs = data.statement?.transactions || [];
+          const closed = txs.filter((t: any) => t.action_type === 'sell');
+          const wins = closed.filter((t: any) => t.amount > 0).length;
+          activeBrokerTelemetry.totalTrades = closed.length;
+          activeBrokerTelemetry.winningTrades = wins;
+          activeBrokerTelemetry.losingTrades = closed.length - wins;
+          activeBrokerTelemetry.winRate = closed.length ? Number(((wins / closed.length) * 100).toFixed(1)) : 0;
+          activeBrokerTelemetry.netProfit = closed.reduce((sum: number, t: any) => sum + t.amount, 0);
+        }
+      });
+
+      ws.on('close', () => {
+        activeBrokerTelemetry.connected = false;
+        const timeout = Math.min(1000 * 2 ** reconnectAttempts, 30000);
+        reconnectAttempts++;
+        console.log(`Deriv WebSocket closed — reconnecting in ${timeout / 1000}s`);
+        setTimeout(connect, timeout);
+      });
+
+      ws.on('error', (err) => {
+        console.error('Deriv WebSocket error:', err.message);
+      });
+    } catch (err: any) {
+      console.error('Deriv Gateway setup failed:', err.message);
       const timeout = Math.min(1000 * 2 ** reconnectAttempts, 30000);
       reconnectAttempts++;
       setTimeout(connect, timeout);
-    });
-
-    ws.on('error', (err) => {
-      console.error('Deriv WebSocket error:', err.message);
-    });
+    }
   }
 
   connect();
