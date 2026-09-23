@@ -501,7 +501,12 @@ app.post('/api/analysis', async (req, res) => {
   });
 
   // 3. Update Bot Configuration
-  app.post('/api/bot/config', (req, res) => {
+  // 3. Update Bot Configuration
+app.post('/api/bot/config', (req, res) => {
+  try {
+    const config = req.body;
+
+    // 1. Update active in-memory configuration
     const {
       masterExecution,
       riskPerTradePct,
@@ -509,8 +514,8 @@ app.post('/api/analysis', async (req, res) => {
       maxDailyTrades,
       trailingStopActive,
       autoBreakevenPips,
-      currency,
-    } = req.body;
+      currency
+    } = config;
 
     if (typeof masterExecution === 'boolean') activeBotConfig.masterExecution = masterExecution;
     if (typeof riskPerTradePct === 'number') activeBotConfig.riskPerTradePct = riskPerTradePct;
@@ -521,15 +526,23 @@ app.post('/api/analysis', async (req, res) => {
     if (typeof currency === 'string') activeBotConfig.currency = currency;
 
     activeBotConfig.updatedAt = new Date().toISOString();
-    activeBotConfig.version += 1;
 
-    res.json({
-      status: 'success',
-      message: 'Bot parameters updated',
-      data: activeBotConfig,
+    // 2. Persist to bot_config.json for matrix.py to read
+    fs.writeFileSync('bot_config.json', JSON.stringify(config, null, 2));
+
+    res.json({ 
+      status: 'success', 
+      message: 'Config updated and written to bot_config.json', 
+      config: activeBotConfig 
     });
-  });
-
+  } catch (error: any) {
+    res.status(500).json({ 
+      status: 'error', 
+      message: error?.message || 'Failed to update config' 
+    });
+  }
+});
+    
   // 3b. Get / Update Risk Limits (max daily/weekly/monthly loss ceilings)
   app.get('/api/limits', (req, res) => {
     recomputeRiskState();
@@ -550,17 +563,42 @@ app.post('/api/analysis', async (req, res) => {
       riskLimits.breakerAction = breakerAction as RiskLimitsConfig['breakerAction'];
     }
 
-    // A human explicitly acknowledging the trip and resetting it is the
-    // ONLY way breakerTriggered clears — it is never auto-cleared just
-    // because a new day started, since the underlying loss already happened.
-    if (resetBreaker === true) {
-      riskState.breakerTriggered = false;
-      riskState.activeTripScope = 'NONE';
-      riskState.lastTriggerReason = undefined;
+    app.post('/api/limits', (req, res) => {
+  try {
+    const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, breakerAction } = req.body;
+
+    if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
+    if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
+    if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
+    
+    const validActions = ['HALT_CLOSE_ALL', 'HALT_PREVENT_NEW', 'REDUCE_SIZE_50', 'ALERT_ONLY'];
+    if (typeof breakerAction === 'string' && validActions.includes(breakerAction)) {
+      riskLimits.breakerAction = breakerAction as RiskLimitsConfig['breakerAction'];
     }
 
-    recomputeRiskState();
+    // Persist full configuration payload for matrix.py
+    const currentConfig = fs.existsSync('bot_config.json') 
+      ? JSON.parse(fs.readFileSync('bot_config.json', 'utf8')) 
+      : {};
 
+    const updatedConfig = {
+      ...currentConfig,
+      maxDailyLoss: riskLimits.maxDailyLossUsd,
+      maxWeeklyLoss: riskLimits.maxWeeklyLossUsd,
+      maxMonthlyLoss: riskLimits.maxMonthlyLossUsd,
+      breakerAction: riskLimits.breakerAction,
+    };
+
+    fs.writeFileSync('bot_config.json', JSON.stringify(updatedConfig, null, 2));
+
+    res.json({
+      status: 'success',
+      data: { ...riskLimits, ...riskState },
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: 'error', message: error?.message || 'Failed to update limits' });
+  }
+});
     res.json({
       status: 'success',
       message: 'Risk limits updated',
