@@ -183,6 +183,7 @@ export default function App() {
               currentEquity: d.equity ?? prev.currentEquity,
               currentBalance: d.balance ?? prev.currentBalance,
               unrealizedPnL: d.floatingPnL ?? prev.unrealizedPnL,
+              totalInjections: typeof d.totalDeposits === 'number' ? d.totalDeposits : prev.totalInjections,
             };
             safeStorage.setItem('2gs_metrics', next);
             return next;
@@ -292,6 +293,18 @@ export default function App() {
     safeStorage.setItem('portal_branding_config', newBranding);
   };
 
+  // Hide pre-existing/old trades from the journal view (does not touch real
+  // Deriv history — see the server's /api/journal/reset for why).
+  const handleResetJournal = async () => {
+    setTrades([]);
+    safeStorage.setItem('2gs_trades', []);
+    try {
+      await fetch('/api/journal/reset', { method: 'POST' });
+    } catch (err) {
+      console.warn('Journal reset push silent fallback:', err);
+    }
+  };
+
   const handleToggleBotActive = () => {
     const updated = !botSettings.masterExecution;
     handleSaveBotSettings({ ...botSettings, masterExecution: updated });
@@ -369,6 +382,7 @@ export default function App() {
             <TradeJournalView
               trades={trades}
               onAddTrade={handleAddTrade}
+              onResetJournal={handleResetJournal}
               sheetsConfig={sheetsConfig}
               brokerConfig={brokerConfig}
               themeMode={themeMode}

@@ -21,6 +21,7 @@ import { formatCurrency } from '../../utils/currency';
 interface TradeJournalViewProps {
   trades: TradeRecord[];
   onAddTrade: (trade: TradeRecord) => void;
+  onResetJournal?: () => void;
   sheetsConfig: GoogleSheetsConfig;
   brokerConfig: BrokerConfig;
   themeMode?: ThemeMode;
@@ -29,6 +30,7 @@ interface TradeJournalViewProps {
 export const TradeJournalView: React.FC<TradeJournalViewProps> = ({ 
   trades, 
   onAddTrade,
+  onResetJournal,
   sheetsConfig,
   brokerConfig,
   themeMode = 'dark'
@@ -306,6 +308,23 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             <Plus className="w-3.5 h-3.5" />
             <span>Add Manual Trade</span>
           </button>
+
+          {/* Clear Journal Button — hides old/pre-existing trades from view.
+              Does not delete anything on Deriv's side; new trades still show up normally after this. */}
+          {onResetJournal && (
+            <button
+              type="button"
+              onClick={() => {
+                if (window.confirm('Clear the journal view? This hides all currently-listed trades (old Deriv account history is NOT deleted, just hidden). New trades will still appear normally.')) {
+                  onResetJournal();
+                }
+              }}
+              className="px-3.5 py-2 rounded-xl bg-red-600/10 hover:bg-red-600/20 text-red-500 border border-red-500/30 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+              <span>Clear Journal</span>
+            </button>
+          )}
         </div>
       </motion.div>
 

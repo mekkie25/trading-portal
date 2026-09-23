@@ -48,6 +48,7 @@ interface BrokerTelemetry {
   equity: number;
   floatingPnL: number;
   netProfit: number;
+  totalDeposits: number;
   winRate: number;
   totalTrades: number;
   winningTrades: number;
@@ -81,6 +82,39 @@ let activeBotConfig: BotGatewayConfig = {
   version: 1,
 };
 
+// Every trade Deriv has ever reported for this account, unfiltered. Risk
+// calculations (recomputeRiskState) always read from THIS list, never from
+// the journal-filtered one below — hiding old trades from the UI must never
+// let real historical losses "disappear" from the kill switch's math.
+// Contract IDs of trades WE placed via /api/bot/trade, so the journal can
+// label them "Bot Engine" instead of lumping them in with pre-existing
+// account history pulled from Deriv.
+const botPlacedContractIds = new Set<string>();
+
+let allTrades: any[] = [];
+
+// Trades closed before this timestamp are hidden from the journal/UI (see
+// POST /api/journal/reset). null = show everything.
+let journalCutoffTime: string | null = null;
+
+// Deriv's profit_table only includes shortcode/longcode (which contain the
+// instrument name) if you explicitly ask for them via description:1. Even
+// then, shortcode looks like "CALL_R_100_20_...", so we pull the readable
+// name out of longcode's "... if <Instrument Name> is/was ..." phrasing,
+// falling back to picking the known symbol code out of the shortcode.
+const KNOWN_SYMBOL_PATTERN = /\b(R_\d+|1HZ\d+V|BOOM\d+|CRASH\d+|JD\d+|frx[A-Z]+|cry[A-Z]+|WLD[A-Z]+)\b/;
+function extractInstrumentName(shortcode?: string, longcode?: string): string {
+  if (longcode) {
+    const m = longcode.match(/if\s+(.+?)\s+(?:is|was|ends|strictly)/i);
+    if (m && m[1]) return m[1].trim();
+  }
+  if (shortcode) {
+    const m = shortcode.match(KNOWN_SYMBOL_PATTERN);
+    if (m) return m[1];
+  }
+  return 'Unknown';
+}
+
 let riskLimits: RiskLimitsConfig = {
   maxDailyLossUsd: 2500,
   maxWeeklyLossUsd: 6500,
@@ -112,7 +146,7 @@ function recomputeRiskState() {
   let weeklyLoss = 0;
   let monthlyLoss = 0;
 
-  for (const t of activeBrokerTelemetry.trades) {
+  for (const t of allTrades) {
     if (typeof t.pnl !== 'number' || t.pnl >= 0) continue; // only realized losses count
     const closeTime = t.closeTime ? new Date(t.closeTime) : null;
     if (!closeTime || isNaN(closeTime.getTime())) continue;
@@ -164,6 +198,7 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   equity: 0.00,
   floatingPnL: 0.00,
   netProfit: 0.00,
+  totalDeposits: 0.00,
   winRate: 0.0,
   totalTrades: 0,
   winningTrades: 0,
@@ -271,7 +306,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
         ws!.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: 1 }));
         ws!.send(JSON.stringify({ portfolio: 1, req_id: 2 }));
         ws!.send(JSON.stringify({ statement: 1, limit: 100, req_id: 3 }));
-        ws!.send(JSON.stringify({ profit_table: 1, limit: 50, sort: 'DESC', req_id: 4 }));
+        ws!.send(JSON.stringify({ profit_table: 1, limit: 50, sort: 'DESC', description: 1, req_id: 4 }));
       });
 
       ws.on('message', (raw) => {
@@ -309,7 +344,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
 
         if (data.msg_type === 'profit_table') {
           const txs = data.profit_table?.transactions || [];
-          activeBrokerTelemetry.trades = txs.map((t: any) => {
+          allTrades = txs.map((t: any) => {
             const pnl = (t.sell_price ?? 0) - (t.buy_price ?? 0);
             const openMs = (t.purchase_time ?? 0) * 1000;
             const closeMs = (t.sell_time ?? 0) * 1000;
@@ -317,7 +352,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
             return {
               id: String(t.transaction_id ?? t.contract_id),
               ticket: String(t.contract_id ?? t.transaction_id),
-              asset: t.shortcode || t.longcode || 'Unknown',
+              asset: extractInstrumentName(t.shortcode, t.longcode),
               type: 'BUY',
               lots: t.payout || 0,
               openPrice: t.buy_price ?? 0,
@@ -328,10 +363,15 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
               closeTime: t.sell_time ? new Date(closeMs).toISOString() : '',
               duration: `${durationMin}m`,
               status: pnl > 0 ? 'WIN' : pnl < 0 ? 'LOSS' : 'BREAKEVEN',
-              source: 'Deriv Live',
+              source: botPlacedContractIds.has(String(t.contract_id)) ? 'Bot Engine' : 'Deriv Live',
             };
           });
-          console.log(`📒 Loaded ${activeBrokerTelemetry.trades.length} real trades from Deriv profit_table`);
+
+          activeBrokerTelemetry.trades = journalCutoffTime
+            ? allTrades.filter((t) => !t.closeTime || t.closeTime >= journalCutoffTime!)
+            : allTrades;
+
+          console.log(`📒 Loaded ${allTrades.length} real trades from Deriv profit_table (${activeBrokerTelemetry.trades.length} visible in journal)`);
           recomputeRiskState();
         }
 
@@ -357,6 +397,13 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
           activeBrokerTelemetry.losingTrades = closed.length - wins;
           activeBrokerTelemetry.winRate = closed.length ? Number(((wins / closed.length) * 100).toFixed(1)) : 0;
           activeBrokerTelemetry.netProfit = closed.reduce((sum: number, t: any) => sum + t.amount, 0);
+
+          // Real "total injections" — sum of actual deposit transactions on
+          // this account, replacing the old hardcoded $125,000 placeholder.
+          const deposits = txs.filter((t: any) => t.action_type === 'deposit');
+          activeBrokerTelemetry.totalDeposits = Number(
+            deposits.reduce((sum: number, t: any) => sum + (t.amount || 0), 0).toFixed(2)
+          );
         }
       });
 
@@ -414,11 +461,26 @@ async function startServer() {
   // 2. Journal and Analysis API Endpoints
 app.get('/api/journal', async (req, res) => {
     try {
-        const trades: any[] = []; 
+        const trades: any[] = activeBrokerTelemetry.trades;
         res.status(200).json(trades);
     } catch (error) {
         res.status(500).json({ error: "Failed to fetch journal entries" });
     }
+});
+
+// "Reset" the journal view. This does NOT delete anything from Deriv (that's
+// real broker history and can't be erased) — it just hides everything closed
+// before right now from the dashboard, so old/unrelated trades stop showing
+// up as if the bot placed them. Real risk/kill-switch math still accounts
+// for ALL historical trades regardless of this cutoff.
+app.post('/api/journal/reset', (req, res) => {
+    journalCutoffTime = new Date().toISOString();
+    activeBrokerTelemetry.trades = allTrades.filter((t) => !t.closeTime || t.closeTime >= journalCutoffTime!);
+    res.json({
+      status: 'success',
+      message: 'Journal view cleared. New trades from this point on will appear normally.',
+      cutoff: journalCutoffTime,
+    });
 });
 
 app.post('/api/analysis', async (req, res) => {
@@ -563,6 +625,9 @@ app.post('/api/analysis', async (req, res) => {
       });
 
       res.json({ status: 'success', message: 'Trade placed on Deriv.', data: bought.buy });
+      if (bought.buy?.contract_id) {
+        botPlacedContractIds.add(String(bought.buy.contract_id));
+      }
     } catch (err: any) {
       console.error('Trade execution failed:', err.message);
       res.status(502).json({ status: 'error', message: `Trade execution failed: ${err.message}` });
