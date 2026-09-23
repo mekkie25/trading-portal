@@ -80,24 +80,25 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
 
     setFormLimits(updated);
     onUpdateLimits(updated);
+    // Note: this is a UI-only demo of the trip banner. The server recomputes
+    // real loss figures from actual closed trades every ~8s, so this fake
+    // trip will be overwritten automatically unless a real loss also
+    // breaches the ceiling. What DOES take effect for real is the halt:
     if (onHaltBot) {
-      onHaltBot(false); // turn off bot
+      onHaltBot(true); // actually engage the kill switch (masterExecution -> false)
     }
   };
 
+  // Resetting no longer fakes the loss figures. The server recomputes the
+  // real currentDailyLossUsd/Weekly/Monthly from actual closed Deriv trades
+  // and sends them back — this just clears the breaker flag and re-enables
+  // the bot (handled server-side via onHaltBot -> resetBreaker: true).
   const handleResetBreakers = () => {
-    const updated: AdvancedLimits = {
-      ...formLimits,
-      breakerTriggered: false,
-      activeTripScope: 'NONE',
-      currentDailyLossUsd: 820.00,
-      currentWeeklyLossUsd: 1450.00,
-      currentMonthlyLossUsd: 2180.00,
-      currentDailyDrawdownPct: 0.82,
-      lastTriggerReason: undefined,
-    };
-    setFormLimits(updated);
-    onUpdateLimits(updated);
+    if (onHaltBot) {
+      onHaltBot(false); // resume trading; App.tsx clears the breaker server-side
+    } else {
+      onUpdateLimits({ ...formLimits, breakerTriggered: false, activeTripScope: 'NONE', lastTriggerReason: undefined });
+    }
   };
 
   const maxDaily = formLimits.maxDailyLossUsd || 2500;

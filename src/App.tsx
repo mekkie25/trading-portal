@@ -201,9 +201,80 @@ export default function App() {
     return () => clearInterval(interval);
   }, [syncBrokerTelemetry]);
 
-  const handleUpdateLimits = (newLimits: AdvancedLimits) => {
+  // Save changes to storage AND push the loss ceilings + any manual breaker
+  // reset to the backend. The server is the source of truth for the
+  // *current* loss figures and breakerTriggered — those come back on the
+  // next syncRiskStatus() call and overwrite whatever was sent here.
+  const handleUpdateLimits = async (newLimits: AdvancedLimits, resetBreaker = false) => {
     setLimits(newLimits);
     safeStorage.setItem('2gs_limits', newLimits);
+
+    try {
+      const res = await fetch('/api/limits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          maxDailyLossUsd: newLimits.maxDailyLossUsd,
+          maxWeeklyLossUsd: newLimits.maxWeeklyLossUsd,
+          maxMonthlyLossUsd: newLimits.maxMonthlyLossUsd,
+          breakerAction: newLimits.breakerAction,
+          resetBreaker,
+        }),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json.status === 'success' && json.data) {
+          const merged = { ...newLimits, ...json.data };
+          setLimits(merged);
+          safeStorage.setItem('2gs_limits', merged);
+        }
+      }
+    } catch (err) {
+      console.warn('Limits gateway push silent fallback:', err);
+    }
+  };
+
+  // Pull the server-computed risk state (real daily/weekly/monthly loss +
+  // breakerTriggered) so the UI always shows the backend's numbers, not
+  // stale local ones.
+  const syncRiskStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/risk/status');
+      if (res.ok) {
+        const json = await res.json();
+        if (json.status === 'success' && json.data) {
+          setLimits((prev) => {
+            const next = { ...prev, ...json.data };
+            safeStorage.setItem('2gs_limits', next);
+            return next;
+          });
+          // If the server auto-tripped the breaker, it also forces
+          // masterExecution off server-side — mirror that locally too.
+          if (json.data.breakerTriggered) {
+            setBotSettings((prev) => prev.masterExecution ? { ...prev, masterExecution: false } : prev);
+          }
+        }
+      }
+    } catch {
+      // Ignore background fetch error in static/offline mode
+    }
+  }, []);
+
+  // Poll risk status alongside telemetry every 8 seconds
+  useEffect(() => {
+    syncRiskStatus();
+    const interval = setInterval(syncRiskStatus, 8000);
+    return () => clearInterval(interval);
+  }, [syncRiskStatus]);
+
+  // Manual halt/resume from the Advanced Limits screen. Resuming after a
+  // breaker trip explicitly clears it server-side (a human is confirming
+  // they've reviewed the loss, not the clock silently resetting it).
+  const handleHaltBot = (halted: boolean) => {
+    handleSaveBotSettings({ ...botSettings, masterExecution: !halted });
+    if (!halted) {
+      handleUpdateLimits({ ...limits, breakerTriggered: false, activeTripScope: 'NONE', lastTriggerReason: undefined }, true);
+    }
   };
 
   const handleUpdateMetrics = (newMetrics: TopMetrics) => {
@@ -310,6 +381,7 @@ export default function App() {
               onUpdateLimits={handleUpdateLimits}
               currentEquity={metrics.currentEquity}
               themeMode={themeMode}
+              onHaltBot={handleHaltBot}
             />
           )}
 

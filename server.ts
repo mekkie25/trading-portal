@@ -17,6 +17,26 @@ interface BotGatewayConfig {
   version: number;
 }
 
+// Server-side risk limit configuration. This is the SOURCE OF TRUTH for the
+// kill switch. The frontend AdvancedLimits UI reads/writes this via
+// /api/limits, but the numbers that actually block trades are computed here,
+// on the server, from real closed trades — never trusted from the browser.
+interface RiskLimitsConfig {
+  maxDailyLossUsd: number;
+  maxWeeklyLossUsd: number;
+  maxMonthlyLossUsd: number;
+  breakerAction: 'HALT_CLOSE_ALL' | 'HALT_PREVENT_NEW' | 'REDUCE_SIZE_50' | 'ALERT_ONLY';
+}
+
+interface RiskState {
+  currentDailyLossUsd: number;
+  currentWeeklyLossUsd: number;
+  currentMonthlyLossUsd: number;
+  breakerTriggered: boolean;
+  activeTripScope: 'NONE' | 'DAY' | 'WEEK' | 'MONTH';
+  lastTriggerReason?: string;
+}
+
 interface BrokerTelemetry {
   connected: boolean;
   provider: string;
@@ -61,6 +81,79 @@ let activeBotConfig: BotGatewayConfig = {
   version: 1,
 };
 
+let riskLimits: RiskLimitsConfig = {
+  maxDailyLossUsd: 2500,
+  maxWeeklyLossUsd: 6500,
+  maxMonthlyLossUsd: 15000,
+  breakerAction: 'HALT_PREVENT_NEW',
+};
+
+let riskState: RiskState = {
+  currentDailyLossUsd: 0,
+  currentWeeklyLossUsd: 0,
+  currentMonthlyLossUsd: 0,
+  breakerTriggered: false,
+  activeTripScope: 'NONE',
+  lastTriggerReason: undefined,
+};
+
+// Recomputes real daily/weekly/monthly realized loss from actual closed
+// Deriv trades (activeBrokerTelemetry.trades), and trips the kill switch
+// automatically the moment any ceiling is breached. This replaces the old
+// static placeholder numbers (820 / 1450 / 2180) that never changed.
+function recomputeRiskState() {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfWeek = new Date(startOfDay);
+  startOfWeek.setDate(startOfDay.getDate() - startOfDay.getDay()); // Sunday
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  let dailyLoss = 0;
+  let weeklyLoss = 0;
+  let monthlyLoss = 0;
+
+  for (const t of activeBrokerTelemetry.trades) {
+    if (typeof t.pnl !== 'number' || t.pnl >= 0) continue; // only realized losses count
+    const closeTime = t.closeTime ? new Date(t.closeTime) : null;
+    if (!closeTime || isNaN(closeTime.getTime())) continue;
+
+    const loss = Math.abs(t.pnl);
+    if (closeTime >= startOfDay) dailyLoss += loss;
+    if (closeTime >= startOfWeek) weeklyLoss += loss;
+    if (closeTime >= startOfMonth) monthlyLoss += loss;
+  }
+
+  riskState.currentDailyLossUsd = Number(dailyLoss.toFixed(2));
+  riskState.currentWeeklyLossUsd = Number(weeklyLoss.toFixed(2));
+  riskState.currentMonthlyLossUsd = Number(monthlyLoss.toFixed(2));
+
+  let scope: RiskState['activeTripScope'] = 'NONE';
+  let reason: string | undefined;
+
+  if (dailyLoss >= riskLimits.maxDailyLossUsd) {
+    scope = 'DAY';
+    reason = `Daily loss limit breached: -$${dailyLoss.toFixed(2)} vs ceiling -$${riskLimits.maxDailyLossUsd.toFixed(2)}.`;
+  } else if (weeklyLoss >= riskLimits.maxWeeklyLossUsd) {
+    scope = 'WEEK';
+    reason = `Weekly loss limit breached: -$${weeklyLoss.toFixed(2)} vs ceiling -$${riskLimits.maxWeeklyLossUsd.toFixed(2)}.`;
+  } else if (monthlyLoss >= riskLimits.maxMonthlyLossUsd) {
+    scope = 'MONTH';
+    reason = `Monthly loss limit breached: -$${monthlyLoss.toFixed(2)} vs ceiling -$${riskLimits.maxMonthlyLossUsd.toFixed(2)}.`;
+  }
+
+  if (scope !== 'NONE') {
+    if (!riskState.breakerTriggered) {
+      console.warn(`🚨 Kill switch tripped automatically: ${reason}`);
+    }
+    riskState.breakerTriggered = true;
+    riskState.activeTripScope = scope;
+    riskState.lastTriggerReason = reason;
+    // The breaker is the real kill switch: force masterExecution off so
+    // /api/bot/trade refuses new orders until a human resets it.
+    activeBotConfig.masterExecution = false;
+  }
+}
+
 let activeBrokerTelemetry: BrokerTelemetry = {
   connected: false,
   provider: 'Deriv API',
@@ -81,6 +174,36 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   openPositions: [],
   trades: [],
 };
+
+// Module-level so the trade-execution endpoint (further down) can reach the
+// live Deriv socket instead of each part of the file holding its own copy.
+let derivSocket: WebSocket | null = null;
+
+// Pending request/response tracking for req_id-correlated Deriv API calls
+// (buy, proposal, etc. — anything that isn't a plain subscription).
+const pendingDerivRequests = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+let nextReqId = 1000;
+
+function sendDerivRequest(payload: Record<string, any>, timeoutMs = 15000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!derivSocket || derivSocket.readyState !== WebSocket.OPEN) {
+      reject(new Error('Deriv WebSocket is not connected.'));
+      return;
+    }
+    const req_id = nextReqId++;
+    const timer = setTimeout(() => {
+      pendingDerivRequests.delete(req_id);
+      reject(new Error('Deriv API request timed out.'));
+    }, timeoutMs);
+
+    pendingDerivRequests.set(req_id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
+
+    derivSocket.send(JSON.stringify({ ...payload, req_id }));
+  });
+}
 
 async function startDerivGateway() {
  const DERIV_APP_ID = process.env.DERIV_APP_ID!;
@@ -138,6 +261,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
     try {
       const wsUrl = await getAuthenticatedWsUrl();
       ws = new WebSocket(wsUrl);
+      derivSocket = ws;
 
       ws.on('open', () => {
         console.log('✅ Connected to Deriv API (new options endpoint)');
@@ -152,6 +276,20 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
 
       ws.on('message', (raw) => {
         const data = JSON.parse(raw.toString());
+
+        // If this message answers a specific request we're waiting on
+        // (e.g. a buy order or a price proposal), resolve/reject that
+        // promise instead of falling through to the telemetry handlers.
+        if (data.req_id && pendingDerivRequests.has(data.req_id)) {
+          const pending = pendingDerivRequests.get(data.req_id)!;
+          pendingDerivRequests.delete(data.req_id);
+          if (data.error) {
+            pending.reject(new Error(data.error.message || 'Deriv API error'));
+          } else {
+            pending.resolve(data);
+          }
+          return;
+        }
 
         if (data.error) {
           console.error('Deriv API error:', data.error.message);
@@ -194,6 +332,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
             };
           });
           console.log(`📒 Loaded ${activeBrokerTelemetry.trades.length} real trades from Deriv profit_table`);
+          recomputeRiskState();
         }
 
         if (data.msg_type === 'portfolio') {
@@ -223,6 +362,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
 
       ws.on('close', () => {
         activeBrokerTelemetry.connected = false;
+        derivSocket = null;
         const timeout = Math.min(1000 * 2 ** reconnectAttempts, 30000);
         reconnectAttempts++;
         console.log(`Deriv WebSocket closed — reconnecting in ${timeout / 1000}s`);
@@ -274,7 +414,7 @@ async function startServer() {
   // 2. Journal and Analysis API Endpoints
 app.get('/api/journal', async (req, res) => {
     try {
-        const trades = []; 
+        const trades: any[] = []; 
         res.status(200).json(trades);
     } catch (error) {
         res.status(500).json({ error: "Failed to fetch journal entries" });
@@ -328,8 +468,110 @@ app.post('/api/analysis', async (req, res) => {
     });
   });
 
+  // 3b. Get / Update Risk Limits (max daily/weekly/monthly loss ceilings)
+  app.get('/api/limits', (req, res) => {
+    recomputeRiskState();
+    res.json({
+      status: 'success',
+      data: { ...riskLimits, ...riskState },
+    });
+  });
+
+  app.post('/api/limits', (req, res) => {
+    const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, breakerAction, resetBreaker } = req.body;
+
+    if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
+    if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
+    if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
+    const validActions = ['HALT_CLOSE_ALL', 'HALT_PREVENT_NEW', 'REDUCE_SIZE_50', 'ALERT_ONLY'];
+    if (typeof breakerAction === 'string' && validActions.includes(breakerAction)) {
+      riskLimits.breakerAction = breakerAction as RiskLimitsConfig['breakerAction'];
+    }
+
+    // A human explicitly acknowledging the trip and resetting it is the
+    // ONLY way breakerTriggered clears — it is never auto-cleared just
+    // because a new day started, since the underlying loss already happened.
+    if (resetBreaker === true) {
+      riskState.breakerTriggered = false;
+      riskState.activeTripScope = 'NONE';
+      riskState.lastTriggerReason = undefined;
+    }
+
+    recomputeRiskState();
+
+    res.json({
+      status: 'success',
+      message: 'Risk limits updated',
+      data: { ...riskLimits, ...riskState },
+    });
+  });
+
+  // 3c. Get Risk Status (real computed daily/weekly/monthly loss + breaker state)
+  app.get('/api/risk/status', (req, res) => {
+    recomputeRiskState();
+    res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
+  });
+
+  // 3d. Place a real trade on Deriv — the actual "execute" call that was
+  // previously missing entirely. Gated by the kill switch: refuses to fire
+  // if masterExecution is off or the risk breaker has tripped.
+  app.post('/api/bot/trade', async (req, res) => {
+    recomputeRiskState();
+
+    if (!activeBotConfig.masterExecution) {
+      return res.status(403).json({
+        status: 'blocked',
+        message: 'Trade rejected: masterExecution is OFF (kill switch engaged).',
+      });
+    }
+    if (riskState.breakerTriggered) {
+      return res.status(403).json({
+        status: 'blocked',
+        message: `Trade rejected: risk breaker tripped (${riskState.activeTripScope}). ${riskState.lastTriggerReason || ''}`,
+      });
+    }
+
+    const { symbol, contractType, stakeUsd, durationValue, durationUnit } = req.body;
+    if (!symbol || !contractType || typeof stakeUsd !== 'number') {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Required: symbol (e.g. "R_100"), contractType ("CALL" or "PUT"), stakeUsd (number).',
+      });
+    }
+
+    try {
+      // Step 1: price the contract
+      const proposal = await sendDerivRequest({
+        proposal: 1,
+        amount: stakeUsd,
+        basis: 'stake',
+        contract_type: contractType,
+        currency: activeBrokerTelemetry.currency || 'USD',
+        duration: durationValue ?? 5,
+        duration_unit: durationUnit ?? 'm',
+        symbol,
+      });
+
+      if (!proposal.proposal?.id) {
+        throw new Error('No proposal id returned from Deriv.');
+      }
+
+      // Step 2: buy the priced contract
+      const bought = await sendDerivRequest({
+        buy: proposal.proposal.id,
+        price: stakeUsd,
+      });
+
+      res.json({ status: 'success', message: 'Trade placed on Deriv.', data: bought.buy });
+    } catch (err: any) {
+      console.error('Trade execution failed:', err.message);
+      res.status(502).json({ status: 'error', message: `Trade execution failed: ${err.message}` });
+    }
+  });
+
   // 4. Get Live Telemetry
   app.get('/api/broker/telemetry', (req, res) => {
+    recomputeRiskState(); // keep the kill switch fresh on every poll, not just on new trades
     res.json({
       status: 'success',
       data: activeBrokerTelemetry,
