@@ -29,13 +29,23 @@ export const INITIAL_METRICS: TopMetrics = {
 
 export const INITIAL_BOT_SETTINGS: BotSettings = {
   masterExecution: true,
-  riskPerTradePct: 1.25,
-  riskToReward: 2.5,
+  riskPerTradePct: 1.0,
+  riskToReward: 2.0,
   maxDailyTrades: 4,
   trailingStopActive: true,
   autoBreakevenPips: 15,
   currency: 'USD',
   lastAppliedTimestamp: '09:30:00',
+  strategyModes: {
+    "GRUBBER_KICK": "LIVE",
+    "STRATEGY_513": "LIVE",
+    "ORB_LIQUIDITY_SWEEP": "LIVE",
+    "AVWAP_200EMA_CONTINUATION": "LIVE",
+    "PDH_PDL_FAILED_BREAKOUT": "LIVE",
+    "EMA_9_25_CROSS": "LIVE",
+    "ORB_CRACKER": "DRY_RUN",
+    "OES_4H_ORDER_BLOCK": "LIVE",
+  }
 };
 
 export const INITIAL_ADVANCED_LIMITS: AdvancedLimits = {

@@ -1,3 +1,10 @@
+"""
+strategies/strategy_manager.py
+Orchestrates the 8 quantitative strategies across the 7 whitelisted assets,
+respecting the 3-Way Mode Switch (LIVE | DRY_RUN | OFF).
+"""
+import os
+import json
 import logging
 from strategies.base import StrategySignal
 from strategies.grubber_kick import GrubberKick
@@ -10,25 +17,21 @@ from strategies.orb_cracker_counter_sweep import ORBCracker
 from strategies.oes_4h_order_block_retest import OrderBlockRetest
 
 log = logging.getLogger("StrategyManager")
+CONFIG_FILE = "bot_config.json"
 
 class StrategyManager:
-    """
-    Orchestrates the 8 quantitative strategies across the 7 strictly whitelisted assets.
-    """
-    # Strict Asset Whitelist - Nothing else can be traded
     ALLOWED_ASSETS = {
         "GOLD": "frxXAUUSD",
-        "US30": "US30",
-        "NAS100": "NAS100",
-        "GERMAN30": "GERMAN30",
+        "US30": "OTC_DJI",
+        "NAS100": "OTC_NDX",
+        "GERMAN30": "OTC_GDAXI",
         "EURUSD": "frxEURUSD",
         "USDJPY": "frxUSDJPY",
         "GBPUSD": "frxGBPUSD"
     }
 
-    # Strict Asset Matrix per Strategy
     STRATEGY_PERMITTED_ASSETS = {
-        "GRUBBER_KICK": {"US30"},  # Strictly US30 only!
+        "GRUBBER_KICK": {"US30"},
         "STRATEGY_513": {"GOLD", "US30", "NAS100", "GERMAN30", "EURUSD", "USDJPY", "GBPUSD"},
         "ORB_LIQUIDITY_SWEEP": {"GOLD", "US30", "NAS100", "GERMAN30", "EURUSD", "GBPUSD"},
         "AVWAP_200EMA_CONTINUATION": {"GOLD", "US30", "NAS100", "GERMAN30"},
@@ -50,23 +53,43 @@ class StrategyManager:
             OrderBlockRetest()
         ]
 
+    def _get_strategy_modes(self) -> dict:
+        if not os.path.exists(CONFIG_FILE):
+            return {}
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+            return cfg.get("strategyModes", {})
+        except Exception:
+            return {}
+
     def evaluate_all(self, symbol: str, data_5m, session_levels: dict) -> StrategySignal | None:
         if symbol not in self.ALLOWED_ASSETS:
             return None
 
+        strategy_modes = self._get_strategy_modes()
+
         for strat in self.strategies:
             strat_name = strat.__class__.__name__
-            # Map class name to strategy ID
-            strat_id = getattr(strat, 'strategy_id', None)
-            
             try:
                 signal: StrategySignal | None = strat.evaluate(symbol, data_5m, session_levels)
                 if signal:
-                    # Enforce strict asset boundary silently
+                    # 1. Enforce strict asset boundary
                     permitted = self.STRATEGY_PERMITTED_ASSETS.get(signal.strategy, set())
                     if signal.symbol not in permitted:
-                        continue  # Silently skip if asset is not on this strategy's permitted list
+                        continue
+
+                    # 2. Enforce 3-Way Mode Switch (LIVE | DRY_RUN | OFF)
+                    mode = strategy_modes.get(signal.strategy, "LIVE")
+                    if mode == "OFF":
+                        continue  # Strategy disabled by user in UI
                     
+                    if mode == "DRY_RUN":
+                        # Mark signal for paper trading execution
+                        setattr(signal, "is_dry_run", True)
+                    else:
+                        setattr(signal, "is_dry_run", False)
+
                     return signal
             except Exception as e:
                 log.error(f"Error evaluating {strat.__class__.__name__} on {symbol}: {e}")

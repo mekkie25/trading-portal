@@ -11,6 +11,7 @@ import {
   TrendingDown, 
   CheckCircle2, 
   X,
+  Trash2,
   Database,
   ArrowUpRight,
   ArrowDownRight
@@ -21,6 +22,7 @@ import { formatCurrency } from '../../utils/currency';
 interface TradeJournalViewProps {
   trades: TradeRecord[];
   onAddTrade: (trade: TradeRecord) => void;
+  onDeleteTrade?: (tradeId: string) => void;
   onResetJournal?: () => void;
   sheetsConfig: GoogleSheetsConfig;
   brokerConfig: BrokerConfig;
@@ -30,6 +32,7 @@ interface TradeJournalViewProps {
 export const TradeJournalView: React.FC<TradeJournalViewProps> = ({ 
   trades, 
   onAddTrade,
+  onDeleteTrade,
   onResetJournal,
   sheetsConfig,
   brokerConfig,
@@ -100,7 +103,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
   const handleExportPDF = () => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
-      alert('Please allow popups to export the PDF trade statement.');
+      alert('Please allow popups to export the PDF statement.');
       return;
     }
 
@@ -200,7 +203,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
-      {/* Toast Notice */}
       {syncNotice && (
         <div className="p-4 rounded-xl bg-blue-600 text-white shadow-lg flex items-center gap-2.5 text-xs font-semibold animate-in fade-in border border-blue-400">
           <CheckCircle2 className="w-4 h-4 text-emerald-300 shrink-0" />
@@ -208,11 +210,10 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
         </div>
       )}
 
-      {/* View Header */}
+      {/* Header */}
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.35 }}
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-300 dark:border-[#1a2030]"
       >
         <div>
@@ -223,7 +224,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Audited execution log showing the exact strategy used for every trade.
+            Audited execution log showing the exact strategy used for every trade. Deleting entries recalculates dashboard stats.
           </p>
         </div>
 
@@ -233,7 +234,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             type="button"
             onClick={handleSyncSheets}
             disabled={isSyncingSheets}
-            className="px-3.5 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-300 flex items-center gap-2 transition-colors disabled:opacity-50 cursor-pointer shadow-xs"
+            className="px-3.5 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-300 flex items-center gap-2 cursor-pointer shadow-xs"
           >
             <FileSpreadsheet className={`w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 ${isSyncingSheets ? 'animate-spin' : ''}`} />
             <span>{isSyncingSheets ? 'Syncing...' : 'Sync Google Sheet'}</span>
@@ -242,7 +243,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
           <button
             type="button"
             onClick={handleExportPDF}
-            className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-2 transition-colors shadow-xs cursor-pointer"
+            className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer shadow-xs"
           >
             <FileText className="w-3.5 h-3.5" />
             <span>Export PDF</span>
@@ -251,7 +252,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
           <button
             type="button"
             onClick={() => setShowAddModal(true)}
-            className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-white dark:hover:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
+            className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-white dark:hover:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs"
           >
             <Plus className="w-3.5 h-3.5" />
             <span>Add Manual Trade</span>
@@ -261,14 +262,14 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             <button
               type="button"
               onClick={() => {
-                if (window.confirm('Clear the journal view? This hides past trades from view without affecting your Deriv account.')) {
+                if (window.confirm('Wipe entire journal? This will also reset your Dashboard statistics to $0.00.')) {
                   onResetJournal();
                 }
               }}
-              className="px-3.5 py-2 rounded-xl bg-red-600/10 hover:bg-red-600/20 text-red-500 border border-red-500/30 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
+              className="px-3.5 py-2 rounded-xl bg-rose-600/10 hover:bg-rose-600/20 text-rose-500 border border-rose-500/30 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs"
             >
-              <X className="w-3.5 h-3.5" />
-              <span>Clear Journal</span>
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Wipe Entire Journal</span>
             </button>
           )}
         </div>
@@ -277,9 +278,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
       {/* Stats Summary Bento */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
+        animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-2 lg:grid-cols-4 gap-6"
       >
         <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
@@ -311,16 +310,14 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
           <div className="text-2xl font-bold font-mono text-black dark:text-white mt-2">
             {stats.totalCount}
           </div>
-          <div className="text-[11px] text-black dark:text-slate-400 mt-1">In selected filter range</div>
+          <div className="text-[11px] text-black dark:text-slate-400 mt-1">In active ledger</div>
         </div>
       </motion.div>
 
       {/* Filter and Search Bar */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
+        animate={{ opacity: 1, y: 0 }}
         className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs"
       >
         <div className="relative w-full sm:w-80">
@@ -362,9 +359,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
       {/* Main Table Container */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.45 }}
+        animate={{ opacity: 1, y: 0 }}
         className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden"
       >
         <div className="overflow-x-auto">
@@ -374,14 +369,12 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                 <th className="py-4 px-5">Ticket #</th>
                 <th className="py-4 px-4">Instrument</th>
                 <th className="py-4 px-4">Strategy</th>
-                <th className="py-4 px-4">Direction</th>
-                <th className="py-4 px-4">Lots</th>
-                <th className="py-4 px-4">Open Fill</th>
-                <th className="py-4 px-4">Close Fill</th>
+                <th className="py-4 px-4">Type</th>
+                <th className="py-4 px-4">Fill / Close</th>
                 <th className="py-4 px-4">Net P&L ($)</th>
-                <th className="py-4 px-4">Duration</th>
                 <th className="py-4 px-4">Timestamp</th>
-                <th className="py-4 px-5 text-right">Status</th>
+                <th className="py-4 px-4 text-center">Status</th>
+                <th className="py-4 px-4 text-right">Action</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-[#141a26]">
@@ -389,12 +382,16 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                 const isWin = trade.status === 'WIN';
                 const isLoss = trade.status === 'LOSS';
                 return (
-                  <tr 
-                    key={trade.id} 
-                    className="hover:bg-slate-50 dark:hover:bg-[#121520] transition-colors"
-                  >
+                  <tr key={trade.id} className="hover:bg-slate-50 dark:hover:bg-[#121520] transition-colors">
                     <td className="py-3.5 px-5 font-mono text-black dark:text-slate-400">
-                      {trade.ticket}
+                      <div className="flex items-center gap-1.5">
+                        <span>{trade.ticket}</span>
+                        {trade.isSimulated && (
+                          <span className="text-[9px] px-1.5 py-0.2 rounded font-mono font-bold bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/20">
+                            SIMULATED
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="py-3.5 px-4 font-semibold text-black dark:text-white">
                       {trade.asset}
@@ -415,26 +412,17 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                       </span>
                     </td>
                     <td className="py-3.5 px-4 font-mono text-black dark:text-slate-300">
-                      {trade.lots.toFixed(2)}
-                    </td>
-                    <td className="py-3.5 px-4 font-mono text-black dark:text-slate-300">
-                      {trade.openPrice.toFixed(2)}
-                    </td>
-                    <td className="py-3.5 px-4 font-mono text-black dark:text-slate-300">
-                      {trade.closePrice.toFixed(2)}
+                      {trade.openPrice?.toFixed(2)} → {trade.closePrice?.toFixed(2)}
                     </td>
                     <td className="py-3.5 px-4 font-mono font-bold">
                       <span className={trade.pnl >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600'}>
                         {formatCurrency(trade.pnl, brokerConfig.currency)}
                       </span>
                     </td>
-                    <td className="py-3.5 px-4 text-black dark:text-slate-400 text-[11px]">
-                      {trade.duration}
-                    </td>
                     <td className="py-3.5 px-4 text-black dark:text-slate-400 text-[11px] font-mono">
                       {trade.closeTime}
                     </td>
-                    <td className="py-3.5 px-5 text-right">
+                    <td className="py-3.5 px-4 text-center">
                       <span className={`font-mono text-[10px] font-bold px-2.5 py-1 rounded-full ${
                         isWin
                           ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30'
@@ -445,6 +433,23 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                         {trade.status}
                       </span>
                     </td>
+                    {/* Individual Delete Action */}
+                    <td className="py-3.5 px-4 text-right">
+                      {onDeleteTrade && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (window.confirm(`Delete trade ${trade.ticket}? This will recalculate your Dashboard P&L and Win Rate.`)) {
+                              onDeleteTrade(trade.id);
+                            }
+                          }}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-500/10 transition-colors cursor-pointer"
+                          title="Delete this trade record"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
@@ -453,53 +458,30 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Add Manual Trade Modal */}
+      {/* Manual Modal */}
       {showAddModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <motion.div 
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="w-full max-w-md bg-white dark:bg-[#0f1118] rounded-2xl border border-slate-300 dark:border-[#1a2030] shadow-2xl p-6 space-y-5"
-          >
+          <div className="w-full max-w-md bg-white dark:bg-[#0f1118] rounded-2xl border border-slate-300 dark:border-[#1a2030] shadow-2xl p-6 space-y-5">
             <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-[#1a2030]">
               <h3 className="text-base font-bold text-black dark:text-white">Record Manual Execution</h3>
-              <button 
-                onClick={() => setShowAddModal(false)}
-                className="text-black dark:text-slate-400 hover:text-slate-600 dark:hover:text-white cursor-pointer"
-              >
+              <button onClick={() => setShowAddModal(false)} className="text-slate-400 hover:text-white cursor-pointer">
                 <X className="w-5 h-5" />
               </button>
             </div>
-
             <form onSubmit={handleCreateTrade} className="space-y-4 text-xs">
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
-                  <label className="font-semibold text-black dark:text-slate-300">Ticket #</label>
-                  <input
-                    type="text"
-                    value={newTicket}
-                    onChange={(e) => setNewTicket(e.target.value)}
-                    className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white"
-                  />
+                  <label className="font-semibold text-slate-300">Ticket #</label>
+                  <input type="text" value={newTicket} onChange={(e) => setNewTicket(e.target.value)} className="w-full px-3 py-2 rounded-xl bg-[#08090d] border border-[#1a2030] font-mono text-white" />
                 </div>
                 <div className="space-y-1">
-                  <label className="font-semibold text-black dark:text-slate-300">Instrument</label>
-                  <input
-                    type="text"
-                    value={newAsset}
-                    onChange={(e) => setNewAsset(e.target.value)}
-                    className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-black dark:text-white"
-                  />
+                  <label className="font-semibold text-slate-300">Instrument</label>
+                  <input type="text" value={newAsset} onChange={(e) => setNewAsset(e.target.value)} className="w-full px-3 py-2 rounded-xl bg-[#08090d] border border-[#1a2030] text-white" />
                 </div>
               </div>
-
               <div className="space-y-1">
-                <label className="font-semibold text-black dark:text-slate-300">Strategy</label>
-                <select
-                  value={newStrategy}
-                  onChange={(e) => setNewStrategy(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-black dark:text-white font-mono"
-                >
+                <label className="font-semibold text-slate-300">Strategy</label>
+                <select value={newStrategy} onChange={(e) => setNewStrategy(e.target.value)} className="w-full px-3 py-2 rounded-xl bg-[#08090d] border border-[#1a2030] text-white font-mono">
                   <option value="GRUBBER_KICK">GRUBBER_KICK</option>
                   <option value="STRATEGY_513">STRATEGY_513</option>
                   <option value="ORB_LIQUIDITY_SWEEP">ORB_LIQUIDITY_SWEEP</option>
@@ -510,82 +492,16 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                   <option value="OES_4H_ORDER_BLOCK">OES_4H_ORDER_BLOCK</option>
                 </select>
               </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <label className="font-semibold text-black dark:text-slate-300">Direction</label>
-                  <select
-                    value={newType}
-                    onChange={(e) => setNewType(e.target.value as any)}
-                    className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-black dark:text-white font-semibold"
-                  >
-                    <option value="BUY">BUY</option>
-                    <option value="SELL">SELL</option>
-                  </select>
-                </div>
-                <div className="space-y-1">
-                  <label className="font-semibold text-black dark:text-slate-300">Lots</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={newLots}
-                    onChange={(e) => setNewLots(parseFloat(e.target.value) || 0)}
-                    className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <label className="font-semibold text-black dark:text-slate-300">Open Price</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={newOpenPrice}
-                    onChange={(e) => setNewOpenPrice(parseFloat(e.target.value) || 0)}
-                    className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <label className="font-semibold text-black dark:text-slate-300">Close Price</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={newClosePrice}
-                    onChange={(e) => setNewClosePrice(parseFloat(e.target.value) || 0)}
-                    className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white"
-                  />
-                </div>
-              </div>
-
               <div className="space-y-1">
-                <label className="font-semibold text-black dark:text-slate-300">Net Closed P&L ($ USD)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={newPnL}
-                  onChange={(e) => setNewPnL(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-black dark:text-white"
-                />
+                <label className="font-semibold text-slate-300">Net Closed P&L ($)</label>
+                <input type="number" step="0.01" value={newPnL} onChange={(e) => setNewPnL(parseFloat(e.target.value) || 0)} className="w-full px-3 py-2.5 rounded-xl bg-[#08090d] border border-[#1a2030] font-mono font-bold text-white" />
               </div>
-
               <div className="pt-3 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAddModal(false)}
-                  className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-black dark:text-slate-300 font-semibold cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold cursor-pointer"
-                >
-                  Save to Journal
-                </button>
+                <button type="button" onClick={() => setShowAddModal(false)} className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 font-semibold cursor-pointer">Cancel</button>
+                <button type="submit" className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold cursor-pointer">Save</button>
               </div>
             </form>
-          </motion.div>
+          </div>
         </div>
       )}
     </div>

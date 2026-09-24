@@ -7,6 +7,7 @@ export type TabId =
   | 'settings';
 
 export type ThemeMode = 'dark' | 'light';
+export type StrategyExecutionMode = 'LIVE' | 'DRY_RUN' | 'OFF';
 
 export interface SiteBrandingConfig {
   siteName: string;
@@ -52,19 +53,20 @@ export interface TopMetrics {
 export interface BotSettings {
   masterExecution: boolean;
   riskPerTradePct: number;
-  riskToReward: number; // 1 : X (e.g. 2.5)
+  riskToReward: number;
   maxDailyTrades: number;
   trailingStopActive: boolean;
   autoBreakevenPips: number;
   currency?: string;
   lastAppliedTimestamp?: string;
+  strategyModes: Record<string, StrategyExecutionMode>;
 }
 
 export interface TradeRecord {
   id: string;
   ticket: string;
   asset: string;
-  strategy: string; // <-- Added strategy identification
+  strategy: string;
   type: 'BUY' | 'SELL';
   lots: number;
   openPrice: number;
@@ -75,13 +77,14 @@ export interface TradeRecord {
   closeTime: string;
   duration: string;
   status: 'WIN' | 'LOSS' | 'BREAKEVEN';
-  source: 'MT5 Bridge' | 'Google Sheets' | 'Manual' | string;
+  source: 'Deriv Live' | 'Simulator' | 'Manual' | string;
+  isSimulated?: boolean;
 }
 
 export interface AdvancedLimits {
   maxDailyDrawdownPct: number;
   currentDailyDrawdownPct: number;
-  emergencyStopThreshold: number; // in $ equity level
+  emergencyStopThreshold: number;
   consecutiveLossesLimit: number;
   currentConsecutiveLosses: number;
   maxOpenExposureLots: number;
@@ -124,7 +127,7 @@ export interface MacroRelease {
 }
 
 export interface CalendarDayData {
-  date: string; // YYYY-MM-DD
+  date: string;
   dayNumber: number;
   dayOfWeek: string;
   hasHighImpact: boolean;

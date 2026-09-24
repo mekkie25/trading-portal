@@ -25,9 +25,13 @@ import {
   Layers,
   Code,
   Terminal,
-  Copy
+  Copy,
+  Zap,
+  PlayCircle,
+  StopCircle,
+  Eye
 } from 'lucide-react';
-import { TopMetrics, BotSettings, ThemeMode } from '../../types';
+import { TopMetrics, BotSettings, ThemeMode, TradeRecord, StrategyExecutionMode } from '../../types';
 import { EQUITY_TIMEFRAME_DATA } from '../../data/mockTradingData';
 import { formatCurrency } from '../../utils/currency';
 
@@ -45,6 +49,7 @@ ChartJS.register(
 interface DashboardViewProps {
   metrics: TopMetrics;
   botSettings: BotSettings;
+  trades?: TradeRecord[];
   onSaveBotSettings: (settings: BotSettings) => void;
   onQuickNavigate: (tab: any) => void;
   themeMode?: ThemeMode;
@@ -52,9 +57,21 @@ interface DashboardViewProps {
   onOpenBridge?: () => void;
 }
 
+const STRATEGY_METADATA = [
+  { id: "GRUBBER_KICK", name: "Grubber Kick", asset: "US30", desc: "3-Rule AMD Equilibrium Sweep" },
+  { id: "STRATEGY_513", name: "513 Strategy", asset: "Multi-Asset", desc: "5/13 EMA Cross + Daily Flip" },
+  { id: "ORB_LIQUIDITY_SWEEP", name: "ORB Liquidity Sweep", asset: "Multi-Asset", desc: "Asia High/Low Fakeout Reversal" },
+  { id: "AVWAP_200EMA_CONTINUATION", name: "AVWAP / 200 EMA", asset: "Indices & Gold", desc: "Dynamic Trend Pullback Hold" },
+  { id: "PDH_PDL_FAILED_BREAKOUT", name: "PDH/PDL Trap", asset: "Multi-Asset", desc: "Previous Daily High/Low Trap" },
+  { id: "EMA_9_25_CROSS", name: "9/25 EMA Cross", asset: "Forex & Gold", desc: "Dynamic Crossover & Trail" },
+  { id: "ORB_CRACKER", name: "ORB Cracker", asset: "NAS, US30, Gold", desc: "NYSE Open Counter-Sweep" },
+  { id: "OES_4H_ORDER_BLOCK", name: "OES 4H Order Block", asset: "Multi-Asset", desc: "Institutional 4H Zone Retest" },
+];
+
 export const DashboardView: React.FC<DashboardViewProps> = ({
   metrics,
   botSettings,
+  trades = [],
   onSaveBotSettings,
   onQuickNavigate,
   themeMode = 'dark',
@@ -66,21 +83,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [saveToast, setSaveToast] = useState<string | null>(null);
   const [showJsonPayload, setShowJsonPayload] = useState(false);
   const [copiedJson, setCopiedJson] = useState(false);
-  const [appliedNotice, setAppliedNotice] = useState<{
-    timestamp: string;
-    settings: BotSettings;
-  } | null>(() => {
-    if (botSettings.lastAppliedTimestamp) {
-      return {
-        timestamp: botSettings.lastAppliedTimestamp,
-        settings: botSettings,
-      };
-    }
-    return {
-      timestamp: 'Initial Active',
-      settings: botSettings,
+
+  // Sync props to form if updated externally
+  React.useEffect(() => {
+    setFormSettings(botSettings);
+  }, [botSettings]);
+
+  const handleStrategyModeChange = (stratId: string, mode: StrategyExecutionMode) => {
+    const updatedModes = {
+      ...(formSettings.strategyModes || {}),
+      [stratId]: mode
     };
-  });
+    const updated = {
+      ...formSettings,
+      strategyModes: updatedModes
+    };
+    setFormSettings(updated);
+    onSaveBotSettings(updated);
+    setSaveToast(`${stratId} switched to ${mode}`);
+    setTimeout(() => setSaveToast(null), 3000);
+  };
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
@@ -92,20 +114,33 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       lastAppliedTimestamp: timestamp,
     };
     onSaveBotSettings(updated);
-    setAppliedNotice({
-      timestamp,
-      settings: updated,
-    });
-    setSaveToast(`Parameters broadcasted to bot gateway successfully at ${timestamp}!`);
+    setSaveToast(`Parameters broadcasted to bot engine at ${timestamp}!`);
     setTimeout(() => setSaveToast(null), 4000);
   };
 
   const isDark = themeMode === 'dark';
 
+  // Calculate per-strategy performance from actual trades
+  const strategyStats = useMemo(() => {
+    const statsMap: Record<string, { trades: number; wins: number; losses: number; pnl: number }> = {};
+    STRATEGY_METADATA.forEach(s => {
+      statsMap[s.id] = { trades: 0, wins: 0, losses: 0, pnl: 0 };
+    });
+
+    trades.forEach(t => {
+      const id = t.strategy || 'OTHER';
+      if (!statsMap[id]) statsMap[id] = { trades: 0, wins: 0, losses: 0, pnl: 0 };
+      statsMap[id].trades += 1;
+      if (t.status === 'WIN') statsMap[id].wins += 1;
+      if (t.status === 'LOSS') statsMap[id].losses += 1;
+      statsMap[id].pnl += (t.pnl || 0);
+    });
+
+    return statsMap;
+  }, [trades]);
+
   const chartData = useMemo(() => {
     const data = EQUITY_TIMEFRAME_DATA[timeframe] || EQUITY_TIMEFRAME_DATA['30D'];
-    
-    // Scale curve directly to your real Deriv account equity ($10,051.99)
     const liveEquity = metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99;
     const liveBalance = metrics.currentBalance > 0 ? metrics.currentBalance : liveEquity;
     
@@ -166,88 +201,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const chartOptions: ChartOptions<'line'> = {
     responsive: true,
     maintainAspectRatio: false,
-    interaction: {
-      mode: 'index',
-      intersect: false,
-    },
+    interaction: { mode: 'index', intersect: false },
     plugins: {
       legend: {
         position: 'top' as const,
         align: 'end' as const,
-        labels: {
-          color: isDark ? '#94a3b8' : '#000000',
-          font: {
-            size: 11,
-            family: "'Oswald', 'Bebas Neue', sans-serif",
-          },
-          boxWidth: 12,
-          boxHeight: 2,
-          usePointStyle: false,
-        },
+        labels: { color: isDark ? '#94a3b8' : '#000000', font: { size: 11, family: "'Oswald', sans-serif" } },
       },
       tooltip: {
-        backgroundColor: isDark ? '#08090d' : '#ffffff',
-        titleColor: isDark ? '#ffffff' : '#000000',
-        bodyColor: isDark ? '#94a3b8' : '#000000',
-        borderColor: isDark ? '#1a2030' : '#cbd5e1',
-        borderWidth: 1,
-        padding: 12,
-        cornerRadius: 10,
-        bodyFont: {
-          family: "'Oswald', 'Bebas Neue', sans-serif",
-          size: 11,
-        },
-        titleFont: {
-          family: "'Oswald', 'Bebas Neue', sans-serif",
-          weight: 'bold',
-          size: 12,
-        },
         callbacks: {
-          label: (context) => {
-            const val = context.parsed.y;
-            return ` ${context.dataset.label}: ${formatCurrency(val ?? 0, brokerCurrency)}`;
-          },
+          label: (context) => ` ${context.dataset.label}: ${formatCurrency(context.parsed.y ?? 0, brokerCurrency)}`,
         },
       },
     },
     scales: {
-      x: {
-        grid: {
-          color: isDark ? '#141a26' : '#e2e8f0',
-        },
-        ticks: {
-          color: isDark ? '#64748b' : '#000000',
-          font: {
-            family: "'Oswald', 'Bebas Neue', sans-serif",
-            size: 10,
-          },
-        },
-      },
-      y: {
-        grid: {
-          color: isDark ? '#141a26' : '#e2e8f0',
-        },
-        ticks: {
-          color: isDark ? '#64748b' : '#000000',
-          font: {
-            family: "'Oswald', 'Bebas Neue', sans-serif",
-            size: 10,
-          },
-          callback: (value) => `$${Number(value).toLocaleString()}`,
-        },
-      },
+      x: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000' } },
+      y: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000', callback: (v) => `$${Number(v).toLocaleString()}` } },
     },
   };
 
-  const botTargetJson = JSON.stringify({
-    master_execution: formSettings.masterExecution,
-    risk_per_trade_pct: formSettings.riskPerTradePct,
-    risk_to_reward_ratio: formSettings.riskToReward,
-    max_daily_trades: formSettings.maxDailyTrades,
-    trailing_stop: formSettings.trailingStopActive,
-    auto_breakeven_pips: formSettings.autoBreakevenPips,
-    timestamp: new Date().toISOString(),
-  }, null, 2);
+  const botTargetJson = JSON.stringify(formSettings, null, 2);
 
   const handleCopyJson = () => {
     navigator.clipboard.writeText(botTargetJson);
@@ -258,7 +231,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
       {saveToast && (
-        <div className="fixed top-20 right-8 z-50 p-4 rounded-xl bg-blue-600 text-white shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in slide-in-from-top-2 border border-blue-400">
+        <div className="fixed top-20 right-8 z-50 p-4 rounded-xl bg-blue-600 text-white shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in border border-blue-400">
           <CheckCircle2 className="w-4 h-4 text-emerald-300" />
           <span>{saveToast}</span>
         </div>
@@ -268,18 +241,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.35 }}
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200 dark:border-[#1a2030]"
       >
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white flex items-center gap-2.5">
-            Trading Dashboard & Bot Command
+            Trading Dashboard & Strategy Command
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
               Live Core
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Real-time equity growth, audited win telemetry, and live execution target controls.
+            Real-time equity growth, 3-way strategy execution switches, and audited ledger statistics.
           </p>
         </div>
 
@@ -295,15 +267,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* 4 Metric Cards */}
+      {/* 4 Metric Cards (Dynamic Live Ledger) */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
+        animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6"
       >
-        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
+        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Net Profit</span>
             <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/20">
@@ -311,20 +281,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
           <div className="mt-4">
-            <div className="text-3xl font-bold font-mono text-black dark:text-white tracking-tight">
-              {metrics.netProfit >= 0 ? '+' : ''}{formatCurrency(metrics.netProfit, brokerCurrency)}
+            <div className={`text-3xl font-bold font-mono tracking-tight ${metrics.netProfit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'}`}>
+              {formatCurrency(metrics.netProfit, brokerCurrency)}
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs">
-              <span className="flex items-center font-mono font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded">
-                <ArrowUpRight className="w-3.5 h-3.5 mr-0.5" />
-                +{metrics.netProfitPct}%
-              </span>
-              <span className="text-black dark:text-slate-400">vs Deposits</span>
+              <span className="font-mono text-black dark:text-slate-400">Calculated from active trades</span>
             </div>
           </div>
         </div>
 
-        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
+        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Win Rate</span>
             <div className="p-2.5 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
@@ -336,16 +302,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {metrics.winRate}%
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs text-black dark:text-slate-400">
-              <span className="font-mono text-black dark:text-slate-200 font-semibold">{metrics.totalTrades} Trades</span>
+              <span className="font-mono text-black dark:text-slate-200 font-semibold">{metrics.totalTrades} Total Trades</span>
               <span>•</span>
-              <span className="text-emerald-700 dark:text-emerald-400 font-mono font-semibold">{metrics.winningTrades}W</span>
+              <span className="text-emerald-600 dark:text-emerald-400 font-mono font-semibold">{metrics.winningTrades}W</span>
               <span>/</span>
               <span className="text-rose-600 font-mono font-semibold">{metrics.losingTrades}L</span>
             </div>
           </div>
         </div>
 
-        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
+        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Total Injections</span>
             <div className="p-2.5 rounded-xl bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border border-indigo-500/20">
@@ -362,7 +328,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
+        <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Live Account Equity</span>
             <div className="p-2.5 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
@@ -380,15 +346,117 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Main Split: Cumulative Equity Chart + Bot Controls */}
+      {/* STRATEGY CONTROL CENTER & PERFORMANCE LEADERBOARD */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.45 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6 space-y-4"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-[#1a2030]">
+          <div>
+            <h2 className="text-base font-bold text-black dark:text-white tracking-tight flex items-center gap-2">
+              <Zap className="w-4 h-4 text-amber-500" />
+              Strategy Performance & 3-Way Execution Mode Switch
+            </h2>
+            <p className="text-xs text-black dark:text-slate-400 mt-0.5">
+              Set each strategy to <strong className="text-emerald-600 dark:text-emerald-400">LIVE</strong> (Real Capital), <strong className="text-blue-600 dark:text-blue-400">SIMULATOR</strong> (Paper Trading / Dry-Run), or <strong className="text-rose-600">OFF</strong>.
+            </p>
+          </div>
+          <span className="text-xs font-mono text-slate-500">8 Modular Engines Loaded</span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead>
+              <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400">
+                <th className="py-3 px-3">Strategy Name</th>
+                <th className="py-3 px-3">Target Asset</th>
+                <th className="py-3 px-3 text-center">Execution Mode</th>
+                <th className="py-3 px-3 text-center">Trades</th>
+                <th className="py-3 px-3 text-center">Win Rate</th>
+                <th className="py-3 px-3 text-right">Net P&L</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+              {STRATEGY_METADATA.map((strat) => {
+                const currentMode: StrategyExecutionMode = formSettings.strategyModes?.[strat.id] || 'LIVE';
+                const stats = strategyStats[strat.id] || { trades: 0, wins: 0, losses: 0, pnl: 0 };
+                const wr = stats.trades > 0 ? ((stats.wins / stats.trades) * 100).toFixed(0) : '0';
+
+                return (
+                  <tr key={strat.id} className="hover:bg-slate-50 dark:hover:bg-[#121520] transition-colors">
+                    <td className="py-3 px-3">
+                      <div className="font-bold text-black dark:text-white">{strat.name}</div>
+                      <div className="text-[10px] text-slate-500">{strat.desc}</div>
+                    </td>
+                    <td className="py-3 px-3 font-mono font-semibold text-blue-600 dark:text-blue-400">
+                      {strat.asset}
+                    </td>
+                    <td className="py-3 px-3 text-center">
+                      {/* 3-Way Mode Pill Selector */}
+                      <div className="inline-flex p-1 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+                        <button
+                          type="button"
+                          onClick={() => handleStrategyModeChange(strat.id, 'LIVE')}
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-bold font-mono transition-all cursor-pointer ${
+                            currentMode === 'LIVE'
+                              ? 'bg-emerald-600 text-white shadow-xs'
+                              : 'text-slate-500 hover:text-black dark:hover:text-white'
+                          }`}
+                        >
+                          LIVE
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleStrategyModeChange(strat.id, 'DRY_RUN')}
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-bold font-mono transition-all cursor-pointer ${
+                            currentMode === 'DRY_RUN'
+                              ? 'bg-blue-600 text-white shadow-xs'
+                              : 'text-slate-500 hover:text-black dark:hover:text-white'
+                          }`}
+                        >
+                          SIMULATOR
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleStrategyModeChange(strat.id, 'OFF')}
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-bold font-mono transition-all cursor-pointer ${
+                            currentMode === 'OFF'
+                              ? 'bg-rose-600 text-white shadow-xs'
+                              : 'text-slate-500 hover:text-black dark:hover:text-white'
+                          }`}
+                        >
+                          OFF
+                        </button>
+                      </div>
+                    </td>
+                    <td className="py-3 px-3 text-center font-mono font-semibold text-black dark:text-white">
+                      {stats.trades}
+                    </td>
+                    <td className="py-3 px-3 text-center font-mono font-semibold">
+                      <span className={Number(wr) >= 50 ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400'}>
+                        {wr}% ({stats.wins}W/{stats.losses}L)
+                      </span>
+                    </td>
+                    <td className="py-3 px-3 text-right font-mono font-bold">
+                      <span className={stats.pnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'}>
+                        {formatCurrency(stats.pnl, brokerCurrency)}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </motion.div>
+
+      {/* Main Split: Cumulative Equity Chart + Risk Target Controls */}
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-1 lg:grid-cols-12 gap-6"
       >
-        {/* Equity Chart */}
         <div className="lg:col-span-8 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div>
@@ -411,9 +479,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   key={tf}
                   onClick={() => setTimeframe(tf)}
                   className={`px-3 py-1.5 text-xs font-mono font-semibold rounded-lg transition-all cursor-pointer ${
-                    timeframe === tf
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-slate-200'
+                    timeframe === tf ? 'bg-blue-600 text-white shadow-xs' : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-white'
                   }`}
                 >
                   {tf}
@@ -426,7 +492,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <Line data={chartData} options={chartOptions} />
           </div>
 
-          {/* Quick stats footer with live figures */}
           <div className="grid grid-cols-3 gap-3 pt-4 mt-auto border-t border-slate-200 dark:border-[#1a2030] text-center text-xs shrink-0">
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period Drawdown Low</div>
@@ -447,7 +512,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* Bot Target Controls */}
+        {/* Bot Controls */}
         <div className="lg:col-span-4 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div className="flex items-center gap-2.5">
@@ -459,7 +524,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   Bot Target Controls
                 </h2>
                 <p className="text-[11px] text-black dark:text-slate-400">
-                  Direct algorithmic parameters for trading bot
+                  Global limits and sizing rules
                 </p>
               </div>
             </div>
@@ -467,226 +532,95 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <button
               type="button"
               onClick={() => setShowJsonPayload(!showJsonPayload)}
-              className="p-1.5 rounded-lg text-black dark:text-slate-400 hover:text-black dark:hover:text-slate-200 text-xs border border-transparent hover:border-slate-300 dark:hover:border-[#1a2030] transition-colors cursor-pointer"
-              title="Inspect JSON Payload"
+              className="p-1.5 rounded-lg text-black dark:text-slate-400 hover:text-black dark:hover:text-slate-200 text-xs cursor-pointer"
+              title="Inspect JSON"
             >
               <Code className="w-4 h-4" />
             </button>
           </div>
 
           {showJsonPayload && (
-            <div className="my-3 p-3 rounded-xl bg-slate-950 text-slate-300 font-mono text-[11px] border border-slate-800 space-y-2 animate-in fade-in">
+            <div className="my-3 p-3 rounded-xl bg-slate-950 text-slate-300 font-mono text-[11px] border border-slate-800 space-y-2">
               <div className="flex items-center justify-between text-[10px] text-slate-400">
-                <span>POST /api/bot/config payload</span>
-                <button
-                  type="button"
-                  onClick={handleCopyJson}
-                  className="text-blue-400 hover:text-blue-300 flex items-center gap-1 cursor-pointer"
-                >
+                <span>bot_config.json</span>
+                <button type="button" onClick={handleCopyJson} className="text-blue-400 flex items-center gap-1">
                   <Copy className="w-3 h-3" />
                   <span>{copiedJson ? 'Copied' : 'Copy'}</span>
                 </button>
               </div>
-              <pre className="overflow-x-auto text-[10px]">{botTargetJson}</pre>
+              <pre className="overflow-x-auto text-[10px] max-h-40">{botTargetJson}</pre>
             </div>
           )}
 
           <form onSubmit={handleSave} className="flex-1 flex flex-col justify-between mt-4 space-y-5">
             <div className="space-y-4">
-              {/* Master Execution Switch */}
-              <div className="p-4 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between shadow-xs">
+              <div className="p-4 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold text-black dark:text-white">
-                      Master Execution Switch
-                    </span>
-                    <span
-                      className={`text-[9px] font-mono px-2 py-0.5 rounded font-bold ${
-                        formSettings.masterExecution
-                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30'
-                          : 'bg-rose-500/15 text-rose-600 border border-rose-500/30'
-                      }`}
-                    >
+                    <span className="text-xs font-bold text-black dark:text-white">Master Execution</span>
+                    <span className={`text-[9px] font-mono px-2 py-0.5 rounded font-bold ${
+                      formSettings.masterExecution ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/15 text-rose-600'
+                    }`}>
                       {formSettings.masterExecution ? 'ARMED' : 'HALTED'}
                     </span>
                   </div>
-                  <p className="text-[11px] text-black dark:text-slate-400 mt-0.5">
-                    Permits bot to open automated orders on broker
-                  </p>
+                  <p className="text-[11px] text-black dark:text-slate-400 mt-0.5">Master toggle across all strategies</p>
                 </div>
-
                 <label className="relative inline-flex items-center cursor-pointer">
                   <input
                     type="checkbox"
                     checked={formSettings.masterExecution}
-                    onChange={(e) =>
-                      setFormSettings({ ...formSettings, masterExecution: e.target.checked })
-                    }
+                    onChange={(e) => setFormSettings({ ...formSettings, masterExecution: e.target.checked })}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-slate-300 dark:bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600 shadow-inner"></div>
+                  <div className="w-11 h-6 bg-slate-300 dark:bg-slate-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
                 </label>
               </div>
 
-              {/* Risk Per Trade */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
-                    <Percent className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                    Risk Per Trade Allocation (0.1% – 5%)
+                    <Percent className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Base Risk Per Trade
                   </label>
-                  <span className="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">
-                    {formSettings.riskPerTradePct.toFixed(1)}%
-                  </span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="range"
-                    min="0.1"
-                    max="5.0"
-                    step="0.1"
-                    value={formSettings.riskPerTradePct}
-                    onChange={(e) =>
-                      setFormSettings({
-                        ...formSettings,
-                        riskPerTradePct: parseFloat(e.target.value) || 0.5,
-                      })
-                    }
-                    className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                  />
-                  <div className="flex items-center gap-1 shrink-0">
-                    <input
-                      type="number"
-                      min="0.1"
-                      max="10.0"
-                      step="0.1"
-                      value={formSettings.riskPerTradePct}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value);
-                        setFormSettings({
-                          ...formSettings,
-                          riskPerTradePct: isNaN(val) ? 0.5 : Math.max(0.1, val),
-                        });
-                      }}
-                      className="w-16 px-2.5 py-1 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-lg text-right font-mono text-xs text-black dark:text-white focus:border-blue-500 focus:outline-none"
-                    />
-                    <span className="text-xs font-mono text-slate-500">%</span>
-                  </div>
-                </div>
-                <p className="text-[11px] text-black dark:text-slate-400">
-                  Dollar Risk: <strong className="font-mono text-black dark:text-slate-300">{formatCurrency(((metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99) * formSettings.riskPerTradePct) / 100, brokerCurrency)}</strong> per trade
-                </p>
-              </div>
-
-              {/* R:R Ratio */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-xs">
-                  <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
-                    <Target className="w-3.5 h-3.5 text-indigo-500" />
-                    Risk-To-Reward Target (1 : R)
-                  </label>
-                  <span className="font-mono text-xs font-bold text-indigo-600 dark:text-indigo-400">
-                    1 : {formSettings.riskToReward}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="px-3 py-2 bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs font-bold text-black dark:text-slate-300 shrink-0">
-                    1 :
-                  </span>
-                  <input
-                    type="number"
-                    min="0.5"
-                    max="10"
-                    step="0.5"
-                    value={formSettings.riskToReward}
-                    onChange={(e) =>
-                      setFormSettings({
-                        ...formSettings,
-                        riskToReward: parseFloat(e.target.value) || 2.0,
-                      })
-                    }
-                    className="flex-1 px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white focus:border-blue-500 focus:outline-none"
-                  />
-                </div>
-              </div>
-
-              {/* Max Daily Trades */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-xs">
-                  <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
-                    <Layers className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                    Maximum Daily Trades Quota
-                  </label>
-                  <span className="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">
-                    {formSettings.maxDailyTrades} Trades
-                  </span>
+                  <span className="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">{formSettings.riskPerTradePct.toFixed(1)}%</span>
                 </div>
                 <input
-                  type="number"
-                  min="1"
-                  max="20"
-                  value={formSettings.maxDailyTrades}
-                  onChange={(e) =>
-                    setFormSettings({
-                      ...formSettings,
-                      maxDailyTrades: parseInt(e.target.value, 10) || 4,
-                    })
-                  }
-                  className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white focus:border-blue-500 focus:outline-none"
+                  type="range"
+                  min="0.1"
+                  max="5.0"
+                  step="0.1"
+                  value={formSettings.riskPerTradePct}
+                  onChange={(e) => setFormSettings({ ...formSettings, riskPerTradePct: parseFloat(e.target.value) || 0.5 })}
+                  className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
                 />
               </div>
 
-              {/* Active Values Confirmation */}
-              {appliedNotice && (
-                <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="flex items-center gap-1.5 font-bold text-xs text-emerald-700 dark:text-emerald-400">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                      Parameters Active & Synced to Bot
-                    </span>
-                    <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400">
-                      {appliedNotice.timestamp}
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 font-mono text-[11px] text-black dark:text-slate-200">
-                    <div className="p-2 rounded-lg bg-white/70 dark:bg-black/40 border border-emerald-500/20">
-                      <div className="text-[9px] uppercase text-slate-500">Risk %</div>
-                      <div className="font-bold text-blue-600 dark:text-blue-400">{appliedNotice.settings.riskPerTradePct}%</div>
-                    </div>
-                    <div className="p-2 rounded-lg bg-white/70 dark:bg-black/40 border border-emerald-500/20">
-                      <div className="text-[9px] uppercase text-slate-500">Target R:R</div>
-                      <div className="font-bold text-indigo-600 dark:text-indigo-400">1 : {appliedNotice.settings.riskToReward}</div>
-                    </div>
-                    <div className="p-2 rounded-lg bg-white/70 dark:bg-black/40 border border-emerald-500/20">
-                      <div className="text-[9px] uppercase text-slate-500">Max Trades</div>
-                      <div className="font-bold text-black dark:text-white">{appliedNotice.settings.maxDailyTrades}</div>
-                    </div>
-                  </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
+                    <Target className="w-3.5 h-3.5 text-indigo-500" /> Target R:R (1 : R)
+                  </label>
+                  <span className="font-mono text-xs font-bold text-indigo-600 dark:text-indigo-400">1 : {formSettings.riskToReward}</span>
                 </div>
-              )}
+                <input
+                  type="number"
+                  min="0.5"
+                  max="10"
+                  step="0.5"
+                  value={formSettings.riskToReward}
+                  onChange={(e) => setFormSettings({ ...formSettings, riskToReward: parseFloat(e.target.value) || 2.0 })}
+                  className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white"
+                />
+              </div>
             </div>
 
-            <div className="pt-3 space-y-2">
-              <button
-                type="submit"
-                id="apply-bot-parameters-btn"
-                className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-xs flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Apply & Push to Bot Engine</span>
-              </button>
-
-              {onOpenBridge && (
-                <button
-                  type="button"
-                  onClick={onOpenBridge}
-                  className="w-full py-2.5 px-4 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#08090d] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-black dark:text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
-                >
-                  <Terminal className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                  <span>Connect VS Code & Broker Bridge</span>
-                </button>
-              )}
-            </div>
+            <button
+              type="submit"
+              className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-xs flex items-center justify-center gap-2 cursor-pointer mt-4"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>Apply & Push to Bot Gateway</span>
+            </button>
           </form>
         </div>
       </motion.div>
