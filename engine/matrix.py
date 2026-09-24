@@ -24,6 +24,11 @@ Deployment:   Headless Linux / Cloud VPS / Docker Container / Railway
 
 import sys
 import os
+
+# Ensure project root is in Python search path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 import time
 import json
 import math

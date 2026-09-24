@@ -756,12 +756,22 @@ app.post('/api/bot/config', (req, res) => {
 // =========================================================================
   // AUTOMATIC PYTHON BOT SPAWN & LIFECYCLE MONITOR
   // =========================================================================
+  // =========================================================================
+  // AUTOMATIC PYTHON BOT SPAWN & LIFECYCLE MONITOR
+  // =========================================================================
   function launchPythonBot() {
     console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    
+    // Pass current directory to PYTHONPATH so Python finds 'strategies' and 'risk'
     const bot = spawn(pythonCmd, ['engine/matrix.py'], {
-      env: { ...process.env },
+      env: { ...process.env, PYTHONPATH: process.cwd() },
       stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    // Safety handler: Prevents Node from crashing if Python is starting up
+    bot.on('error', (err) => {
+      console.error(`[Python Engine Spawn Warning]: ${err.message}`);
     });
 
     bot.stdout.on('data', (chunk) => {
@@ -788,9 +798,8 @@ app.post('/api/bot/config', (req, res) => {
     });
   }
 
-  // Launch the Python engine automatically alongside the server
   launchPythonBot();
-
+  
 startServer().catch((err) => {
   console.error('Server startup error:', err);
   process.exit(1);
