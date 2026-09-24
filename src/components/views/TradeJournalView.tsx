@@ -39,24 +39,25 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
   const [assetFilter, setAssetFilter] = useState('ALL');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [isSyncingSheets, setIsSyncingSheets] = useState(false);
-  const [isSyncingBroker, setIsSyncingBroker] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
 
   // New manual trade entry state
   const [newTicket, setNewTicket] = useState(`#${Math.floor(8000000 + Math.random() * 999999)}`);
-  const [newAsset, setNewAsset] = useState('DERIV:R_10');
+  const [newAsset, setNewAsset] = useState('US30');
+  const [newStrategy, setNewStrategy] = useState('GRUBBER_KICK');
   const [newType, setNewType] = useState<'BUY' | 'SELL'>('BUY');
   const [newLots, setNewLots] = useState(1.0);
-  const [newOpenPrice, setNewOpenPrice] = useState(6380.00);
-  const [newClosePrice, setNewClosePrice] = useState(6455.50);
-  const [newPnL, setNewPnL] = useState(755.00);
+  const [newOpenPrice, setNewOpenPrice] = useState(46120.00);
+  const [newClosePrice, setNewClosePrice] = useState(46250.00);
+  const [newPnL, setNewPnL] = useState(130.00);
 
   const filteredTrades = useMemo(() => {
     return trades.filter((tr) => {
       const matchSearch =
         tr.ticket.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        tr.asset.toLowerCase().includes(searchQuery.toLowerCase());
+        tr.asset.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (tr.strategy && tr.strategy.toLowerCase().includes(searchQuery.toLowerCase()));
       const matchAsset = assetFilter === 'ALL' || tr.asset === assetFilter;
       const matchStatus = statusFilter === 'ALL' || tr.status === statusFilter;
       return matchSearch && matchAsset && matchStatus;
@@ -87,7 +88,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
     return Array.from(new Set(trades.map((t) => t.asset)));
   }, [trades]);
 
-  // Sync with Google Sheets
   const handleSyncSheets = () => {
     setIsSyncingSheets(true);
     setTimeout(() => {
@@ -97,7 +97,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
     }, 1000);
   };
 
-  // Export PDF Statement
   const handleExportPDF = () => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
@@ -109,6 +108,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
       <tr style="border-bottom: 1px solid #e2e8f0;">
         <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.ticket}</td>
         <td style="padding: 8px; font-size: 11px; font-weight: bold;">${t.asset}</td>
+        <td style="padding: 8px; font-size: 11px; font-weight: bold; color: #2563eb;">${t.strategy || 'MANUAL'}</td>
         <td style="padding: 8px; font-size: 11px; color: ${t.type === 'BUY' ? '#16a34a' : '#dc2626'};">${t.type}</td>
         <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.lots}</td>
         <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.openPrice.toFixed(2)}</td>
@@ -130,62 +130,23 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             body { font-family: 'Helvetica Neue', Arial, sans-serif; color: #0f172a; padding: 40px; margin: 0; }
             .header { display: flex; justify-content: space-between; border-bottom: 2px solid #2563eb; padding-bottom: 20px; margin-bottom: 30px; }
             .title { font-size: 24px; font-weight: bold; color: #0f172a; }
-            .meta { font-size: 12px; color: #64748b; line-height: 1.6; }
-            .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 30px; }
-            .stat-card { background: #f8fafc; border: 1px solid #e2e8f0; padding: 15px; border-radius: 8px; }
-            .stat-label { font-size: 10px; text-transform: uppercase; color: #64748b; font-weight: bold; }
-            .stat-val { font-size: 18px; font-weight: bold; font-family: monospace; margin-top: 5px; color: #0f172a; }
             table { width: 100%; border-collapse: collapse; text-align: left; }
             th { background: #f1f5f9; padding: 10px 8px; font-size: 11px; text-transform: uppercase; color: #475569; border-bottom: 2px solid #cbd5e1; }
-            @media print {
-              body { padding: 20px; }
-              button { display: none; }
-            }
           </style>
         </head>
         <body>
           <div class="header">
             <div>
               <div class="title">TRADING PORTAL</div>
-              <div style="color: #2563eb; font-weight: bold; font-size: 13px; margin-top: 4px;">Audited Institutional Execution Statement</div>
-              <div class="meta" style="margin-top: 8px;">
-                Broker Gateway: ${brokerConfig.provider} (${brokerConfig.server})<br/>
-                Account ID: #${brokerConfig.accountNumber} | Currency: USD
-              </div>
-            </div>
-            <div style="text-align: right;" class="meta">
-              Statement Date: ${new Date().toLocaleDateString('en-US', { dateStyle: 'full' })}<br/>
-              Total Records: ${filteredTrades.length} Closed Positions<br/>
-              Export Origin: Trading Portal V3.5
+              <div style="color: #2563eb; font-weight: bold; font-size: 13px; margin-top: 4px;">Audited Execution Ledger</div>
             </div>
           </div>
-
-          <div class="stats-grid">
-            <div class="stat-card">
-              <div class="stat-label">Net Performance</div>
-              <div class="stat-val" style="color: ${stats.totalPnL >= 0 ? '#16a34a' : '#dc2626'};">
-                ${stats.totalPnL >= 0 ? '+' : ''}$${stats.totalPnL.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-              </div>
-            </div>
-            <div class="stat-card">
-              <div class="stat-label">Win Rate</div>
-              <div class="stat-val" style="color: #2563eb;">${stats.winRate}%</div>
-            </div>
-            <div class="stat-card">
-              <div class="stat-label">Winning Trades</div>
-              <div class="stat-val" style="color: #16a34a;">${stats.wins}W / ${stats.losses}L</div>
-            </div>
-            <div class="stat-card">
-              <div class="stat-label">Profit Factor</div>
-              <div class="stat-val">${stats.profitFactor}</div>
-            </div>
-          </div>
-
           <table>
             <thead>
               <tr>
                 <th>Ticket</th>
                 <th>Asset</th>
+                <th>Strategy</th>
                 <th>Type</th>
                 <th>Lots</th>
                 <th>Open</th>
@@ -195,20 +156,9 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                 <th>Status</th>
               </tr>
             </thead>
-            <tbody>
-              ${rowsHtml}
-            </tbody>
+            <tbody>${rowsHtml}</tbody>
           </table>
-
-          <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #e2e8f0; font-size: 10px; color: #94a3b8; text-align: center;">
-            This audit report is generated automatically by Trading Portal through direct socket telemetry. All prices in USD.
-          </div>
-
-          <script>
-            window.onload = function() {
-              window.print();
-            };
-          </script>
+          <script>window.onload = function() { window.print(); };</script>
         </body>
       </html>
     `;
@@ -228,6 +178,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
       id: `tr-${Date.now()}`,
       ticket: newTicket,
       asset: newAsset,
+      strategy: newStrategy,
       type: newType,
       lots: Number(newLots),
       openPrice: Number(newOpenPrice),
@@ -257,7 +208,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
         </div>
       )}
 
-      {/* View Header with generous negative space */}
+      {/* View Header */}
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
@@ -266,19 +217,18 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
       >
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
-            Trade Journal & Verified Ledger
+            Trade Journal & Strategy Ledger
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
               Live Feed
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Audited execution log synchronized directly with your broker and Google Sheets.
+            Audited execution log showing the exact strategy used for every trade.
           </p>
         </div>
 
         {/* Action Controls */}
         <div className="flex items-center gap-2.5 flex-wrap">
-          {/* Sync Sheets Button */}
           <button
             type="button"
             onClick={handleSyncSheets}
@@ -289,7 +239,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             <span>{isSyncingSheets ? 'Syncing...' : 'Sync Google Sheet'}</span>
           </button>
 
-          {/* PDF Export Button */}
           <button
             type="button"
             onClick={handleExportPDF}
@@ -299,7 +248,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             <span>Export PDF</span>
           </button>
 
-          {/* Manual Trade Button */}
           <button
             type="button"
             onClick={() => setShowAddModal(true)}
@@ -309,13 +257,11 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             <span>Add Manual Trade</span>
           </button>
 
-          {/* Clear Journal Button — hides old/pre-existing trades from view.
-              Does not delete anything on Deriv's side; new trades still show up normally after this. */}
           {onResetJournal && (
             <button
               type="button"
               onClick={() => {
-                if (window.confirm('Clear the journal view? This hides all currently-listed trades (old Deriv account history is NOT deleted, just hidden). New trades will still appear normally.')) {
+                if (window.confirm('Clear the journal view? This hides past trades from view without affecting your Deriv account.')) {
                   onResetJournal();
                 }
               }}
@@ -328,7 +274,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Stats Summary Bento (Pure white bubbles in light mode with clear borders) */}
+      {/* Stats Summary Bento */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
@@ -383,13 +329,12 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search ticket # or asset..."
+            placeholder="Search ticket, asset, or strategy..."
             className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-xs font-medium text-black dark:text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
           />
         </div>
 
         <div className="flex items-center gap-3 w-full sm:w-auto">
-          {/* Asset filter */}
           <select
             value={assetFilter}
             onChange={(e) => setAssetFilter(e.target.value)}
@@ -401,7 +346,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
             ))}
           </select>
 
-          {/* Status filter */}
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
@@ -415,7 +359,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Main Table Container (Uncrowded, Generous Padding) */}
+      {/* Main Table Container */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
@@ -429,7 +373,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
               <tr className="border-b border-slate-200 dark:border-[#1a2030] bg-white dark:bg-[#08090d]/50 text-black dark:text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
                 <th className="py-4 px-5">Ticket #</th>
                 <th className="py-4 px-4">Instrument</th>
-                <th className="py-4 px-4">Strategy</th> {/* Added header */}
+                <th className="py-4 px-4">Strategy</th>
                 <th className="py-4 px-4">Direction</th>
                 <th className="py-4 px-4">Lots</th>
                 <th className="py-4 px-4">Open Fill</th>
@@ -454,7 +398,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                     </td>
                     <td className="py-3.5 px-4 font-semibold text-black dark:text-white">
                       {trade.asset}
-                      {/* Strategy Tag Cell */}
+                    </td>
                     <td className="py-3.5 px-4">
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
                         {trade.strategy || 'DERIV_CORE'}
@@ -547,6 +491,24 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                     className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-black dark:text-white"
                   />
                 </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="font-semibold text-black dark:text-slate-300">Strategy</label>
+                <select
+                  value={newStrategy}
+                  onChange={(e) => setNewStrategy(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-black dark:text-white font-mono"
+                >
+                  <option value="GRUBBER_KICK">GRUBBER_KICK</option>
+                  <option value="STRATEGY_513">STRATEGY_513</option>
+                  <option value="ORB_LIQUIDITY_SWEEP">ORB_LIQUIDITY_SWEEP</option>
+                  <option value="AVWAP_200EMA_CONTINUATION">AVWAP_200EMA_CONTINUATION</option>
+                  <option value="PDH_PDL_FAILED_BREAKOUT">PDH_PDL_FAILED_BREAKOUT</option>
+                  <option value="EMA_9_25_CROSS">EMA_9_25_CROSS</option>
+                  <option value="ORB_CRACKER">ORB_CRACKER</option>
+                  <option value="OES_4H_ORDER_BLOCK">OES_4H_ORDER_BLOCK</option>
+                </select>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
