@@ -35,6 +35,8 @@ import math
 import logging
 import asyncio
 import websockets
+import urllib.request
+import urllib.error
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta, time as dtime
@@ -233,42 +235,96 @@ class DerivCloudClient:
         self._req_id_counter += 1
         return self._req_id_counter
 
+    async def get_authenticated_ws_url(self) -> str:
+        """
+        Deriv New API Architecture:
+        Uses REST + OTP handshake to obtain a pre-authenticated WebSocket URL.
+        """
+        api_base = "https://api.derivws.com"
+        try:
+            # 1. Fetch Accounts using your new App ID and API Token
+            headers = {
+                "Authorization": f"Bearer {self.api_token}",
+                "Deriv-App-ID": str(self.app_id),
+                "User-Agent": "NexusMatrix/1.0"
+            }
+            
+            def _fetch_accounts():
+                req = urllib.request.Request(f"{api_base}/trading/v1/options/accounts", headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+
+            accounts_data = await asyncio.to_thread(_fetch_accounts)
+            accounts = accounts_data.get("data", [])
+            if not accounts:
+                raise ValueError("No accounts returned from Deriv.")
+
+            demo_acc = next((a for a in accounts if a.get("account_type") == "demo"), accounts[0])
+            account_id = demo_acc.get("account_id") or demo_acc.get("loginid") or demo_acc.get("id")
+            log.info(f"Targeting Deriv Account: {account_id}")
+
+            # 2. Request OTP for pre-authenticated WebSocket
+            def _fetch_otp():
+                otp_req = urllib.request.Request(
+                    f"{api_base}/trading/v1/options/accounts/{account_id}/otp",
+                    data=b"{}",
+                    headers={**headers, "Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(otp_req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+
+            otp_res = await asyncio.to_thread(_fetch_otp)
+            ws_url = otp_res.get("data", {}).get("url")
+            if ws_url:
+                log.info("Obtained pre-authenticated WebSocket URL via Deriv OTP handshake.")
+                return ws_url
+
+        except Exception as e:
+            log.warning(f"New Deriv REST+OTP handshake warning: {e}. Trying fallback.")
+
+        # Fallback for legacy connections
+        return f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
+
     async def connect(self) -> bool:
         if not self.app_id or not self.api_token:
             log.critical("Missing DERIV_APP_ID or DERIV_API_TOKEN environment variable.")
             return False
 
         try:
-            log.info(f"Connecting to Deriv Cloud WebSocket: {self.ws_url}")
-            self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
-            
-            auth_payload = {
-                "authorize": self.api_token,
-                "req_id": self._get_next_req_id()
-            }
+            # Connect via the new pre-authenticated endpoint
+            ws_url = await self.get_authenticated_ws_url()
+            log.info(f"Connecting to Deriv WebSocket: {ws_url.split('?')[0]}...")
+            self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=20)
+
+            # If connected via OTP, session is already authenticated
+            if "otp=" in ws_url:
+                self.is_authorized = True
+                req = {"balance": 1, "req_id": self._get_next_req_id()}
+                await self.ws.send(json.dumps(req))
+                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
+                bal = res.get("balance", {}).get("balance", "Verified")
+                log.info(f"--- DERIV CLOUD ONLINE (NEW API) --- Balance: {bal} USD")
+                return True
+
+            # Standard fallback authorization
+            auth_payload = {"authorize": self.api_token, "req_id": self._get_next_req_id()}
             await self.ws.send(json.dumps(auth_payload))
-            response = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
-            res_data = json.loads(response)
+            res_data = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
 
             if "error" in res_data:
-                log.critical(f"Deriv Authorization Failed: {res_data['error']['message']}")
-                self.is_authorized = False
+                log.critical(f"Deriv Auth Failed: {res_data['error']['message']}")
                 return False
 
             self.is_authorized = True
-            self.account_info = res_data.get("authorize", {})
-            log.info(
-                f"--- DERIV CLOUD ONLINE --- "
-                f"Login ID: {self.account_info.get('loginid')} | "
-                f"Balance: {self.account_info.get('balance')} {self.account_info.get('currency')}"
-            )
+            log.info(f"--- DERIV CLOUD ONLINE --- Balance: {res_data.get('authorize', {}).get('balance')} USD")
             return True
 
         except Exception as e:
             log.error(f"Failed to connect to Deriv WebSocket Cloud: {str(e)}")
             self.is_authorized = False
             return False
-
+        
     async def ensure_connected(self) -> bool:
         if self.ws is None or not self.ws.open or not self.is_authorized:
             log.warning("Deriv WebSocket connection dropped. Reconnecting...")
