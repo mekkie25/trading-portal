@@ -183,9 +183,9 @@ class ConfigManager:
     # Strictly 7 Whitelisted Tradable Assets
     SYMBOL_MAP: Dict[str, str] = {
         "GOLD": "frxXAUUSD",
-        "US30": "US30",
-        "NAS100": "NAS100",
-        "GERMAN30": "GERMAN30",
+        "US30": "OTC_DJI",
+        "NAS100": "OTC_NDX",
+        "GERMAN30": "OTC_GDAXI",
         "EURUSD": "frxEURUSD",
         "USDJPY": "frxUSDJPY",
         "GBPUSD": "frxGBPUSD"
@@ -193,9 +193,9 @@ class ConfigManager:
 
     ASSETS: Dict[str, AssetConfig] = {
         "frxXAUUSD": AssetConfig("frxXAUUSD", "Gold (XAU/USD)", 0.01, 1.0, 1.0, 1000.0, 50, False),
-        "US30": AssetConfig("US30", "Dow Jones 30", 0.1, 1.0, 1.0, 2000.0, 100, False),
-        "NAS100": AssetConfig("NAS100", "Nasdaq 100", 0.1, 1.0, 1.0, 2000.0, 100, False),
-        "GERMAN30": AssetConfig("GERMAN30", "DAX 40", 0.1, 1.0, 1.0, 2000.0, 100, False),
+        "OTC_DJI": AssetConfig("OTC_DJI", "Wall Street 30 (US30)", 0.1, 1.0, 1.0, 2000.0, 100, False),
+        "OTC_NDX": AssetConfig("OTC_NDX", "US Tech 100 (NAS100)", 0.1, 1.0, 1.0, 2000.0, 100, False),
+        "OTC_GDAXI": AssetConfig("OTC_GDAXI", "Germany 40 (DAX40)", 0.1, 1.0, 1.0, 2000.0, 100, False),
         "frxEURUSD": AssetConfig("frxEURUSD", "EUR / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
         "frxUSDJPY": AssetConfig("frxUSDJPY", "USD / JPY", 0.001, 100000.0, 1.0, 1000.0, 100, False),
         "frxGBPUSD": AssetConfig("frxGBPUSD", "GBP / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
@@ -699,9 +699,9 @@ class InstitutionalRiskEngine:
         self.max_spread_to_sl_ratio: float = 0.15
         self.max_absolute_spread = {
             "frxXAUUSD": 0.50,
-            "US30": 4.5,
-            "NAS100": 2.5,
-            "GERMAN30": 3.0,
+            "OTC_DJI": 4.5,
+            "OTC_NDX": 2.5,
+            "OTC_GDAXI": 3.0,
             "frxEURUSD": 0.0003,
             "frxUSDJPY": 0.035,
             "frxGBPUSD": 0.00035
@@ -709,9 +709,9 @@ class InstitutionalRiskEngine:
 
         # Sector Correlation Grouping (Max 1 open position per sector)
         self.SECTOR_MAP = {
-            "US30": "EQUITY_INDEX",
-            "NAS100": "EQUITY_INDEX",
-            "GERMAN30": "EQUITY_INDEX",
+            "OTC_DJI": "EQUITY_INDEX",
+            "OTC_NDX": "EQUITY_INDEX",
+            "OTC_GDAXI": "EQUITY_INDEX",
             "frxXAUUSD": "PRECIOUS_METAL",
             "GOLD": "PRECIOUS_METAL",
             "frxEURUSD": "FOREX_MAJORS",
