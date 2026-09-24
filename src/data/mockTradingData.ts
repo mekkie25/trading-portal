@@ -1,178 +1,102 @@
-export interface TradeRecord {
-  id: string;
-  ticket: string;
-  asset: string;
-  strategy: string; // <-- Required strategy identification tag
-  type: 'BUY' | 'SELL';
-  lots: number;
-  openPrice: number;
-  closePrice: number;
-  pnl: number;
-  pnlPct: number;
-  openTime: string;
-  closeTime: string;
-  duration: string;
-  status: 'WIN' | 'LOSS' | 'BREAKEVEN';
-  source: string;
-}
+import { 
+  TradeRecord, 
+  TopMetrics, 
+  BotSettings, 
+  AdvancedLimits, 
+  BrokerConfig, 
+  GoogleSheetsConfig, 
+  SiteBrandingConfig, 
+  MarketAsset, 
+  CalendarDayData 
+} from '../types';
 
-export interface AccountInfo {
-  balance: number;
-  equity: number;
-  margin: number;
-  freeMargin: number;
-  marginLevel: number;
-  unrealizedPnl: number;
-  dailyPnl: number;
-  dailyPnlPct: number;
-  winRate: number;
-  totalTrades: number;
-  winningTrades: number;
-  losingTrades: number;
-}
+// ============================================================================
+// 1. INITIAL APP & BROKER METRICS
+// ============================================================================
 
-export interface RiskLimits {
-  maxDailyLoss: number;
-  maxWeeklyLoss: number;
-  maxMonthlyLoss: number;
-  maxPositionSize: number;
-  maxOpenPositions: number;
-  maxDrawdownPct: number;
-}
-
-export interface AssetConfig {
-  symbol: string;
-  name: string;
-  category: 'Forex' | 'Indices' | 'Commodities' | 'Crypto' | 'Synthetics';
-  minStake: number;
-  maxStake: number;
-  precision: number;
-  enabled: boolean;
-}
-
-export interface EconomicEvent {
-  id: string;
-  time: string;
-  currency: string;
-  event: string;
-  impact: 'HIGH' | 'MEDIUM' | 'LOW';
-  actual: string;
-  forecast: string;
-  previous: string;
-  date: string;
-}
-
-export interface BrandingConfig {
-  portalName: string;
-  companyName: string;
-  logoUrl: string;
-  theme: 'dark' | 'light';
-  accentColor: string;
-}
-
-export interface BrokerPreset {
-  id: string;
-  name: string;
-  server: string;
-  brokerType: 'Deriv' | 'MetaTrader5' | 'Custom';
-  appId: string;
-  wsUrl: string;
-  environment: 'Demo' | 'Real';
-}
-
-export interface GoogleSheetsConfig {
-  enabled: boolean;
-  spreadsheetId: string;
-  sheetName: string;
-  autoSync: boolean;
-  lastSyncedAt: string | null;
-}
-
-export const initialBrandingConfig: BrandingConfig = {
-  portalName: 'Matrix Algorithmic Portal',
-  companyName: 'Matrix Capital Trading',
-  logoUrl: '/logo.svg',
-  theme: 'dark',
-  accentColor: '#10B981',
+export const INITIAL_METRICS: TopMetrics = {
+  netProfit: 34820.50,
+  netProfitPct: 27.8,
+  winRate: 68.4,
+  totalTrades: 142,
+  winningTrades: 97,
+  losingTrades: 45,
+  totalInjections: 125000,
+  currentEquity: 159820.50,
+  currentBalance: 157340.00,
+  unrealizedPnL: 2480.50,
 };
 
-export const brokerPresets: BrokerPreset[] = [
-  {
-    id: 'deriv-demo',
-    name: 'Deriv WebSocket Demo',
-    server: 'wss://ws.derivws.com/websockets/v3',
-    brokerType: 'Deriv',
-    appId: '1089',
-    wsUrl: 'wss://ws.derivws.com/websockets/v3?app_id=1089',
-    environment: 'Demo',
-  },
-  {
-    id: 'deriv-real',
-    name: 'Deriv WebSocket Live',
-    server: 'wss://ws.derivws.com/websockets/v3',
-    brokerType: 'Deriv',
-    appId: '1089',
-    wsUrl: 'wss://ws.derivws.com/websockets/v3?app_id=1089',
-    environment: 'Real',
-  },
-  {
-    id: 'mt5-deriv-demo',
-    name: 'Deriv MT5 SVG Demo',
-    server: 'Deriv-Demo',
-    brokerType: 'MetaTrader5',
-    appId: 'mt5_demo',
-    wsUrl: 'ws://localhost:8080/mt5',
-    environment: 'Demo',
-  },
-];
+export const INITIAL_BOT_SETTINGS: BotSettings = {
+  masterExecution: true,
+  riskPerTradePct: 1.25,
+  riskToReward: 2.5,
+  maxDailyTrades: 4,
+  trailingStopActive: true,
+  autoBreakevenPips: 15,
+  currency: 'USD',
+  lastAppliedTimestamp: '09:30:00',
+};
 
-export const googleSheetsConfig: GoogleSheetsConfig = {
-  enabled: true,
-  spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms',
-  sheetName: 'Live_Trade_Journal',
+export const INITIAL_ADVANCED_LIMITS: AdvancedLimits = {
+  maxDailyDrawdownPct: 3.5,
+  currentDailyDrawdownPct: 0.82,
+  emergencyStopThreshold: 140000,
+  consecutiveLossesLimit: 3,
+  currentConsecutiveLosses: 0,
+  maxOpenExposureLots: 10,
+  currentOpenExposureLots: 1.5,
+  maxMarginUtilizationPct: 25,
+  trailingDrawdownLock: true,
+  breakerAction: 'HALT_PREVENT_NEW',
+  breakerTriggered: false,
+  maxDailyLossUsd: 2500,
+  currentDailyLossUsd: 0,
+  maxWeeklyLossUsd: 6500,
+  currentWeeklyLossUsd: 0,
+  maxMonthlyLossUsd: 15000,
+  currentMonthlyLossUsd: 0,
+  maxOpenPositions: 4,
+  autoLiquidateAllOnTrip: false,
+  activeTripScope: 'NONE',
+};
+
+export const INITIAL_BROKER_CONFIG: BrokerConfig = {
+  provider: 'Deriv',
+  accountNumber: 'CR8492041',
+  server: 'Deriv-Server-02',
+  apiToken: '',
+  webhookUrl: 'https://ws.derivws.com/websockets/v3',
+  connected: true,
+  lastPingMs: 14,
+  lastSyncTime: 'Just now',
   autoSync: true,
-  lastSyncedAt: '2026-09-24 13:00:00',
+  syncIntervalSec: 5,
+  currency: 'USD',
 };
 
-export const initialAccountInfo: AccountInfo = {
-  balance: 25000.00,
-  equity: 25340.50,
-  margin: 1250.00,
-  freeMargin: 24090.50,
-  marginLevel: 2027.24,
-  unrealizedPnl: 340.50,
-  dailyPnl: 580.20,
-  dailyPnlPct: 2.34,
-  winRate: 68.5,
-  totalTrades: 42,
-  winningTrades: 28,
-  losingTrades: 14,
+export const INITIAL_GOOGLE_SHEETS_CONFIG: GoogleSheetsConfig = {
+  sheetUrlOrId: 'https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit',
+  apiKeyOrToken: '',
+  sheetTabName: 'Live_Trade_Journal',
+  lastSyncTime: '2026-09-24 13:00:00',
+  autoSyncEnabled: true,
 };
 
-export const defaultRiskLimits: RiskLimits = {
-  maxDailyLoss: 2500,
-  maxWeeklyLoss: 6500,
-  maxMonthlyLoss: 15000,
-  maxPositionSize: 10,
-  maxOpenPositions: 5,
-  maxDrawdownPct: 5.0,
+export const INITIAL_BRANDING_CONFIG: SiteBrandingConfig = {
+  siteName: 'TRADING PORTAL',
+  iconType: 'chart',
+  customInitials: '',
 };
 
-// Strictly Whitelisted Trading Instruments
-export const allowedAssets: AssetConfig[] = [
-  { symbol: 'US30', name: 'Dow Jones 30', category: 'Indices', minStake: 1, maxStake: 100, precision: 2, enabled: true },
-  { symbol: 'GOLD', name: 'Gold (XAU/USD)', category: 'Commodities', minStake: 1, maxStake: 50, precision: 2, enabled: true },
-  { symbol: 'NAS100', name: 'Nasdaq 100', category: 'Indices', minStake: 1, maxStake: 100, precision: 2, enabled: true },
-  { symbol: 'GERMAN30', name: 'DAX 40', category: 'Indices', minStake: 1, maxStake: 100, precision: 2, enabled: true },
-  { symbol: 'EURUSD', name: 'EUR / USD', category: 'Forex', minStake: 1, maxStake: 100, precision: 5, enabled: true },
-  { symbol: 'USDJPY', name: 'USD / JPY', category: 'Forex', minStake: 1, maxStake: 100, precision: 3, enabled: true },
-  { symbol: 'GBPUSD', name: 'GBP / USD', category: 'Forex', minStake: 1, maxStake: 100, precision: 5, enabled: true },
-];
+// ============================================================================
+// 2. AUDITED TRADE JOURNAL (STRICT 7 ALLOWED ASSETS + STRATEGIES)
+// ============================================================================
 
-export const mockTradeHistory: TradeRecord[] = [
+export const INITIAL_TRADES: TradeRecord[] = [
   {
-    id: '1',
-    ticket: '9841203',
+    id: 'tr-1',
+    ticket: '#8941203',
     asset: 'US30',
     strategy: 'GRUBBER_KICK',
     type: 'BUY',
@@ -185,11 +109,11 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-24 09:30:00',
     duration: '1h 15m',
     status: 'WIN',
-    source: 'Deriv MT5 / Web',
+    source: 'Deriv Live',
   },
   {
-    id: '2',
-    ticket: '9841189',
+    id: 'tr-2',
+    ticket: '#8941189',
     asset: 'EURUSD',
     strategy: 'STRATEGY_513',
     type: 'SELL',
@@ -202,11 +126,11 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-24 07:45:00',
     duration: '1h 45m',
     status: 'WIN',
-    source: 'Deriv MT5 / Web',
+    source: 'Deriv Live',
   },
   {
-    id: '3',
-    ticket: '9841052',
+    id: 'tr-3',
+    ticket: '#8941052',
     asset: 'GOLD',
     strategy: 'ORB_LIQUIDITY_SWEEP',
     type: 'BUY',
@@ -219,11 +143,11 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-23 14:35:00',
     duration: '25m',
     status: 'LOSS',
-    source: 'Deriv MT5 / Web',
+    source: 'Deriv Live',
   },
   {
-    id: '4',
-    ticket: '9840988',
+    id: 'tr-4',
+    ticket: '#8940988',
     asset: 'NAS100',
     strategy: 'AVWAP_200EMA_CONTINUATION',
     type: 'BUY',
@@ -236,11 +160,11 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-23 13:20:00',
     duration: '2h 20m',
     status: 'WIN',
-    source: 'Deriv MT5 / Web',
+    source: 'Deriv Live',
   },
   {
-    id: '5',
-    ticket: '9840810',
+    id: 'tr-5',
+    ticket: '#8940810',
     asset: 'GBPUSD',
     strategy: 'EMA_9_25_CROSS',
     type: 'SELL',
@@ -253,11 +177,11 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-22 15:40:00',
     duration: '40m',
     status: 'BREAKEVEN',
-    source: 'Deriv MT5 / Web',
+    source: 'Deriv Live',
   },
   {
-    id: '6',
-    ticket: '9840744',
+    id: 'tr-6',
+    ticket: '#8940744',
     asset: 'GERMAN30',
     strategy: 'PDH_PDL_FAILED_BREAKOUT',
     type: 'SELL',
@@ -270,11 +194,11 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-22 11:15:00',
     duration: '2h 05m',
     status: 'WIN',
-    source: 'Deriv MT5 / Web',
+    source: 'Deriv Live',
   },
   {
-    id: '7',
-    ticket: '9840612',
+    id: 'tr-7',
+    ticket: '#8940612',
     asset: 'USDJPY',
     strategy: 'OES_4H_ORDER_BLOCK',
     type: 'BUY',
@@ -287,53 +211,113 @@ export const mockTradeHistory: TradeRecord[] = [
     closeTime: '2026-09-21 17:10:00',
     duration: '40m',
     status: 'LOSS',
-    source: 'Deriv MT5 / Web',
-  }
+    source: 'Deriv Live',
+  },
 ];
 
-export const mockEconomicCalendar: EconomicEvent[] = [
-  {
-    id: 'cal-1',
-    date: '2026-09-24',
-    time: '14:30',
-    currency: 'USD',
-    event: 'Unemployment Claims',
-    impact: 'HIGH',
-    actual: '218K',
-    forecast: '224K',
-    previous: '222K',
+// Backwards compatibility alias
+export const mockTradeHistory = INITIAL_TRADES;
+
+// ============================================================================
+// 3. DASHBOARD EQUITY TIMEFRAME TRAJECTORY DATA
+// ============================================================================
+
+export const EQUITY_TIMEFRAME_DATA: Record<string, { labels: string[]; equity: number[]; balance: number[] }> = {
+  '7D': {
+    labels: ['Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5', 'Day 6', 'Day 7'],
+    equity: [152000, 153400, 152900, 155200, 156800, 158100, 159820],
+    balance: [151000, 152000, 152000, 154500, 156000, 156000, 157340],
   },
-  {
-    id: 'cal-2',
-    date: '2026-09-24',
-    time: '15:45',
-    currency: 'USD',
-    event: 'S&P Global Flash US Manufacturing PMI',
-    impact: 'MEDIUM',
-    actual: '47.0',
-    forecast: '48.2',
-    previous: '47.9',
+  '30D': {
+    labels: ['W1', 'W2', 'W3', 'W4'],
+    equity: [142000, 147500, 153000, 159820],
+    balance: [140000, 146000, 151500, 157340],
   },
-  {
-    id: 'cal-3',
-    date: '2026-09-25',
-    time: '08:00',
-    currency: 'EUR',
-    event: 'German Ifo Business Climate',
-    impact: 'HIGH',
-    actual: '--',
-    forecast: '86.5',
-    previous: '86.6',
+  '90D': {
+    labels: ['M1', 'M2', 'M3'],
+    equity: [130000, 144000, 159820],
+    balance: [128000, 141000, 157340],
   },
-  {
-    id: 'cal-4',
-    date: '2026-09-25',
-    time: '14:30',
-    currency: 'USD',
-    event: 'Core PCE Price Index m/m',
-    impact: 'HIGH',
-    actual: '--',
-    forecast: '0.2%',
-    previous: '0.2%',
+  'YTD': {
+    labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep'],
+    equity: [100000, 108000, 115000, 122000, 131000, 138000, 145000, 152000, 159820],
+    balance: [100000, 107000, 114000, 120000, 129000, 136000, 143000, 150000, 157340],
   },
+  'ALL': {
+    labels: ['2024', '2025', '2026'],
+    equity: [50000, 105000, 159820],
+    balance: [50000, 102000, 157340],
+  },
+};
+
+// ============================================================================
+// 4. LIVE FEED WHITELISTED ASSETS (7 ASSETS ONLY)
+// ============================================================================
+
+export const MARKET_ASSETS: MarketAsset[] = [
+  { symbol: 'GOLD', tvSymbol: 'OANDA:XAUUSD', name: 'Gold (XAU/USD)', category: 'Commodities', price: 2642.50, change24h: 1.15 },
+  { symbol: 'US30', tvSymbol: 'CAPITALCOM:US30', name: 'Dow Jones 30', category: 'Indices', price: 46180.00, change24h: 0.62 },
+  { symbol: 'NAS100', tvSymbol: 'CAPITALCOM:NAS100', name: 'Nasdaq 100', category: 'Indices', price: 19880.00, change24h: 0.84 },
+  { symbol: 'GERMAN30', tvSymbol: 'CAPITALCOM:DE40', name: 'DAX 40', category: 'Indices', price: 18620.00, change24h: -0.22 },
+  { symbol: 'EURUSD', tvSymbol: 'FX:EURUSD', name: 'EUR / USD', category: 'Forex', price: 1.08450, change24h: -0.18 },
+  { symbol: 'USDJPY', tvSymbol: 'FX:USDJPY', name: 'USD / JPY', category: 'Forex', price: 143.420, change24h: 0.35 },
+  { symbol: 'GBPUSD', tvSymbol: 'FX:GBPUSD', name: 'GBP / USD', category: 'Forex', price: 1.32150, change24h: 0.12 },
 ];
+
+// ============================================================================
+// 5. ECONOMIC CALENDAR DATA (SEPTEMBER 2026)
+// ============================================================================
+
+export const CALENDAR_DATA_SEPTEMBER_2026: Record<string, CalendarDayData> = {
+  '2026-09-17': {
+    date: '2026-09-17',
+    dayNumber: 17,
+    dayOfWeek: 'Thursday',
+    hasHighImpact: true,
+    eventsCount: 2,
+    releases: [
+      {
+        id: 'rel-5',
+        time: '20:00 SAST',
+        currency: 'USD',
+        title: 'FOMC Interest Rate Decision & Statement',
+        impact: 'HIGH',
+        forecast: '5.00%',
+        previous: '5.25%',
+        coreDefinition: 'Federal Reserve Federal Funds Rate Decision and Policy Statement.',
+        mentorNote: 'Watch initial pulse for liquidity sweep before taking continuation setups.',
+        institutionalInsight: {
+          bullishScenario: 'Rate cut beyond expectations triggers equity expansion.',
+          bearishScenario: 'Hawkish pause or rhetoric creates sharp dollar injection.',
+          fakeoutTrapWarning: 'Avoid entering in the first 5 minutes of release.',
+          mentorExecutionStrategy: 'Wait for 15M opening range to form and trade the failed breakout.',
+        },
+      },
+    ],
+  },
+  '2026-09-24': {
+    date: '2026-09-24',
+    dayNumber: 24,
+    dayOfWeek: 'Thursday',
+    hasHighImpact: true,
+    eventsCount: 1,
+    releases: [
+      {
+        id: 'rel-8',
+        time: '14:30 SAST',
+        currency: 'USD',
+        title: 'Initial Jobless Claims',
+        impact: 'HIGH',
+        forecast: '218K',
+        previous: '222K',
+        coreDefinition: 'Weekly measure of individuals filing for state unemployment benefits.',
+        institutionalInsight: {
+          bullishScenario: 'Claims rising indicates labor cooling and dovish outlook.',
+          bearishScenario: 'Lower claims reinforce dollar strength.',
+          fakeoutTrapWarning: 'London close overlap often causes rapid pullbacks.',
+          mentorExecutionStrategy: 'Focus on US30 and Gold 15M Value Area bounces.',
+        },
+      },
+    ],
+  },
+};
