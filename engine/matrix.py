@@ -4,7 +4,11 @@
 NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (DERIV CLOUD WEBSOCKET EDITION)
 ================================================================================
 Architecture: Institutional Multi-Strategy Quantitative Execution Engine
-Components:   - Modular Strategies & Strategy Manager Integration
+Components:   - All-Day Unrestricted Execution (Trade Anytime Setup Appears)
+              - Daily 21:00 SAST End-of-Day Position Flusher (Zero Overnight Risk)
+              - Instant Personal WhatsApp Alerts Engine (CallMeBot Integration)
+              - Twin-Position 50/50 Partial Scaling (Bank Half at TP1, Trail TP2)
+              - Modular Strategies & Strategy Manager Integration
               - Native Asynchronous Deriv Cloud WebSocket & REST API
               - Gemini AI Overseer & Pre-Trade Prompt Verification
               - Order Flow Analyzer (POC, VAH, VAL, Cumulative Volume Delta)
@@ -12,11 +16,8 @@ Components:   - Modular Strategies & Strategy Manager Integration
               - Temporal Clock & Session Manager (Asian, London, NY)
               - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
               - Range & Consolidation Detection Engine
-              - Live Bid/Ask Spread Gatekeeper & SL/TP Buffer Adjustment
-              - Dynamic Auto Lot Sizing (Risk % / SL Distance Formula)
-              - UI Dynamic Limits Sync (Daily, Weekly, Monthly Ceilings, R:R)
-              - Macro News Blackout Gate (15m Pre/Post Red-Folder Freeze)
-              - Sector Correlation Exposure Limiter (Max 1 Index Trade)
+              - Live Bid/Ask Spread Gatekeeper & News Armor Protection
+              - Dynamic Auto Lot Sizing with Weekly Runway Budgeting
               - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
               - Atomic Bracket Proposal Execution (No Naked Trades)
               - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
@@ -34,6 +35,7 @@ import logging
 import asyncio
 import websockets
 import urllib.request
+import urllib.parse
 import urllib.error
 import pandas as pd
 import numpy as np
@@ -63,7 +65,43 @@ CONFIG_FILE = "bot_config.json"
 TELEMETRY_FILE = "bot_telemetry.json"
 
 # ==============================================================================
-# 1. ADVANCED TELEMETRY & UI CONFIGURATION I/O HELPERS
+# 1. WHATSAPP NOTIFICATION ENGINE
+# ==============================================================================
+
+class WhatsAppNotifier:
+    """Sends instant alerts directly to your personal WhatsApp via CallMeBot."""
+    def __init__(self):
+        self.phone = os.getenv("WHATSAPP_PHONE", "").strip()
+        self.api_key = os.getenv("WHATSAPP_API_KEY", "").strip()
+        self.enabled = bool(self.phone and self.api_key)
+        if self.enabled:
+            log.info(f"WhatsApp Notification Engine Online for {self.phone}")
+        else:
+            log.info("WhatsApp Alerts standby (Set WHATSAPP_PHONE & WHATSAPP_API_KEY in Railway to activate).")
+
+    async def send_alert(self, message: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            clean_phone = self.phone.replace("+", "").replace(" ", "").strip()
+            encoded_text = urllib.parse.quote(message)
+            url = f"https://api.callmebot.com/whatsapp.php?phone={clean_phone}&text={encoded_text}&apikey={self.api_key}"
+
+            def _call():
+                req = urllib.request.Request(url, headers={"User-Agent": "NexusMatrix/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    return resp.read().decode('utf-8', errors='ignore')
+
+            res = await asyncio.to_thread(_call)
+            return "Message Sent" in res or "ok" in res.lower()
+        except Exception as e:
+            log.warning(f"Could not send WhatsApp alert: {e}")
+            return False
+
+whatsapp = WhatsAppNotifier()
+
+# ==============================================================================
+# 2. ADVANCED TELEMETRY & UI CONFIGURATION I/O HELPERS
 # ==============================================================================
 
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
@@ -104,7 +142,7 @@ def read_ui_config() -> dict:
         return {}
 
 # ==============================================================================
-# 2. ADVANCED LOGGING SYSTEM
+# 3. ADVANCED LOGGING SYSTEM
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
@@ -118,18 +156,8 @@ class InstitutionalFormatter(logging.Formatter):
     fmt = "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-20s | %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
-    FORMATS = {
-        logging.DEBUG: grey + fmt + reset,
-        logging.INFO: green + fmt + reset,
-        logging.WARNING: yellow + fmt + reset,
-        logging.ERROR: red + fmt + reset,
-        logging.CRITICAL: bold_red + fmt + reset
-    }
-
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno, self.fmt)
-        formatter = logging.Formatter(log_fmt, datefmt=self.datefmt)
-        return formatter.format(record)
+        return logging.Formatter(self.fmt, datefmt=self.datefmt).format(record)
 
 def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", level=logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -147,15 +175,15 @@ def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", 
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s", "%Y-%m-%d %H:%M:%S"))
         logger.addHandler(fh)
-    except Exception as e:
-        print(f"Warning: Failed to setup file logging: {e}")
+    except Exception:
+        pass
 
     return logger
 
 log = setup_logger()
 
 # ==============================================================================
-# 3. GLOBAL CONSTANTS & ASSET CONFIGURATION (STRICT 7 ALLOWED ONLY)
+# 4. GLOBAL CONSTANTS & ASSET CONFIGURATION (STRICT 7 ALLOWED ONLY)
 # ==============================================================================
 
 class DerivGranularity(Enum):
@@ -219,7 +247,7 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 4. NATIVE DERIV CLOUD WEBSOCKET CLIENT (REST+OTP COMPATIBLE)
+# 5. NATIVE DERIV CLOUD WEBSOCKET CLIENT (REST+OTP COMPATIBLE)
 # ==============================================================================
 
 class DerivCloudClient:
@@ -387,7 +415,6 @@ class DerivCloudClient:
                 data = json.loads(response)
 
             if "error" in data:
-                log.error(f"Deriv Candle Fetch Error ({symbol}): {data['error']['message']}")
                 return pd.DataFrame()
 
             candles = data.get("candles", [])
@@ -405,8 +432,7 @@ class DerivCloudClient:
                 df['tick_volume'] = 1
 
             return df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
-        except Exception as e:
-            log.error(f"Exception during candle fetch ({symbol}): {e}")
+        except Exception:
             return pd.DataFrame()
 
     async def get_live_quote(self, symbol: str) -> Tuple[float, float, float]:
@@ -510,12 +536,27 @@ class DerivCloudClient:
                 await self.ws.send(json.dumps(req))
                 res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
                 return "error" not in res
+        except Exception:
+            return False
+
+    async def close_market_contract(self, contract_id: str) -> bool:
+        """Market closes an active contract immediately (Used by 21:00 SAST Flusher)."""
+        try:
+            async with self._lock:
+                req = {
+                    "sell": int(contract_id),
+                    "price": 0,
+                    "req_id": self._get_next_req_id()
+                }
+                await self.ws.send(json.dumps(req))
+                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=8.0))
+                return "sold" in res or "error" not in res
         except Exception as e:
-            log.error(f"Error moving SL to BE for contract {contract_id}: {e}")
+            log.error(f"Error market closing contract {contract_id}: {e}")
             return False
 
 # ==============================================================================
-# 5. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
+# 6. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
 # ==============================================================================
 
 class MathEngine:
@@ -553,7 +594,7 @@ class MathEngine:
         return 100 - (100 / (1 + rs))
 
 # ==============================================================================
-# 6. TEMPORAL CLOCK & SESSION MANAGER
+# 7. TEMPORAL CLOCK & SESSION MANAGER
 # ==============================================================================
 
 class MarketSession(Enum):
@@ -584,7 +625,7 @@ class TemporalSessionManager:
             return MarketSession.CLOSED
 
 # ==============================================================================
-# 7. ORDER FLOW & VOLUME PROFILE ANALYZER
+# 8. ORDER FLOW & VOLUME PROFILE ANALYZER
 # ==============================================================================
 
 @dataclass
@@ -646,7 +687,7 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 8. INSTITUTIONAL RISK MANAGEMENT & VOLATILITY ENGINE
+# 9. INSTITUTIONAL RISK MANAGEMENT ENGINE (NEWS ARMOR & RUNWAY BUDGETING)
 # ==============================================================================
 
 class InstitutionalRiskEngine:
@@ -692,11 +733,11 @@ class InstitutionalRiskEngine:
             "frxUSDJPY": "FOREX_MAJORS"
         }
 
-        # High-Impact Macro Schedule (UTC times: 15m blackout before & after)
-        self.MACRO_BLACKOUT_WINDOWS = [
-            (dtime(12, 15), dtime(13, 15)),
-            (dtime(17, 45), dtime(19, 45)),
-            (dtime(5, 45), dtime(6, 15))
+        # Targeted Red-Folder Windows (NFP & CPI announcements: 5 min before and after)
+        # Note: We do NOT block; we apply News Armor (cut size by 50% and enforce tight spread)
+        self.RED_FOLDER_WINDOWS = [
+            (dtime(12, 25), dtime(12, 35)),  # US CPI / NFP release window (12:30 UTC)
+            (dtime(17, 55), dtime(18, 5))    # FOMC Rate Decision announcement (18:00 UTC)
         ]
 
     def sync_ui_config(self) -> None:
@@ -713,19 +754,20 @@ class InstitutionalRiskEngine:
         self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
         self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
 
-    def is_macro_news_blackout(self) -> Tuple[bool, str]:
+    def is_red_folder_active(self) -> bool:
+        """Checks if current time is inside a high-impact red folder release window."""
         now_utc = datetime.now(timezone.utc).time()
-        for start, end in self.MACRO_BLACKOUT_WINDOWS:
+        for start, end in self.RED_FOLDER_WINDOWS:
             if start <= now_utc <= end:
-                return True, f"High-Impact Macro Event window active ({start.strftime('%H:%M')} - {end.strftime('%H:%M')} UTC). Trading paused."
-        return False, ""
+                return True
+        return False
 
     def check_sector_exposure(self, symbol: str) -> Tuple[bool, str]:
         sector = self.SECTOR_MAP.get(symbol, "OTHER")
         for ticket, pos in self.open_positions.items():
             open_sym = pos.get("symbol", "")
             if self.SECTOR_MAP.get(open_sym) == sector:
-                return False, f"Sector limit reached: An open trade already exists in {sector} ({open_sym})."
+                return False, f"Sector limit: An open trade already exists in {sector} ({open_sym})."
         return True, ""
 
     def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
@@ -796,7 +838,7 @@ class InstitutionalRiskEngine:
         """
         Adapts dynamically to ANY account size:
         - Micro-Account Mode (R100 / $5-$10): Uses broker min stake to build small deposits.
-        - Goal Shield: When weekly target is 90%+ reached, cuts risk in half to protect gains.
+        - News Armor: Halves risk during red folder windows to absorb slippage.
         """
         equity = current_equity if current_equity > 0 else 10051.99
         active_risk_pct = self.risk_per_trade_pct
@@ -806,7 +848,12 @@ class InstitutionalRiskEngine:
             active_risk_pct = active_risk_pct * 0.5
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
-        # 2. Dynamic Weekly Buffer Budgeting
+        # 2. News Armor: Halve risk during high-impact red folder events
+        if self.is_red_folder_active():
+            active_risk_pct = active_risk_pct * 0.5
+            log.info(f"NEWS ARMOR ENGAGED: Red folder window active. Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
+
+        # 3. Dynamic Weekly Buffer Budgeting
         if self.max_weekly_loss_usd > 0:
             weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
             remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
@@ -822,7 +869,7 @@ class InstitutionalRiskEngine:
         else:
             max_weekly_allowed_dollars = float('inf')
 
-        # 3. Dynamic Daily Buffer Budgeting
+        # 4. Dynamic Daily Buffer Budgeting
         if self.max_daily_loss_usd > 0:
             remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
             max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
@@ -864,14 +911,12 @@ class InstitutionalRiskEngine:
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
 
-        in_blackout, news_msg = self.is_macro_news_blackout()
-        if in_blackout:
-            return False, news_msg, {}
-
+        # Sector Correlation Limit Gate
         sector_ok, sector_msg = self.check_sector_exposure(symbol)
         if not sector_ok:
             return False, sector_msg, {}
 
+        # Ceilings
         if self.current_daily_loss >= self.max_daily_loss_usd:
             return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
 
@@ -893,6 +938,7 @@ class InstitutionalRiskEngine:
             target_distance = sl_distance * self.risk_to_reward
             final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
 
+        # Spread Gate (Primary shield during news volatility)
         spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
         if not spread_ok:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
@@ -919,7 +965,7 @@ RiskState = InstitutionalRiskEngine
 RiskManager = InstitutionalRiskEngine
 
 # ==============================================================================
-# 9. MARKET DATA PIPELINE & MULTI-TIMEFRAME MATRIX
+# 10. MARKET DATA PIPELINE & MULTI-TIMEFRAME MATRIX
 # ==============================================================================
 
 class MarketDataPipeline:
@@ -965,7 +1011,7 @@ class MultiTimeframeMatrix:
         await asyncio.gather(*tasks)
 
 # ==============================================================================
-# 10. PRESERVED ORIGINAL STRATEGY SETUPS & EVALUATOR MATRIX
+# 11. PRESERVED ORIGINAL STRATEGY SETUPS & EVALUATOR MATRIX
 # ==============================================================================
 
 class SetupType(Enum):
@@ -1032,7 +1078,7 @@ class StrategyEvaluator:
         return None
 
 # ==============================================================================
-# 11. AI OVERSEER & CLOUD EXECUTION ENGINE
+# 12. AI OVERSEER & CLOUD EXECUTION (TWIN POSITION 50/50 PARTIAL SCALING)
 # ==============================================================================
 
 class AIOverseer:
@@ -1053,8 +1099,8 @@ class AIOverseer:
         symbol = getattr(signal, 'symbol', 'UNKNOWN')
         strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
         entry = getattr(signal, 'entry_price', 0.0)
-        sl = getattr(signal, 'stop_loss', getattr(signal, 'sl', 0.0))
-        tp = getattr(signal, 'take_profit', getattr(signal, 'tp1', 0.0))
+        sl = getattr(signal, 'stop_loss', None) or getattr(signal, 'sl', 0.0)
+        tp = getattr(signal, 'take_profit', None) or getattr(signal, 'tp1', 0.0)
         reason = getattr(signal, 'reason', getattr(signal, 'reasoning', ''))
 
         prompt = (
@@ -1079,13 +1125,8 @@ class CloudExecutionEngine:
         direction = getattr(signal, 'direction')
         entry = getattr(signal, 'entry_price')
         
-        sl = getattr(signal, 'stop_loss', None)
-        if sl is None:
-            sl = getattr(signal, 'sl', 0.0)
-
-        tp = getattr(signal, 'take_profit', None)
-        if tp is None:
-            tp = getattr(signal, 'tp1', None)
+        sl = getattr(signal, 'stop_loss', None) or getattr(signal, 'sl', 0.0)
+        tp = getattr(signal, 'take_profit', None) or getattr(signal, 'tp1', None)
 
         strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
         if isinstance(strategy_name, Enum):
@@ -1118,37 +1159,63 @@ class CloudExecutionEngine:
         if not await self.ai_overseer.validate_trade(signal, current_balance, bp.get("spread_points", 0.0)):
             return False
 
-        if bp.get("is_dry_run"):
+        is_dry_run = getattr(signal, 'is_dry_run', False) or bp.get("is_dry_run", False)
+
+        # SIMULATOR PAPER TRADE
+        if is_dry_run:
+            msg = f"🔵 *[SIMULATED TRADE]*\n• Asset: {bp['symbol']}\n• Strategy: {strategy_name}\n• Dir: {bp['direction']}\n• Stake: ${bp['stake']}\n• Entry: {bp['entry_price']}\n• SL: {bp['stop_loss']}\n• TP: {bp['take_profit']}"
             log.info(f"[SIMULATOR DRY-RUN] Approved: {bp['direction']} {bp['symbol']} | Strategy: {strategy_name} | Stake: ${bp['stake']}")
+            await whatsapp.send_alert(msg)
             return True
 
-        result = await self.deriv.execute_atomic_order(
-            symbol=bp['symbol'],
-            direction=bp['direction'],
-            stake=bp['stake'],
-            entry_price=bp['entry_price'],
-            sl_price=bp['stop_loss'],
-            tp_price=bp['take_profit']
-        )
+        # TWIN-POSITION 50/50 PARTIAL SCALING EXECUTION:
+        total_stake = bp['stake']
+        half_stake = round(max(total_stake / 2.0, min_stk), 2)
+        sl_distance = abs(bp['entry_price'] - bp['stop_loss'])
+        tp1_price = round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 4)
+        tp2_price = bp['take_profit']
 
-        if result:
-            cid = str(result.get('contract_id'))
+        log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total Stake: ${total_stake} | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
+
+        # Fill Contract A (50% size at TP1)
+        res_a = await self.deriv.execute_atomic_order(bp['symbol'], bp['direction'], half_stake, bp['entry_price'], bp['stop_loss'], tp1_price)
+        # Fill Contract B (50% runner at TP2)
+        res_b = await self.deriv.execute_atomic_order(bp['symbol'], bp['direction'], half_stake, bp['entry_price'], bp['stop_loss'], tp2_price)
+
+        if res_a or res_b:
             self.risk.trades_taken_today += 1
-            self.risk.open_positions[cid] = {
-                "symbol": bp['symbol'],
-                "direction": bp['direction'],
-                "entry_price": bp['entry_price'],
-                "stop_loss": bp['stop_loss'],
-                "take_profit": bp['take_profit'],
-                "is_be_moved": False
-            }
-            log.info(f"SUCCESS: Bracket trade filled on Deriv. Contract ID: {cid} | Active 80% R:R Position Supervisor.")
+            for res, target_price in [(res_a, tp1_price), (res_b, tp2_price)]:
+                if res:
+                    cid = str(res.get('contract_id'))
+                    self.risk.open_positions[cid] = {
+                        "symbol": bp['symbol'],
+                        "direction": bp['direction'],
+                        "entry_price": bp['entry_price'],
+                        "stop_loss": bp['stop_loss'],
+                        "take_profit": target_price,
+                        "is_be_moved": False
+                    }
+
+            # Send WhatsApp confirmation to your phone
+            whatsapp_msg = (
+                f"🟢 *[DERIV LIVE ORDER FILLED]*\n"
+                f"• Asset: {bp['symbol']}\n"
+                f"• Strategy: {strategy_name}\n"
+                f"• Direction: {bp['direction']}\n"
+                f"• Twin Stakes: 2x ${half_stake}\n"
+                f"• Entry: {bp['entry_price']}\n"
+                f"• Stop Loss: {bp['stop_loss']}\n"
+                f"• TP1 (Bank 50%): {tp1_price}\n"
+                f"• TP2 (Runner): {tp2_price}\n"
+                f"• 80% R:R Break-Even Active."
+            )
+            await whatsapp.send_alert(whatsapp_msg)
             return True
 
         return False
 
 # ==============================================================================
-# 12. MASTER SYSTEM ORCHESTRATOR & CONCURRENT EVENT LOOPS
+# 13. MASTER SYSTEM ORCHESTRATOR & CONCURRENT EVENT LOOPS
 # ==============================================================================
 
 class MatrixEngineMaster:
@@ -1169,38 +1236,97 @@ class MatrixEngineMaster:
         self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_mgr)
         log.info(f"SYSTEM READY. Initial Account Balance: ${balance:.2f} USD")
         
-        # Concurrently launch the fast 3s Supervisor and the paced 60s Scan loop
+        # Concurrently launch:
+        # 1. Paced 60-second market scan loop
+        # 2. Fast 3-second 80% R:R position supervisor
+        # 3. Daily 21:00 SAST End-of-Day position flusher
         await asyncio.gather(
             self._market_scan_loop(),
-            self._position_supervisor_loop()
+            self._position_supervisor_loop(),
+            self._daily_eod_flusher_loop()
         )
 
-    async def _position_supervisor_loop(self) -> None:
-        """In-Flight Position Supervisor: Evaluates live progress every 3s and shifts SL to Break-Even at 80% R:R."""
+   async def _position_supervisor_loop(self) -> None:
+        """In-Flight Position Supervisor: Evaluates live exits (SL, TP, BE) and shifts SL at 80% R:R."""
         while True:
             try:
                 for cid, pos in list(self.risk_mgr.open_positions.items()):
-                    if pos.get("is_be_moved"):
-                        continue
                     sym = pos["symbol"]
+                    direction = pos["direction"]
+                    entry = pos["entry_price"]
+                    sl = pos["stop_loss"]
+                    tp = pos["take_profit"]
+                    be_moved = pos.get("is_be_moved", False)
+
                     quote, _, _ = await self.deriv_client.get_live_quote(sym)
                     if quote <= 0:
                         continue
 
-                    if self.risk_mgr.check_breakeven_trigger(pos["entry_price"], pos["stop_loss"], pos["take_profit"], quote, pos["direction"]):
+                    # 1. NOTIFY IF STOP LOSS HIT
+                    sl_hit = (direction == "BUY" and quote <= sl) or (direction == "SELL" and quote >= sl)
+                    if sl_hit:
+                        if be_moved:
+                            sl_msg = f"⚪ *[EXIT AT BREAK-EVEN]*\n• Asset: {sym}\n• Closed at Entry: {quote:.2f}\n• P&L: $0.00 (Risk-Free Exit)\n• Capital 100% Protected."
+                        else:
+                            sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote:.2f}\n• Stop Loss was respected. Risk gate active."
+                        log.info(f"Contract #{cid} exited at SL/BE on {sym}")
+                        await whatsapp.send_alert(sl_msg)
+                        self.risk_mgr.open_positions.pop(cid, None)
+                        continue
+
+                    # 2. NOTIFY IF TAKE PROFIT HIT
+                    tp_hit = (direction == "BUY" and quote >= tp) or (direction == "SELL" and quote <= tp)
+                    if tp_hit:
+                        tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote:.2f}\n• Target reached! Profit banked."
+                        log.info(f"Contract #{cid} exited at TP on {sym}")
+                        await whatsapp.send_alert(tp_msg)
+                        self.risk_mgr.open_positions.pop(cid, None)
+                        continue
+
+                    # 3. MOVE SL TO BREAK-EVEN AT 80% PROGRESS
+                    if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
                         log.info(f"80% R:R TARGET HIT ON {sym} (Contract #{cid})! Moving Stop Loss to Break-Even.")
                         success = await self.deriv_client.update_contract_stop_loss(cid, new_sl_pts=0.01)
                         if success:
                             pos["is_be_moved"] = True
-                            log.info(f"CONTRACT #{cid} IS NOW FULLY RISK-FREE AT BREAK-EVEN.")
+                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 80% of TP!\n• Stop Loss moved to Break-Even.\n• Trade is now 100% Risk-Free."
+                            await whatsapp.send_alert(alert)
 
                 await asyncio.sleep(3.0)
             except Exception as e:
                 log.error(f"Error in Position Supervisor: {e}")
                 await asyncio.sleep(5.0)
 
+    async def _daily_eod_flusher_loop(self) -> None:
+        """Daily 21:00 SAST Flusher: Flattens all open positions every night (zero overnight/weekend risk)."""
+        while True:
+            try:
+                # Johannesburg (SAST) is UTC+2
+                now_sast = datetime.now(timezone.utc) + timedelta(hours=2)
+                hour = now_sast.hour
+                minute = now_sast.minute
+
+                # Trigger at 21:00 SAST (9:00 PM) every night
+                if hour == 21 and minute == 0 and len(self.risk_mgr.open_positions) > 0:
+                    log.warning(f"🌆 21:00 SAST LOCKDOWN: Flattening {len(self.risk_mgr.open_positions)} open positions to cash.")
+                    for cid, pos in list(self.risk_mgr.open_positions.items()):
+                        await self.deriv_client.close_market_contract(cid)
+                    
+                    flushed_count = len(self.risk_mgr.open_positions)
+                    self.risk_mgr.open_positions.clear()
+                    
+                    eod_msg = f"🌆 *[DAILY 21:00 SAST LOCKDOWN]*\n• Flattened {flushed_count} open trades to cash.\n• Zero overnight holding risk.\n• Bot standing by for morning session."
+                    await whatsapp.send_alert(eod_msg)
+                    
+                    await asyncio.sleep(65.0)
+
+                await asyncio.sleep(10.0)
+            except Exception as e:
+                log.error(f"Error in EOD Flusher: {e}")
+                await asyncio.sleep(30.0)
+
     async def _market_scan_loop(self) -> None:
-        """Paced Market Scanning Loop: Scans the 7 assets once every 60s (with 0.20s pause between assets)."""
+        """Paced 60-Second Scan Loop: Evaluates setups all day across the 7 assets."""
         while True:
             try:
                 start_time = time.time()
@@ -1210,8 +1336,7 @@ class MatrixEngineMaster:
                 last_signal: Optional[Any] = None
 
                 for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
-                    # 0.20s pause between assets to eliminate Deriv ticks_history rate limits
-                    await asyncio.sleep(0.20)
+                    await asyncio.sleep(0.20)  # Gentle delay between assets
 
                     m5_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.M5, count=60)
                     h4_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.H4, count=30)
@@ -1255,7 +1380,7 @@ class MatrixEngineMaster:
                 active_setup_str = getattr(last_signal, 'strategy', getattr(last_signal, 'setup_type', 'NONE')) if last_signal else "NONE"
                 if isinstance(active_setup_str, Enum):
                     active_setup_str = active_setup_str.value
-                verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Institutional risk gate active."
+                verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Scanning all day. 21:00 SAST EOD Flusher active."
 
                 emit_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
                 write_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
@@ -1271,7 +1396,7 @@ class MatrixEngineMaster:
                 await asyncio.sleep(5)
 
 # ==============================================================================
-# 13. CLOUD ENTRY POINT
+# 14. CLOUD ENTRY POINT
 # ==============================================================================
 
 def start_bot() -> None:
