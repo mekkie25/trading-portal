@@ -26,10 +26,7 @@ import {
   Code,
   Terminal,
   Copy,
-  Zap,
-  PlayCircle,
-  StopCircle,
-  Eye
+  Zap
 } from 'lucide-react';
 import { TopMetrics, BotSettings, ThemeMode, TradeRecord, StrategyExecutionMode } from '../../types';
 import { EQUITY_TIMEFRAME_DATA } from '../../data/mockTradingData';
@@ -84,7 +81,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [showJsonPayload, setShowJsonPayload] = useState(false);
   const [copiedJson, setCopiedJson] = useState(false);
 
-  // Sync props to form if updated externally
   React.useEffect(() => {
     setFormSettings(botSettings);
   }, [botSettings]);
@@ -114,13 +110,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       lastAppliedTimestamp: timestamp,
     };
     onSaveBotSettings(updated);
-    setSaveToast(`Parameters broadcasted to bot engine at ${timestamp}!`);
+    setSaveToast(`Settings and Weekly Goal saved at ${timestamp}!`);
     setTimeout(() => setSaveToast(null), 4000);
   };
 
   const isDark = themeMode === 'dark';
 
-  // Calculate per-strategy performance from actual trades
+  // Strategy performance statistics
   const strategyStats = useMemo(() => {
     const statsMap: Record<string, { trades: number; wins: number; losses: number; pnl: number }> = {};
     STRATEGY_METADATA.forEach(s => {
@@ -139,6 +135,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return statsMap;
   }, [trades]);
 
+  // Scaled trajectory chart
   const chartData = useMemo(() => {
     const data = EQUITY_TIMEFRAME_DATA[timeframe] || EQUITY_TIMEFRAME_DATA['30D'];
     const liveEquity = metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99;
@@ -228,6 +225,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     setTimeout(() => setCopiedJson(false), 3000);
   };
 
+  // Goal metrics calculations
+  const startBaseline = formSettings.weeklyDepositBaseline || (metrics.currentEquity > 0 ? metrics.currentEquity : 100);
+  const goalTarget = formSettings.weeklyGoalTarget || (startBaseline * 1.5);
+  const currentEq = metrics.currentEquity > 0 ? metrics.currentEquity : startBaseline;
+  const targetDiff = goalTarget - startBaseline;
+  const currentDiff = currentEq - startBaseline;
+  const goalPct = targetDiff > 0 ? Math.min(100, Math.max(0, Math.round((currentDiff / targetDiff) * 100))) : 0;
+  const remainingToGoal = Math.max(0, goalTarget - currentEq);
+
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
       {saveToast && (
@@ -251,7 +257,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Real-time equity growth, 3-way strategy execution switches, and audited ledger statistics.
+            Real-time equity growth, goal pacing, and 3-way strategy execution controls.
           </p>
         </div>
 
@@ -267,7 +273,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* 4 Metric Cards (Dynamic Live Ledger) */}
+      {/* 4 Metric Cards */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -284,8 +290,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className={`text-3xl font-bold font-mono tracking-tight ${metrics.netProfit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'}`}>
               {formatCurrency(metrics.netProfit, brokerCurrency)}
             </div>
-            <div className="flex items-center gap-2 mt-2 text-xs">
-              <span className="font-mono text-black dark:text-slate-400">Calculated from active trades</span>
+            <div className="flex items-center gap-2 mt-2 text-xs font-mono text-slate-500">
+              <span>Audited closed trades</span>
             </div>
           </div>
         </div>
@@ -302,7 +308,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {metrics.winRate}%
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs text-black dark:text-slate-400">
-              <span className="font-mono text-black dark:text-slate-200 font-semibold">{metrics.totalTrades} Total Trades</span>
+              <span className="font-mono text-black dark:text-slate-200 font-semibold">{metrics.totalTrades} Trades</span>
               <span>•</span>
               <span className="text-emerald-600 dark:text-emerald-400 font-mono font-semibold">{metrics.winningTrades}W</span>
               <span>/</span>
@@ -345,7 +351,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       </motion.div>
-          initial={{ opacity: 0, y: 20 }}
+
+      {/* WEEKLY GROWTH GOAL & TARGET MILESTONE CARD */}
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6 space-y-4"
       >
@@ -356,7 +365,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Weekly Account Growth Target & Goal Tracker
             </h2>
             <p className="text-xs text-black dark:text-slate-400 mt-0.5">
-              Set your starting baseline and target goal. The bot auto-adapts for any deposit size (even R100 / $5).
+              Set your starting baseline and target goal. Micro-Account scaling supports any deposit size (from R100 / $5).
             </p>
           </div>
           <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-full border border-emerald-500/20">
@@ -364,7 +373,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </span>
         </div>
 
-        {/* Goal Form Inputs */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
           <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
             <label className="text-[11px] font-bold text-slate-500 uppercase">Starting Baseline</label>
@@ -388,43 +396,28 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             />
           </div>
 
-          {/* Goal Progress Calculation */}
-          {(() => {
-            const start = formSettings.weeklyDepositBaseline || (metrics.currentEquity > 0 ? metrics.currentEquity : 100);
-            const goal = formSettings.weeklyGoalTarget || (start * 1.5);
-            const current = metrics.currentEquity > 0 ? metrics.currentEquity : start;
-            const targetDiff = goal - start;
-            const currentDiff = current - start;
-            const pct = targetDiff > 0 ? Math.min(100, Math.max(0, Math.round((currentDiff / targetDiff) * 100))) : 0;
-            const remaining = Math.max(0, goal - current);
+          <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+            <div className="flex justify-between items-center">
+              <span className="text-[11px] font-bold text-slate-500 uppercase">Goal Progress</span>
+              <span className="font-mono font-bold text-blue-600 dark:text-blue-400">{goalPct}%</span>
+            </div>
+            <div className="w-full bg-slate-200 dark:bg-slate-800 rounded-full h-2.5 overflow-hidden mt-2">
+              <div className="bg-emerald-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${goalPct}%` }}></div>
+            </div>
+            <div className="text-[10px] text-slate-500 mt-1">
+              {goalPct >= 100 ? '🎉 Goal Achieved!' : `${formatCurrency(remainingToGoal, brokerCurrency)} needed to reach goal`}
+            </div>
+          </div>
 
-            return (
-              <>
-                <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[11px] font-bold text-slate-500 uppercase">Goal Progress</span>
-                    <span className="font-mono font-bold text-blue-600 dark:text-blue-400">{pct}%</span>
-                  </div>
-                  <div className="w-full bg-slate-200 dark:bg-slate-800 rounded-full h-2.5 overflow-hidden mt-2">
-                    <div className="bg-emerald-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${pct}%` }}></div>
-                  </div>
-                  <div className="text-[10px] text-slate-500 mt-1">
-                    {pct >= 100 ? '🎉 Goal Achieved!' : `${formatCurrency(remaining, brokerCurrency)} needed to reach goal`}
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-end p-2">
-                  <button
-                    type="button"
-                    onClick={handleSave}
-                    className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-xs transition-colors cursor-pointer"
-                  >
-                    Lock In Weekly Goal
-                  </button>
-                </div>
-              </>
-            );
-          })()}
+          <div className="flex items-center justify-end p-2">
+            <button
+              type="button"
+              onClick={handleSave}
+              className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-xs transition-colors cursor-pointer"
+            >
+              Lock In Weekly Goal
+            </button>
+          </div>
         </div>
       </motion.div>
 
@@ -475,7 +468,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       {strat.asset}
                     </td>
                     <td className="py-3 px-3 text-center">
-                      {/* 3-Way Mode Pill Selector */}
                       <div className="inline-flex p-1 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
                         <button
                           type="button"
@@ -533,7 +525,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Main Split: Cumulative Equity Chart + Risk Target Controls */}
+      {/* Main Split: Cumulative Equity Chart + Bot Controls */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
