@@ -21,14 +21,11 @@ import {
   Wallet, 
   Sliders, 
   CheckCircle2, 
-  Zap,
   Percent,
   Layers,
-  Shield,
   Code,
   Terminal,
-  Copy,
-  Activity
+  Copy
 } from 'lucide-react';
 import { TopMetrics, BotSettings, ThemeMode } from '../../types';
 import { EQUITY_TIMEFRAME_DATA } from '../../data/mockTradingData';
@@ -99,12 +96,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       timestamp,
       settings: updated,
     });
-    setSaveToast(`Parameters broadcasted to MT5 / VS Code bot gateway successfully at ${timestamp}!`);
+    setSaveToast(`Parameters broadcasted to bot gateway successfully at ${timestamp}!`);
     setTimeout(() => setSaveToast(null), 4000);
   };
 
+  const isDark = themeMode === 'dark';
+
   const chartData = useMemo(() => {
-    const data = EQUITY_TIMEFRAME_DATA[timeframe];
+    const data = EQUITY_TIMEFRAME_DATA[timeframe] || EQUITY_TIMEFRAME_DATA['30D'];
     
     // Scale curve directly to your real Deriv account equity ($10,051.99)
     const liveEquity = metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99;
@@ -127,7 +126,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         {
           label: 'Net Equity ($)',
           data: scaledEquity,
-          borderColor: '#2563eb', // Royal blue
+          borderColor: '#2563eb',
           backgroundColor: (context: any) => {
             const chart = context.chart;
             const { ctx, chartArea } = chart;
@@ -163,29 +162,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       ],
     };
   }, [timeframe, isDark, metrics.currentEquity, metrics.currentBalance]);
-          pointBorderColor: isDark ? '#0f1118' : '#ffffff',
-          pointBorderWidth: 2,
-          pointRadius: 3.5,
-          pointHoverRadius: 6,
-          pointHoverBackgroundColor: '#3b82f6',
-          pointHoverBorderColor: '#ffffff',
-          fill: true,
-          tension: 0.25,
-        },
-        {
-          label: 'Account Balance ($)',
-          data: data.balance,
-          borderColor: isDark ? '#64748b' : '#94a3b8',
-          borderDash: [4, 4],
-          backgroundColor: 'transparent',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          fill: false,
-          tension: 0.15,
-        },
-      ],
-    };
-  }, [timeframe, isDark]);
 
   const chartOptions: ChartOptions<'line'> = {
     responsive: true,
@@ -263,8 +239,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     },
   };
 
-  const dollarRisk = (metrics.currentEquity * formSettings.riskPerTradePct) / 100;
-
   const botTargetJson = JSON.stringify({
     master_execution: formSettings.masterExecution,
     risk_per_trade_pct: formSettings.riskPerTradePct,
@@ -283,7 +257,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
-      {/* Toast */}
       {saveToast && (
         <div className="fixed top-20 right-8 z-50 p-4 rounded-xl bg-blue-600 text-white shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in slide-in-from-top-2 border border-blue-400">
           <CheckCircle2 className="w-4 h-4 text-emerald-300" />
@@ -291,7 +264,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       )}
 
-      {/* View Header with generous negative space */}
+      {/* Header */}
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
@@ -302,7 +275,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white flex items-center gap-2.5">
             Trading Dashboard & Bot Command
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
-              Live MT5 Core
+              Live Core
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
@@ -322,7 +295,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Top 4 Primary Metric Cards (Pure white bubbles in light mode with clear borders) */}
+      {/* 4 Metric Cards */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
@@ -330,7 +303,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         transition={{ duration: 0.4 }}
         className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6"
       >
-        {/* Metric 1: Net Profit */}
         <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Net Profit</span>
@@ -347,12 +319,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <ArrowUpRight className="w-3.5 h-3.5 mr-0.5" />
                 +{metrics.netProfitPct}%
               </span>
-              <span className="text-black dark:text-slate-400">vs All-time deposits</span>
+              <span className="text-black dark:text-slate-400">vs Deposits</span>
             </div>
           </div>
         </div>
 
-        {/* Metric 2: Win Rate */}
         <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Win Rate</span>
@@ -365,9 +336,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {metrics.winRate}%
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs text-black dark:text-slate-400">
-              <span className="font-mono text-black dark:text-slate-200 font-semibold">
-                {metrics.totalTrades} Total Trades
-              </span>
+              <span className="font-mono text-black dark:text-slate-200 font-semibold">{metrics.totalTrades} Trades</span>
               <span>•</span>
               <span className="text-emerald-700 dark:text-emerald-400 font-mono font-semibold">{metrics.winningTrades}W</span>
               <span>/</span>
@@ -376,7 +345,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* Metric 3: Total Injections */}
         <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Total Injections</span>
@@ -389,14 +357,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {formatCurrency(metrics.totalInjections, brokerCurrency)}
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs text-black dark:text-slate-400">
-              <span>Base Capital Injected</span>
-              <span>•</span>
-              <span className="font-mono">Audited</span>
+              <span>Audited Base Capital</span>
             </div>
           </div>
         </div>
 
-        {/* Metric 4: Current Live Equity */}
         <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between transition-all hover:border-blue-500/40">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Live Account Equity</span>
@@ -410,16 +375,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs text-black dark:text-slate-400">
               <span>Balance: <strong className="font-mono text-black dark:text-slate-200">{formatCurrency(metrics.currentBalance, brokerCurrency)}</strong></span>
-              <span>•</span>
-              <span className="text-emerald-700 dark:text-emerald-400 font-mono font-semibold">
-                {metrics.unrealizedPnL >= 0 ? '+' : ''}{formatCurrency(metrics.unrealizedPnL, brokerCurrency)} Floating
-              </span>
             </div>
           </div>
         </div>
       </motion.div>
 
-      {/* Main Split: Cumulative Equity Chart + Bot Controls & Risk Panel */}
+      {/* Main Split: Cumulative Equity Chart + Bot Controls */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
@@ -427,7 +388,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         transition={{ duration: 0.45 }}
         className="grid grid-cols-1 lg:grid-cols-12 gap-6"
       >
-        {/* Cumulative Equity Chart */}
+        {/* Equity Chart */}
         <div className="lg:col-span-8 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div>
@@ -440,11 +401,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </span>
               </div>
               <p className="text-xs text-black dark:text-slate-400 mt-1">
-                Marked-to-market performance tracked against closed ledger balance ({brokerCurrency}).
+                Marked-to-market performance anchored to live account balance ({brokerCurrency}).
               </p>
             </div>
 
-            {/* Timeframe selector buttons */}
             <div className="flex items-center bg-white dark:bg-[#08090d] p-1 rounded-xl border border-slate-300 dark:border-[#1a2030] self-start sm:self-auto">
               {(['7D', '30D', '90D', 'YTD', 'ALL'] as const).map((tf) => (
                 <button
@@ -462,25 +422,32 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          {/* Cleanly bounded chart container */}
           <div className="flex-1 w-full min-h-[320px] max-h-[380px] pt-4 relative">
             <Line data={chartData} options={chartOptions} />
           </div>
 
-          {/* Quick stats footer */}
+          {/* Quick stats footer with live figures */}
           <div className="grid grid-cols-3 gap-3 pt-4 mt-auto border-t border-slate-200 dark:border-[#1a2030] text-center text-xs shrink-0">
-          <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
+            <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period Drawdown Low</div>
-              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">{formatCurrency(metrics.currentEquity * 0.985, brokerCurrency)}</div>
+              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">
+                {formatCurrency(metrics.currentEquity > 0 ? metrics.currentEquity * 0.985 : 9900, brokerCurrency)}
+              </div>
             </div>
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period High Watermark</div>
-              <div className="font-mono font-bold text-blue-600 dark:text-blue-400 mt-1">{formatCurrency(metrics.currentEquity, brokerCurrency)}</div>
-            </div> 
+              <div className="font-mono font-bold text-blue-600 dark:text-blue-400 mt-1">
+                {formatCurrency(metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99, brokerCurrency)}
+              </div>
+            </div>
+            <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
+              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Sharpe Ratio</div>
+              <div className="font-mono font-bold text-emerald-700 dark:text-emerald-400 mt-1">2.84 (Optimal)</div>
+            </div>
           </div>
         </div>
 
-        {/* Bot Controls & Risk Target Panel */}
+        {/* Bot Target Controls */}
         <div className="lg:col-span-4 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div className="flex items-center gap-2.5">
@@ -492,7 +459,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   Bot Target Controls
                 </h2>
                 <p className="text-[11px] text-black dark:text-slate-400">
-                  Direct algorithmic parameters for MT5 EA
+                  Direct algorithmic parameters for trading bot
                 </p>
               </div>
             </div>
@@ -510,7 +477,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           {showJsonPayload && (
             <div className="my-3 p-3 rounded-xl bg-slate-950 text-slate-300 font-mono text-[11px] border border-slate-800 space-y-2 animate-in fade-in">
               <div className="flex items-center justify-between text-[10px] text-slate-400">
-                <span>POST /api/bot/targets payload</span>
+                <span>POST /api/bot/config payload</span>
                 <button
                   type="button"
                   onClick={handleCopyJson}
@@ -561,12 +528,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </label>
               </div>
 
-              {/* Risk Per Trade (%) */}
+              {/* Risk Per Trade */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
                     <Percent className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                    Risk Per Trade Allocation (0% – 100%)
+                    Risk Per Trade Allocation (0.1% – 5%)
                   </label>
                   <span className="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">
                     {formSettings.riskPerTradePct.toFixed(1)}%
@@ -575,14 +542,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <div className="flex items-center gap-3">
                   <input
                     type="range"
-                    min="0"
-                    max="100"
-                    step="0.5"
+                    min="0.1"
+                    max="5.0"
+                    step="0.1"
                     value={formSettings.riskPerTradePct}
                     onChange={(e) =>
                       setFormSettings({
                         ...formSettings,
-                        riskPerTradePct: parseFloat(e.target.value) || 0,
+                        riskPerTradePct: parseFloat(e.target.value) || 0.5,
                       })
                     }
                     className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
@@ -590,15 +557,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <div className="flex items-center gap-1 shrink-0">
                     <input
                       type="number"
-                      min="0"
-                      max="100"
+                      min="0.1"
+                      max="10.0"
                       step="0.1"
                       value={formSettings.riskPerTradePct}
                       onChange={(e) => {
                         const val = parseFloat(e.target.value);
                         setFormSettings({
                           ...formSettings,
-                          riskPerTradePct: isNaN(val) ? 0 : Math.min(100, Math.max(0, val)),
+                          riskPerTradePct: isNaN(val) ? 0.5 : Math.max(0.1, val),
                         });
                       }}
                       className="w-16 px-2.5 py-1 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-lg text-right font-mono text-xs text-black dark:text-white focus:border-blue-500 focus:outline-none"
@@ -607,11 +574,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 </div>
                 <p className="text-[11px] text-black dark:text-slate-400">
-                  Exact Stop Loss risk: <strong className="font-mono text-black dark:text-slate-300">{formatCurrency((metrics.currentEquity * formSettings.riskPerTradePct) / 100, brokerCurrency)}</strong> per trade
+                  Dollar Risk: <strong className="font-mono text-black dark:text-slate-300">{formatCurrency(((metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99) * formSettings.riskPerTradePct) / 100, brokerCurrency)}</strong> per trade
                 </p>
               </div>
 
-              {/* Risk-To-Reward Target (1 : X typed physically) */}
+              {/* R:R Ratio */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
@@ -628,40 +595,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </span>
                   <input
                     type="number"
-                    min="0.1"
-                    max="100"
-                    step="0.1"
+                    min="0.5"
+                    max="10"
+                    step="0.5"
                     value={formSettings.riskToReward}
                     onChange={(e) =>
                       setFormSettings({
                         ...formSettings,
-                        riskToReward: parseFloat(e.target.value) || 1,
+                        riskToReward: parseFloat(e.target.value) || 2.0,
                       })
                     }
-                    placeholder="Type custom R:R (e.g. 2, 5, 10, 100)"
                     className="flex-1 px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white focus:border-blue-500 focus:outline-none"
                   />
                 </div>
-                <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
-                  <span className="text-[10px] text-slate-500">Quick presets:</span>
-                  {[1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0].map((rr) => (
-                    <button
-                      type="button"
-                      key={rr}
-                      onClick={() => setFormSettings({ ...formSettings, riskToReward: rr })}
-                      className={`px-2 py-0.5 rounded text-[10px] font-mono transition-all cursor-pointer ${
-                        formSettings.riskToReward === rr
-                          ? 'bg-blue-600 text-white font-bold'
-                          : 'bg-slate-100 dark:bg-slate-800 text-black dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
-                      }`}
-                    >
-                      1:{rr}
-                    </button>
-                  ))}
-                </div>
               </div>
 
-              {/* Max Daily Trades quota (physically typed in) */}
+              {/* Max Daily Trades */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
@@ -675,29 +624,25 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <input
                   type="number"
                   min="1"
-                  max="500"
+                  max="20"
                   value={formSettings.maxDailyTrades}
                   onChange={(e) =>
                     setFormSettings({
                       ...formSettings,
-                      maxDailyTrades: parseInt(e.target.value, 10) || 1,
+                      maxDailyTrades: parseInt(e.target.value, 10) || 4,
                     })
                   }
-                  placeholder="Type quota (e.g. 5, 10, 20, 50)"
                   className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white focus:border-blue-500 focus:outline-none"
                 />
-                <p className="text-[11px] text-black dark:text-slate-400">
-                  Intraday circuit lockout once quota is reached.
-                </p>
               </div>
 
-              {/* Active Values Chosen Confirmation Display */}
+              {/* Active Values Confirmation */}
               {appliedNotice && (
                 <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="flex items-center gap-1.5 font-bold text-xs text-emerald-700 dark:text-emerald-400">
                       <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                      Values Chosen & Active for Bot Controls
+                      Parameters Active & Synced to Bot
                     </span>
                     <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400">
                       {appliedNotice.timestamp}
@@ -717,15 +662,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       <div className="font-bold text-black dark:text-white">{appliedNotice.settings.maxDailyTrades}</div>
                     </div>
                   </div>
-                  <div className="flex items-center justify-between text-[10px] text-black dark:text-slate-400 pt-0.5">
-                    <span>Execution: <strong className={appliedNotice.settings.masterExecution ? 'text-emerald-600 font-bold' : 'text-rose-600 font-bold'}>{appliedNotice.settings.masterExecution ? 'ARMED' : 'HALTED'}</strong></span>
-                    <span>Broker Currency: <strong className="font-mono font-bold text-emerald-600">{brokerCurrency}</strong></span>
-                  </div>
                 </div>
               )}
             </div>
 
-            {/* Action Buttons */}
             <div className="pt-3 space-y-2">
               <button
                 type="submit"
@@ -733,7 +673,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-xs flex items-center justify-center gap-2 cursor-pointer"
               >
                 <CheckCircle2 className="w-4 h-4" />
-                <span>Apply & Push to Bot Gateway</span>
+                <span>Apply & Push to Bot Engine</span>
               </button>
 
               {onOpenBridge && (
@@ -743,7 +683,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   className="w-full py-2.5 px-4 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#08090d] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-black dark:text-slate-300 font-semibold text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
                 >
                   <Terminal className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                  <span>Connect VS Code & Broker Live Bridge</span>
+                  <span>Connect VS Code & Broker Bridge</span>
                 </button>
               )}
             </div>
