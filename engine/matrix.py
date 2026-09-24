@@ -4,8 +4,9 @@
 NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (DERIV CLOUD WEBSOCKET EDITION)
 ================================================================================
 Architecture: Institutional Multi-Strategy Quantitative Execution Engine
-Interface:    Native Asynchronous Deriv Cloud WebSocket API (No MT5 / No GUI Required)
-Deployment:   Headless Linux / Cloud VPS / Docker Container / AWS EC2
+Components:   Modular Strategies, AI Overseer, Order Flow Profile,
+              Multi-Timeframe Volatility & Spread Gate Risk Management
+Deployment:   Headless Linux / Cloud VPS / Docker Container / Railway
 ================================================================================
 """
 
@@ -24,12 +25,27 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-# --- CONNECT MODULAR STRATEGY MANAGER ---
+# Gemini AI SDK
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
+# Modular Strategy Framework
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 
-# IPC Helper to transmit telemetry to server.ts
+# File paths for IPC and UI configuration
+CONFIG_FILE = "bot_config.json"
+TELEMETRY_FILE = "bot_telemetry.json"
+
+# ==============================================================================
+# 1. TELEMETRY & UI CONFIGURATION HELPERS
+# ==============================================================================
+
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
+    """Outputs structured telemetry line for server.ts IPC process reader."""
     msg = json.dumps({
         "balance": balance,
         "equity": equity,
@@ -39,13 +55,37 @@ def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str
     })
     print(f"[MATRIX_TELEMETRY] {msg}", flush=True)
 
+def write_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str) -> None:
+    """Persists telemetry to bot_telemetry.json for the React frontend."""
+    data = {
+        "balance": balance,
+        "equity": equity,
+        "regime": regime,
+        "active_setup": active_setup,
+        "ai_verdict": ai_verdict,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    try:
+        with open(TELEMETRY_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        log.error(f"Failed to write telemetry: {e}")
+
+def read_ui_config() -> dict:
+    """Reads live slider and loss ceiling values set on the website dashboard."""
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 # ==============================================================================
-# 1. ADVANCED LOGGING & TELEMETRY SYSTEM
+# 2. ADVANCED LOGGING SYSTEM
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
-    """Custom formatter providing ISO-8601 timestamps and structured logging."""
-    
     grey = "\x1b[38;20m"
     yellow = "\x1b[33;20m"
     red = "\x1b[31;20m"
@@ -70,23 +110,20 @@ class InstitutionalFormatter(logging.Formatter):
         return formatter.format(record)
 
 def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", level=logging.INFO) -> logging.Logger:
-    """Configures multi-sink institutional logger (Console + Rotating File)."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.handlers.clear()
 
-    # Console Handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
     ch.setFormatter(InstitutionalFormatter())
     logger.addHandler(ch)
 
-    # File Handler
     try:
         os.makedirs("logs", exist_ok=True)
         fh = logging.FileHandler(f"logs/{log_file}")
         fh.setLevel(level)
-        fh.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-20s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s", "%Y-%m-%d %H:%M:%S"))
         logger.addHandler(fh)
     except Exception as e:
         print(f"Warning: Failed to setup file logging: {e}")
@@ -96,11 +133,10 @@ def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", 
 log = setup_logger()
 
 # ==============================================================================
-# 2. DERIV GLOBAL CONSTANTS & CONFIGURATION MANAGER
+# 3. GLOBAL CONSTANTS & ASSET CONFIGURATION
 # ==============================================================================
 
 class DerivGranularity(Enum):
-    """Deriv WebSocket candle granularity in seconds."""
     M1 = 60
     M5 = 300
     M15 = 900
@@ -110,24 +146,22 @@ class DerivGranularity(Enum):
 
 @dataclass
 class AssetConfig:
-    symbol: str               # e.g., 'R_100', 'R_75', 'frxXAUUSD'
+    symbol: str
     display_name: str
     pip_size: float
     point_value: float
     min_stake: float
     max_stake: float
     default_multiplier: int
-    is_synthetic: bool        # Synthetic indices operate 24/7/365
+    is_synthetic: bool
 
 class ConfigManager:
-    """Centralized configuration for Deriv Cloud Execution Engine."""
-    
-    # --- DERIV CLOUD API CREDENTIALS ---
     DERIV_APP_ID: str = os.getenv("DERIV_APP_ID", "")
     DERIV_API_TOKEN: str = os.getenv("DERIV_API_TOKEN", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3"
 
-    # --- ASSET UNIVERSE SPECIFICATIONS (STRICT 7 ALLOWED ONLY) ---
+    # Strictly 7 Whitelisted Tradable Assets
     SYMBOL_MAP: Dict[str, str] = {
         "GOLD": "frxXAUUSD",
         "US30": "US30",
@@ -148,14 +182,12 @@ class ConfigManager:
         "frxGBPUSD": AssetConfig("frxGBPUSD", "GBP / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
     }
 
-    # --- RISK CONTROL PARAMETERS ---
-    
-    MAX_ACCOUNT_RISK_PER_TRADE: float = 0.015    # 1.5% max account risk
-    DAILY_DRAWDOWN_KILL_SWITCH: float = 0.05    # 5.0% hard daily equity drop limit
+    # Default baseline risk parameters
+    MAX_ACCOUNT_RISK_PER_TRADE: float = 0.01
+    DAILY_DRAWDOWN_KILL_SWITCH: float = 0.05
     MAX_CONCURRENT_TRADES: int = 4
     BASE_ACCOUNT_CURRENCY: str = "USD"
-    
-    # --- TIMEFRAME MATRIX MAPPING ---
+
     TIMEFRAMES: Dict[str, DerivGranularity] = {
         "M1": DerivGranularity.M1,
         "M5": DerivGranularity.M5,
@@ -166,15 +198,10 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 3. NATIVE DERIV CLOUD WEBSOCKET CLIENT
+# 4. NATIVE DERIV CLOUD WEBSOCKET CLIENT
 # ==============================================================================
 
 class DerivCloudClient:
-    """
-    Asynchronous, headless WebSocket client for Deriv Cloud API.
-    Handles persistent connection, authorization, tick streaming, 
-    historical OHLC data fetching, and order execution.
-    """
     def __init__(self, app_id: str = None, api_token: str = None):
         self.app_id = app_id or ConfigManager.DERIV_APP_ID
         self.api_token = api_token or ConfigManager.DERIV_API_TOKEN
@@ -190,16 +217,14 @@ class DerivCloudClient:
         return self._req_id_counter
 
     async def connect(self) -> bool:
-        """Establishes WebSocket connection and authorizes with Deriv Cloud."""
-        try:
-            if not self.app_id or not self.api_token:
-                log.critical("DERIV_APP_ID or DERIV_API_TOKEN environment variable missing.")
-                return False
+        if not self.app_id or not self.api_token:
+            log.critical("Missing DERIV_APP_ID or DERIV_API_TOKEN environment variable.")
+            return False
 
+        try:
             log.info(f"Connecting to Deriv Cloud WebSocket: {self.ws_url}")
             self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
             
-            # Authorize session
             auth_payload = {
                 "authorize": self.api_token,
                 "req_id": self._get_next_req_id()
@@ -228,14 +253,12 @@ class DerivCloudClient:
             return False
 
     async def ensure_connected(self) -> bool:
-        """Ensures active connection and reconnects if stream dropped."""
         if self.ws is None or not self.ws.open or not self.is_authorized:
-            log.warning("Deriv WebSocket connection lost. Reconnecting...")
+            log.warning("Deriv WebSocket connection dropped. Reconnecting...")
             return await self.connect()
         return True
 
     async def ping(self) -> bool:
-        """Pings Deriv Cloud server to ensure connectivity."""
         if not await self.ensure_connected():
             return False
         try:
@@ -246,11 +269,10 @@ class DerivCloudClient:
                 data = json.loads(res)
                 return data.get("ping") == "pong"
         except Exception as e:
-            log.error(f"Deriv Ping Error: {str(e)}")
+            log.error(f"Deriv Ping Error: {e}")
             return False
 
     async def get_balance(self) -> float:
-        """Retrieves real-time account balance from Deriv Cloud."""
         if not await self.ensure_connected():
             return 0.0
         try:
@@ -261,19 +283,10 @@ class DerivCloudClient:
                 data = json.loads(res)
                 return float(data.get("balance", {}).get("balance", 0.0))
         except Exception as e:
-            log.error(f"Error fetching balance from Deriv: {str(e)}")
+            log.error(f"Error fetching balance from Deriv: {e}")
             return 0.0
 
-    async def fetch_ohlc_candles(
-        self, 
-        symbol: str, 
-        granularity: DerivGranularity, 
-        count: int = 500
-    ) -> pd.DataFrame:
-        """
-        Fetches historical OHLC candle data from Deriv Cloud API.
-        Converts raw response into standardized Pandas DataFrame.
-        """
+    async def fetch_ohlc_candles(self, symbol: str, granularity: DerivGranularity, count: int = 300) -> pd.DataFrame:
         if not await self.ensure_connected():
             return pd.DataFrame()
 
@@ -299,38 +312,52 @@ class DerivCloudClient:
 
             candles = data.get("candles", [])
             if not candles:
-                log.warning(f"No candles returned for {symbol} at granularity {granularity.name}")
                 return pd.DataFrame()
 
             df = pd.DataFrame(candles)
             df.rename(columns={'epoch': 'time'}, inplace=True)
             df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             
-            # Numeric conversion
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-            # Synthesize tick_volume if unavailable in raw candle response
             if 'tick_volume' not in df.columns:
-                df['tick_volume'] = np.random.randint(100, 500, size=len(df))
+                df['tick_volume'] = 1
 
             return df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
-
         except Exception as e:
-            log.error(f"Exception during Deriv candle fetch ({symbol}): {str(e)}")
+            log.error(f"Exception during Deriv candle fetch ({symbol}): {e}")
             return pd.DataFrame()
 
-    async def execute_order(
+    async def get_live_quote(self, symbol: str) -> Tuple[float, float, float]:
+        """Fetches live spot price, bid, and ask for precise spread checking."""
+        if not await self.ensure_connected():
+            return 0.0, 0.0, 0.0
+        try:
+            async with self._lock:
+                req = {"ticks": symbol, "req_id": self._get_next_req_id()}
+                await self.ws.send(json.dumps(req))
+                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
+                tick = res.get("tick", {})
+                quote = float(tick.get("quote", 0.0))
+                bid = float(tick.get("bid", quote))
+                ask = float(tick.get("ask", quote))
+                return quote, bid, ask
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+    async def execute_atomic_order(
         self, 
         symbol: str, 
         direction: str, 
         stake: float, 
+        entry_price: float,
         sl_price: float, 
-        tp_price: float,
-        current_price: float
+        tp_price: float
     ) -> Optional[Dict[str, Any]]:
         """
-        Executes a direct Multiplier or CFD contract on Deriv Cloud with SL/TP bounds.
+        ATOMIC BRACKET EXECUTION: Attaches SL and TP into the proposal prior to purchase.
+        The trade enters the market fully protected at the exact millisecond of purchase.
         """
         if not await self.ensure_connected():
             return None
@@ -339,9 +366,8 @@ class DerivCloudClient:
         asset_cfg = ConfigManager.ASSETS.get(symbol)
         multiplier = asset_cfg.default_multiplier if asset_cfg else 100
 
-        # Calculate SL / TP offset distance in absolute monetary value / points
-        sl_pts = abs(current_price - sl_price)
-        tp_pts = abs(tp_price - current_price)
+        sl_pts = abs(entry_price - sl_price)
+        tp_pts = abs(tp_price - entry_price)
 
         proposal_req = {
             "proposal": 1,
@@ -360,7 +386,7 @@ class DerivCloudClient:
 
         try:
             async with self._lock:
-                # 1. Request Trade Proposal
+                # 1. Price Proposal with SL/TP bounds locked
                 await self.ws.send(json.dumps(proposal_req))
                 prop_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
 
@@ -370,10 +396,9 @@ class DerivCloudClient:
 
                 proposal_id = prop_res.get("proposal", {}).get("id")
                 if not proposal_id:
-                    log.error("Failed to extract Proposal ID from Deriv response.")
                     return None
 
-                # 2. Execute Purchase
+                # 2. Atomic Purchase
                 buy_req = {
                     "buy": proposal_id,
                     "price": stake,
@@ -387,23 +412,20 @@ class DerivCloudClient:
                     return None
 
                 contract_info = buy_res.get("buy", {})
-                log.info(f"DERIV CLOUD TRADE EXECUTED | Symbol: {symbol} | ID: {contract_info.get('contract_id')} | Stake: ${stake}")
+                log.info(f"DERIV ATOMIC BRACKET ORDER FILLED | {symbol} | ID: {contract_info.get('contract_id')} | Stake: ${stake} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
                 return contract_info
 
         except Exception as e:
-            log.error(f"Exception during Deriv order execution ({symbol}): {str(e)}")
+            log.error(f"Exception during Deriv order execution ({symbol}): {e}")
             return None
 
 # ==============================================================================
-# 4. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
+# 5. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
 # ==============================================================================
 
 class MathEngine:
-    """Vectorized mathematical and statistical calculations for quantitative analysis."""
-
     @staticmethod
     def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Calculates Average True Range (ATR)."""
         high = df['high']
         low = df['low']
         close = df['close'].shift(1)
@@ -417,12 +439,10 @@ class MathEngine:
 
     @staticmethod
     def calculate_ema(series: pd.Series, period: int) -> pd.Series:
-        """Calculates Exponential Moving Average (EMA)."""
         return series.ewm(span=period, adjust=False).mean()
 
     @staticmethod
     def calculate_bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Calculates Bollinger Bands (Upper, Middle, Lower)."""
         sma = series.rolling(window=period).mean()
         std = series.rolling(window=period).std()
         upper = sma + (std * std_dev)
@@ -431,69 +451,11 @@ class MathEngine:
 
     @staticmethod
     def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-        """Calculates Relative Strength Index (RSI)."""
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / (loss + 1e-10)
         return 100 - (100 / (1 + rs))
-
-# ==============================================================================
-# 5. RISK MANAGEMENT ENGINE
-# ==============================================================================
-
-class RiskState:
-    """Manages system exposure, daily drawdown limiters, and trade sizing rules."""
-
-    def __init__(self, initial_equity: float):
-        self.initial_equity: float = initial_equity
-        self.peak_equity: float = initial_equity
-        self.daily_start_equity: float = initial_equity
-        self.current_equity: float = initial_equity
-        self.daily_drawdown_pct: float = 0.0
-        self.trading_halted: bool = False
-        self.active_trade_count: int = 0
-
-    def update_equity(self, current_equity: float) -> None:
-        """Updates equity metrics and evaluates kill-switch constraints."""
-        self.current_equity = current_equity
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
-
-        # Calculate daily drawdown
-        self.daily_drawdown_pct = (self.daily_start_equity - current_equity) / self.daily_start_equity
-        
-        if self.daily_drawdown_pct >= ConfigManager.DAILY_DRAWDOWN_KILL_SWITCH:
-            if not self.trading_halted:
-                log.critical(
-                    f"--- KILL SWITCH TRIGGERED --- Daily Drawdown: {self.daily_drawdown_pct*100:.2f}% "
-                    f"exceeds limit ({ConfigManager.DAILY_DRAWDOWN_KILL_SWITCH*100:.1f}%). Halting Trading."
-                )
-                self.trading_halted = True
-
-    def calculate_position_stake(self, symbol: str, sl_distance_pts: float) -> float:
-        """Calculates optimal position stake ($) based on account risk rules."""
-        if self.trading_halted or sl_distance_pts <= 0:
-            return 0.0
-
-        asset_cfg = ConfigManager.ASSETS.get(symbol)
-        if not asset_cfg:
-            return 0.0
-
-        # Maximum monetary risk allowed for this setup
-        risk_amount = self.current_equity * ConfigManager.MAX_ACCOUNT_RISK_PER_TRADE
-        
-        # Calculate stake bounded by min/max asset parameters
-        stake = min(max(risk_amount, asset_cfg.min_stake), asset_cfg.max_stake)
-        return round(stake, 2)
-
-    def is_trading_allowed(self) -> Tuple[bool, str]:
-        """Checks if new trades can be executed under active risk policy."""
-        if self.trading_halted:
-            return False, "Trading halted due to Daily Drawdown Kill Switch."
-        if self.active_trade_count >= ConfigManager.MAX_CONCURRENT_TRADES:
-            return False, f"Maximum concurrent trade limit reached ({ConfigManager.MAX_CONCURRENT_TRADES})."
-        return True, "Trading allowed."
 
 # ==============================================================================
 # 6. TEMPORAL CLOCK & SESSION MANAGER
@@ -507,13 +469,10 @@ class MarketSession(Enum):
     CLOSED = "CLOSED"
 
 class TemporalSessionManager:
-    """Manages session timing, liquidity windows, and synthetic asset schedules."""
-
     @staticmethod
-    def get_current_session(is_synthetic: bool = True) -> MarketSession:
-        """Determines current trading session."""
+    def get_current_session(is_synthetic: bool = False) -> MarketSession:
         if is_synthetic:
-            return MarketSession.NEW_YORK  # Always active for synthetics
+            return MarketSession.NEW_YORK
 
         now_utc = datetime.now(timezone.utc)
         hour = now_utc.hour
@@ -535,17 +494,14 @@ class TemporalSessionManager:
 
 @dataclass
 class VolumeProfileNode:
-    poc_price: float        # Point of Control (Highest Volume Price)
-    value_area_high: float  # VAH (70% Volume Upper Bound)
-    value_area_low: float   # VAL (70% Volume Lower Bound)
-    cum_delta: float        # Cumulative Volume Delta (Buying vs Selling bias)
+    poc_price: float
+    value_area_high: float
+    value_area_low: float
+    cum_delta: float
 
 class OrderFlowAnalyzer:
-    """Computes Point of Control (POC), Value Area (VA), and Volume Delta."""
-
     @staticmethod
     def compute_volume_profile(df: pd.DataFrame, num_bins: int = 30) -> VolumeProfileNode:
-        """Computes institutional volume distribution across price levels."""
         if df.empty or len(df) < 10:
             return VolumeProfileNode(0.0, 0.0, 0.0, 0.0)
 
@@ -564,7 +520,7 @@ class OrderFlowAnalyzer:
             bin_idx = np.digitize(candle_avg, bins) - 1
             bin_idx = min(max(bin_idx, 0), num_bins - 2)
             
-            vol = row['tick_volume']
+            vol = row.get('tick_volume', 1)
             vol_distribution[bin_idx] += vol
             
             close_range = row['high'] - row['low']
@@ -595,17 +551,195 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 8. MARKET DATA PIPELINE & MULTI-TIMEFRAME MATRIX
+# 8. INSTITUTIONAL RISK MANAGEMENT ENGINE (MULTI-TF VOLATILITY & SPREAD GATE)
+# ==============================================================================
+
+class RiskManager:
+    def __init__(self, config_file: str = CONFIG_FILE):
+        self.config_file = config_file
+        self.master_execution: bool = True
+        self.risk_per_trade_pct: float = 1.0
+        self.risk_to_reward: float = 2.0
+        self.max_daily_trades: int = 4
+        self.max_daily_loss_usd: float = 2500.0
+        self.max_weekly_loss_usd: float = 6500.0
+        self.max_monthly_loss_usd: float = 15000.0
+        
+        self.trades_taken_today: int = 0
+        self.consecutive_losses: int = 0
+        self.current_daily_loss: float = 0.0
+        self.current_weekly_loss: float = 0.0
+        self.current_monthly_loss: float = 0.0
+
+        # Spread Gate Thresholds
+        self.max_spread_to_sl_ratio: float = 0.15
+        self.max_absolute_spread = {
+            "frxXAUUSD": 0.50,
+            "US30": 4.5,
+            "NAS100": 2.5,
+            "GERMAN30": 3.0,
+            "frxEURUSD": 0.0003,
+            "frxUSDJPY": 0.035,
+            "frxGBPUSD": 0.00035
+        }
+
+    def sync_ui_config(self) -> None:
+        """Dynamically syncs user interface controls from bot_config.json."""
+        cfg = read_ui_config()
+        if not cfg:
+            return
+        self.master_execution = cfg.get("masterExecution", self.master_execution)
+        self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
+        self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
+        self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
+        self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
+        self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
+        self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
+
+    @staticmethod
+    def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
+        """Computes M5, H4, D1 candle averages and identifies market consolidation."""
+        def get_atr(df: pd.DataFrame, period: int = 14) -> float:
+            if df is None or df.empty or len(df) < 2:
+                return 0.0
+            high_low = df['high'] - df['low']
+            high_close = (df['high'] - df['close'].shift(1)).abs()
+            low_close = (df['low'] - df['close'].shift(1)).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            return float(tr.tail(period).mean())
+
+        m5_avg = get_atr(m5_df, 14)
+        h4_avg = get_atr(h4_df, 14)
+        d1_avg = get_atr(d1_df, 14)
+
+        is_ranging = False
+        range_high = 0.0
+        range_low = 0.0
+        range_span = 0.0
+
+        if m5_df is not None and len(m5_df) >= 20:
+            recent_20 = m5_df.tail(20)
+            range_high = float(recent_20['high'].max())
+            range_low = float(recent_20['low'].min())
+            range_span = range_high - range_low
+            if m5_avg > 0 and range_span < (m5_avg * 2.5):
+                is_ranging = True
+
+        return {
+            "m5_candle_avg": round(m5_avg, 4),
+            "h4_candle_avg": round(h4_avg, 4),
+            "d1_candle_avg": round(d1_avg, 4),
+            "is_ranging": is_ranging,
+            "range_high": round(range_high, 4),
+            "range_low": round(range_low, 4),
+            "range_span": round(range_span, 4),
+        }
+
+    def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
+        """Spread Gatekeeper: Checks if bid-ask spread is acceptable."""
+        spread = abs(current_ask - current_bid)
+        max_allowed_spread = self.max_absolute_spread.get(symbol, 5.0)
+        
+        if spread > max_allowed_spread:
+            return False, f"Spread ({spread:.4f}) exceeds threshold ({max_allowed_spread:.4f})", spread
+
+        if sl_distance > 0:
+            ratio = spread / sl_distance
+            if ratio > self.max_spread_to_sl_ratio:
+                return False, f"Spread is {ratio*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
+
+        return True, "Spread optimal", spread
+
+    def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
+        """Dynamic Auto Lot Sizing directly tied to Stop Loss distance."""
+        if current_equity <= 0 or sl_distance <= 0:
+            return 0.0
+
+        active_risk = self.risk_per_trade_pct
+        if self.consecutive_losses >= 3:
+            active_risk = self.risk_per_trade_pct * 0.5
+            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk:.2f}%")
+
+        risk_dollars = current_equity * (active_risk / 100.0)
+        calculated_stake = risk_dollars / (sl_distance * point_value)
+        return round(max(min(calculated_stake, max_stake), min_stake), 2)
+
+    def validate_pre_trade(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        current_bid: float,
+        current_ask: float,
+        current_equity: float,
+        point_value: float,
+        min_stake: float,
+        max_stake: float
+    ) -> Tuple[bool, str, dict]:
+        """Pre-trade verification checking loss limits, spread, and lot sizing."""
+        self.sync_ui_config()
+
+        if not self.master_execution:
+            return False, "Master execution switch is OFF in UI", {}
+
+        if self.current_daily_loss >= self.max_daily_loss_usd:
+            return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
+
+        if self.current_weekly_loss >= self.max_weekly_loss_usd:
+            return False, f"Weekly loss ceiling breached (-${self.current_weekly_loss:.2f})", {}
+
+        if self.current_monthly_loss >= self.max_monthly_loss_usd:
+            return False, f"Monthly loss ceiling breached (-${self.current_monthly_loss:.2f})", {}
+
+        if self.trades_taken_today >= self.max_daily_trades:
+            return False, f"Daily trade quota reached ({self.trades_taken_today}/{self.max_daily_trades})", {}
+
+        sl_distance = abs(entry_price - stop_loss)
+        if sl_distance <= 0:
+            return False, "Invalid Stop Loss distance", {}
+
+        # Default Take Profit to UI R:R if not set
+        final_tp = take_profit
+        if final_tp is None or final_tp == 0:
+            target_distance = sl_distance * self.risk_to_reward
+            final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
+
+        # Spread Gate Verification
+        spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
+        if not spread_ok:
+            return False, f"Spread Gate Rejection: {spread_msg}", {}
+
+        # Spread buffer on Stop Loss
+        adjusted_sl = (stop_loss - spread_pts) if direction.upper() == "BUY" else (stop_loss + spread_pts)
+
+        # Dynamic Auto Position Sizing
+        stake = self.calculate_lot_size(current_equity, sl_distance, point_value, min_stake, max_stake)
+        if stake <= 0:
+            return False, "Calculated stake is 0", {}
+
+        blueprint = {
+            "symbol": symbol,
+            "direction": direction.upper(),
+            "stake": stake,
+            "entry_price": entry_price,
+            "stop_loss": round(adjusted_sl, 4),
+            "take_profit": round(final_tp, 4),
+            "spread_points": round(spread_pts, 4),
+            "risk_dollars": round(current_equity * (self.risk_per_trade_pct / 100.0), 2)
+        }
+        return True, "Approved", blueprint
+
+# ==============================================================================
+# 9. MARKET DATA PIPELINE & MULTI-TIMEFRAME MATRIX
 # ==============================================================================
 
 class MarketDataPipeline:
-    """Fetches and enriches multi-timeframe candle datasets from Deriv Cloud."""
-
     def __init__(self, deriv_client: DerivCloudClient):
         self.deriv = deriv_client
 
     async def get_enriched_dataframe(self, symbol: str, granularity: DerivGranularity, count: int = 300) -> pd.DataFrame:
-        """Fetches candles and computes full technical indicator matrix."""
         df = await self.deriv.fetch_ohlc_candles(symbol, granularity, count)
         if df.empty or len(df) < 50:
             return pd.DataFrame()
@@ -623,18 +757,15 @@ class MarketDataPipeline:
         return df
 
 class MultiTimeframeMatrix:
-    """Maintains synchronized multi-timeframe state across all monitored assets."""
-
     def __init__(self, deriv_client: DerivCloudClient):
         self.pipeline = MarketDataPipeline(deriv_client)
         self.matrix: Dict[str, Dict[str, pd.DataFrame]] = {}
         self.volume_profiles: Dict[str, VolumeProfileNode] = {}
 
     async def sync_symbol(self, symbol: str) -> None:
-        """Asynchronously syncs all timeframes for a given asset from Deriv Cloud."""
         self.matrix[symbol] = {}
         for tf_name, granularity in ConfigManager.TIMEFRAMES.items():
-            df = await self.pipeline.get_enriched_dataframe(symbol, granularity, count=300)
+            df = await self.pipeline.get_enriched_dataframe(symbol, granularity, count=150)
             if not df.empty:
                 self.matrix[symbol][tf_name] = df
 
@@ -643,240 +774,173 @@ class MultiTimeframeMatrix:
             self.volume_profiles[symbol] = vp
 
     async def sync_all_assets(self) -> None:
-        """Synchronizes data across all configured assets in parallel."""
         tasks = [self.sync_symbol(sym) for sym in ConfigManager.ASSETS.keys()]
         await asyncio.gather(*tasks)
-        log.info(f"Multi-Timeframe Matrix Synchronized for {len(ConfigManager.ASSETS)} Assets.")
 
 # ==============================================================================
-# 9. SIGNAL STRUCTURE & STRATEGY EVALUATION MATRIX
+# 10. AI OVERSEER (GOOGLE GEMINI FLASH MODEL)
 # ==============================================================================
 
-class SetupType(Enum):
-    LIQUIDITY_SWEEP_REVERSAL = "SETUP_1_LIQUIDITY_SWEEP"
-    ORDER_BLOCK_MITIGATION = "SETUP_2_ORDER_BLOCK"
-    FAIR_VALUE_GAP_FILL = "SETUP_3_FVG_REFILL"
-    VOLUME_PROFILE_POC_BOUNCE = "SETUP_4_POC_BOUNCE"
-    DYNAMIC_TREND_CONTINUATION = "SETUP_5_TREND_CONTINUATION"
-    VOLATILITY_EXPANSION_BREAKOUT = "SETUP_6_VOL_EXPANSION"
-    MEAN_REVERSION_EXTREME = "SETUP_7_MEAN_REVERSION"
+class AIOverseer:
+    def __init__(self):
+        self.api_key = ConfigManager.GEMINI_API_KEY
+        if self.api_key and GENAI_AVAILABLE:
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            log.info("Gemini AI Overseer initialized successfully.")
+        else:
+            self.model = None
+            log.warning("GEMINI_API_KEY not found or SDK unavailable. Auto-approving trades.")
 
-@dataclass
-class TradeSignal:
-    symbol: str
-    direction: str              # 'BUY' or 'SELL'
-    setup_type: SetupType
-    entry_price: float
-    sl: float
-    tp1: float
-    tp2: float
-    confidence_score: float     # Scale 0.0 - 1.0
-    reasoning: str
+    async def validate_trade(self, signal: StrategySignal, current_balance: float, spread_pts: float) -> bool:
+        if not self.model:
+            return True
 
-class StrategyEvaluator:
-    """Evaluates multi-timeframe matrices across 7 quantitative trading setups."""
+        prompt = (
+            f"You are an institutional quantitative risk manager evaluating an algorithmic trade signal.\n"
+            f"Asset: {signal.symbol}\n"
+            f"Strategy Name: {signal.strategy}\n"
+            f"Direction: {signal.direction}\n"
+            f"Entry Price: {signal.entry_price}\n"
+            f"Stop Loss: {signal.stop_loss}\n"
+            f"Take Profit: {signal.take_profit}\n"
+            f"Spread: {spread_pts} points\n"
+            f"Algorithmic Trigger Reasoning: {signal.reason}\n"
+            f"Account Balance: ${current_balance:.2f} USD\n\n"
+            f"Reply strictly with 'APPROVED' if the setup aligns with sound risk management, "
+            f"or 'REJECTED' if it appears unfavorable."
+        )
 
-    @staticmethod
-    def evaluate_symbol(symbol: str, tf_data: Dict[str, pd.DataFrame], vp: Optional[VolumeProfileNode]) -> Optional[TradeSignal]:
-        """Evaluates asset data against institutional quantitative setups."""
-        m5 = tf_data.get("M5")
-        m15 = tf_data.get("M15")
-        h1 = tf_data.get("H1")
-
-        if m5 is None or m15 is None or h1 is None or m5.empty or m15.empty or h1.empty:
-            return None
-
-        last_m5 = m5.iloc[-1]
-        prev_m5 = m5.iloc[-2]
-        last_h1 = h1.iloc[-1]
-        
-        current_price = float(last_m5['close'])
-        atr = float(last_m5['atr']) if not np.isnan(last_m5['atr']) else current_price * 0.005
-
-        # ----------------------------------------------------------------------
-        # SETUP 1: LIQUIDITY SWEEP & REVERSAL (SMC / Price Action)
-        # ----------------------------------------------------------------------
-        h1_high = h1['high'].tail(20).max()
-        h1_low = h1['low'].tail(20).min()
-
-        if prev_m5['low'] < h1_low and last_m5['close'] > h1_low and last_m5['rsi'] < 35:
-            sl = current_price - (1.5 * atr)
-            tp1 = current_price + (2.0 * atr)
-            tp2 = current_price + (4.0 * atr)
-            return TradeSignal(
-                symbol, "BUY", SetupType.LIQUIDITY_SWEEP_REVERSAL, 
-                current_price, sl, tp1, tp2, 0.85, 
-                f"Bullish sweep of H1 key low ({h1_low:.2f}) with RSI oversold recovery."
-            )
-
-        if prev_m5['high'] > h1_high and last_m5['close'] < h1_high and last_m5['rsi'] > 65:
-            sl = current_price + (1.5 * atr)
-            tp1 = current_price - (2.0 * atr)
-            tp2 = current_price - (4.0 * atr)
-            return TradeSignal(
-                symbol, "SELL", SetupType.LIQUIDITY_SWEEP_REVERSAL, 
-                current_price, sl, tp1, tp2, 0.85, 
-                f"Bearish sweep of H1 key high ({h1_high:.2f}) with RSI overbought reversal."
-            )
-
-        # ----------------------------------------------------------------------
-        # SETUP 4: VOLUME PROFILE POINT OF CONTROL (POC) BOUNCE
-        # ----------------------------------------------------------------------
-        if vp and vp.poc_price > 0:
-            dist_to_poc = abs(current_price - vp.poc_price)
-            if dist_to_poc <= (0.3 * atr):
-                if last_h1['close'] > last_h1['ema_50'] and vp.cum_delta > 0:
-                    sl = current_price - (1.2 * atr)
-                    tp1 = current_price + (2.5 * atr)
-                    tp2 = current_price + (4.5 * atr)
-                    return TradeSignal(
-                        symbol, "BUY", SetupType.VOLUME_PROFILE_POC_BOUNCE,
-                        current_price, sl, tp1, tp2, 0.82,
-                        f"Bullish bounce at Volume Profile POC ({vp.poc_price:.2f}) with positive Delta."
-                    )
-
-        # ----------------------------------------------------------------------
-        # SETUP 5: DYNAMIC TREND CONTINUATION (EMA Alignment)
-        # ----------------------------------------------------------------------
-        bullish_alignment = (last_h1['close'] > last_h1['ema_20']) and (last_h1['ema_20'] > last_h1['ema_50'])
-        bearish_alignment = (last_h1['close'] < last_h1['ema_20']) and (last_h1['ema_20'] < last_h1['ema_50'])
-
-        if bullish_alignment and (last_m5['low'] <= last_m5['ema_20']) and (last_m5['close'] > last_m5['ema_20']):
-            sl = current_price - (1.0 * atr)
-            tp1 = current_price + (2.0 * atr)
-            tp2 = current_price + (3.5 * atr)
-            return TradeSignal(
-                symbol, "BUY", SetupType.DYNAMIC_TREND_CONTINUATION,
-                current_price, sl, tp1, tp2, 0.78,
-                "Pullback to M5 EMA20 aligned with macro H1 bullish trend."
-            )
-
-        if bearish_alignment and (last_m5['high'] >= last_m5['ema_20']) and (last_m5['close'] < last_m5['ema_20']):
-            sl = current_price + (1.0 * atr)
-            tp1 = current_price - (2.0 * atr)
-            tp2 = current_price - (3.5 * atr)
-            return TradeSignal(
-                symbol, "SELL", SetupType.DYNAMIC_TREND_CONTINUATION,
-                current_price, sl, tp1, tp2, 0.78,
-                "Pullback to M5 EMA20 aligned with macro H1 bearish trend."
-            )
-
-        return None
+        try:
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            verdict = response.text.strip().upper()
+            if "APPROVED" in verdict:
+                log.info(f"AI OVERSEER: APPROVED trade for {signal.symbol} [{signal.strategy}].")
+                return True
+            else:
+                log.warning(f"AI OVERSEER: REJECTED trade for {signal.symbol}. Verdict: {verdict}")
+                return False
+        except Exception as e:
+            log.error(f"AI Overseer API Error: {e}. Defaulting to safe execution.")
+            return True
 
 # ==============================================================================
-# 10. CLOUD EXECUTION ENGINE
+# 11. CLOUD EXECUTION ENGINE
 # ==============================================================================
 
 class CloudExecutionEngine:
-    """Manages order routing, stake sizing, and position tracking over Deriv WebSockets."""
-
-    def __init__(self, deriv_client: DerivCloudClient, risk_state: RiskState):
+    def __init__(self, deriv_client: DerivCloudClient, risk_mgr: RiskManager):
         self.deriv = deriv_client
-        self.risk = risk_state
+        self.risk = risk_mgr
+        self.ai_overseer = AIOverseer()
 
-    async def process_signal(self, signal: TradeSignal) -> bool:
-        """Validates signal against risk engine and executes via Deriv Cloud."""
-        is_allowed, reason = self.risk.is_trading_allowed()
-        if not is_allowed:
-            log.info(f"Signal for {signal.symbol} rejected by Risk Engine: {reason}")
-            return False
+    async def process_signal(self, signal: StrategySignal, current_balance: float) -> bool:
+        quote, bid, ask = await self.deriv.get_live_quote(signal.symbol)
+        asset_cfg = ConfigManager.ASSETS.get(signal.symbol)
+        pt_val = asset_cfg.point_value if asset_cfg else 1.0
+        min_stk = asset_cfg.min_stake if asset_cfg else 1.0
+        max_stk = asset_cfg.max_stake if asset_cfg else 1000.0
 
-        sl_pts = abs(signal.entry_price - signal.sl)
-        stake = self.risk.calculate_position_stake(signal.symbol, sl_pts)
-
-        if stake <= 0:
-            log.warning(f"Invalid calculated stake (${stake}) for {signal.symbol}. Trade skipped.")
-            return False
-
-        log.info(
-            f"DISPATCHING ORDER | {signal.direction} {signal.symbol} | "
-            f"Setup: {signal.setup_type.value} | Stake: ${stake} | "
-            f"Entry: {signal.entry_price:.2f} | SL: {signal.sl:.2f} | TP: {signal.tp1:.2f}"
-        )
-
-        result = await self.deriv.execute_order(
+        # 1. Risk Manager Pre-Trade Gate
+        is_ok, reason, blueprint = self.risk.validate_pre_trade(
             symbol=signal.symbol,
             direction=signal.direction,
-            stake=stake,
-            sl_price=signal.sl,
-            tp_price=signal.tp1,
-            current_price=signal.entry_price
+            entry_price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            current_bid=bid,
+            current_ask=ask,
+            current_equity=current_balance,
+            point_value=pt_val,
+            min_stake=min_stk,
+            max_stake=max_stk
+        )
+
+        if not is_ok:
+            log.warning(f"ORDER REJECTED BY RISK GATE: {reason}")
+            return False
+
+        # 2. AI Overseer Review
+        ai_approved = await self.ai_overseer.validate_trade(signal, current_balance, blueprint.get("spread_points", 0.0))
+        if not ai_approved:
+            return False
+
+        # 3. Atomic Bracket Execution (SL and TP embedded)
+        log.info(
+            f"DISPATCHING ATOMIC ORDER | {blueprint['direction']} {blueprint['symbol']} | "
+            f"Strategy: {signal.strategy} | Stake: ${blueprint['stake']} | "
+            f"SL: {blueprint['stop_loss']} | TP: {blueprint['take_profit']}"
+        )
+
+        result = await self.deriv.execute_atomic_order(
+            symbol=blueprint['symbol'],
+            direction=blueprint['direction'],
+            stake=blueprint['stake'],
+            entry_price=blueprint['entry_price'],
+            sl_price=blueprint['stop_loss'],
+            tp_price=blueprint['take_profit']
         )
 
         if result:
-            self.risk.active_trade_count += 1
-            log.info(f"SUCCESS: Trade filled on Deriv Cloud. Contract ID: {result.get('contract_id')}")
+            self.risk.trades_taken_today += 1
+            log.info(f"SUCCESS: Bracket trade filled on Deriv Cloud. Contract ID: {result.get('contract_id')}")
             return True
 
         return False
 
 # ==============================================================================
-# 11. MASTER EVENT LOOP & SYSTEM ORCHESTRATOR
+# 12. MASTER SYSTEM ORCHESTRATOR & EVENT LOOP
 # ==============================================================================
 
-    class MatrixEngineMaster:
-    """Main Orchestrator tying together Data Engine, Strategies, and Risk Control."""
-
+class MatrixEngineMaster:
     def __init__(self):
         self.deriv_client = DerivCloudClient()
         self.matrix = MultiTimeframeMatrix(self.deriv_client)
-        self.risk_state: Optional[RiskState] = None
-        self.execution_engine: Optional[CloudExecutionEngine] = None
         self.strategy_mgr = StrategyManager()
+        self.risk_mgr = RiskManager()
+        self.execution_engine: Optional[CloudExecutionEngine] = None
 
     async def start(self) -> None:
-        """Initializes WebSocket connection and enters main execution loop."""
         log.info("Starting Nexus Matrix Trading Engine (Deriv Cloud Edition)...")
-        
         connected = await self.deriv_client.connect()
         if not connected:
             log.critical("Failed to connect to Deriv Cloud. Exiting.")
             return
 
         balance = await self.deriv_client.get_balance()
-        self.risk_state = RiskState(initial_equity=balance)
-        self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_state)
-
-        log.info(f"SYSTEM READY. Initial Account Equity: ${balance:.2f} USD")
+        self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_mgr)
+        log.info(f"SYSTEM READY. Initial Account Balance: ${balance:.2f} USD")
         await self._main_loop()
 
     async def _main_loop(self) -> None:
-        """Asynchronous execution loop running continuous market scans."""
         while True:
             try:
                 start_time = time.time()
-
                 current_balance = await self.deriv_client.get_balance()
-                if current_balance > 0:
-                    self.risk_state.update_equity(current_balance)
+                self.risk_mgr.sync_ui_config()
 
-                if self.risk_state.trading_halted:
-                    log.critical("Trading halted due to risk constraints. Main loop standing by.")
-                    emit_telemetry(
-                        balance=current_balance,
-                        equity=current_balance,
-                        regime="TRADING_HALTED",
-                        active_setup="NONE",
-                        ai_verdict="Halted due to Daily Drawdown Kill Switch."
-                    )
-                    await asyncio.sleep(60)
-                    continue
-
+                # Sync all multi-timeframe candles (M1, M5, M15, H1, H4, D1)
                 await self.matrix.sync_all_assets()
 
                 last_signal: Optional[StrategySignal] = None
-                for symbol in ConfigManager.ASSETS.keys():
-                    tf_data = self.matrix.matrix.get(symbol, {})
-                    m5_data = tf_data.get("M5")
-                    h1_data = tf_data.get("H1")
 
-                    if m5_data is None or m5_data.empty:
+                for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
+                    tf_data = self.matrix.matrix.get(deriv_symbol, {})
+                    m5_df = tf_data.get("M5")
+                    h4_df = tf_data.get("H4")
+                    d1_df = tf_data.get("D1")
+                    h1_df = tf_data.get("H1")
+
+                    if m5_df is None or m5_df.empty:
                         continue
 
-                    # Build required structural levels for the 8 strategies
-                    h1_high = float(h1_data['high'].tail(24).max()) if h1_data is not None and not h1_data.empty else float(m5_data['high'].max())
-                    h1_low = float(h1_data['low'].tail(24).min()) if h1_data is not None and not h1_data.empty else float(m5_data['low'].min())
-                    latest_close = float(m5_data.iloc[-1]['close'])
+                    # Multi-Timeframe Volatility & Range Metrics
+                    candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
+
+                    # Extract session high/low & pivots for the strategies
+                    h1_high = float(h1_df['high'].tail(24).max()) if h1_df is not None and not h1_df.empty else float(m5_df['high'].max())
+                    h1_low = float(h1_df['low'].tail(24).min()) if h1_df is not None and not h1_df.empty else float(m5_df['low'].min())
+                    latest_close = float(m5_df.iloc[-1]['close'])
 
                     session_levels = {
                         "asia_high": h1_high,
@@ -887,49 +951,44 @@ class CloudExecutionEngine:
                         "daily_pivot": (h1_high + h1_low + latest_close) / 3.0,
                         "pivot_r1": (2.0 * ((h1_high + h1_low + latest_close) / 3.0)) - h1_low,
                         "pivot_s1": (2.0 * ((h1_high + h1_low + latest_close) / 3.0)) - h1_high,
-                        "orb_high": float(m5_data['high'].tail(3).max()),
-                        "orb_low": float(m5_data['low'].tail(3).min()),
+                        "orb_high": float(m5_df['high'].tail(3).max()),
+                        "orb_low": float(m5_df['low'].tail(3).min()),
+                        "is_ranging": candle_stats["is_ranging"],
+                        "range_span": candle_stats["range_span"],
+                        "m5_avg": candle_stats["m5_candle_avg"],
+                        "h4_avg": candle_stats["h4_candle_avg"],
+                        "d1_avg": candle_stats["d1_candle_avg"],
                     }
 
-                    # Map Deriv symbol (e.g. frxXAUUSD) to standard strategy asset name (e.g. GOLD)
-                    clean_asset = symbol
-                    for friendly_name, deriv_sym in ConfigManager.SYMBOL_MAP.items():
-                        if deriv_sym == symbol or friendly_name == symbol:
-                            clean_asset = friendly_name
-                            break
+                    # Evaluate across modular strategies
+                    signal = self.strategy_mgr.evaluate_all(friendly_name, m5_df, session_levels)
 
-                    # Evaluate across the 8 strategies
-                    signal = self.strategy_mgr.evaluate_all(clean_asset, m5_data, session_levels)
                     if signal:
-                        log.info(f"STRATEGY SIGNAL: [{signal.strategy}] on {signal.symbol} ({signal.direction}) | Reason: {signal.reason}")
-                        # Remap to Deriv trading symbol for execution
+                        log.info(f"STRATEGY TRIGGERED: [{signal.strategy}] on {signal.symbol} ({signal.direction}) | {signal.reason}")
+                        # Remap to Deriv trading symbol
                         signal.symbol = ConfigManager.SYMBOL_MAP.get(signal.symbol, signal.symbol)
-                        await self.execution_engine.process_signal(signal)
+                        await self.execution_engine.process_signal(signal, current_balance)
                         last_signal = signal
 
-                emit_telemetry(
-                    balance=current_balance,
-                    equity=current_balance,
-                    regime="SCANNING",
-                    active_setup=last_signal.setup_type.value if last_signal else "NONE",
-                    ai_verdict=last_signal.reasoning if last_signal else "No qualifying setup this cycle."
-                )
+                # Push telemetry to server.ts and write to bot_telemetry.json
+                regime_status = "ACTIVE" if self.risk_mgr.master_execution else "HALTED"
+                active_setup_str = last_signal.strategy if last_signal else "NONE"
+                verdict_str = last_signal.reason if last_signal else "Monitoring spreads, volatility ranges, and 7 assets."
+
+                emit_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
+                write_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
 
                 elapsed = time.time() - start_time
-                sleep_time = max(1.0, 10.0 - elapsed)
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(max(1.0, 10.0 - elapsed))
 
             except asyncio.CancelledError:
-                log.info("Main loop cancelled. Disconnecting from Deriv...")
                 break
             except Exception as e:
-                log.error(f"Error in main event loop: {str(e)}", exc_info=True)
+                log.error(f"Error in main event loop: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-                
-
 # ==============================================================================
-# 12. CLOUD ENTRY POINT
+# 13. CLOUD ENTRY POINT
 # ==============================================================================
 
 def start_bot() -> None:
