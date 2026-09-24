@@ -1,3 +1,4 @@
+# File: trading-portal/strategies/base.py
 from dataclasses import dataclass
 from typing import Optional
 
@@ -12,3 +13,12 @@ class StrategySignal:
     take_profit_2: Optional[float] = None
     confidence: float = 0.85
     reason: str = ""
+
+    # Universal aliases so both .sl and .stop_loss work interchangeably
+    @property
+    def sl(self) -> float:
+        return self.stop_loss
+
+    @property
+    def tp1(self) -> float:
+        return self.take_profit

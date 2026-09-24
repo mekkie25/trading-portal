@@ -1059,8 +1059,13 @@ class CloudExecutionEngine:
         symbol = getattr(signal, 'symbol')
         direction = getattr(signal, 'direction')
         entry = getattr(signal, 'entry_price')
-        sl = getattr(signal, 'stop_loss', getattr(signal, 'sl'))
-        tp = getattr(signal, 'take_profit', getattr(signal, 'tp1', None))
+        sl = getattr(signal, 'stop_loss', None)
+        if sl is None:
+            sl = getattr(signal, 'sl', 0.0)
+
+        tp = getattr(signal, 'take_profit', None)
+        if tp is None:
+            tp = getattr(signal, 'tp1', None)
         strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
         if isinstance(strategy_name, Enum):
             strategy_name = strategy_name.value

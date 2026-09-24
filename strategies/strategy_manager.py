@@ -55,14 +55,17 @@ class StrategyManager:
             return None
 
         for strat in self.strategies:
+            strat_name = strat.__class__.__name__
+            # Map class name to strategy ID
+            strat_id = getattr(strat, 'strategy_id', None)
+            
             try:
                 signal: StrategySignal | None = strat.evaluate(symbol, data_5m, session_levels)
                 if signal:
-                    # Enforce asset boundary
+                    # Enforce strict asset boundary silently
                     permitted = self.STRATEGY_PERMITTED_ASSETS.get(signal.strategy, set())
                     if signal.symbol not in permitted:
-                        log.warning(f"Rejected signal {signal.strategy} on disallowed asset {signal.symbol}")
-                        continue
+                        continue  # Silently skip if asset is not on this strategy's permitted list
                     
                     return signal
             except Exception as e:
