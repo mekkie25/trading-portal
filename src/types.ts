@@ -60,6 +60,9 @@ export interface BotSettings {
   currency?: string;
   lastAppliedTimestamp?: string;
   strategyModes: Record<string, StrategyExecutionMode>;
+  // Weekly Growth Goal System
+  weeklyDepositBaseline?: number; // Starting deposit (e.g. 100 ZAR or $10)
+  weeklyGoalTarget?: number;      // Target balance (e.g. 300 ZAR or $25)
 }
 
 export interface TradeRecord {

@@ -449,50 +449,78 @@ async function startServer() {
     next();
   });
 
-  // 1. Health check
-  app.get('/api/health', (req, res) => {
+  // =========================================================================
+  // 2. JOURNAL & PERMANENT DISK STORAGE (trades_db.json)
+  // =========================================================================
+  const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
+
+  function saveTradesToDisk(tradesList: any[]) {
+    try {
+      fs.writeFileSync(TRADES_DB_FILE, JSON.stringify(tradesList, null, 2));
+    } catch (e) {
+      console.error('Failed to save trades to disk:', e);
+    }
+  }
+
+  function loadTradesFromDisk(): any[] {
+    try {
+      if (fs.existsSync(TRADES_DB_FILE)) {
+        return JSON.parse(fs.readFileSync(TRADES_DB_FILE, 'utf8'));
+      }
+    } catch (e) {
+      console.error('Failed to load trades from disk:', e);
+    }
+    return [];
+  }
+
+  // Load saved trades on startup
+  const savedTrades = loadTradesFromDisk();
+  if (savedTrades.length > 0) {
+    activeBrokerTelemetry.trades = savedTrades;
+  }
+
+  // A. GET ALL TRADES
+  app.get('/api/journal', async (req, res) => {
+    try {
+      res.status(200).json(activeBrokerTelemetry.trades);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch journal entries" });
+    }
+  });
+
+  // B. DELETE SINGLE TRADE (Triggered by the Trash Can icon)
+  app.delete('/api/journal/:id', (req, res) => {
+    const tradeId = req.params.id;
+    activeBrokerTelemetry.trades = activeBrokerTelemetry.trades.filter(t => t.id !== tradeId);
+    allTrades = allTrades.filter(t => t.id !== tradeId);
+    saveTradesToDisk(activeBrokerTelemetry.trades);
+    recomputeRiskState();
+    res.json({ status: 'success', message: `Trade ${tradeId} deleted permanently.` });
+  });
+
+  // C. WIPE ENTIRE JOURNAL (Triggered by "Wipe Entire Journal")
+  app.post('/api/journal/reset', (req, res) => {
+    journalCutoffTime = new Date().toISOString();
+    activeBrokerTelemetry.trades = [];
+    allTrades = [];
+    saveTradesToDisk([]);
+    recomputeRiskState();
     res.json({
-      status: 'ok',
-      service: 'Trading Portal Gateway',
-      time: new Date().toISOString(),
-      botVersion: activeBotConfig.version,
+      status: 'success',
+      message: 'Journal wiped completely. Metrics reset to zero.',
+      cutoff: journalCutoffTime,
     });
   });
 
-  // 2. Journal and Analysis API Endpoints
-app.get('/api/journal', async (req, res) => {
+  // D. ANALYSIS ENDPOINT
+  app.post('/api/analysis', async (req, res) => {
     try {
-        const trades: any[] = activeBrokerTelemetry.trades;
-        res.status(200).json(trades);
+      res.status(200).json({ status: "success", message: "Live analysis executed." });
     } catch (error) {
-        res.status(500).json({ error: "Failed to fetch journal entries" });
+      res.status(500).json({ error: "Analysis execution failed" });
     }
-});
-
-// "Reset" the journal view. This does NOT delete anything from Deriv (that's
-// real broker history and can't be erased) — it just hides everything closed
-// before right now from the dashboard, so old/unrelated trades stop showing
-// up as if the bot placed them. Real risk/kill-switch math still accounts
-// for ALL historical trades regardless of this cutoff.
-app.post('/api/journal/reset', (req, res) => {
-    journalCutoffTime = new Date().toISOString();
-    activeBrokerTelemetry.trades = allTrades.filter((t) => !t.closeTime || t.closeTime >= journalCutoffTime!);
-    res.json({
-      status: 'success',
-      message: 'Journal view cleared. New trades from this point on will appear normally.',
-      cutoff: journalCutoffTime,
-    });
-});
-
-app.post('/api/analysis', async (req, res) => {
-    try {
-        const analysisResult = { status: "success", message: "Live analysis executed." };
-        res.status(200).json(analysisResult);
-    } catch (error) {
-        res.status(500).json({ error: "Analysis execution failed" });
-    }
-});
-
+  });
+  
   // 2. Get Bot Configuration
   app.get('/api/bot/config', (req, res) => {
     res.json({

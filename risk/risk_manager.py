@@ -1,6 +1,6 @@
 """
 risk/risk_manager.py
-Institutional Risk Management & Volatility Engine
+Institutional Risk Management & Volatility Engine with "News Armor"
 """
 
 import os
@@ -8,8 +8,8 @@ import json
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta, time
-from typing import Dict, Tuple, Optional, Set
+from datetime import datetime, timezone, time as dtime
+from typing import Dict, Tuple, Optional
 
 log = logging.getLogger("RiskManager")
 
@@ -19,8 +19,8 @@ class RiskManager:
         
         # UI Synced Controls
         self.master_execution: bool = True
-        self.dry_run: bool = False                 # Dry-run simulator mode
-        self.risk_per_trade_pct: float = 1.0       # 1.0% risk per trade
+        self.dry_run: bool = False
+        self.risk_per_trade_pct: float = 1.0       # 1.0% base risk
         self.risk_to_reward: float = 2.0           # 1 : 2 default target
         self.max_daily_trades: int = 4
         self.max_daily_loss_usd: float = 2500.0
@@ -33,15 +33,19 @@ class RiskManager:
         self.current_daily_loss: float = 0.0
         self.current_weekly_loss: float = 0.0
         self.current_monthly_loss: float = 0.0
-        self.open_positions: Dict[str, dict] = {}   # ticket -> position info
+        self.open_positions: Dict[str, dict] = {}
+
+        # Weekly Growth Goal Engine
+        self.weekly_deposit_baseline: float = 0.0
+        self.weekly_goal_target: float = 0.0
 
         # Spread Gate Thresholds
         self.max_spread_to_sl_ratio: float = 0.15
         self.max_absolute_spread = {
             "frxXAUUSD": 0.50,
-            "US30": 4.5,
-            "NAS100": 2.5,
-            "GERMAN30": 3.0,
+            "OTC_DJI": 4.5,
+            "OTC_NDX": 2.5,
+            "OTC_GDAXI": 3.0,
             "frxEURUSD": 0.0003,
             "frxUSDJPY": 0.035,
             "frxGBPUSD": 0.00035
@@ -49,9 +53,9 @@ class RiskManager:
 
         # Sector Correlation Grouping (Max 1 open position per sector)
         self.SECTOR_MAP = {
-            "US30": "EQUITY_INDEX",
-            "NAS100": "EQUITY_INDEX",
-            "GERMAN30": "EQUITY_INDEX",
+            "OTC_DJI": "EQUITY_INDEX",
+            "OTC_NDX": "EQUITY_INDEX",
+            "OTC_GDAXI": "EQUITY_INDEX",
             "frxXAUUSD": "PRECIOUS_METAL",
             "GOLD": "PRECIOUS_METAL",
             "frxEURUSD": "FOREX_MAJORS",
@@ -59,19 +63,13 @@ class RiskManager:
             "frxUSDJPY": "FOREX_MAJORS"
         }
 
-        # High-Impact Macro Schedule (UTC times: 15m blackout before & after)
-        self.MACRO_BLACKOUT_WINDOWS = [
-            # NFP / US CPI / Retail Sales recurring windows (12:30 - 13:00 UTC)
-            (time(12, 15), time(13, 15)),
-            # FOMC Rate Decision & Presser (18:00 - 19:30 UTC)
-            (time(17, 45), time(19, 45)),
-            # London Session Open Liquidity Rush (05:45 - 06:15 UTC)
-            (time(5, 45), time(6, 15))
+        # Targeted Red-Folder Windows (Only high-impact NFP/CPI releases: 5 min before & after)
+        # Note: We do NOT block trading; we apply "News Armor" (cut size by 50% & require tight spread)
+        self.RED_FOLDER_WINDOWS = [
+            (dtime(12, 25), dtime(12, 35)),  # US CPI / NFP release window (12:30 UTC)
+            (dtime(17, 55), dtime(18, 05))   # FOMC Rate Decision announcement (18:00 UTC)
         ]
 
-    # =========================================================================
-    # 1. READ UI CONTROLS IN REAL TIME
-    # =========================================================================
     def sync_ui_config(self) -> None:
         if not os.path.exists(self.config_file):
             return
@@ -86,34 +84,28 @@ class RiskManager:
             self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
             self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
             self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
-        except Exception as e:
+            # Read Weekly Growth Goal targets from UI
+            self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline))
+            self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target))
             log.warning(f"Error parsing {self.config_file}: {e}")
 
-    # =========================================================================
-    # 2. MACRO NEWS & SECTOR CORRELATION GATES
-    # =========================================================================
-    def is_macro_news_blackout(self) -> Tuple[bool, str]:
+    def is_red_folder_active(self) -> bool:
+        """Checks if current time is inside a high-impact red folder release window."""
         now_utc = datetime.now(timezone.utc).time()
-        for start, end in self.MACRO_BLACKOUT_WINDOWS:
+        for start, end in self.RED_FOLDER_WINDOWS:
             if start <= now_utc <= end:
-                return True, f"High-Impact Macro Event window active ({start.strftime('%H:%M')} - {end.strftime('%H:%M')} UTC). Trading paused."
-        return False, ""
+                return True
+        return False
 
     def check_sector_exposure(self, symbol: str) -> Tuple[bool, str]:
         sector = self.SECTOR_MAP.get(symbol, "OTHER")
         for ticket, pos in self.open_positions.items():
             open_sym = pos.get("symbol", "")
             if self.SECTOR_MAP.get(open_sym) == sector:
-                return False, f"Sector limit reached: An open trade already exists in {sector} ({open_sym})."
+                return False, f"Sector limit: An open trade already exists in {sector} ({open_sym})."
         return True, ""
 
-    # =========================================================================
-    # 3. 80% R:R BREAK-EVEN POSITION SUPERVISOR
-    # =========================================================================
     def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
-        """
-        Returns True if price has reached 80% of the distance from entry to Take Profit.
-        """
         total_target_distance = abs(tp - entry)
         if total_target_distance <= 0:
             return False
@@ -126,9 +118,6 @@ class RiskManager:
         progress_ratio = current_progress / total_target_distance
         return progress_ratio >= 0.80
 
-    # =========================================================================
-    # 4. MULTI-TF CANDLE SIZES & RANGE DETECTION
-    # =========================================================================
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
         def get_atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -165,15 +154,13 @@ class RiskManager:
             "range_span": round(range_span, 4),
         }
 
-    # =========================================================================
-    # 5. SPREAD GATE & AUTO LOT SIZING
-    # =========================================================================
     def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
         spread = abs(current_ask - current_bid)
         max_allowed = self.max_absolute_spread.get(symbol, 5.0)
         
+        # News protection: During high-impact news, spreads blow out. If spread is too wide, pause.
         if spread > max_allowed:
-            return False, f"Spread ({spread:.4f}) exceeds threshold ({max_allowed:.4f})", spread
+            return False, f"Spread ({spread:.4f}) exceeds safety ceiling ({max_allowed:.4f})", spread
 
         if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
             return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
@@ -182,63 +169,98 @@ class RiskManager:
 
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
         """
-        Dynamic Drawdown-Adaptive Position Sizing & Buffer Budgeting Engine:
-        1. Evaluates percentage of weekly and daily loss budgets consumed.
-        2. Gradually tapers risk (100% -> 50% -> 25% -> 10% survival mode).
-        3. Uses runway cap to guarantee remaining buffer is never wiped out in a single trade.
-        4. Scales stake based on exact stop-loss distance and point value.
+        Adapts dynamically to ANY account size:
+        - Micro-Account Mode (R100 / $5-$10): Uses broker min stake to build small deposits.
+        - Goal Shield: When weekly target is 90%+ reached, cuts risk in half to protect gains.
         """
         equity = current_equity if current_equity > 0 else 10051.99
         active_risk_pct = self.risk_per_trade_pct
 
-        # 1. Consecutive Loss Protection
+        # 1. Weekly Goal Shield (Lock in profits when goal is almost reached)
+        if self.weekly_goal_target > 0 and self.weekly_deposit_baseline > 0:
+            target_gain = self.weekly_goal_target - self.weekly_deposit_baseline
+            current_gain = equity - self.weekly_deposit_baseline
+            if target_gain > 0 and (current_gain / target_gain) >= 0.90:
+                active_risk_pct = active_risk_pct * 0.5
+                log.info(f"CAPITAL SHIELD ENGAGED: 90%+ of Weekly Goal achieved! Risk halved to {active_risk_pct:.2f}% to lock in gains.")
+
+        # 2. Consecutive Loss Protection
         if self.consecutive_losses >= 3:
             active_risk_pct = active_risk_pct * 0.5
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
-        # 2. Dynamic Weekly Buffer Budgeting (Graduated Safety Ramp)
+        # 3. News Armor
+        if self.is_red_folder_active():
+            active_risk_pct = active_risk_pct * 0.5
+
+        # 4. Weekly & Daily Buffer Budgeting
+        if self.max_weekly_loss_usd > 0:
+            weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
+            remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
+            if weekly_used_ratio >= 0.75:
+                active_risk_pct = min(active_risk_pct, 0.25)
+            elif weekly_used_ratio >= 0.50:
+                active_risk_pct = min(active_risk_pct, 0.50)
+            max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
+        else:
+            max_weekly_allowed_dollars = float('inf')
+
+        base_risk_dollars = equity * (active_risk_pct / 100.0)
+        final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars)
+
+        # 5. Micro-Account Scaling
+        # If account is small (R100 / $5 - $10) and standard % yields less than min_stake:
+        denom = sl_distance * point_value
+        calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
+
+        # Micro-Account Growth Rule:
+        # If balance is small but greater than min_stake, allow min_stake so the account can grow!
+        if calculated_stake < min_stake and equity >= min_stake:
+            log.info(f"MICRO-ACCOUNT GROWTH MODE: Balance is small ({equity:.2f}). Floor stake set to broker minimum ({min_stake}).")
+            calculated_stake = min_stake
+
+        return round(max(min(calculated_stake, max_stake), min_stake), 2)
+
+        # Consecutive loss protection
+        if self.consecutive_losses >= 3:
+            active_risk_pct = active_risk_pct * 0.5
+            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
+
+        # News Armor: If trading during a red-folder event, halve risk to protect against slippage
+        if self.is_red_folder_active():
+            active_risk_pct = active_risk_pct * 0.5
+            log.info(f"NEWS ARMOR ENGAGED: Red folder window active. Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
+
+        # Weekly Buffer Budgeting
         if self.max_weekly_loss_usd > 0:
             weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
             remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
 
             if weekly_used_ratio >= 0.90:
-                active_risk_pct = min(active_risk_pct, 0.10)   # Survival Zone (0.10% micro-risk)
-                log.warning(f"DRAWDOWN TAPER: 90%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Survival risk: {active_risk_pct:.2f}%")
+                active_risk_pct = min(active_risk_pct, 0.10)
             elif weekly_used_ratio >= 0.75:
-                active_risk_pct = min(active_risk_pct, 0.25)   # Taper Zone (0.25% risk)
-                log.warning(f"DRAWDOWN TAPER: 75%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Scaled risk: {active_risk_pct:.2f}%")
+                active_risk_pct = min(active_risk_pct, 0.25)
             elif weekly_used_ratio >= 0.50:
-                active_risk_pct = min(active_risk_pct, 0.50)   # Caution Zone (0.50% risk)
-                log.info(f"DRAWDOWN TAPER: 50%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Scaled risk: {active_risk_pct:.2f}%")
+                active_risk_pct = min(active_risk_pct, 0.50)
 
-            # Runway Cap: Never risk more than 1/4th of remaining weekly room on one trade
             max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
         else:
             max_weekly_allowed_dollars = float('inf')
 
-        # 3. Dynamic Daily Buffer Budgeting
+        # Daily Buffer Budgeting
         if self.max_daily_loss_usd > 0:
             remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
-            # Never risk more than 1/2 of remaining daily room on one trade
             max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
         else:
             max_daily_allowed_dollars = float('inf')
 
-        # Baseline percentage risk in dollars
         base_risk_dollars = equity * (active_risk_pct / 100.0)
-
-        # Cap dollar risk by the tightest remaining runway budget
         final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars, max_daily_allowed_dollars)
-
-        # Calculate exact stake matching stop loss distance
         denom = sl_distance * point_value
         calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
 
         return round(max(min(calculated_stake, max_stake), min_stake), 2)
 
-    # =========================================================================
-    # 6. MASTER PRE-TRADE GATE
-    # =========================================================================
     def validate_pre_trade(
         self,
         symbol: str,
@@ -257,11 +279,6 @@ class RiskManager:
 
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
-
-        # Macro News Blackout Gate
-        in_blackout, news_msg = self.is_macro_news_blackout()
-        if in_blackout:
-            return False, news_msg, {}
 
         # Sector Correlation Limit Gate
         sector_ok, sector_msg = self.check_sector_exposure(symbol)
@@ -287,6 +304,7 @@ class RiskManager:
             target_distance = sl_distance * self.risk_to_reward
             final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
 
+        # Spread Gate (Primary shield during news volatility)
         spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
         if not spread_ok:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
@@ -307,3 +325,6 @@ class RiskManager:
             "is_dry_run": self.dry_run
         }
         return True, "Approved", blueprint
+
+RiskState = RiskManager
+InstitutionalRiskEngine = RiskManager

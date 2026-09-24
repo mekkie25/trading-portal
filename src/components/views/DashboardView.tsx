@@ -345,6 +345,88 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       </motion.div>
+          initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6 space-y-4"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-[#1a2030]">
+          <div>
+            <h2 className="text-base font-bold text-black dark:text-white tracking-tight flex items-center gap-2">
+              <Target className="w-4 h-4 text-emerald-500" />
+              Weekly Account Growth Target & Goal Tracker
+            </h2>
+            <p className="text-xs text-black dark:text-slate-400 mt-0.5">
+              Set your starting baseline and target goal. The bot auto-adapts for any deposit size (even R100 / $5).
+            </p>
+          </div>
+          <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-full border border-emerald-500/20">
+            Micro-Account Auto-Scaler Active
+          </span>
+        </div>
+
+        {/* Goal Form Inputs */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+          <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+            <label className="text-[11px] font-bold text-slate-500 uppercase">Starting Baseline</label>
+            <input
+              type="number"
+              placeholder="e.g. 100 or 10000"
+              value={formSettings.weeklyDepositBaseline || ''}
+              onChange={(e) => setFormSettings({ ...formSettings, weeklyDepositBaseline: parseFloat(e.target.value) || 0 })}
+              className="w-full px-3 py-1.5 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-black dark:text-white text-sm"
+            />
+          </div>
+
+          <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+            <label className="text-[11px] font-bold text-slate-500 uppercase">Target Goal for Week</label>
+            <input
+              type="number"
+              placeholder="e.g. 300 or 12000"
+              value={formSettings.weeklyGoalTarget || ''}
+              onChange={(e) => setFormSettings({ ...formSettings, weeklyGoalTarget: parseFloat(e.target.value) || 0 })}
+              className="w-full px-3 py-1.5 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-emerald-600 dark:text-emerald-400 text-sm"
+            />
+          </div>
+
+          {/* Goal Progress Calculation */}
+          {(() => {
+            const start = formSettings.weeklyDepositBaseline || (metrics.currentEquity > 0 ? metrics.currentEquity : 100);
+            const goal = formSettings.weeklyGoalTarget || (start * 1.5);
+            const current = metrics.currentEquity > 0 ? metrics.currentEquity : start;
+            const targetDiff = goal - start;
+            const currentDiff = current - start;
+            const pct = targetDiff > 0 ? Math.min(100, Math.max(0, Math.round((currentDiff / targetDiff) * 100))) : 0;
+            const remaining = Math.max(0, goal - current);
+
+            return (
+              <>
+                <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[11px] font-bold text-slate-500 uppercase">Goal Progress</span>
+                    <span className="font-mono font-bold text-blue-600 dark:text-blue-400">{pct}%</span>
+                  </div>
+                  <div className="w-full bg-slate-200 dark:bg-slate-800 rounded-full h-2.5 overflow-hidden mt-2">
+                    <div className="bg-emerald-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${pct}%` }}></div>
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-1">
+                    {pct >= 100 ? '🎉 Goal Achieved!' : `${formatCurrency(remaining, brokerCurrency)} needed to reach goal`}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end p-2">
+                  <button
+                    type="button"
+                    onClick={handleSave}
+                    className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-xs transition-colors cursor-pointer"
+                  >
+                    Lock In Weekly Goal
+                  </button>
+                </div>
+              </>
+            );
+          })()}
+        </div>
+      </motion.div>
 
       {/* STRATEGY CONTROL CENTER & PERFORMANCE LEADERBOARD */}
       <motion.div 
