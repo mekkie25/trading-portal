@@ -8,17 +8,29 @@ import {
   Activity,
   Layers,
   Sparkles,
-  RefreshCw,
-  Eye,
   Sliders,
   CheckCircle2,
-  Maximize2
+  Maximize2,
+  Minimize2,
+  Crosshair,
+  Target,
+  Minus,
+  Square,
+  Trash2,
+  Settings2,
+  X,
+  Clock,
+  Eye,
+  ArrowUp,
+  ArrowDown
 } from 'lucide-react';
 import { MARKET_ASSETS } from '../../data/mockTradingData';
-import { MarketAsset, ThemeMode } from '../../types';
+import { MarketAsset, ThemeMode, TradeRecord } from '../../types';
 
 interface Candle {
   time: string;
+  hour: number;
+  minute: number;
   open: number;
   high: number;
   low: number;
@@ -26,32 +38,44 @@ interface Candle {
   volume: number;
 }
 
+interface DrawingItem {
+  id: string;
+  type: 'TRENDLINE' | 'RAY' | 'RECTANGLE';
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  color: string;
+}
+
 interface LiveFeedViewProps {
   currentEquity: number;
   riskPerTradePct: number;
   themeMode?: ThemeMode;
+  activeTrades?: TradeRecord[];
 }
 
-// Generate realistic synthetic OHLC series for any asset and timeframe
-function generateCandleData(basePrice: number, count: number = 60, intervalStr: string = '15'): Candle[] {
+function generateCandleData(basePrice: number, count: number = 70, intervalStr: string = '5'): Candle[] {
   const candles: Candle[] = [];
-  let current = basePrice * 0.96;
+  let current = basePrice * 0.985;
   const now = Date.now();
-  const stepMinutes = intervalStr === '1' ? 1 : intervalStr === '5' ? 5 : intervalStr === '60' ? 60 : intervalStr === '240' ? 240 : intervalStr === 'D' ? 1440 : 15;
+  const stepMinutes = intervalStr === '1' ? 1 : intervalStr === '5' ? 5 : intervalStr === '15' ? 15 : intervalStr === '30' ? 30 : intervalStr === '60' ? 60 : intervalStr === '240' ? 240 : 1440;
   const stepMs = stepMinutes * 60 * 1000;
 
   for (let i = count; i >= 0; i--) {
-    const timestamp = new Date(now - i * stepMs);
-    const volatility = basePrice * 0.0035;
-    const change = (Math.random() - 0.48) * volatility;
+    const d = new Date(now - i * stepMs);
+    const volatility = basePrice * 0.0032;
+    const change = (Math.random() - 0.485) * volatility;
     const open = current;
     const close = open + change;
-    const high = Math.max(open, close) + Math.random() * (volatility * 0.8);
-    const low = Math.min(open, close) - Math.random() * (volatility * 0.8);
-    const volume = Math.floor(200 + Math.random() * 850);
+    const high = Math.max(open, close) + Math.random() * (volatility * 0.7);
+    const low = Math.min(open, close) - Math.random() * (volatility * 0.7);
+    const volume = Math.floor(180 + Math.random() * 820);
 
     candles.push({
-      time: timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }),
+      time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }),
+      hour: d.getHours(),
+      minute: d.getMinutes(),
       open: Number(open.toFixed(2)),
       high: Number(high.toFixed(2)),
       low: Number(low.toFixed(2)),
@@ -63,7 +87,6 @@ function generateCandleData(basePrice: number, count: number = 60, intervalStr: 
   return candles;
 }
 
-// Compute Exponential Moving Average (EMA)
 function calculateEMA(candles: Candle[], period: number): (number | null)[] {
   const k = 2 / (period + 1);
   const emaArray: (number | null)[] = [];
@@ -86,11 +109,9 @@ function calculateEMA(candles: Candle[], period: number): (number | null)[] {
   return emaArray;
 }
 
-// Compute Relative Strength Index (RSI 14)
 function calculateRSI(candles: Candle[], period: number = 14): (number | null)[] {
   const rsiArray: (number | null)[] = [];
-  let gains = 0;
-  let losses = 0;
+  let gains = 0, losses = 0;
 
   for (let i = 1; i < candles.length; i++) {
     const diff = candles[i].close - candles[i - 1].close;
@@ -102,8 +123,7 @@ function calculateRSI(candles: Candle[], period: number = 14): (number | null)[]
         const avgGain = gains / period;
         const avgLoss = losses / period;
         const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-        const rsi = 100 - (100 / (1 + rs));
-        rsiArray.push(Number(rsi.toFixed(1)));
+        rsiArray.push(Number((100 - (100 / (1 + rs))).toFixed(1)));
       } else {
         rsiArray.push(null);
       }
@@ -115,56 +135,93 @@ function calculateRSI(candles: Candle[], period: number = 14): (number | null)[]
         gains = (gains * (period - 1) + currentGain) / period;
         losses = (losses * (period - 1) + currentLoss) / period;
         const rs = losses === 0 ? 100 : gains / losses;
-        const rsi = 100 - (100 / (1 + rs));
-        rsiArray.push(Number(rsi.toFixed(1)));
+        rsiArray.push(Number((100 - (100 / (1 + rs))).toFixed(1)));
       } else {
         rsiArray.push(null);
       }
     }
   }
-  // Align length with candles
   return [null, ...rsiArray];
 }
 
-export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskPerTradePct, themeMode = 'dark' }) => {
-  const [selectedAsset, setSelectedAsset] = useState<MarketAsset>(MARKET_ASSETS[0]); // DERIV:R_10
+export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ 
+  currentEquity, 
+  riskPerTradePct, 
+  themeMode = 'dark',
+  activeTrades = []
+}) => {
+  const [selectedAsset, setSelectedAsset] = useState<MarketAsset>(MARKET_ASSETS[1] || MARKET_ASSETS[0]); // Default US30
   const [customSymbol, setCustomSymbol] = useState('');
-  const [selectedInterval, setSelectedInterval] = useState<string>('15');
-  const [chartMode, setChartMode] = useState<'native' | 'tradingview'>('native');
-  const [stopLossPips, setStopLossPips] = useState<number>(25);
+  const [selectedInterval, setSelectedInterval] = useState<string>('5');
+  const [stopLossPips, setStopLossPips] = useState<number>(35);
   const [orderToast, setOrderToast] = useState<string | null>(null);
+
+  // Full Screen State
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const chartWrapperRef = useRef<HTMLDivElement>(null);
 
   // Indicators toggle
   const [showEma20, setShowEma20] = useState(true);
   const [showEma50, setShowEma50] = useState(true);
-  const [showEma200, setShowEma200] = useState(false);
+  const [showEma200, setShowEma200] = useState(true);
   const [showVolume, setShowVolume] = useState(true);
   const [showRsi, setShowRsi] = useState(true);
+  const [showVwap, setShowVwap] = useState(true);
+  const [showPivots, setShowPivots] = useState(true);
+  const [showAsiaBox, setShowAsiaBox] = useState(true);
+
+  // Customization Settings
+  const [asiaOpacity, setAsiaOpacity] = useState<number>(0.18);
+  const [asiaColor, setAsiaColor] = useState<string>('#3b82f6');
+  const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+
+  // Active Drawing Tool: 'POINTER' | 'TRENDLINE' | 'RAY' | 'RECTANGLE' | 'POSITION_BOX'
+  const [activeTool, setActiveTool] = useState<'POINTER' | 'TRENDLINE' | 'RAY' | 'RECTANGLE' | 'POSITION_BOX'>('POSITION_BOX');
+  const [drawings, setDrawings] = useState<DrawingItem[]>([]);
+  const [currentDraw, setCurrentDraw] = useState<{ startX: number; startY: number } | null>(null);
+
+  // Red & Green Risk-to-Reward Position Box Tool State
+  const [showPositionBox, setShowPositionBox] = useState(true);
+  const [positionType, setPositionType] = useState<'LONG' | 'SHORT'>('LONG');
+  const [targetMultiplier, setTargetMultiplier] = useState<number>(2.0); // 1:2 R:R
 
   // Chart data state
-  const [candles, setCandles] = useState<Candle[]>(() => generateCandleData(selectedAsset.price, 60, selectedInterval));
+  const [candles, setCandles] = useState<Candle[]>(() => generateCandleData(selectedAsset.price, 70, selectedInterval));
   const [hoveredCandle, setHoveredCandle] = useState<{ candle: Candle; index: number; x: number; y: number } | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Reset candle history on asset or interval change
   useEffect(() => {
-    setCandles(generateCandleData(selectedAsset.price, 60, selectedInterval));
+    setCandles(generateCandleData(selectedAsset.price, 70, selectedInterval));
   }, [selectedAsset.symbol, selectedInterval]);
 
-  // Real-time live tick engine simulating Deriv Synthetic Volatility & Market movements
+  const toggleFullscreen = () => {
+    if (!chartWrapperRef.current) return;
+    if (!document.fullscreenElement) {
+      chartWrapperRef.current.requestFullscreen().then(() => setIsFullscreen(true)).catch(() => {});
+    } else {
+      document.exitFullscreen().then(() => setIsFullscreen(false)).catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    const handleFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => document.removeEventListener('fullscreenchange', handleFsChange);
+  }, []);
+
+  // Tick engine
   useEffect(() => {
     const timer = window.setInterval(() => {
       setCandles((prev) => {
         if (prev.length === 0) return prev;
         const last = { ...prev[prev.length - 1] };
-        // Realistic random walk tick
-        const tickMove = (Math.random() - 0.49) * (selectedAsset.price * 0.0007);
+        const tickMove = (Math.random() - 0.495) * (selectedAsset.price * 0.0006);
         const newClose = Number((last.close + tickMove).toFixed(2));
         const newHigh = Math.max(last.high, newClose);
         const newLow = Math.min(last.low, newClose);
-        const newVolume = last.volume + Math.floor(Math.random() * 8 + 1);
+        const newVolume = last.volume + Math.floor(Math.random() * 6 + 1);
 
         const updatedLast: Candle = {
           ...last,
@@ -173,33 +230,59 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
           low: newLow,
           volume: newVolume,
         };
-
         return [...prev.slice(0, prev.length - 1), updatedLast];
       });
-    }, 1200);
+    }, 1000);
 
     return () => window.clearInterval(timer);
   }, [selectedAsset.price]);
 
-  // Derived indicator calculations
   const ema20 = useMemo(() => calculateEMA(candles, 20), [candles]);
   const ema50 = useMemo(() => calculateEMA(candles, 50), [candles]);
   const ema200 = useMemo(() => calculateEMA(candles, 200), [candles]);
   const rsi14 = useMemo(() => calculateRSI(candles, 14), [candles]);
 
-  // Calculate lot size based on equity, risk % and stop loss
+  const vwapLine = useMemo(() => {
+    let cumVol = 0, cumTypicalVol = 0;
+    return candles.map((c) => {
+      const typical = (c.high + c.low + c.close) / 3;
+      cumVol += c.volume;
+      cumTypicalVol += typical * c.volume;
+      return cumVol > 0 ? Number((cumTypicalVol / cumVol).toFixed(2)) : c.close;
+    });
+  }, [candles]);
+
+  // Daily Pivot Points (Traditional)
+  const pivotLevels = useMemo(() => {
+    if (candles.length < 20) return null;
+    const subset = candles.slice(-40);
+    const high = Math.max(...subset.map(c => c.high));
+    const low = Math.min(...subset.map(c => c.low));
+    const close = subset[subset.length - 1].close;
+
+    const p = (high + low + close) / 3.0;
+    const r1 = (2 * p) - low;
+    const s1 = (2 * p) - high;
+    const r2 = p + (high - low);
+    const s2 = p - (high - low);
+    const r3 = high + 2 * (p - low);
+    const s3 = low - 2 * (high - p);
+
+    return { p, r1, s1, r2, s2, r3, s3 };
+  }, [candles]);
+
+  // Position sizing
   const dollarRisk = (currentEquity * riskPerTradePct) / 100;
-  const estimatedPipValue = selectedAsset.symbol.includes('DERIV') ? 2.5 : 10;
+  const estimatedPipValue = selectedAsset.symbol.includes('DERIV') ? 2.5 : 1.0;
   const calculatedLots = Math.max(0.01, Number((dollarRisk / (stopLossPips * estimatedPipValue)).toFixed(2)));
 
-  // Canvas Drawing Routine
+  // Master Canvas Drawing Routine
   const drawChart = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Handle high-DPI retina display
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
     canvas.width = rect.width * dpr;
@@ -208,42 +291,37 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
 
     const width = rect.width;
     const height = rect.height;
-
     const isLight = themeMode !== 'dark';
 
-    // Clear background
     ctx.fillStyle = isLight ? '#ffffff' : '#07090e';
     ctx.fillRect(0, 0, width, height);
 
     if (candles.length === 0) return;
 
-    // Layout configuration
-    const paddingRight = 65; // Y-axis labels
-    const paddingBottom = showRsi ? 90 : 25; // X-axis + RSI subchart
+    const paddingRight = 72;
+    const paddingBottom = showRsi ? 85 : 25;
     const chartWidth = width - paddingRight;
     const priceChartHeight = height - paddingBottom;
 
-    // Compute min / max price for scaling
     let minPrice = Infinity;
     let maxPrice = -Infinity;
     candles.forEach((c) => {
       if (c.low < minPrice) minPrice = c.low;
       if (c.high > maxPrice) maxPrice = c.high;
     });
+
     const priceRange = maxPrice - minPrice || 1;
-    const paddedMin = minPrice - priceRange * 0.05;
-    const paddedMax = maxPrice + priceRange * 0.05;
+    const paddedMin = minPrice - priceRange * 0.08;
+    const paddedMax = maxPrice + priceRange * 0.08;
     const finalPriceRange = paddedMax - paddedMin;
 
     const getY = (price: number) => {
       return priceChartHeight - ((price - paddedMin) / finalPriceRange) * priceChartHeight;
     };
 
-    // 1. Draw Grid Lines
+    // 1. Grid
     ctx.strokeStyle = isLight ? '#e2e8f0' : '#121927';
     ctx.lineWidth = 1;
-
-    // Horizontal price grid lines
     const gridStepCount = 6;
     ctx.fillStyle = isLight ? '#000000' : '#64748b';
     ctx.font = '10px JetBrains Mono, monospace';
@@ -256,40 +334,164 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
       ctx.moveTo(0, y);
       ctx.lineTo(chartWidth, y);
       ctx.stroke();
-
-      // Price label on right margin
       ctx.fillText(p.toLocaleString('en-US', { minimumFractionDigits: 2 }), chartWidth + 6, y + 3);
     }
 
-    // Candle bar geometry
     const candleWidth = Math.max(3, (chartWidth / candles.length) * 0.65);
     const candleGap = chartWidth / candles.length;
 
-    // 2. Draw Volume Histogram (at base of price chart)
+    // 2. ASIA SESSION SHADED BOX (01:00 - 06:00 SAST) WITH 50% EQUILIBRIUM (EQ)
+    if (showAsiaBox) {
+      let asiaStartIndex = -1;
+      let asiaEndIndex = -1;
+      let asiaHigh = -Infinity;
+      let asiaLow = Infinity;
+
+      candles.forEach((c, idx) => {
+        // Asian session roughly maps between hours 1 and 6
+        const isAsia = c.hour >= 1 && c.hour < 6;
+        if (isAsia) {
+          if (asiaStartIndex === -1) asiaStartIndex = idx;
+          asiaEndIndex = idx;
+          if (c.high > asiaHigh) asiaHigh = c.high;
+          if (c.low < asiaLow) asiaLow = c.low;
+        }
+      });
+
+      if (asiaStartIndex !== -1 && asiaEndIndex !== -1 && asiaHigh !== -Infinity) {
+        const boxX = asiaStartIndex * candleGap;
+        const boxW = Math.max(candleGap, (asiaEndIndex - asiaStartIndex + 1) * candleGap);
+        const boxTopY = getY(asiaHigh);
+        const boxBottomY = getY(asiaLow);
+        const boxH = Math.abs(boxBottomY - boxTopY);
+
+        // Shaded Box
+        ctx.fillStyle = `rgba(59, 130, 246, ${asiaOpacity})`;
+        ctx.fillRect(boxX, boxTopY, boxW, boxH);
+        ctx.strokeStyle = asiaColor;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(boxX, boxTopY, boxW, boxH);
+
+        // 50% Daily Equilibrium (EQ) Line
+        const eqPrice = (asiaHigh + asiaLow) / 2;
+        const eqY = getY(eqPrice);
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = '#f59e0b';
+        ctx.beginPath();
+        ctx.moveTo(boxX, eqY);
+        ctx.lineTo(chartWidth, eqY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = '#f59e0b';
+        ctx.font = 'bold 9px JetBrains Mono, monospace';
+        ctx.fillText(`ASIA EQ: ${eqPrice.toFixed(2)}`, boxX + 4, eqY - 4);
+
+        ctx.fillStyle = isLight ? '#1e40af' : '#93c5fd';
+        ctx.fillText(`ASIA RANGE (01:00 - 06:00 SAST)`, boxX + 4, boxTopY - 6);
+      }
+    }
+
+    // 3. DAILY FLOOR PIVOT POINTS (P, R1, S1, R2, S2, R3, S3)
+    if (showPivots && pivotLevels) {
+      const drawPivotLine = (price: number, label: string, color: string) => {
+        const y = getY(price);
+        ctx.setLineDash([3, 4]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(chartWidth, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = color;
+        ctx.font = 'bold 9px JetBrains Mono, monospace';
+        ctx.fillText(`${label}: ${price.toFixed(1)}`, chartWidth + 6, y - 2);
+      };
+
+      drawPivotLine(pivotLevels.p, 'P', '#f59e0b');
+      drawPivotLine(pivotLevels.r1, 'R1', '#3b82f6');
+      drawPivotLine(pivotLevels.s1, 'S1', '#3b82f6');
+      drawPivotLine(pivotLevels.r2, 'R2', '#10b981');
+      drawPivotLine(pivotLevels.s2, 'S2', '#ef4444');
+    }
+
+    // 4. TRADINGVIEW RED/GREEN RISK-TO-REWARD POSITION BOX
+    if (showPositionBox && candles.length > 25) {
+      const lastPrice = candles[candles.length - 1].close;
+      const slDist = stopLossPips;
+      const tpDist = stopLossPips * targetMultiplier;
+
+      const entryPrice = lastPrice;
+      const slPrice = positionType === 'LONG' ? entryPrice - slDist : entryPrice + slDist;
+      const tpPrice = positionType === 'LONG' ? entryPrice + tpDist : entryPrice - tpDist;
+
+      const entryY = getY(entryPrice);
+      const slY = getY(slPrice);
+      const tpY = getY(tpPrice);
+
+      const boxStartX = Math.max(0, chartWidth - (candleGap * 30));
+      const boxWidth = chartWidth - boxStartX;
+
+      // Green Box (Reward Zone)
+      const greenTop = Math.min(entryY, tpY);
+      const greenHeight = Math.abs(tpY - entryY);
+      ctx.fillStyle = 'rgba(16, 185, 129, 0.22)';
+      ctx.fillRect(boxStartX, greenTop, boxWidth, greenHeight);
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(boxStartX, greenTop, boxWidth, greenHeight);
+
+      // Red Box (Risk Zone)
+      const redTop = Math.min(entryY, slY);
+      const redHeight = Math.abs(slY - entryY);
+      ctx.fillStyle = 'rgba(244, 63, 94, 0.22)';
+      ctx.fillRect(boxStartX, redTop, boxWidth, redHeight);
+      ctx.strokeStyle = '#f43f5e';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(boxStartX, redTop, boxWidth, redHeight);
+
+      // Entry Ray
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(boxStartX, entryY);
+      ctx.lineTo(chartWidth, entryY);
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 10px JetBrains Mono, monospace';
+      ctx.fillText(`Target: ${tpPrice.toFixed(2)} (+${tpDist.toFixed(1)} pts)`, boxStartX + 8, greenTop + (greenHeight / 2) + 3);
+      ctx.fillText(`Stop Loss: ${slPrice.toFixed(2)} (-${slDist.toFixed(1)} pts)`, boxStartX + 8, redTop + (redHeight / 2) + 3);
+      ctx.fillText(`R:R 1:${targetMultiplier.toFixed(1)} | Risk: $${dollarRisk.toFixed(2)}`, boxStartX + 8, entryY - 6);
+    }
+
+    // 5. Volume Histogram
     if (showVolume) {
       const maxVolume = Math.max(...candles.map((c) => c.volume), 1);
-      const volumeAreaHeight = priceChartHeight * 0.22;
+      const volumeAreaHeight = priceChartHeight * 0.18;
 
       candles.forEach((c, i) => {
         const x = i * candleGap + candleGap / 2;
         const vHeight = (c.volume / maxVolume) * volumeAreaHeight;
-        const isUp = c.close >= c.open;
-        ctx.fillStyle = isUp ? 'rgba(16, 185, 129, 0.2)' : 'rgba(244, 63, 94, 0.2)';
+        const isCandleUp = c.close >= c.open;
+        ctx.fillStyle = isCandleUp ? 'rgba(16, 185, 129, 0.18)' : 'rgba(244, 63, 94, 0.18)';
         ctx.fillRect(x - candleWidth / 2, priceChartHeight - vHeight, candleWidth, vHeight);
       });
     }
 
-    // 3. Draw Candlesticks
+    // 6. Candlesticks
     candles.forEach((c, i) => {
       const x = i * candleGap + candleGap / 2;
       const openY = getY(c.open);
       const closeY = getY(c.close);
       const highY = getY(c.high);
       const lowY = getY(c.low);
-      const isUp = c.close >= c.open;
+      const isCandleUp = c.close >= c.open;
 
       // Wick
-      ctx.strokeStyle = isUp ? '#10b981' : '#f43f5e';
+      ctx.strokeStyle = isCandleUp ? '#10b981' : '#f43f5e';
       ctx.lineWidth = 1.2;
       ctx.beginPath();
       ctx.moveTo(x, highY);
@@ -297,16 +499,49 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
       ctx.stroke();
 
       // Body
-      ctx.fillStyle = isUp ? '#10b981' : '#f43f5e';
+      ctx.fillStyle = isCandleUp ? '#10b981' : '#f43f5e';
       const bodyTop = Math.min(openY, closeY);
       const bodyHeight = Math.max(2, Math.abs(closeY - openY));
       ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+
+      // 7. GREEN BUY & RED SELL ARROWS AT THE CANDLES (TRADE MARKERS)
+      // Display visual arrows when bot executed on this candle
+      if (i === candles.length - 12) {
+        // Example Green Buy Arrow below candle pointing UP
+        ctx.fillStyle = '#10b981';
+        ctx.beginPath();
+        ctx.moveTo(x, lowY + 16);
+        ctx.lineTo(x - 6, lowY + 28);
+        ctx.lineTo(x + 6, lowY + 28);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.font = 'bold 9px JetBrains Mono, monospace';
+        ctx.fillText(`BUY US30`, x - 20, lowY + 40);
+        ctx.fillText(`+130 pts`, x - 18, lowY + 52);
+      }
+
+      if (i === candles.length - 28) {
+        // Example Red Sell Arrow above candle pointing DOWN
+        ctx.fillStyle = '#ef4444';
+        ctx.beginPath();
+        ctx.moveTo(x, highY - 16);
+        ctx.lineTo(x - 6, highY - 28);
+        ctx.lineTo(x + 6, highY - 28);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.font = 'bold 9px JetBrains Mono, monospace';
+        ctx.fillText(`SELL US30`, x - 22, highY - 32);
+        ctx.fillText(`+85 pts`, x - 16, highY - 42);
+      }
     });
 
-    // 4. Draw EMAs
-    const drawIndicatorLine = (data: (number | null)[], strokeStyle: string) => {
+    // 8. Indicators Lines
+    const drawIndicatorLine = (data: (number | null)[], strokeStyle: string, dash: number[] = []) => {
       ctx.strokeStyle = strokeStyle;
       ctx.lineWidth = 1.5;
+      ctx.setLineDash(dash);
       ctx.beginPath();
       let hasStarted = false;
 
@@ -322,21 +557,38 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
         }
       });
       ctx.stroke();
+      ctx.setLineDash([]);
     };
 
-    if (showEma20) drawIndicatorLine(ema20, '#06b6d4'); // Cyan
-    if (showEma50) drawIndicatorLine(ema50, '#f59e0b'); // Amber
-    if (showEma200) drawIndicatorLine(ema200, '#a855f7'); // Purple
+    if (showEma20) drawIndicatorLine(ema20, '#06b6d4');
+    if (showEma50) drawIndicatorLine(ema50, '#f59e0b');
+    if (showEma200) drawIndicatorLine(ema200, '#a855f7');
+    if (showVwap) drawIndicatorLine(vwapLine, '#3b82f6', [4, 4]);
 
-    // 5. Draw Live Last-Price Marker Line
+    // 9. User Interactive Custom Drawings
+    drawings.forEach(d => {
+      ctx.strokeStyle = d.color;
+      ctx.lineWidth = 2;
+      if (d.type === 'TRENDLINE' || d.type === 'RAY') {
+        ctx.beginPath();
+        ctx.moveTo(d.x1, d.y1);
+        ctx.lineTo(d.x2, d.y2);
+        ctx.stroke();
+      } else if (d.type === 'RECTANGLE') {
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
+        ctx.fillRect(Math.min(d.x1, d.x2), Math.min(d.y1, d.y2), Math.abs(d.x2 - d.x1), Math.abs(d.y2 - d.y1));
+        ctx.strokeRect(Math.min(d.x1, d.x2), Math.min(d.y1, d.y2), Math.abs(d.x2 - d.x1), Math.abs(d.y2 - d.y1));
+      }
+    });
+
+    // 10. Live Price Marker Line
     const lastCandle = candles[candles.length - 1];
     if (lastCandle) {
       const currentY = getY(lastCandle.close);
-      const isUp = lastCandle.close >= lastCandle.open;
+      const isCandleUp = lastCandle.close >= lastCandle.open;
 
-      // Dashed horizontal price beam
-      ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = isUp ? '#10b981' : '#f43f5e';
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = isCandleUp ? '#10b981' : '#f43f5e';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, currentY);
@@ -344,24 +596,21 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Live price tag bubble
-      ctx.fillStyle = isUp ? '#059669' : '#e11d48';
-      ctx.fillRect(chartWidth + 1, currentY - 9, 62, 18);
+      ctx.fillStyle = isCandleUp ? '#059669' : '#e11d48';
+      ctx.fillRect(chartWidth + 1, currentY - 9, 68, 18);
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 9.5px JetBrains Mono, monospace';
       ctx.fillText(lastCandle.close.toFixed(2), chartWidth + 5, currentY + 3.5);
     }
 
-    // 6. Draw RSI Subchart
+    // 11. RSI Subchart
     if (showRsi) {
-      const rsiTop = height - 75;
-      const rsiHeight = 55;
+      const rsiTop = height - 72;
+      const rsiHeight = 52;
 
-      // Subchart background divider
       ctx.fillStyle = isLight ? '#f8fafc' : '#090d16';
       ctx.fillRect(0, rsiTop, chartWidth, rsiHeight);
 
-      // RSI Guide levels: 70, 50, 30
       ctx.strokeStyle = isLight ? '#e2e8f0' : '#1a2438';
       ctx.lineWidth = 1;
       [70, 50, 30].forEach((lvl) => {
@@ -376,13 +625,11 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
         ctx.fillText(String(lvl), chartWidth + 6, y + 3);
       });
 
-      // RSI Label
       ctx.fillStyle = isLight ? '#000000' : '#94a3b8';
       ctx.font = '9px JetBrains Mono, monospace';
       const currentRsi = rsi14[rsi14.length - 1] ?? 50;
-      ctx.fillText(`RSI(14): ${currentRsi}`, 8, rsiTop + 14);
+      ctx.fillText(`RSI(14): ${currentRsi}`, 8, rsiTop + 13);
 
-      // Plot RSI line
       ctx.strokeStyle = isLight ? '#4f46e5' : '#818cf8';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -402,28 +649,24 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
       ctx.stroke();
     }
 
-    // 7. Interactive Crosshair and Hover Line
+    // 12. Crosshair
     if (hoveredCandle) {
       const { x, y, candle } = hoveredCandle;
-
       ctx.setLineDash([3, 3]);
       ctx.strokeStyle = isLight ? 'rgba(0, 0, 0, 0.4)' : 'rgba(255, 255, 255, 0.4)';
       ctx.lineWidth = 1;
 
-      // Vertical line
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, height);
       ctx.stroke();
 
-      // Horizontal line
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(chartWidth, y);
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Timestamp at bottom
       ctx.fillStyle = isLight ? '#000000' : '#1e293b';
       ctx.fillRect(x - 30, height - 16, 60, 16);
       ctx.fillStyle = '#ffffff';
@@ -432,21 +675,18 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
       ctx.fillText(candle.time, x, height - 4);
       ctx.textAlign = 'left';
     }
-  }, [candles, ema20, ema50, ema200, rsi14, showEma20, showEma50, showEma200, showVolume, showRsi, hoveredCandle, themeMode]);
+  }, [candles, ema20, ema50, ema200, vwapLine, rsi14, pivotLevels, showEma20, showEma50, showEma200, showVwap, showPivots, showAsiaBox, asiaOpacity, asiaColor, showVolume, showRsi, showPositionBox, positionType, targetMultiplier, stopLossPips, drawings, hoveredCandle, themeMode]);
 
-  // Redraw when candles or indicators change
   useEffect(() => {
     drawChart();
   }, [drawChart]);
 
-  // Handle Canvas Resize
   useEffect(() => {
     const handleResize = () => drawChart();
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, [drawChart]);
 
-  // Mouse move on canvas for interactive crosshair
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas || candles.length === 0) return;
@@ -454,7 +694,7 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    const paddingRight = 65;
+    const paddingRight = 70;
     const chartWidth = rect.width - paddingRight;
     if (x < 0 || x > chartWidth) {
       setHoveredCandle(null);
@@ -473,24 +713,32 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
     });
   };
 
-  const handleCanvasMouseLeave = () => {
-    setHoveredCandle(null);
-  };
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
-  const handleAssetSelect = (asset: MarketAsset) => {
-    setSelectedAsset(asset);
-    setCustomSymbol('');
-  };
+    if (activeTool === 'POINTER') return;
 
-  const handleCustomSearch = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!customSymbol.trim()) return;
-  };
-
-  const handleExecuteOrder = (direction: 'BUY' | 'SELL') => {
-    const ticketNum = Math.floor(8920000 + Math.random() * 9999);
-    setOrderToast(`${direction} order #${ticketNum} (${calculatedLots} lots on ${customSymbol || selectedAsset.symbol}) dispatched to MT5!`);
-    setTimeout(() => setOrderToast(null), 4000);
+    if (!currentDraw) {
+      setCurrentDraw({ startX: x, startY: y });
+    } else {
+      // Finish Drawing
+      const newD: DrawingItem = {
+        id: `draw-${Date.now()}`,
+        type: activeTool === 'TRENDLINE' ? 'TRENDLINE' : activeTool === 'RAY' ? 'RAY' : 'RECTANGLE',
+        x1: currentDraw.startX,
+        y1: currentDraw.startY,
+        x2: x,
+        y2: y,
+        color: '#3b82f6'
+      };
+      setDrawings([...drawings, newD]);
+      setCurrentDraw(null);
+      setActiveTool('POINTER');
+    }
   };
 
   const lastCandle = candles[candles.length - 1];
@@ -499,356 +747,268 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({ currentEquity, riskP
   const candleChange = activeHover ? Number((((activeHover.close - activeHover.open) / activeHover.open) * 100).toFixed(2)) : 0;
 
   return (
-    <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
-      {/* Toast Notification */}
-      {orderToast && (
-        <div className="fixed top-20 right-8 z-50 p-4 rounded-xl bg-blue-600 text-white shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in slide-in-from-top-2 border border-blue-400">
-          <CheckCircle2 className="w-4 h-4 text-emerald-300" />
-          <span>{orderToast}</span>
-        </div>
+    <div className={`h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto ${isFullscreen ? '!p-0 !m-0 !max-w-none' : ''}`}>
+      {/* Header */}
+      {!isFullscreen && (
+        <motion.div 
+          initial={{ opacity: 0, y: 15 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-300 dark:border-[#1a2030]"
+        >
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
+              Live Charting Terminal & Strategy Visualizer
+              <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
+                TradingView Suite
+              </span>
+            </h1>
+            <p className="text-sm text-black dark:text-slate-400 mt-1">
+              Asia Range Shaded Box, Daily Floor Pivots, Buy/Sell Candle Arrows, and Full Drawing Suite with 0 Limits.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={toggleFullscreen}
+              className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-2 shadow-xs cursor-pointer transition-colors"
+            >
+              <Maximize2 className="w-3.5 h-3.5" />
+              <span>Full Screen</span>
+            </button>
+          </div>
+        </motion.div>
       )}
 
-      {/* View Header */}
-      <motion.div 
-        initial={{ opacity: 0, y: 15 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.35 }}
-        className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-300 dark:border-[#1a2030]"
+      {/* Main Chart with Left Drawing Toolbar */}
+      <div 
+        ref={chartWrapperRef} 
+        className={`rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden flex flex-col relative ${
+          isFullscreen ? 'w-screen h-screen !rounded-none !border-none' : 'min-h-[560px]'
+        }`}
       >
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
-            Live Market Feeds & Terminal
-            <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
-              Broker Low-Latency Stream
-            </span>
-          </h1>
-          <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Real-time market streaming, institutional EMAs, RSI oscillator, and automated risk sizing.
-          </p>
-        </div>
+        {/* Top Control Bar */}
+        <div className="px-4 py-3 bg-white dark:bg-[#0b101a] border-b border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs shrink-0 select-none">
+          <div className="flex items-center gap-3 flex-wrap">
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-black dark:text-white font-mono text-sm">
+                {customSymbol || selectedAsset.symbol}
+              </span>
+              <span className="text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-mono">
+                LIVE DERIV
+              </span>
+            </div>
 
-        {/* Mode Selector & Timeframe Bar */}
-        <div className="flex items-center gap-3">
-          {/* Chart Mode Toggle */}
-          <div className="flex items-center bg-white dark:bg-[#0f1118] p-1 rounded-xl border border-slate-300 dark:border-[#1a2030] shadow-xs">
-            <button
-              onClick={() => setChartMode('native')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
-                chartMode === 'native'
-                  ? 'bg-blue-600 text-white shadow-xs'
-                  : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-white'
-              }`}
-            >
-              Native Engine
-            </button>
-            <button
-              onClick={() => setChartMode('tradingview')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
-                chartMode === 'tradingview'
-                  ? 'bg-blue-600 text-white shadow-xs'
-                  : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-white'
-              }`}
-            >
-              TradingView Frame
-            </button>
-          </div>
+            {/* Timeframe Selectors */}
+            <div className="flex items-center bg-slate-100 dark:bg-[#08090d] p-0.5 rounded-lg border border-slate-300 dark:border-[#1a2030]">
+              {['1', '5', '15', '30', '60', '240', 'D'].map((tf) => (
+                <button
+                  key={tf}
+                  onClick={() => setSelectedInterval(tf)}
+                  className={`px-2 py-0.5 text-[11px] font-mono font-bold rounded transition-all cursor-pointer ${
+                    selectedInterval === tf ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-black dark:hover:text-white'
+                  }`}
+                >
+                  {tf === '60' ? '1h' : tf === '240' ? '4h' : tf === 'D' ? '1D' : `${tf}m`}
+                </button>
+              ))}
+            </div>
 
-          {/* Timeframe Bar */}
-          <div className="flex items-center bg-white dark:bg-[#0f1118] p-1 rounded-xl border border-slate-300 dark:border-[#1a2030] shadow-xs">
-            {[
-              { label: '1m', val: '1' },
-              { label: '5m', val: '5' },
-              { label: '15m', val: '15' },
-              { label: '1h', val: '60' },
-              { label: '4h', val: '240' },
-              { label: '1D', val: 'D' },
-            ].map((tf) => (
-              <button
-                key={tf.val}
-                onClick={() => setSelectedInterval(tf.val)}
-                className={`px-2.5 py-1 text-xs font-mono font-semibold rounded-lg transition-all cursor-pointer ${
-                  selectedInterval === tf.val
-                    ? 'bg-blue-600 text-white shadow-xs'
-                    : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-white'
-                }`}
-              >
-                {tf.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </motion.div>
-
-      {/* Asset Quick Switcher Pills */}
-      <motion.div 
-        initial={{ opacity: 0, y: 15 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.35 }}
-        className="flex items-center gap-3 overflow-x-auto pb-1"
-      >
-        {MARKET_ASSETS.map((asset) => {
-          const isSelected = selectedAsset.symbol === asset.symbol && !customSymbol;
-          const isAssetUp = asset.change24h >= 0;
-
-          return (
-            <button
-              key={asset.symbol}
-              onClick={() => handleAssetSelect(asset)}
-              className={`flex items-center gap-3 px-3.5 py-2 rounded-xl border transition-all shrink-0 text-left cursor-pointer ${
-                isSelected
-                  ? 'bg-blue-600/10 border-blue-500 shadow-xs text-blue-600 dark:text-blue-400'
-                  : 'bg-white dark:bg-[#0f1118] border-slate-300 dark:border-[#1a2030] hover:border-slate-400 dark:hover:border-slate-700 shadow-xs'
-              }`}
-            >
-              <div className="flex flex-col">
-                <div className="flex items-center gap-1.5">
-                  <span className={`text-xs font-bold font-mono ${isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-black dark:text-white'}`}>
-                    {asset.symbol}
-                  </span>
-                  {asset.symbol.includes('DERIV') && (
-                    <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-bold">
-                      SYNTHETIC
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2 text-[11px] mt-0.5">
-                  <span className="font-mono text-black dark:text-slate-300">
-                    {asset.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                  </span>
-                  <span className={`flex items-center font-mono font-semibold ${isAssetUp ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
-                    {isAssetUp ? '+' : ''}{asset.change24h}%
-                  </span>
-                </div>
+            {/* OHLC HUD */}
+            {activeHover && (
+              <div className="hidden xl:flex items-center gap-2.5 text-[11px] font-mono">
+                <span className="text-slate-500">O: <strong className="text-black dark:text-slate-200">{activeHover.open.toFixed(2)}</strong></span>
+                <span className="text-slate-500">H: <strong className="text-black dark:text-slate-200">{activeHover.high.toFixed(2)}</strong></span>
+                <span className="text-slate-500">L: <strong className="text-black dark:text-slate-200">{activeHover.low.toFixed(2)}</strong></span>
+                <span className="text-slate-500">C: <strong className={isUp ? 'text-emerald-600' : 'text-rose-600'}>{activeHover.close.toFixed(2)}</strong></span>
+                <span className={isUp ? 'text-emerald-600 font-bold' : 'text-rose-600 font-bold'}>({candleChange > 0 ? '+' : ''}{candleChange}%)</span>
               </div>
-            </button>
-          );
-        })}
+            )}
+          </div>
 
-        {/* Custom Symbol Search */}
-        <form onSubmit={handleCustomSearch} className="flex items-center shrink-0">
-          <div className="relative">
-            <input
-              type="text"
-              placeholder="Other symbol (e.g. DERIV:R_75)..."
-              value={customSymbol}
-              onChange={(e) => setCustomSymbol(e.target.value.toUpperCase())}
-              className="px-3 py-2 pl-9 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-xl text-xs font-mono text-black dark:text-white placeholder:text-slate-500 focus:outline-none focus:border-blue-500 w-56 shadow-xs"
+          {/* Quick Indicator Toggles */}
+          <div className="flex items-center gap-1.5 flex-wrap text-[10px] font-mono">
+            <button onClick={() => setShowAsiaBox(!showAsiaBox)} className={`px-2 py-0.5 rounded border ${showAsiaBox ? 'bg-blue-500/15 text-blue-600 border-blue-500/30 font-bold' : 'text-slate-500 border-transparent'}`}>🌙 ASIA BOX</button>
+            <button onClick={() => setShowPivots(!showPivots)} className={`px-2 py-0.5 rounded border ${showPivots ? 'bg-amber-500/15 text-amber-500 border-amber-500/30 font-bold' : 'text-slate-500 border-transparent'}`}>PIVOTS</button>
+            <button onClick={() => setShowVwap(!showVwap)} className={`px-2 py-0.5 rounded border ${showVwap ? 'bg-blue-500/15 text-blue-600 border-blue-500/30 font-bold' : 'text-slate-500 border-transparent'}`}>VWAP</button>
+            <button onClick={() => setShowEma200(!showEma200)} className={`px-2 py-0.5 rounded border ${showEma200 ? 'bg-purple-500/15 text-purple-500 border-purple-500/30 font-bold' : 'text-slate-500 border-transparent'}`}>200 EMA</button>
+
+            {/* Gear Settings Modal Toggle */}
+            <button
+              onClick={() => setShowSettingsModal(true)}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-black dark:hover:text-white cursor-pointer"
+              title="Customize Indicators & Opacity"
+            >
+              <Settings2 className="w-4 h-4 text-blue-500" />
+            </button>
+
+            {/* Fullscreen Button */}
+            <button
+              onClick={toggleFullscreen}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-black dark:hover:text-white cursor-pointer"
+              title={isFullscreen ? 'Exit Full Screen' : 'Enter Full Screen'}
+            >
+              {isFullscreen ? <Minimize2 className="w-4 h-4 text-amber-400" /> : <Maximize2 className="w-4 h-4 text-blue-500" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Chart Body: Left TradingView Drawing Toolbar + Canvas Viewport */}
+        <div className="flex-1 w-full flex relative min-h-[460px]">
+          {/* TRADINGVIEW LEFT DRAWING TOOLBAR */}
+          <div className="w-12 bg-white dark:bg-[#0b101a] border-r border-slate-300 dark:border-[#1a2030] flex flex-col items-center py-3 gap-2 shrink-0 select-none z-10">
+            <button
+              onClick={() => setActiveTool('POINTER')}
+              className={`p-2 rounded-xl transition-colors cursor-pointer ${
+                activeTool === 'POINTER' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-black dark:hover:text-white'
+              }`}
+              title="Crosshair / Pointer"
+            >
+              <Crosshair className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTool('POSITION_BOX')}
+              className={`p-2 rounded-xl transition-colors cursor-pointer ${
+                activeTool === 'POSITION_BOX' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-black dark:hover:text-white'
+              }`}
+              title="Long/Short Risk-Reward Box (TradingView Tool)"
+            >
+              <Target className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTool('TRENDLINE')}
+              className={`p-2 rounded-xl transition-colors cursor-pointer ${
+                activeTool === 'TRENDLINE' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-black dark:hover:text-white'
+              }`}
+              title="Trendline Tool"
+            >
+              <TrendingUp className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTool('RAY')}
+              className={`p-2 rounded-xl transition-colors cursor-pointer ${
+                activeTool === 'RAY' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-black dark:hover:text-white'
+              }`}
+              title="Horizontal Support/Resistance Line"
+            >
+              <Minus className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTool('RECTANGLE')}
+              className={`p-2 rounded-xl transition-colors cursor-pointer ${
+                activeTool === 'RECTANGLE' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-black dark:hover:text-white'
+              }`}
+              title="Order Block / FVG Rectangle Box"
+            >
+              <Square className="w-4 h-4" />
+            </button>
+
+            <div className="w-6 h-px bg-slate-200 dark:bg-slate-800 my-1" />
+
+            <button
+              onClick={() => setDrawings([])}
+              className="p-2 rounded-xl text-slate-500 hover:text-rose-600 transition-colors cursor-pointer"
+              title="Clear Custom Drawings"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Canvas Viewport */}
+          <div ref={containerRef} className="flex-1 h-full relative bg-white dark:bg-[#07090e]">
+            <canvas
+              ref={canvasRef}
+              onMouseMove={handleCanvasMouseMove}
+              onMouseDown={handleCanvasMouseDown}
+              onMouseLeave={() => setHoveredCandle(null)}
+              className="w-full h-full cursor-crosshair block"
             />
-            <Search className="w-3.5 h-3.5 text-black dark:text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-          </div>
-        </form>
-      </motion.div>
-
-      {/* Main Split: Canvas Chart / Safe TradingView Frame + Sizing Terminal */}
-      <motion.div 
-        initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
-        className="grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-[500px]"
-      >
-        {/* Chart Viewport */}
-        <div className="lg:col-span-8 xl:col-span-9 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden flex flex-col relative min-h-[420px]">
-          {/* Chart Info Header HUD & Indicator Controls */}
-          <div className="px-4 py-3 bg-white dark:bg-[#0b101a] border-b border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs shrink-0 select-none">
-            {/* Symbol & Live OHLC HUD */}
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-black dark:text-white font-mono">
-                  {customSymbol || selectedAsset.symbol}
-                </span>
-                <span className="text-[10px] text-blue-600 dark:text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded-full border border-blue-500/20 font-mono">
-                  {chartMode === 'native' ? 'LOW-LATENCY STREAM' : 'TRADINGVIEW BRIDGE'}
-                </span>
-              </div>
-
-              {activeHover && chartMode === 'native' && (
-                <div className="hidden sm:flex items-center gap-3 text-[11px] font-mono">
-                  <span className="text-black dark:text-slate-500">O: <strong className="text-black dark:text-slate-200">{activeHover.open.toFixed(2)}</strong></span>
-                  <span className="text-black dark:text-slate-500">H: <strong className="text-black dark:text-slate-200">{activeHover.high.toFixed(2)}</strong></span>
-                  <span className="text-black dark:text-slate-500">L: <strong className="text-black dark:text-slate-200">{activeHover.low.toFixed(2)}</strong></span>
-                  <span className="text-black dark:text-slate-500">C: <strong className={isUp ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>{activeHover.close.toFixed(2)}</strong></span>
-                  <span className={isUp ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>({candleChange > 0 ? '+' : ''}{candleChange}%)</span>
-                </div>
-              )}
-            </div>
-
-            {/* Indicator Toggles */}
-            {chartMode === 'native' && (
-              <div className="flex items-center gap-1.5 text-[10px] font-mono">
-                <button
-                  onClick={() => setShowEma20(!showEma20)}
-                  className={`px-2 py-0.5 rounded-md border transition-colors cursor-pointer ${
-                    showEma20
-                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/30 font-bold'
-                      : 'text-black dark:text-slate-500 border-transparent hover:text-blue-600 dark:hover:text-slate-300'
-                  }`}
-                >
-                  EMA 20
-                </button>
-                <button
-                  onClick={() => setShowEma50(!showEma50)}
-                  className={`px-2 py-0.5 rounded-md border transition-colors cursor-pointer ${
-                    showEma50
-                      ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30 font-bold'
-                      : 'text-black dark:text-slate-500 border-transparent hover:text-amber-600 dark:hover:text-slate-300'
-                  }`}
-                >
-                  EMA 50
-                </button>
-                <button
-                  onClick={() => setShowEma200(!showEma200)}
-                  className={`px-2 py-0.5 rounded-md border transition-colors cursor-pointer ${
-                    showEma200
-                      ? 'bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/30 font-bold'
-                      : 'text-black dark:text-slate-500 border-transparent hover:text-purple-600 dark:hover:text-slate-300'
-                  }`}
-                >
-                  EMA 200
-                </button>
-                <button
-                  onClick={() => setShowVolume(!showVolume)}
-                  className={`px-2 py-0.5 rounded-md border transition-colors cursor-pointer ${
-                    showVolume
-                      ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 font-bold'
-                      : 'text-black dark:text-slate-500 border-transparent hover:text-emerald-700 dark:hover:text-slate-300'
-                  }`}
-                >
-                  VOL
-                </button>
-                <button
-                  onClick={() => setShowRsi(!showRsi)}
-                  className={`px-2 py-0.5 rounded-md border transition-colors cursor-pointer ${
-                    showRsi
-                      ? 'bg-indigo-500/15 text-indigo-700 dark:text-indigo-400 border-indigo-500/30 font-bold'
-                      : 'text-black dark:text-slate-500 border-transparent hover:text-indigo-700 dark:hover:text-slate-300'
-                  }`}
-                >
-                  RSI
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* Chart Display Area */}
-          <div ref={containerRef} className="flex-1 w-full h-full relative bg-white dark:bg-[#07090e]">
-            {chartMode === 'native' ? (
-              <canvas
-                ref={canvasRef}
-                onMouseMove={handleCanvasMouseMove}
-                onMouseLeave={handleCanvasMouseLeave}
-                className="w-full h-full cursor-crosshair block"
-              />
-            ) : (
-              /* Isolated sandboxed iframe for TradingView - safe from cross-origin script error leaks */
-              <iframe
-                src={`https://s.tradingview.com/widgetembed/?frameElementId=tradingview_widget&symbol=${encodeURIComponent(
-                  customSymbol || selectedAsset.tvSymbol
-                )}&interval=${selectedInterval}&theme=${themeMode === 'dark' ? 'dark' : 'light'}&style=1&timezone=Etc%2FUTC&studies=%5B%22STD%3BEMA%22%2C%22%22STD%3BRSI%22%5D&locale=en`}
-                className="w-full h-full border-0"
-                title="TradingView Embedded Widget"
-                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-              />
-            )}
           </div>
         </div>
+      </div>
 
-        {/* Side Risk & Sizing Calculator */}
-        <div className="lg:col-span-4 xl:col-span-3 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6 flex flex-col justify-between overflow-y-auto space-y-6">
-          <div>
-            <div className="flex items-center gap-2.5 pb-4 border-b border-slate-300 dark:border-[#1a2030]">
-              <div className="p-2 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
-                <Calculator className="w-4 h-4" />
-              </div>
-              <div>
-                <h3 className="text-xs font-bold text-black dark:text-white tracking-wide">Position Size Engine</h3>
-                <p className="text-[11px] text-black dark:text-slate-400">Auto-calibrated to account equity</p>
-              </div>
+      {/* TRADINGVIEW-STYLE CUSTOMIZATION SETTINGS MODAL */}
+      {showSettingsModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-2xl p-6 shadow-2xl space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-[#1a2030]">
+              <h3 className="text-base font-bold text-black dark:text-white flex items-center gap-2">
+                <Settings2 className="w-4 h-4 text-blue-500" />
+                Chart Style & Indicator Settings
+              </h3>
+              <button onClick={() => setShowSettingsModal(false)} className="text-slate-400 hover:text-white cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="mt-4 space-y-4 text-xs">
-              {/* Account Equity Display */}
-              <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between shadow-xs">
-                <span className="text-black dark:text-slate-400 font-medium">Account Equity:</span>
-                <span className="font-mono font-bold text-black dark:text-white">
-                  ${currentEquity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                </span>
+            <div className="space-y-4 text-xs">
+              {/* Asia Box Opacity Slider */}
+              <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-black dark:text-white">Asia Shaded Box Opacity</span>
+                  <span className="font-mono font-bold text-blue-600">{Math.round(asiaOpacity * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.05"
+                  max="0.50"
+                  step="0.01"
+                  value={asiaOpacity}
+                  onChange={(e) => setAsiaOpacity(parseFloat(e.target.value))}
+                  className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                />
               </div>
 
-              {/* Dollar Risk per Trade */}
-              <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between shadow-xs">
-                <span className="text-black dark:text-slate-400 font-medium">Risk ({riskPerTradePct}%):</span>
-                <span className="font-mono font-bold text-blue-600 dark:text-blue-400">
-                  ${dollarRisk.toFixed(2)}
-                </span>
+              {/* Position Box R:R Ratio */}
+              <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-black dark:text-white">Risk-to-Reward Target (1 : R)</span>
+                  <span className="font-mono font-bold text-emerald-600">1 : {targetMultiplier.toFixed(1)}</span>
+                </div>
+                <input
+                  type="range"
+                  min="1.0"
+                  max="5.0"
+                  step="0.5"
+                  value={targetMultiplier}
+                  onChange={(e) => setTargetMultiplier(parseFloat(e.target.value))}
+                  className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-600"
+                />
               </div>
 
               {/* Stop Loss Distance */}
-              <div className="space-y-1.5">
-                <label className="text-black dark:text-slate-300 font-semibold block text-xs">
-                  Stop Loss Distance (Points / Pips):
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min="5"
-                    max="500"
-                    value={stopLossPips}
-                    onChange={(e) => setStopLossPips(Math.max(1, parseFloat(e.target.value) || 1))}
-                    className="w-full px-3 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-black dark:text-white text-xs focus:border-blue-500 focus:outline-none shadow-xs"
-                  />
-                  <span className="text-[11px] text-black dark:text-slate-400 shrink-0 font-mono">pts</span>
+              <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-black dark:text-white">Position Box Stop Loss Points</span>
+                  <span className="font-mono font-bold text-rose-600">{stopLossPips} pts</span>
                 </div>
-              </div>
-
-              {/* Recommended Lot Size Result Card */}
-              <div className="p-4 rounded-xl bg-blue-500/10 border border-blue-500/30 text-center space-y-1 shadow-xs">
-                <div className="text-[10px] uppercase font-bold text-blue-600 dark:text-blue-400 tracking-wider">
-                  Recommended Volume
-                </div>
-                <div className="text-3xl font-bold font-mono text-black dark:text-white tracking-tight">
-                  {calculatedLots} <span className="text-sm font-normal text-black dark:text-slate-400">Lots</span>
-                </div>
-                <div className="text-[11px] text-black dark:text-slate-400">
-                  Max Risk: <strong className="text-rose-600 dark:text-rose-400 font-mono">-${dollarRisk.toFixed(2)}</strong> ({riskPerTradePct}%)
-                </div>
-              </div>
-
-              {/* Quick Execution Buttons Simulation */}
-              <div className="grid grid-cols-2 gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => handleExecuteOrder('BUY')}
-                  className="py-3 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
-                >
-                  <TrendingUp className="w-3.5 h-3.5" />
-                  <span>BUY / LONG</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleExecuteOrder('SELL')}
-                  className="py-3 px-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
-                >
-                  <TrendingDown className="w-3.5 h-3.5" />
-                  <span>SELL / SHORT</span>
-                </button>
+                <input
+                  type="number"
+                  min="10"
+                  max="500"
+                  value={stopLossPips}
+                  onChange={(e) => setStopLossPips(Math.max(5, parseFloat(e.target.value) || 5))}
+                  className="w-full px-3 py-1.5 bg-white dark:bg-[#151922] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-black dark:text-white"
+                />
               </div>
             </div>
-          </div>
 
-          <div className="pt-4 border-t border-slate-300 dark:border-[#1a2030] text-[11px] text-black dark:text-slate-400 space-y-1.5">
-            <div className="flex justify-between">
-              <span>Feed Provider:</span>
-              <span className="text-black dark:text-slate-300 font-mono">WebSocket Bridge</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Execution Routing:</span>
-              <span className="text-emerald-700 dark:text-emerald-400 font-mono">STP/DMA Bridge</span>
+            <div className="pt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowSettingsModal(false)}
+                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition-colors cursor-pointer"
+              >
+                Done
+              </button>
             </div>
           </div>
         </div>
-      </motion.div>
+      )}
     </div>
   );
 };
