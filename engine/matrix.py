@@ -4,8 +4,20 @@
 NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (DERIV CLOUD WEBSOCKET EDITION)
 ================================================================================
 Architecture: Institutional Multi-Strategy Quantitative Execution Engine
-Components:   Modular Strategies, AI Overseer, Order Flow Profile,
-              Multi-Timeframe Volatility & Spread Gate Risk Management
+Components:   - Modular Strategies & Strategy Manager Integration
+              - Native Asynchronous Deriv Cloud WebSocket & REST API
+              - Gemini AI Overseer & Pre-Trade Prompt Verification
+              - Order Flow Analyzer (POC, VAH, VAL, Cumulative Volume Delta)
+              - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
+              - Range & Consolidation Detection Engine
+              - Live Bid/Ask Spread Gatekeeper & SL/TP Adjustment
+              - Dynamic Auto Lot Sizing (Risk % / SL Distance)
+              - UI Dynamic Limits Sync (Daily, Weekly, Monthly Ceilings, R:R)
+              - Macro News Blackout Gate (15m Pre/Post Red-Folder Release)
+              - Sector Correlation Exposure Limiter (Max 1 Index Trade)
+              - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
+              - Atomic Bracket Proposal Execution (No Naked Trades)
+              - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
 Deployment:   Headless Linux / Cloud VPS / Docker Container / Railway
 ================================================================================
 """
@@ -20,12 +32,12 @@ import asyncio
 import websockets
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-# Gemini AI SDK
+# Google Gemini Generative AI SDK
 try:
     import google.generativeai as genai
     GENAI_AVAILABLE = True
@@ -41,7 +53,7 @@ CONFIG_FILE = "bot_config.json"
 TELEMETRY_FILE = "bot_telemetry.json"
 
 # ==============================================================================
-# 1. TELEMETRY & UI CONFIGURATION HELPERS
+# 1. ADVANCED TELEMETRY & UI CONFIGURATION I/O HELPERS
 # ==============================================================================
 
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
@@ -133,7 +145,7 @@ def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", 
 log = setup_logger()
 
 # ==============================================================================
-# 3. GLOBAL CONSTANTS & ASSET CONFIGURATION
+# 3. GLOBAL CONSTANTS & ASSET CONFIGURATION (STRICT 7 ALLOWED ONLY)
 # ==============================================================================
 
 class DerivGranularity(Enum):
@@ -146,7 +158,7 @@ class DerivGranularity(Enum):
 
 @dataclass
 class AssetConfig:
-    symbol: str
+    symbol: str               # Deriv symbol identifier
     display_name: str
     pip_size: float
     point_value: float
@@ -356,7 +368,7 @@ class DerivCloudClient:
         tp_price: float
     ) -> Optional[Dict[str, Any]]:
         """
-        ATOMIC BRACKET EXECUTION: Attaches SL and TP into the proposal prior to purchase.
+        ATOMIC BRACKET EXECUTION: Bundles SL and TP bounds directly into the contract proposal.
         The trade enters the market fully protected at the exact millisecond of purchase.
         """
         if not await self.ensure_connected():
@@ -418,6 +430,23 @@ class DerivCloudClient:
         except Exception as e:
             log.error(f"Exception during Deriv order execution ({symbol}): {e}")
             return None
+
+    async def update_contract_stop_loss(self, contract_id: str, new_sl_pts: float) -> bool:
+        """Sends live order amendment to move Stop Loss to break-even."""
+        try:
+            async with self._lock:
+                req = {
+                    "contract_update": 1,
+                    "contract_id": int(contract_id),
+                    "limit_order": {"stop_loss": round(new_sl_pts, 2)},
+                    "req_id": self._get_next_req_id()
+                }
+                await self.ws.send(json.dumps(req))
+                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
+                return "error" not in res
+        except Exception as e:
+            log.error(f"Error moving SL to BE for contract {contract_id}: {e}")
+            return False
 
 # ==============================================================================
 # 5. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
@@ -551,13 +580,14 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 8. INSTITUTIONAL RISK MANAGEMENT ENGINE (MULTI-TF VOLATILITY & SPREAD GATE)
+# 8. INSTITUTIONAL RISK MANAGEMENT & VOLATILITY ENGINE
 # ==============================================================================
 
-class RiskManager:
+class InstitutionalRiskEngine:
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config_file = config_file
         self.master_execution: bool = True
+        self.dry_run: bool = False
         self.risk_per_trade_pct: float = 1.0
         self.risk_to_reward: float = 2.0
         self.max_daily_trades: int = 4
@@ -570,6 +600,7 @@ class RiskManager:
         self.current_daily_loss: float = 0.0
         self.current_weekly_loss: float = 0.0
         self.current_monthly_loss: float = 0.0
+        self.open_positions: Dict[str, dict] = {}
 
         # Spread Gate Thresholds
         self.max_spread_to_sl_ratio: float = 0.15
@@ -583,18 +614,67 @@ class RiskManager:
             "frxGBPUSD": 0.00035
         }
 
+        # Sector Correlation Grouping (Max 1 open position per sector)
+        self.SECTOR_MAP = {
+            "US30": "EQUITY_INDEX",
+            "NAS100": "EQUITY_INDEX",
+            "GERMAN30": "EQUITY_INDEX",
+            "frxXAUUSD": "PRECIOUS_METAL",
+            "GOLD": "PRECIOUS_METAL",
+            "frxEURUSD": "FOREX_MAJORS",
+            "frxGBPUSD": "FOREX_MAJORS",
+            "frxUSDJPY": "FOREX_MAJORS"
+        }
+
+        # High-Impact Macro Schedule (UTC times: 15m blackout before & after)
+        self.MACRO_BLACKOUT_WINDOWS = [
+            (dtime(12, 15), dtime(13, 15)),
+            (dtime(17, 45), dtime(19, 45)),
+            (dtime(5, 45), dtime(6, 15))
+        ]
+
     def sync_ui_config(self) -> None:
         """Dynamically syncs user interface controls from bot_config.json."""
         cfg = read_ui_config()
         if not cfg:
             return
         self.master_execution = cfg.get("masterExecution", self.master_execution)
+        self.dry_run = cfg.get("dryRun", self.dry_run)
         self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
         self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
         self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
         self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
         self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
+
+    def is_macro_news_blackout(self) -> Tuple[bool, str]:
+        now_utc = datetime.now(timezone.utc).time()
+        for start, end in self.MACRO_BLACKOUT_WINDOWS:
+            if start <= now_utc <= end:
+                return True, f"High-Impact Macro Event window active ({start.strftime('%H:%M')} - {end.strftime('%H:%M')} UTC). Trading paused."
+        return False, ""
+
+    def check_sector_exposure(self, symbol: str) -> Tuple[bool, str]:
+        sector = self.SECTOR_MAP.get(symbol, "OTHER")
+        for ticket, pos in self.open_positions.items():
+            open_sym = pos.get("symbol", "")
+            if self.SECTOR_MAP.get(open_sym) == sector:
+                return False, f"Sector limit reached: An open trade already exists in {sector} ({open_sym})."
+        return True, ""
+
+    def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
+        """Returns True if price has reached 80% of the distance from entry to Take Profit."""
+        total_target_distance = abs(tp - entry)
+        if total_target_distance <= 0:
+            return False
+
+        if direction.upper() == "BUY":
+            current_progress = current_price - entry
+        else:
+            current_progress = entry - current_price
+
+        progress_ratio = current_progress / total_target_distance
+        return progress_ratio >= 0.80
 
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
@@ -613,9 +693,7 @@ class RiskManager:
         d1_avg = get_atr(d1_df, 14)
 
         is_ranging = False
-        range_high = 0.0
-        range_low = 0.0
-        range_span = 0.0
+        range_high, range_low, range_span = 0.0, 0.0, 0.0
 
         if m5_df is not None and len(m5_df) >= 20:
             recent_20 = m5_df.tail(20)
@@ -638,15 +716,13 @@ class RiskManager:
     def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
         """Spread Gatekeeper: Checks if bid-ask spread is acceptable."""
         spread = abs(current_ask - current_bid)
-        max_allowed_spread = self.max_absolute_spread.get(symbol, 5.0)
+        max_allowed = self.max_absolute_spread.get(symbol, 5.0)
         
-        if spread > max_allowed_spread:
-            return False, f"Spread ({spread:.4f}) exceeds threshold ({max_allowed_spread:.4f})", spread
+        if spread > max_allowed:
+            return False, f"Spread ({spread:.4f}) exceeds threshold ({max_allowed:.4f})", spread
 
-        if sl_distance > 0:
-            ratio = spread / sl_distance
-            if ratio > self.max_spread_to_sl_ratio:
-                return False, f"Spread is {ratio*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
+        if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
+            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
 
         return True, "Spread optimal", spread
 
@@ -678,11 +754,19 @@ class RiskManager:
         min_stake: float,
         max_stake: float
     ) -> Tuple[bool, str, dict]:
-        """Pre-trade verification checking loss limits, spread, and lot sizing."""
+        """Pre-trade verification checking loss limits, spread, news, and lot sizing."""
         self.sync_ui_config()
 
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
+
+        in_blackout, news_msg = self.is_macro_news_blackout()
+        if in_blackout:
+            return False, news_msg, {}
+
+        sector_ok, sector_msg = self.check_sector_exposure(symbol)
+        if not sector_ok:
+            return False, sector_msg, {}
 
         if self.current_daily_loss >= self.max_daily_loss_usd:
             return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
@@ -700,21 +784,16 @@ class RiskManager:
         if sl_distance <= 0:
             return False, "Invalid Stop Loss distance", {}
 
-        # Default Take Profit to UI R:R if not set
         final_tp = take_profit
         if final_tp is None or final_tp == 0:
             target_distance = sl_distance * self.risk_to_reward
             final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
 
-        # Spread Gate Verification
         spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
         if not spread_ok:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
 
-        # Spread buffer on Stop Loss
         adjusted_sl = (stop_loss - spread_pts) if direction.upper() == "BUY" else (stop_loss + spread_pts)
-
-        # Dynamic Auto Position Sizing
         stake = self.calculate_lot_size(current_equity, sl_distance, point_value, min_stake, max_stake)
         if stake <= 0:
             return False, "Calculated stake is 0", {}
@@ -727,9 +806,13 @@ class RiskManager:
             "stop_loss": round(adjusted_sl, 4),
             "take_profit": round(final_tp, 4),
             "spread_points": round(spread_pts, 4),
-            "risk_dollars": round(current_equity * (self.risk_per_trade_pct / 100.0), 2)
+            "is_dry_run": self.dry_run
         }
         return True, "Approved", blueprint
+
+# Backwards compatibility alias
+RiskState = InstitutionalRiskEngine
+RiskManager = InstitutionalRiskEngine
 
 # ==============================================================================
 # 9. MARKET DATA PIPELINE & MULTI-TIMEFRAME MATRIX
@@ -778,7 +861,66 @@ class MultiTimeframeMatrix:
         await asyncio.gather(*tasks)
 
 # ==============================================================================
-# 10. AI OVERSEER (GOOGLE GEMINI FLASH MODEL)
+# 10. PRESERVED ORIGINAL STRATEGY SETUPS & EVALUATOR MATRIX
+# ==============================================================================
+
+class SetupType(Enum):
+    LIQUIDITY_SWEEP_REVERSAL = "SETUP_1_LIQUIDITY_SWEEP"
+    ORDER_BLOCK_MITIGATION = "SETUP_2_ORDER_BLOCK"
+    FAIR_VALUE_GAP_FILL = "SETUP_3_FVG_REFILL"
+    VOLUME_PROFILE_POC_BOUNCE = "SETUP_4_POC_BOUNCE"
+    DYNAMIC_TREND_CONTINUATION = "SETUP_5_TREND_CONTINUATION"
+    VOLATILITY_EXPANSION_BREAKOUT = "SETUP_6_VOL_EXPANSION"
+    MEAN_REVERSION_EXTREME = "SETUP_7_MEAN_REVERSION"
+    OPENING_RANGE_SWEEP = "SETUP_8_ORB_SWEEP"
+    GRUBBER_KICK = "SETUP_9_GRUBBER_KICK"
+
+@dataclass
+class TradeSignal:
+    symbol: str
+    direction: str
+    setup_type: SetupType
+    entry_price: float
+    sl: float
+    tp1: float
+    tp2: float
+    confidence_score: float
+    reasoning: str
+
+class StrategyEvaluator:
+    @staticmethod
+    def evaluate_symbol(symbol: str, tf_data: Dict[str, pd.DataFrame], vp: Optional[VolumeProfileNode]) -> Optional[TradeSignal]:
+        m5 = tf_data.get("M5")
+        h1 = tf_data.get("H1")
+        if m5 is None or h1 is None or m5.empty or h1.empty:
+            return None
+
+        last_m5 = m5.iloc[-1]
+        prev_m5 = m5.iloc[-2]
+        last_h1 = h1.iloc[-1]
+        
+        current_price = float(last_m5['close'])
+        atr = float(last_m5['atr']) if 'atr' in last_m5 and not np.isnan(last_m5['atr']) else current_price * 0.005
+
+        h1_high = h1['high'].tail(20).max()
+        h1_low = h1['low'].tail(20).min()
+
+        if prev_m5['low'] < h1_low and last_m5['close'] > h1_low and last_m5.get('rsi', 50) < 35:
+            sl = current_price - (1.5 * atr)
+            tp1 = current_price + (2.0 * atr)
+            tp2 = current_price + (4.0 * atr)
+            return TradeSignal(symbol, "BUY", SetupType.LIQUIDITY_SWEEP_REVERSAL, current_price, sl, tp1, tp2, 0.85, f"Bullish sweep of H1 low ({h1_low:.2f})")
+
+        if prev_m5['high'] > h1_high and last_m5['close'] < h1_high and last_m5.get('rsi', 50) > 65:
+            sl = current_price + (1.5 * atr)
+            tp1 = current_price - (2.0 * atr)
+            tp2 = current_price - (4.0 * atr)
+            return TradeSignal(symbol, "SELL", SetupType.LIQUIDITY_SWEEP_REVERSAL, current_price, sl, tp1, tp2, 0.85, f"Bearish sweep of H1 high ({h1_high:.2f})")
+
+        return None
+
+# ==============================================================================
+# 11. AI OVERSEER & CLOUD EXECUTION ENGINE
 # ==============================================================================
 
 class AIOverseer:
@@ -790,64 +932,58 @@ class AIOverseer:
             log.info("Gemini AI Overseer initialized successfully.")
         else:
             self.model = None
-            log.warning("GEMINI_API_KEY not found or SDK unavailable. Auto-approving trades.")
 
-    async def validate_trade(self, signal: StrategySignal, current_balance: float, spread_pts: float) -> bool:
+    async def validate_trade(self, signal: Any, current_balance: float, spread_pts: float) -> bool:
         if not self.model:
             return True
 
-        prompt = (
-            f"You are an institutional quantitative risk manager evaluating an algorithmic trade signal.\n"
-            f"Asset: {signal.symbol}\n"
-            f"Strategy Name: {signal.strategy}\n"
-            f"Direction: {signal.direction}\n"
-            f"Entry Price: {signal.entry_price}\n"
-            f"Stop Loss: {signal.stop_loss}\n"
-            f"Take Profit: {signal.take_profit}\n"
-            f"Spread: {spread_pts} points\n"
-            f"Algorithmic Trigger Reasoning: {signal.reason}\n"
-            f"Account Balance: ${current_balance:.2f} USD\n\n"
-            f"Reply strictly with 'APPROVED' if the setup aligns with sound risk management, "
-            f"or 'REJECTED' if it appears unfavorable."
-        )
+        direction = getattr(signal, 'direction', 'BUY')
+        symbol = getattr(signal, 'symbol', 'UNKNOWN')
+        strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
+        entry = getattr(signal, 'entry_price', 0.0)
+        sl = getattr(signal, 'stop_loss', getattr(signal, 'sl', 0.0))
+        tp = getattr(signal, 'take_profit', getattr(signal, 'tp1', 0.0))
+        reason = getattr(signal, 'reason', getattr(signal, 'reasoning', ''))
 
+        prompt = (
+            f"You are a quant risk manager. Validate: {direction} {symbol} | Strategy: {strategy_name} | "
+            f"Entry: {entry} | SL: {sl} | TP: {tp} | Spread: {spread_pts} pts | "
+            f"Reason: {reason} | Balance: ${current_balance:.2f}. Reply ONLY 'APPROVED' or 'REJECTED'."
+        )
         try:
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
-            verdict = response.text.strip().upper()
-            if "APPROVED" in verdict:
-                log.info(f"AI OVERSEER: APPROVED trade for {signal.symbol} [{signal.strategy}].")
-                return True
-            else:
-                log.warning(f"AI OVERSEER: REJECTED trade for {signal.symbol}. Verdict: {verdict}")
-                return False
-        except Exception as e:
-            log.error(f"AI Overseer API Error: {e}. Defaulting to safe execution.")
+            res = await asyncio.to_thread(self.model.generate_content, prompt)
+            return "APPROVED" in res.text.strip().upper()
+        except Exception:
             return True
 
-# ==============================================================================
-# 11. CLOUD EXECUTION ENGINE
-# ==============================================================================
-
 class CloudExecutionEngine:
-    def __init__(self, deriv_client: DerivCloudClient, risk_mgr: RiskManager):
+    def __init__(self, deriv_client: DerivCloudClient, risk_mgr: InstitutionalRiskEngine):
         self.deriv = deriv_client
         self.risk = risk_mgr
         self.ai_overseer = AIOverseer()
 
-    async def process_signal(self, signal: StrategySignal, current_balance: float) -> bool:
-        quote, bid, ask = await self.deriv.get_live_quote(signal.symbol)
-        asset_cfg = ConfigManager.ASSETS.get(signal.symbol)
+    async def process_signal(self, signal: Any, current_balance: float) -> bool:
+        symbol = getattr(signal, 'symbol')
+        direction = getattr(signal, 'direction')
+        entry = getattr(signal, 'entry_price')
+        sl = getattr(signal, 'stop_loss', getattr(signal, 'sl'))
+        tp = getattr(signal, 'take_profit', getattr(signal, 'tp1', None))
+        strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
+        if isinstance(strategy_name, Enum):
+            strategy_name = strategy_name.value
+
+        quote, bid, ask = await self.deriv.get_live_quote(symbol)
+        asset_cfg = ConfigManager.ASSETS.get(symbol)
         pt_val = asset_cfg.point_value if asset_cfg else 1.0
         min_stk = asset_cfg.min_stake if asset_cfg else 1.0
         max_stk = asset_cfg.max_stake if asset_cfg else 1000.0
 
-        # 1. Risk Manager Pre-Trade Gate
-        is_ok, reason, blueprint = self.risk.validate_pre_trade(
-            symbol=signal.symbol,
-            direction=signal.direction,
-            entry_price=signal.entry_price,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+        is_ok, reason, bp = self.risk.validate_pre_trade(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit=tp,
             current_bid=bid,
             current_ask=ask,
             current_equity=current_balance,
@@ -857,39 +993,43 @@ class CloudExecutionEngine:
         )
 
         if not is_ok:
-            log.warning(f"ORDER REJECTED BY RISK GATE: {reason}")
+            log.warning(f"ORDER BLOCKED BY RISK GATE: {reason}")
             return False
 
-        # 2. AI Overseer Review
-        ai_approved = await self.ai_overseer.validate_trade(signal, current_balance, blueprint.get("spread_points", 0.0))
-        if not ai_approved:
+        if not await self.ai_overseer.validate_trade(signal, current_balance, bp.get("spread_points", 0.0)):
             return False
 
-        # 3. Atomic Bracket Execution (SL and TP embedded)
-        log.info(
-            f"DISPATCHING ATOMIC ORDER | {blueprint['direction']} {blueprint['symbol']} | "
-            f"Strategy: {signal.strategy} | Stake: ${blueprint['stake']} | "
-            f"SL: {blueprint['stop_loss']} | TP: {blueprint['take_profit']}"
-        )
+        if bp.get("is_dry_run"):
+            log.info(f"[SIMULATOR DRY-RUN] Approved: {bp['direction']} {bp['symbol']} | Strategy: {strategy_name} | Stake: ${bp['stake']}")
+            return True
 
         result = await self.deriv.execute_atomic_order(
-            symbol=blueprint['symbol'],
-            direction=blueprint['direction'],
-            stake=blueprint['stake'],
-            entry_price=blueprint['entry_price'],
-            sl_price=blueprint['stop_loss'],
-            tp_price=blueprint['take_profit']
+            symbol=bp['symbol'],
+            direction=bp['direction'],
+            stake=bp['stake'],
+            entry_price=bp['entry_price'],
+            sl_price=bp['stop_loss'],
+            tp_price=bp['take_profit']
         )
 
         if result:
+            cid = str(result.get('contract_id'))
             self.risk.trades_taken_today += 1
-            log.info(f"SUCCESS: Bracket trade filled on Deriv Cloud. Contract ID: {result.get('contract_id')}")
+            self.risk.open_positions[cid] = {
+                "symbol": bp['symbol'],
+                "direction": bp['direction'],
+                "entry_price": bp['entry_price'],
+                "stop_loss": bp['stop_loss'],
+                "take_profit": bp['take_profit'],
+                "is_be_moved": False
+            }
+            log.info(f"SUCCESS: Bracket trade filled on Deriv. Contract ID: {cid} | Active 80% R:R Position Supervisor.")
             return True
 
         return False
 
 # ==============================================================================
-# 12. MASTER SYSTEM ORCHESTRATOR & EVENT LOOP
+# 12. MASTER SYSTEM ORCHESTRATOR & CONCURRENT EVENT LOOPS
 # ==============================================================================
 
 class MatrixEngineMaster:
@@ -897,32 +1037,58 @@ class MatrixEngineMaster:
         self.deriv_client = DerivCloudClient()
         self.matrix = MultiTimeframeMatrix(self.deriv_client)
         self.strategy_mgr = StrategyManager()
-        self.risk_mgr = RiskManager()
+        self.risk_mgr = InstitutionalRiskEngine()
         self.execution_engine: Optional[CloudExecutionEngine] = None
 
     async def start(self) -> None:
         log.info("Starting Nexus Matrix Trading Engine (Deriv Cloud Edition)...")
-        connected = await self.deriv_client.connect()
-        if not connected:
+        if not await self.deriv_client.connect():
             log.critical("Failed to connect to Deriv Cloud. Exiting.")
             return
 
         balance = await self.deriv_client.get_balance()
         self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_mgr)
         log.info(f"SYSTEM READY. Initial Account Balance: ${balance:.2f} USD")
-        await self._main_loop()
+        
+        # Concurrently execute market scanning loop and in-flight position supervisor loop
+        await asyncio.gather(
+            self._market_scan_loop(),
+            self._position_supervisor_loop()
+        )
 
-    async def _main_loop(self) -> None:
+    async def _position_supervisor_loop(self) -> None:
+        """In-Flight Position Supervisor: Evaluates live progress and shifts SL to Break-Even at 80% R:R."""
+        while True:
+            try:
+                for cid, pos in list(self.risk_mgr.open_positions.items()):
+                    if pos.get("is_be_moved"):
+                        continue
+                    sym = pos["symbol"]
+                    quote, _, _ = await self.deriv_client.get_live_quote(sym)
+                    if quote <= 0:
+                        continue
+
+                    if self.risk_mgr.check_breakeven_trigger(pos["entry_price"], pos["stop_loss"], pos["take_profit"], quote, pos["direction"]):
+                        log.info(f"80% R:R TARGET HIT ON {sym} (Contract #{cid})! Moving Stop Loss to Break-Even.")
+                        success = await self.deriv_client.update_contract_stop_loss(cid, new_sl_pts=0.01)
+                        if success:
+                            pos["is_be_moved"] = True
+                            log.info(f"CONTRACT #{cid} IS NOW FULLY RISK-FREE AT BREAK-EVEN.")
+
+                await asyncio.sleep(3.0)
+            except Exception as e:
+                log.error(f"Error in Position Supervisor: {e}")
+                await asyncio.sleep(5.0)
+
+    async def _market_scan_loop(self) -> None:
         while True:
             try:
                 start_time = time.time()
                 current_balance = await self.deriv_client.get_balance()
                 self.risk_mgr.sync_ui_config()
 
-                # Sync all multi-timeframe candles (M1, M5, M15, H1, H4, D1)
                 await self.matrix.sync_all_assets()
-
-                last_signal: Optional[StrategySignal] = None
+                last_signal: Optional[Any] = None
 
                 for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
                     tf_data = self.matrix.matrix.get(deriv_symbol, {})
@@ -934,57 +1100,54 @@ class MatrixEngineMaster:
                     if m5_df is None or m5_df.empty:
                         continue
 
-                    # Multi-Timeframe Volatility & Range Metrics
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
-
-                    # Extract session high/low & pivots for the strategies
-                    h1_high = float(h1_df['high'].tail(24).max()) if h1_df is not None and not h1_df.empty else float(m5_df['high'].max())
-                    h1_low = float(h1_df['low'].tail(24).min()) if h1_df is not None and not h1_df.empty else float(m5_df['low'].min())
+                    recent_high = float(h1_df['high'].tail(24).max()) if h1_df is not None and not h1_df.empty else float(m5_df['high'].max())
+                    recent_low = float(h1_df['low'].tail(24).min()) if h1_df is not None and not h1_df.empty else float(m5_df['low'].min())
                     latest_close = float(m5_df.iloc[-1]['close'])
 
                     session_levels = {
-                        "asia_high": h1_high,
-                        "asia_low": h1_low,
-                        "daily_eq": (h1_high + h1_low) / 2.0,
-                        "pdh": h1_high,
-                        "pdl": h1_low,
-                        "daily_pivot": (h1_high + h1_low + latest_close) / 3.0,
-                        "pivot_r1": (2.0 * ((h1_high + h1_low + latest_close) / 3.0)) - h1_low,
-                        "pivot_s1": (2.0 * ((h1_high + h1_low + latest_close) / 3.0)) - h1_high,
+                        "asia_high": recent_high,
+                        "asia_low": recent_low,
+                        "daily_eq": (recent_high + recent_low) / 2.0,
+                        "pdh": recent_high,
+                        "pdl": recent_low,
+                        "daily_pivot": (recent_high + recent_low + latest_close) / 3.0,
+                        "pivot_r1": (2.0 * ((recent_high + recent_low + latest_close) / 3.0)) - recent_low,
+                        "pivot_s1": (2.0 * ((recent_high + recent_low + latest_close) / 3.0)) - recent_high,
                         "orb_high": float(m5_df['high'].tail(3).max()),
                         "orb_low": float(m5_df['low'].tail(3).min()),
                         "is_ranging": candle_stats["is_ranging"],
                         "range_span": candle_stats["range_span"],
-                        "m5_avg": candle_stats["m5_candle_avg"],
-                        "h4_avg": candle_stats["h4_candle_avg"],
-                        "d1_avg": candle_stats["d1_candle_avg"],
                     }
 
-                    # Evaluate across modular strategies
+                    # 1. Primary Evaluation via Modular Strategy Manager
                     signal = self.strategy_mgr.evaluate_all(friendly_name, m5_df, session_levels)
 
+                    # 2. Secondary Fallback via Core Evaluator
+                    if not signal:
+                        vp = self.matrix.volume_profiles.get(deriv_symbol)
+                        signal = StrategyEvaluator.evaluate_symbol(deriv_symbol, tf_data, vp)
+
                     if signal:
-                        log.info(f"STRATEGY TRIGGERED: [{signal.strategy}] on {signal.symbol} ({signal.direction}) | {signal.reason}")
-                        # Remap to Deriv trading symbol
+                        last_signal = signal
                         signal.symbol = ConfigManager.SYMBOL_MAP.get(signal.symbol, signal.symbol)
                         await self.execution_engine.process_signal(signal, current_balance)
-                        last_signal = signal
 
-                # Push telemetry to server.ts and write to bot_telemetry.json
                 regime_status = "ACTIVE" if self.risk_mgr.master_execution else "HALTED"
-                active_setup_str = last_signal.strategy if last_signal else "NONE"
-                verdict_str = last_signal.reason if last_signal else "Monitoring spreads, volatility ranges, and 7 assets."
+                active_setup_str = getattr(last_signal, 'strategy', getattr(last_signal, 'setup_type', 'NONE')) if last_signal else "NONE"
+                if isinstance(active_setup_str, Enum):
+                    active_setup_str = active_setup_str.value
+                verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Institutional risk gate active."
 
                 emit_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
                 write_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
 
                 elapsed = time.time() - start_time
                 await asyncio.sleep(max(1.0, 10.0 - elapsed))
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.error(f"Error in main event loop: {e}", exc_info=True)
+                log.error(f"Scan loop error: {e}")
                 await asyncio.sleep(5)
 
 # ==============================================================================
@@ -992,12 +1155,11 @@ class MatrixEngineMaster:
 # ==============================================================================
 
 def start_bot() -> None:
-    log.info("Starting Nexus Matrix Trading Engine (Deriv Cloud Edition)...")
     master = MatrixEngineMaster()
     try:
         asyncio.run(master.start())
     except KeyboardInterrupt:
-        log.info("Shutdown signal received. Terminating Nexus Matrix Engine.")
+        log.info("Shutdown signal received. Stopping Nexus Matrix Engine.")
 
 if __name__ == "__main__":
     start_bot()

@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import WebSocket from 'ws';
+import { spawn } from 'child_process'; // <-- ADD THIS LINE
 
 // In-memory shared state between web dashboard, trading bot, and broker
 interface BotGatewayConfig {
@@ -752,6 +753,43 @@ app.post('/api/bot/config', (req, res) => {
     console.log(`🚀 Trading Portal & API Gateway active on port ${PORT}`);
   });
 }
+// =========================================================================
+  // AUTOMATIC PYTHON BOT SPAWN & LIFECYCLE MONITOR
+  // =========================================================================
+  function launchPythonBot() {
+    console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const bot = spawn(pythonCmd, ['engine/matrix.py'], {
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    bot.stdout.on('data', (chunk) => {
+      const line = chunk.toString().trim();
+      if (line.includes('[MATRIX_TELEMETRY]')) {
+        try {
+          const jsonStr = line.split('[MATRIX_TELEMETRY]')[1].trim();
+          const telem = JSON.parse(jsonStr);
+          activeBrokerTelemetry.balance = telem.balance;
+          activeBrokerTelemetry.equity = telem.equity;
+          activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
+        } catch {}
+      }
+      console.log(`[Python Engine] ${line}`);
+    });
+
+    bot.stderr.on('data', (chunk) => {
+      console.error(`[Python Engine Error] ${chunk.toString().trim()}`);
+    });
+
+    bot.on('exit', (code) => {
+      console.warn(`⚠️ Python Bot process exited with code ${code}. Restarting in 5s...`);
+      setTimeout(launchPythonBot, 5000);
+    });
+  }
+
+  // Launch the Python engine automatically alongside the server
+  launchPythonBot();
 
 startServer().catch((err) => {
   console.error('Server startup error:', err);

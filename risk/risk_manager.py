@@ -8,8 +8,8 @@ import json
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
-from typing import Dict, Tuple, Optional
+from datetime import datetime, timezone, timedelta, time
+from typing import Dict, Tuple, Optional, Set
 
 log = logging.getLogger("RiskManager")
 
@@ -17,8 +17,9 @@ class RiskManager:
     def __init__(self, config_file: str = "bot_config.json"):
         self.config_file = config_file
         
-        # Default fallback limits (overwritten dynamically by bot_config.json from UI)
+        # UI Synced Controls
         self.master_execution: bool = True
+        self.dry_run: bool = False                 # Dry-run simulator mode
         self.risk_per_trade_pct: float = 1.0       # 1.0% risk per trade
         self.risk_to_reward: float = 2.0           # 1 : 2 default target
         self.max_daily_trades: int = 4
@@ -32,60 +33,104 @@ class RiskManager:
         self.current_daily_loss: float = 0.0
         self.current_weekly_loss: float = 0.0
         self.current_monthly_loss: float = 0.0
-        self.last_reset_day: int = datetime.now(timezone.utc).day
+        self.open_positions: Dict[str, dict] = {}   # ticket -> position info
 
-        # Maximum spread allowed as percentage of the trade's Stop Loss distance
-        # e.g., If stop loss is 40 points, spread cannot exceed 15% (6 points)
+        # Spread Gate Thresholds
         self.max_spread_to_sl_ratio: float = 0.15
-
-        # Asset-specific spread absolute caps (in points/pips)
         self.max_absolute_spread = {
-            "frxXAUUSD": 0.50,   # Gold: max $0.50 spread
-            "US30": 4.5,         # US30: max 4.5 points
-            "NAS100": 2.5,       # Nasdaq: max 2.5 points
-            "GERMAN30": 3.0,     # DAX: max 3.0 points
-            "frxEURUSD": 0.0003, # EUR/USD: max 3 pips
-            "frxUSDJPY": 0.035,  # USD/JPY: max 3.5 pips
-            "frxGBPUSD": 0.00035 # GBP/USD: max 3.5 pips
+            "frxXAUUSD": 0.50,
+            "US30": 4.5,
+            "NAS100": 2.5,
+            "GERMAN30": 3.0,
+            "frxEURUSD": 0.0003,
+            "frxUSDJPY": 0.035,
+            "frxGBPUSD": 0.00035
         }
 
+        # Sector Correlation Grouping (Max 1 open position per sector)
+        self.SECTOR_MAP = {
+            "US30": "EQUITY_INDEX",
+            "NAS100": "EQUITY_INDEX",
+            "GERMAN30": "EQUITY_INDEX",
+            "frxXAUUSD": "PRECIOUS_METAL",
+            "GOLD": "PRECIOUS_METAL",
+            "frxEURUSD": "FOREX_MAJORS",
+            "frxGBPUSD": "FOREX_MAJORS",
+            "frxUSDJPY": "FOREX_MAJORS"
+        }
+
+        # High-Impact Macro Schedule (UTC times: 15m blackout before & after)
+        self.MACRO_BLACKOUT_WINDOWS = [
+            # NFP / US CPI / Retail Sales recurring windows (12:30 - 13:00 UTC)
+            (time(12, 15), time(13, 15)),
+            # FOMC Rate Decision & Presser (18:00 - 19:30 UTC)
+            (time(17, 45), time(19, 45)),
+            # London Session Open Liquidity Rush (05:45 - 06:15 UTC)
+            (time(5, 45), time(6, 15))
+        ]
+
     # =========================================================================
-    # 1. READ UI CONTROLS IN REAL TIME (FROM YOUR DASHBOARD SLIDERS)
+    # 1. READ UI CONTROLS IN REAL TIME
     # =========================================================================
     def sync_ui_config(self) -> None:
-        """Reads dynamic settings pushed by the React UI into bot_config.json."""
         if not os.path.exists(self.config_file):
             return
-
         try:
             with open(self.config_file, "r") as f:
                 cfg = json.load(f)
-
             self.master_execution = cfg.get("masterExecution", self.master_execution)
+            self.dry_run = cfg.get("dryRun", self.dry_run)
             self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
             self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
             self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
-            
-            # Loss ceilings set on Advanced Limits screen
             self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
             self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
             self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
-
         except Exception as e:
-            log.warning(f"Could not parse {self.config_file}: {e}")
+            log.warning(f"Error parsing {self.config_file}: {e}")
 
     # =========================================================================
-    # 2. CANDLE AVERAGE SIZES & RANGE DETECTION (M5, H4, D1)
+    # 2. MACRO NEWS & SECTOR CORRELATION GATES
+    # =========================================================================
+    def is_macro_news_blackout(self) -> Tuple[bool, str]:
+        now_utc = datetime.now(timezone.utc).time()
+        for start, end in self.MACRO_BLACKOUT_WINDOWS:
+            if start <= now_utc <= end:
+                return True, f"High-Impact Macro Event window active ({start.strftime('%H:%M')} - {end.strftime('%H:%M')} UTC). Trading paused."
+        return False, ""
+
+    def check_sector_exposure(self, symbol: str) -> Tuple[bool, str]:
+        sector = self.SECTOR_MAP.get(symbol, "OTHER")
+        for ticket, pos in self.open_positions.items():
+            open_sym = pos.get("symbol", "")
+            if self.SECTOR_MAP.get(open_sym) == sector:
+                return False, f"Sector limit reached: An open trade already exists in {sector} ({open_sym})."
+        return True, ""
+
+    # =========================================================================
+    # 3. 80% R:R BREAK-EVEN POSITION SUPERVISOR
+    # =========================================================================
+    def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
+        """
+        Returns True if price has reached 80% of the distance from entry to Take Profit.
+        """
+        total_target_distance = abs(tp - entry)
+        if total_target_distance <= 0:
+            return False
+
+        if direction.upper() == "BUY":
+            current_progress = current_price - entry
+        else:
+            current_progress = entry - current_price
+
+        progress_ratio = current_progress / total_target_distance
+        return progress_ratio >= 0.80
+
+    # =========================================================================
+    # 4. MULTI-TF CANDLE SIZES & RANGE DETECTION
     # =========================================================================
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
-        """
-        Calculates:
-          - Average 5-Minute candle size (M5 ATR)
-          - Average 4-Hourly candle size (H4 ATR)
-          - Average Daily candle size (D1 ATR)
-          - Range bounds and whether market is consolidating
-        """
         def get_atr(df: pd.DataFrame, period: int = 14) -> float:
             if df is None or df.empty or len(df) < 2:
                 return 0.0
@@ -99,19 +144,14 @@ class RiskManager:
         h4_avg = get_atr(h4_df, 14)
         d1_avg = get_atr(d1_df, 14)
 
-        # Range detection: Analyze high-low span over recent 20 periods on M5
         is_ranging = False
-        range_high = 0.0
-        range_low = 0.0
-        range_span = 0.0
+        range_high, range_low, range_span = 0.0, 0.0, 0.0
 
         if m5_df is not None and len(m5_df) >= 20:
             recent_20 = m5_df.tail(20)
             range_high = float(recent_20['high'].max())
             range_low = float(recent_20['low'].min())
             range_span = range_high - range_low
-            
-            # If the entire 20-candle span is smaller than 2.5x the average M5 candle, price is in consolidation
             if m5_avg > 0 and range_span < (m5_avg * 2.5):
                 is_ranging = True
 
@@ -126,58 +166,35 @@ class RiskManager:
         }
 
     # =========================================================================
-    # 3. SPREAD GATEKEEPER & SL/TP SPREAD ADJUSTMENT
+    # 5. SPREAD GATE & AUTO LOT SIZING
     # =========================================================================
     def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
-        """
-        Calculates spread in points and verifies if it is within institutional limits.
-        Returns: (is_allowed, reason, spread_points)
-        """
         spread = abs(current_ask - current_bid)
+        max_allowed = self.max_absolute_spread.get(symbol, 5.0)
         
-        # Check against absolute asset maximum limit
-        max_allowed_spread = self.max_absolute_spread.get(symbol, 5.0)
-        if spread > max_allowed_spread:
-            return False, f"Spread ({spread:.4f}) exceeds asset max threshold ({max_allowed_spread:.4f})", spread
+        if spread > max_allowed:
+            return False, f"Spread ({spread:.4f}) exceeds threshold ({max_allowed:.4f})", spread
 
-        # Check against Stop Loss ratio (spread cannot consume more than 15% of your SL)
-        if sl_distance > 0:
-            spread_ratio = spread / sl_distance
-            if spread_ratio > self.max_spread_to_sl_ratio:
-                return False, f"Spread is {spread_ratio*100:.1f}% of SL distance (Max allowed is {self.max_spread_to_sl_ratio*100:.0f}%)", spread
+        if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
+            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
 
-        return True, "Spread is optimal", spread
+        return True, "Spread optimal", spread
 
-    # =========================================================================
-    # 4. AUTO POSITION / LOT SIZING FORMULA
-    # =========================================================================
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        """
-        Dynamically sizes the trade based on account equity and exact stop loss distance:
-        Risk $ = Account Equity * (Risk % / 100)
-        Stake = Risk $ / (SL distance * point_value)
-        """
         if current_equity <= 0 or sl_distance <= 0:
             return 0.0
 
-        # Enforce consecutive loss protection:
-        # If the bot loses 3 trades in a row, temporarily reduce risk by 50%
-        active_risk_pct = self.risk_per_trade_pct
+        active_risk = self.risk_per_trade_pct
         if self.consecutive_losses >= 3:
-            active_risk_pct = self.risk_per_trade_pct * 0.5
-            log.info(f"CONSECUTIVE LOSS PROTECTION: Risk reduced from {self.risk_per_trade_pct}% to {active_risk_pct:.2f}%")
+            active_risk = self.risk_per_trade_pct * 0.5
+            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk:.2f}%")
 
-        risk_dollars = current_equity * (active_risk_pct / 100.0)
-
-        # Calculate position size directly linked to stop-loss distance
+        risk_dollars = current_equity * (active_risk / 100.0)
         calculated_stake = risk_dollars / (sl_distance * point_value)
-        
-        # Bound within broker parameters
-        final_stake = max(min(calculated_stake, max_stake), min_stake)
-        return round(final_stake, 2)
+        return round(max(min(calculated_stake, max_stake), min_stake), 2)
 
     # =========================================================================
-    # 5. MASTER PRE-TRADE EVALUATION GATE
+    # 6. MASTER PRE-TRADE GATE
     # =========================================================================
     def validate_pre_trade(
         self,
@@ -193,75 +210,57 @@ class RiskManager:
         min_stake: float,
         max_stake: float
     ) -> Tuple[bool, str, dict]:
-        """
-        Comprehensive pre-trade gate:
-        - Verifies UI kill switch
-        - Verifies daily/weekly/monthly loss limits
-        - Verifies spread
-        - Enforces automatic lot sizing
-        - Adjusts SL/TP with spread buffer
-        """
         self.sync_ui_config()
 
-        # 1. Master Kill Switch
         if not self.master_execution:
-            return False, "Trade blocked: Master execution switch is OFF in UI.", {}
+            return False, "Master execution switch is OFF in UI", {}
 
-        # 2. Daily Loss Ceiling
+        # Macro News Blackout Gate
+        in_blackout, news_msg = self.is_macro_news_blackout()
+        if in_blackout:
+            return False, news_msg, {}
+
+        # Sector Correlation Limit Gate
+        sector_ok, sector_msg = self.check_sector_exposure(symbol)
+        if not sector_ok:
+            return False, sector_msg, {}
+
+        # Ceilings
         if self.current_daily_loss >= self.max_daily_loss_usd:
-            return False, f"Trade blocked: Daily loss ceiling breached (-${self.current_daily_loss:.2f} / ${self.max_daily_loss_usd:.2f})", {}
-
-        # 3. Weekly Loss Ceiling
+            return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
         if self.current_weekly_loss >= self.max_weekly_loss_usd:
-            return False, f"Trade blocked: Weekly loss ceiling breached (-${self.current_weekly_loss:.2f} / ${self.max_weekly_loss_usd:.2f})", {}
-
-        # 4. Monthly Loss Ceiling
+            return False, f"Weekly loss ceiling breached (-${self.current_weekly_loss:.2f})", {}
         if self.current_monthly_loss >= self.max_monthly_loss_usd:
-            return False, f"Trade blocked: Monthly loss ceiling breached (-${self.current_monthly_loss:.2f} / ${self.max_monthly_loss_usd:.2f})", {}
-
-        # 5. Daily Trade Count Quota
+            return False, f"Monthly loss ceiling breached (-${self.current_monthly_loss:.2f})", {}
         if self.trades_taken_today >= self.max_daily_trades:
-            return False, f"Trade blocked: Reached max daily trades quota ({self.trades_taken_today}/{self.max_daily_trades})", {}
+            return False, f"Daily trade quota reached ({self.trades_taken_today}/{self.max_daily_trades})", {}
 
-        # 6. Stop Loss & Take Profit Validation
         sl_distance = abs(entry_price - stop_loss)
         if sl_distance <= 0:
-            return False, "Trade blocked: Invalidation distance (SL) is 0 or negative.", {}
+            return False, "Invalid Stop Loss distance", {}
 
-        # If strategy did not supply a TP, automatically calculate based on UI Risk-to-Reward ratio
         final_tp = take_profit
         if final_tp is None or final_tp == 0:
             target_distance = sl_distance * self.risk_to_reward
             final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
 
-        # 7. Spread Gate Check
         spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
         if not spread_ok:
-            return False, f"Trade blocked by Spread Gate: {spread_msg}", {}
+            return False, f"Spread Gate Rejection: {spread_msg}", {}
 
-        # 8. Spread Adjustment to SL/TP:
-        # Buffer SL slightly so normal bid-ask bounce does not prematurely stop out the trade
-        adjusted_sl = stop_loss
-        adjusted_tp = final_tp
-        if direction.upper() == "BUY":
-            adjusted_sl = stop_loss - spread_pts
-        else:
-            adjusted_sl = stop_loss + spread_pts
-
-        # 9. Dynamic Auto Lot / Stake Sizing
+        adjusted_sl = (stop_loss - spread_pts) if direction.upper() == "BUY" else (stop_loss + spread_pts)
         stake = self.calculate_lot_size(current_equity, sl_distance, point_value, min_stake, max_stake)
         if stake <= 0:
-            return False, "Calculated position size is 0.", {}
+            return False, "Calculated stake is 0", {}
 
-        order_blueprint = {
+        blueprint = {
             "symbol": symbol,
             "direction": direction.upper(),
             "stake": stake,
             "entry_price": entry_price,
             "stop_loss": round(adjusted_sl, 4),
-            "take_profit": round(adjusted_tp, 4),
+            "take_profit": round(final_tp, 4),
             "spread_points": round(spread_pts, 4),
-            "risk_dollars": round(current_equity * (self.risk_per_trade_pct / 100.0), 2)
+            "is_dry_run": self.dry_run
         }
-
-        return True, "Pre-trade validation successful", order_blueprint
+        return True, "Approved", blueprint
