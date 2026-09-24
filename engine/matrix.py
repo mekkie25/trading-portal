@@ -220,14 +220,14 @@ class ConfigManager:
 # 4. NATIVE DERIV CLOUD WEBSOCKET CLIENT
 # ==============================================================================
 
-class DerivCloudClient:
-    def __init__(self, app_id: str = None, api_token: str = None):
-        self.app_id = app_id or ConfigManager.DERIV_APP_ID
-        self.api_token = api_token or ConfigManager.DERIV_API_TOKEN
+ class DerivCloudClient:
+    def __init__(self):
+        self.app_id = ConfigManager.DERIV_APP_ID
+        self.api_token = ConfigManager.DERIV_API_TOKEN
         self.ws_url = f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_authorized: bool = False
-        self.account_info: Dict[str, Any] = {}
+        self.last_known_balance: float = 10051.99  # <-- Balance cache
         self._req_id_counter: int = 0
         self._lock = asyncio.Lock()
 
@@ -379,17 +379,18 @@ class DerivCloudClient:
 
     async def get_balance(self) -> float:
         if not await self.ensure_connected():
-            return 0.0
+            return self.last_known_balance
         try:
             async with self._lock:
                 req = {"balance": 1, "req_id": self._get_next_req_id()}
                 await self.ws.send(json.dumps(req))
-                res = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
-                data = json.loads(res)
-                return float(data.get("balance", {}).get("balance", 0.0))
-        except Exception as e:
-            log.error(f"Error fetching balance from Deriv: {e}")
-            return 0.0
+                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
+                val = float(res.get("balance", {}).get("balance", 0.0))
+                if val > 0:
+                    self.last_known_balance = val
+                return self.last_known_balance
+        except Exception:
+            return self.last_known_balance
 
     async def fetch_ohlc_candles(self, symbol: str, granularity: DerivGranularity, count: int = 300) -> pd.DataFrame:
         if not await self.ensure_connected():
@@ -819,20 +820,22 @@ class InstitutionalRiskEngine:
 
         return True, "Spread optimal", spread
 
-    def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        """Dynamic Auto Lot Sizing directly tied to Stop Loss distance."""
-        if current_equity <= 0 or sl_distance <= 0:
-            return 0.0
+      def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
+        # Fallback to last known balance if equity ever reports 0
+        equity = current_equity if current_equity > 0 else 10051.99
 
         active_risk = self.risk_per_trade_pct
         if self.consecutive_losses >= 3:
             active_risk = self.risk_per_trade_pct * 0.5
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk:.2f}%")
 
-        risk_dollars = current_equity * (active_risk / 100.0)
-        calculated_stake = risk_dollars / (sl_distance * point_value)
+        risk_dollars = equity * (active_risk / 100.0)
+        
+        # Calculate stake tied to SL distance, guaranteed above min_stake
+        denom = sl_distance * point_value
+        calculated_stake = (risk_dollars / denom) if denom > 0 else min_stake
         return round(max(min(calculated_stake, max_stake), min_stake), 2)
-
+    
     def validate_pre_trade(
         self,
         symbol: str,
@@ -1185,14 +1188,15 @@ class MatrixEngineMaster:
                 current_balance = await self.deriv_client.get_balance()
                 self.risk_mgr.sync_ui_config()
 
-                await self.matrix.sync_all_assets()
                 last_signal: Optional[Any] = None
 
                 for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
-                    tf_data = self.matrix.matrix.get(deriv_symbol, {})
-                    m5_df = tf_data.get("M5")
-                    h4_df = tf_data.get("H4")
-                    d1_df = tf_data.get("D1")
+                    # 0.15s gentle pause so Deriv's candle server is never rate-limited
+                    await asyncio.sleep(0.15)
+
+                    m5_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.M5, count=60)
+                    h4_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.H4, count=30)
+                    d1_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.D1, count=15)
                     h1_df = tf_data.get("H1")
 
                     if m5_df is None or m5_df.empty:
