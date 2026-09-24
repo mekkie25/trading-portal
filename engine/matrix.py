@@ -325,8 +325,40 @@ class DerivCloudClient:
             self.is_authorized = False
             return False
         
+    def is_connection_open(self) -> bool:
+        if self.ws is None:
+            return False
+        # Modern websockets (v14+) uses .state.name == "OPEN"
+        if hasattr(self.ws, "state"):
+            return getattr(self.ws.state, "name", "") == "OPEN"
+        return getattr(self.ws, "open", False)
+
+    def is_connection_open(self) -> bool:
+        if self.ws is None:
+            return False
+        # Modern websockets (v14+) uses .state.name == "OPEN"
+        if hasattr(self.ws, "state"):
+            return getattr(self.ws.state, "name", "") == "OPEN"
+        return getattr(self.ws, "open", False)
+
+    def is_connection_open(self) -> bool:
+        if self.ws is None:
+            return False
+        # Modern websockets (v14+) uses .state.name == "OPEN"
+        if hasattr(self.ws, "state"):
+            return getattr(self.ws.state, "name", "") == "OPEN"
+        return getattr(self.ws, "open", False)
+
+    def is_connection_open(self) -> bool:
+        if self.ws is None:
+            return False
+        # Modern websockets (v14+) uses .state.name == "OPEN"
+        if hasattr(self.ws, "state"):
+            return getattr(self.ws.state, "name", "") == "OPEN"
+        return getattr(self.ws, "open", False)
+
     async def ensure_connected(self) -> bool:
-        if self.ws is None or not self.ws.open or not self.is_authorized:
+        if not self.is_connection_open() or not self.is_authorized:
             log.warning("Deriv WebSocket connection dropped. Reconnecting...")
             return await self.connect()
         return True
