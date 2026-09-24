@@ -24,11 +24,6 @@ Deployment:   Headless Linux / Cloud VPS / Docker Container / Railway
 
 import sys
 import os
-
-# Ensure project root is in Python search path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
 import time
 import json
 import math
@@ -43,6 +38,11 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum, auto
+
+# Ensure project root is in Python search path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # Google Gemini Generative AI SDK
 try:
@@ -165,7 +165,7 @@ class DerivGranularity(Enum):
 
 @dataclass
 class AssetConfig:
-    symbol: str               # Deriv symbol identifier
+    symbol: str
     display_name: str
     pip_size: float
     point_value: float
@@ -180,7 +180,7 @@ class ConfigManager:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3"
 
-    # Strictly 7 Whitelisted Tradable Assets
+    # Strictly 7 Whitelisted Tradable Assets mapped to Deriv symbols
     SYMBOL_MAP: Dict[str, str] = {
         "GOLD": "frxXAUUSD",
         "US30": "OTC_DJI",
@@ -201,7 +201,6 @@ class ConfigManager:
         "frxGBPUSD": AssetConfig("frxGBPUSD", "GBP / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
     }
 
-    # Default baseline risk parameters
     MAX_ACCOUNT_RISK_PER_TRADE: float = 0.01
     DAILY_DRAWDOWN_KILL_SWITCH: float = 0.05
     MAX_CONCURRENT_TRADES: int = 4
@@ -220,14 +219,15 @@ class ConfigManager:
 # 4. NATIVE DERIV CLOUD WEBSOCKET CLIENT
 # ==============================================================================
 
- class DerivCloudClient:
-    def __init__(self):
-        self.app_id = ConfigManager.DERIV_APP_ID
-        self.api_token = ConfigManager.DERIV_API_TOKEN
+class DerivCloudClient:
+    def __init__(self, app_id: str = None, api_token: str = None):
+        self.app_id = app_id or ConfigManager.DERIV_APP_ID
+        self.api_token = api_token or ConfigManager.DERIV_API_TOKEN
         self.ws_url = f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_authorized: bool = False
-        self.last_known_balance: float = 10051.99  # <-- Balance cache
+        self.last_known_balance: float = 10051.99
+        self.account_info: Dict[str, Any] = {}
         self._req_id_counter: int = 0
         self._lock = asyncio.Lock()
 
@@ -235,14 +235,17 @@ class ConfigManager:
         self._req_id_counter += 1
         return self._req_id_counter
 
+    def is_connection_open(self) -> bool:
+        if self.ws is None:
+            return False
+        if hasattr(self.ws, "state"):
+            return getattr(self.ws.state, "name", "") == "OPEN"
+        return getattr(self.ws, "open", False)
+
     async def get_authenticated_ws_url(self) -> str:
-        """
-        Deriv New API Architecture:
-        Uses REST + OTP handshake to obtain a pre-authenticated WebSocket URL.
-        """
+        """Deriv New API Architecture: Uses REST + OTP handshake to obtain pre-authenticated WS URL."""
         api_base = "https://api.derivws.com"
         try:
-            # 1. Fetch Accounts using your new App ID and API Token
             headers = {
                 "Authorization": f"Bearer {self.api_token}",
                 "Deriv-App-ID": str(self.app_id),
@@ -263,7 +266,6 @@ class ConfigManager:
             account_id = demo_acc.get("account_id") or demo_acc.get("loginid") or demo_acc.get("id")
             log.info(f"Targeting Deriv Account: {account_id}")
 
-            # 2. Request OTP for pre-authenticated WebSocket
             def _fetch_otp():
                 otp_req = urllib.request.Request(
                     f"{api_base}/trading/v1/options/accounts/{account_id}/otp",
@@ -283,7 +285,6 @@ class ConfigManager:
         except Exception as e:
             log.warning(f"New Deriv REST+OTP handshake warning: {e}. Trying fallback.")
 
-        # Fallback for legacy connections
         return f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
 
     async def connect(self) -> bool:
@@ -292,22 +293,21 @@ class ConfigManager:
             return False
 
         try:
-            # Connect via the new pre-authenticated endpoint
             ws_url = await self.get_authenticated_ws_url()
             log.info(f"Connecting to Deriv WebSocket: {ws_url.split('?')[0]}...")
             self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=20)
 
-            # If connected via OTP, session is already authenticated
             if "otp=" in ws_url:
                 self.is_authorized = True
                 req = {"balance": 1, "req_id": self._get_next_req_id()}
                 await self.ws.send(json.dumps(req))
                 res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
-                bal = res.get("balance", {}).get("balance", "Verified")
-                log.info(f"--- DERIV CLOUD ONLINE (NEW API) --- Balance: {bal} USD")
+                val = float(res.get("balance", {}).get("balance", 0.0))
+                if val > 0:
+                    self.last_known_balance = val
+                log.info(f"--- DERIV CLOUD ONLINE (NEW API) --- Balance: {self.last_known_balance} USD")
                 return True
 
-            # Standard fallback authorization
             auth_payload = {"authorize": self.api_token, "req_id": self._get_next_req_id()}
             await self.ws.send(json.dumps(auth_payload))
             res_data = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
@@ -317,45 +317,16 @@ class ConfigManager:
                 return False
 
             self.is_authorized = True
-            log.info(f"--- DERIV CLOUD ONLINE --- Balance: {res_data.get('authorize', {}).get('balance')} USD")
+            bal_val = float(res_data.get("authorize", {}).get("balance", 0.0))
+            if bal_val > 0:
+                self.last_known_balance = bal_val
+            log.info(f"--- DERIV CLOUD ONLINE --- Balance: {self.last_known_balance} USD")
             return True
 
         except Exception as e:
             log.error(f"Failed to connect to Deriv WebSocket Cloud: {str(e)}")
             self.is_authorized = False
             return False
-        
-    def is_connection_open(self) -> bool:
-        if self.ws is None:
-            return False
-        # Modern websockets (v14+) uses .state.name == "OPEN"
-        if hasattr(self.ws, "state"):
-            return getattr(self.ws.state, "name", "") == "OPEN"
-        return getattr(self.ws, "open", False)
-
-    def is_connection_open(self) -> bool:
-        if self.ws is None:
-            return False
-        # Modern websockets (v14+) uses .state.name == "OPEN"
-        if hasattr(self.ws, "state"):
-            return getattr(self.ws.state, "name", "") == "OPEN"
-        return getattr(self.ws, "open", False)
-
-    def is_connection_open(self) -> bool:
-        if self.ws is None:
-            return False
-        # Modern websockets (v14+) uses .state.name == "OPEN"
-        if hasattr(self.ws, "state"):
-            return getattr(self.ws.state, "name", "") == "OPEN"
-        return getattr(self.ws, "open", False)
-
-    def is_connection_open(self) -> bool:
-        if self.ws is None:
-            return False
-        # Modern websockets (v14+) uses .state.name == "OPEN"
-        if hasattr(self.ws, "state"):
-            return getattr(self.ws.state, "name", "") == "OPEN"
-        return getattr(self.ws, "open", False)
 
     async def ensure_connected(self) -> bool:
         if not self.is_connection_open() or not self.is_authorized:
@@ -462,7 +433,7 @@ class ConfigManager:
         tp_price: float
     ) -> Optional[Dict[str, Any]]:
         """
-        ATOMIC BRACKET EXECUTION: Bundles SL and TP bounds directly into the contract proposal.
+        ATOMIC BRACKET EXECUTION: Bundles SL and TP bounds directly into the proposal.
         The trade enters the market fully protected at the exact millisecond of purchase.
         """
         if not await self.ensure_connected():
@@ -492,7 +463,6 @@ class ConfigManager:
 
         try:
             async with self._lock:
-                # 1. Price Proposal with SL/TP bounds locked
                 await self.ws.send(json.dumps(proposal_req))
                 prop_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
 
@@ -504,7 +474,6 @@ class ConfigManager:
                 if not proposal_id:
                     return None
 
-                # 2. Atomic Purchase
                 buy_req = {
                     "buy": proposal_id,
                     "price": stake,
@@ -820,8 +789,8 @@ class InstitutionalRiskEngine:
 
         return True, "Spread optimal", spread
 
-      def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        # Fallback to last known balance if equity ever reports 0
+    def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
+        """Dynamic Auto Lot Sizing directly tied to Stop Loss distance."""
         equity = current_equity if current_equity > 0 else 10051.99
 
         active_risk = self.risk_per_trade_pct
@@ -830,12 +799,10 @@ class InstitutionalRiskEngine:
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk:.2f}%")
 
         risk_dollars = equity * (active_risk / 100.0)
-        
-        # Calculate stake tied to SL distance, guaranteed above min_stake
         denom = sl_distance * point_value
         calculated_stake = (risk_dollars / denom) if denom > 0 else min_stake
         return round(max(min(calculated_stake, max_stake), min_stake), 2)
-    
+
     def validate_pre_trade(
         self,
         symbol: str,
@@ -906,7 +873,6 @@ class InstitutionalRiskEngine:
         }
         return True, "Approved", blueprint
 
-# Backwards compatibility alias
 RiskState = InstitutionalRiskEngine
 RiskManager = InstitutionalRiskEngine
 
@@ -982,6 +948,14 @@ class TradeSignal:
     tp2: float
     confidence_score: float
     reasoning: str
+
+    @property
+    def stop_loss(self) -> float:
+        return self.sl
+
+    @property
+    def take_profit(self) -> float:
+        return self.tp1
 
 class StrategyEvaluator:
     @staticmethod
@@ -1062,6 +1036,7 @@ class CloudExecutionEngine:
         symbol = getattr(signal, 'symbol')
         direction = getattr(signal, 'direction')
         entry = getattr(signal, 'entry_price')
+        
         sl = getattr(signal, 'stop_loss', None)
         if sl is None:
             sl = getattr(signal, 'sl', 0.0)
@@ -1069,6 +1044,7 @@ class CloudExecutionEngine:
         tp = getattr(signal, 'take_profit', None)
         if tp is None:
             tp = getattr(signal, 'tp1', None)
+
         strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
         if isinstance(strategy_name, Enum):
             strategy_name = strategy_name.value
@@ -1151,7 +1127,6 @@ class MatrixEngineMaster:
         self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_mgr)
         log.info(f"SYSTEM READY. Initial Account Balance: ${balance:.2f} USD")
         
-        # Concurrently execute market scanning loop and in-flight position supervisor loop
         await asyncio.gather(
             self._market_scan_loop(),
             self._position_supervisor_loop()
@@ -1197,14 +1172,13 @@ class MatrixEngineMaster:
                     m5_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.M5, count=60)
                     h4_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.H4, count=30)
                     d1_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.D1, count=15)
-                    h1_df = tf_data.get("H1")
 
-                    if m5_df is None or m5_df.empty:
+                    if m5_df.empty:
                         continue
 
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
-                    recent_high = float(h1_df['high'].tail(24).max()) if h1_df is not None and not h1_df.empty else float(m5_df['high'].max())
-                    recent_low = float(h1_df['low'].tail(24).min()) if h1_df is not None and not h1_df.empty else float(m5_df['low'].min())
+                    recent_high = float(m5_df['high'].tail(24).max())
+                    recent_low = float(m5_df['low'].tail(24).min())
                     latest_close = float(m5_df.iloc[-1]['close'])
 
                     session_levels = {
@@ -1222,13 +1196,11 @@ class MatrixEngineMaster:
                         "range_span": candle_stats["range_span"],
                     }
 
-                    # 1. Primary Evaluation via Modular Strategy Manager
                     signal = self.strategy_mgr.evaluate_all(friendly_name, m5_df, session_levels)
 
-                    # 2. Secondary Fallback via Core Evaluator
                     if not signal:
                         vp = self.matrix.volume_profiles.get(deriv_symbol)
-                        signal = StrategyEvaluator.evaluate_symbol(deriv_symbol, tf_data, vp)
+                        signal = StrategyEvaluator.evaluate_symbol(deriv_symbol, {"M5": m5_df, "H1": m5_df}, vp)
 
                     if signal:
                         last_signal = signal
