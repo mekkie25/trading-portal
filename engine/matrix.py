@@ -1196,7 +1196,6 @@ class CloudExecutionEngine:
                         "is_be_moved": False
                     }
 
-            # Send WhatsApp confirmation to your phone
             whatsapp_msg = (
                 f"🟢 *[DERIV LIVE ORDER FILLED]*\n"
                 f"• Asset: {bp['symbol']}\n"
@@ -1246,7 +1245,7 @@ class MatrixEngineMaster:
             self._daily_eod_flusher_loop()
         )
 
-   async def _position_supervisor_loop(self) -> None:
+    async def _position_supervisor_loop(self) -> None:
         """In-Flight Position Supervisor: Evaluates live exits (SL, TP, BE) and shifts SL at 80% R:R."""
         while True:
             try:
