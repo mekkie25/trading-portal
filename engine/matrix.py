@@ -8,16 +8,19 @@ Components:   - Modular Strategies & Strategy Manager Integration
               - Native Asynchronous Deriv Cloud WebSocket & REST API
               - Gemini AI Overseer & Pre-Trade Prompt Verification
               - Order Flow Analyzer (POC, VAH, VAL, Cumulative Volume Delta)
+              - Quantitative Math Engine (EMA, ATR, Bollinger Bands, RSI)
+              - Temporal Clock & Session Manager (Asian, London, NY)
               - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
               - Range & Consolidation Detection Engine
-              - Live Bid/Ask Spread Gatekeeper & SL/TP Adjustment
-              - Dynamic Auto Lot Sizing (Risk % / SL Distance)
+              - Live Bid/Ask Spread Gatekeeper & SL/TP Buffer Adjustment
+              - Dynamic Auto Lot Sizing (Risk % / SL Distance Formula)
               - UI Dynamic Limits Sync (Daily, Weekly, Monthly Ceilings, R:R)
-              - Macro News Blackout Gate (15m Pre/Post Red-Folder Release)
+              - Macro News Blackout Gate (15m Pre/Post Red-Folder Freeze)
               - Sector Correlation Exposure Limiter (Max 1 Index Trade)
               - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
               - Atomic Bracket Proposal Execution (No Naked Trades)
               - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
+              - Paced 60-Second Scan Cadence (Anti-Rate-Limiting Architecture)
 Deployment:   Headless Linux / Cloud VPS / Docker Container / Railway
 ================================================================================
 """
@@ -165,7 +168,7 @@ class DerivGranularity(Enum):
 
 @dataclass
 class AssetConfig:
-    symbol: str
+    symbol: str               # Official Deriv symbol identifier
     display_name: str
     pip_size: float
     point_value: float
@@ -180,7 +183,7 @@ class ConfigManager:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3"
 
-    # Strictly 7 Whitelisted Tradable Assets mapped to Deriv symbols
+    # Strictly 7 Whitelisted Tradable Assets mapped to Deriv official OTC/Forex symbols
     SYMBOL_MAP: Dict[str, str] = {
         "GOLD": "frxXAUUSD",
         "US30": "OTC_DJI",
@@ -216,7 +219,7 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 4. NATIVE DERIV CLOUD WEBSOCKET CLIENT
+# 4. NATIVE DERIV CLOUD WEBSOCKET CLIENT (REST+OTP COMPATIBLE)
 # ==============================================================================
 
 class DerivCloudClient:
@@ -283,7 +286,7 @@ class DerivCloudClient:
                 return ws_url
 
         except Exception as e:
-            log.warning(f"New Deriv REST+OTP handshake warning: {e}. Trying fallback.")
+            log.warning(f"Deriv REST+OTP handshake warning: {e}. Trying standard connection.")
 
         return f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
 
@@ -341,7 +344,7 @@ class DerivCloudClient:
             async with self._lock:
                 req = {"ping": 1, "req_id": self._get_next_req_id()}
                 await self.ws.send(json.dumps(req))
-                res = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
+                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
                 data = json.loads(res)
                 return data.get("ping") == "pong"
         except Exception as e:
@@ -363,7 +366,7 @@ class DerivCloudClient:
         except Exception:
             return self.last_known_balance
 
-    async def fetch_ohlc_candles(self, symbol: str, granularity: DerivGranularity, count: int = 300) -> pd.DataFrame:
+    async def fetch_ohlc_candles(self, symbol: str, granularity: DerivGranularity, count: int = 100) -> pd.DataFrame:
         if not await self.ensure_connected():
             return pd.DataFrame()
 
@@ -403,7 +406,7 @@ class DerivCloudClient:
 
             return df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
         except Exception as e:
-            log.error(f"Exception during Deriv candle fetch ({symbol}): {e}")
+            log.error(f"Exception during candle fetch ({symbol}): {e}")
             return pd.DataFrame()
 
     async def get_live_quote(self, symbol: str) -> Tuple[float, float, float]:
@@ -790,17 +793,59 @@ class InstitutionalRiskEngine:
         return True, "Spread optimal", spread
 
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        """Dynamic Auto Lot Sizing directly tied to Stop Loss distance."""
+        """
+        Dynamic Drawdown-Adaptive Position Sizing & Buffer Budgeting Engine:
+        1. Evaluates percentage of weekly and daily loss budgets consumed.
+        2. Gradually tapers risk (100% -> 50% -> 25% -> 10% survival mode).
+        3. Uses runway cap to guarantee remaining buffer is never wiped out in a single trade.
+        4. Scales stake based on exact stop-loss distance and point value.
+        """
         equity = current_equity if current_equity > 0 else 10051.99
+        active_risk_pct = self.risk_per_trade_pct
 
-        active_risk = self.risk_per_trade_pct
+        # 1. Consecutive Loss Protection
         if self.consecutive_losses >= 3:
-            active_risk = self.risk_per_trade_pct * 0.5
-            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk:.2f}%")
+            active_risk_pct = active_risk_pct * 0.5
+            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
-        risk_dollars = equity * (active_risk / 100.0)
+        # 2. Dynamic Weekly Buffer Budgeting (Graduated Safety Ramp)
+        if self.max_weekly_loss_usd > 0:
+            weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
+            remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
+
+            if weekly_used_ratio >= 0.90:
+                active_risk_pct = min(active_risk_pct, 0.10)   # Survival Zone (0.10% micro-risk)
+                log.warning(f"DRAWDOWN TAPER: 90%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Survival risk: {active_risk_pct:.2f}%")
+            elif weekly_used_ratio >= 0.75:
+                active_risk_pct = min(active_risk_pct, 0.25)   # Taper Zone (0.25% risk)
+                log.warning(f"DRAWDOWN TAPER: 75%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Scaled risk: {active_risk_pct:.2f}%")
+            elif weekly_used_ratio >= 0.50:
+                active_risk_pct = min(active_risk_pct, 0.50)   # Caution Zone (0.50% risk)
+                log.info(f"DRAWDOWN TAPER: 50%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Scaled risk: {active_risk_pct:.2f}%")
+
+            # Runway Cap: Never risk more than 1/4th of remaining weekly room on one trade
+            max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
+        else:
+            max_weekly_allowed_dollars = float('inf')
+
+        # 3. Dynamic Daily Buffer Budgeting
+        if self.max_daily_loss_usd > 0:
+            remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
+            # Never risk more than 1/2 of remaining daily room on one trade
+            max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
+        else:
+            max_daily_allowed_dollars = float('inf')
+
+        # Baseline percentage risk in dollars
+        base_risk_dollars = equity * (active_risk_pct / 100.0)
+
+        # Cap dollar risk by the tightest remaining runway budget
+        final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars, max_daily_allowed_dollars)
+
+        # Calculate exact stake matching stop loss distance
         denom = sl_distance * point_value
-        calculated_stake = (risk_dollars / denom) if denom > 0 else min_stake
+        calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
+
         return round(max(min(calculated_stake, max_stake), min_stake), 2)
 
     def validate_pre_trade(
@@ -873,6 +918,7 @@ class InstitutionalRiskEngine:
         }
         return True, "Approved", blueprint
 
+# Backward compatibility aliases
 RiskState = InstitutionalRiskEngine
 RiskManager = InstitutionalRiskEngine
 
@@ -1127,13 +1173,14 @@ class MatrixEngineMaster:
         self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_mgr)
         log.info(f"SYSTEM READY. Initial Account Balance: ${balance:.2f} USD")
         
+        # Concurrently launch the fast 3s Supervisor and the paced 60s Scan loop
         await asyncio.gather(
             self._market_scan_loop(),
             self._position_supervisor_loop()
         )
 
     async def _position_supervisor_loop(self) -> None:
-        """In-Flight Position Supervisor: Evaluates live progress and shifts SL to Break-Even at 80% R:R."""
+        """In-Flight Position Supervisor: Evaluates live progress every 3s and shifts SL to Break-Even at 80% R:R."""
         while True:
             try:
                 for cid, pos in list(self.risk_mgr.open_positions.items()):
@@ -1157,6 +1204,7 @@ class MatrixEngineMaster:
                 await asyncio.sleep(5.0)
 
     async def _market_scan_loop(self) -> None:
+        """Paced Market Scanning Loop: Scans the 7 assets once every 60s (with 0.20s pause between assets)."""
         while True:
             try:
                 start_time = time.time()
@@ -1166,8 +1214,8 @@ class MatrixEngineMaster:
                 last_signal: Optional[Any] = None
 
                 for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
-                    # 0.15s gentle pause so Deriv's candle server is never rate-limited
-                    await asyncio.sleep(0.15)
+                    # 0.20s pause between assets to eliminate Deriv ticks_history rate limits
+                    await asyncio.sleep(0.20)
 
                     m5_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.M5, count=60)
                     h4_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.H4, count=30)
@@ -1216,8 +1264,10 @@ class MatrixEngineMaster:
                 emit_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
                 write_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
 
+                # Paced 60-second cycle: Only scan once per minute to respect candle closures and broker rate limits
                 elapsed = time.time() - start_time
-                await asyncio.sleep(max(1.0, 10.0 - elapsed))
+                await asyncio.sleep(max(1.0, 60.0 - elapsed))
+
             except asyncio.CancelledError:
                 break
             except Exception as e:

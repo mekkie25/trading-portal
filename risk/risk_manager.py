@@ -181,16 +181,59 @@ class RiskManager:
         return True, "Spread optimal", spread
 
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        if current_equity <= 0 or sl_distance <= 0:
-            return 0.0
+        """
+        Dynamic Drawdown-Adaptive Position Sizing & Buffer Budgeting Engine:
+        1. Evaluates percentage of weekly and daily loss budgets consumed.
+        2. Gradually tapers risk (100% -> 50% -> 25% -> 10% survival mode).
+        3. Uses runway cap to guarantee remaining buffer is never wiped out in a single trade.
+        4. Scales stake based on exact stop-loss distance and point value.
+        """
+        equity = current_equity if current_equity > 0 else 10051.99
+        active_risk_pct = self.risk_per_trade_pct
 
-        active_risk = self.risk_per_trade_pct
+        # 1. Consecutive Loss Protection
         if self.consecutive_losses >= 3:
-            active_risk = self.risk_per_trade_pct * 0.5
-            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk:.2f}%")
+            active_risk_pct = active_risk_pct * 0.5
+            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
-        risk_dollars = current_equity * (active_risk / 100.0)
-        calculated_stake = risk_dollars / (sl_distance * point_value)
+        # 2. Dynamic Weekly Buffer Budgeting (Graduated Safety Ramp)
+        if self.max_weekly_loss_usd > 0:
+            weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
+            remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
+
+            if weekly_used_ratio >= 0.90:
+                active_risk_pct = min(active_risk_pct, 0.10)   # Survival Zone (0.10% micro-risk)
+                log.warning(f"DRAWDOWN TAPER: 90%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Survival risk: {active_risk_pct:.2f}%")
+            elif weekly_used_ratio >= 0.75:
+                active_risk_pct = min(active_risk_pct, 0.25)   # Taper Zone (0.25% risk)
+                log.warning(f"DRAWDOWN TAPER: 75%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Scaled risk: {active_risk_pct:.2f}%")
+            elif weekly_used_ratio >= 0.50:
+                active_risk_pct = min(active_risk_pct, 0.50)   # Caution Zone (0.50% risk)
+                log.info(f"DRAWDOWN TAPER: 50%+ weekly budget used ({weekly_used_ratio*100:.1f}%). Scaled risk: {active_risk_pct:.2f}%")
+
+            # Runway Cap: Never risk more than 1/4th of remaining weekly room on one trade
+            max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
+        else:
+            max_weekly_allowed_dollars = float('inf')
+
+        # 3. Dynamic Daily Buffer Budgeting
+        if self.max_daily_loss_usd > 0:
+            remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
+            # Never risk more than 1/2 of remaining daily room on one trade
+            max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
+        else:
+            max_daily_allowed_dollars = float('inf')
+
+        # Baseline percentage risk in dollars
+        base_risk_dollars = equity * (active_risk_pct / 100.0)
+
+        # Cap dollar risk by the tightest remaining runway budget
+        final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars, max_daily_allowed_dollars)
+
+        # Calculate exact stake matching stop loss distance
+        denom = sl_distance * point_value
+        calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
+
         return round(max(min(calculated_stake, max_stake), min_stake), 2)
 
     # =========================================================================
