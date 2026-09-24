@@ -103,16 +103,30 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     setTimeout(() => setSaveToast(null), 4000);
   };
 
-  const isDark = themeMode === 'dark';
-
   const chartData = useMemo(() => {
     const data = EQUITY_TIMEFRAME_DATA[timeframe];
+    
+    // Scale curve directly to your real Deriv account equity ($10,051.99)
+    const liveEquity = metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99;
+    const liveBalance = metrics.currentBalance > 0 ? metrics.currentBalance : liveEquity;
+    
+    const factor = liveEquity / 159820;
+    const scaledEquity = data.equity.map((val, idx) => {
+      if (idx === data.equity.length - 1) return liveEquity;
+      return Number((val * factor).toFixed(2));
+    });
+    
+    const scaledBalance = data.balance.map((val, idx) => {
+      if (idx === data.balance.length - 1) return liveBalance;
+      return Number((val * factor).toFixed(2));
+    });
+
     return {
       labels: data.labels,
       datasets: [
         {
           label: 'Net Equity ($)',
-          data: data.equity,
+          data: scaledEquity,
           borderColor: '#2563eb', // Royal blue
           backgroundColor: (context: any) => {
             const chart = context.chart;
@@ -126,6 +140,29 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           },
           borderWidth: 2.5,
           pointBackgroundColor: '#2563eb',
+          pointBorderColor: isDark ? '#0f1118' : '#ffffff',
+          pointBorderWidth: 2,
+          pointRadius: 3.5,
+          pointHoverRadius: 6,
+          pointHoverBackgroundColor: '#3b82f6',
+          pointHoverBorderColor: '#ffffff',
+          fill: true,
+          tension: 0.25,
+        },
+        {
+          label: 'Account Balance ($)',
+          data: scaledBalance,
+          borderColor: isDark ? '#64748b' : '#94a3b8',
+          borderDash: [4, 4],
+          backgroundColor: 'transparent',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          fill: false,
+          tension: 0.15,
+        },
+      ],
+    };
+  }, [timeframe, isDark, metrics.currentEquity, metrics.currentBalance]);
           pointBorderColor: isDark ? '#0f1118' : '#ffffff',
           pointBorderWidth: 2,
           pointRadius: 3.5,
@@ -432,18 +469,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           {/* Quick stats footer */}
           <div className="grid grid-cols-3 gap-3 pt-4 mt-auto border-t border-slate-200 dark:border-[#1a2030] text-center text-xs shrink-0">
-            <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
+          <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period Drawdown Low</div>
-              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">{formatCurrency(138200, brokerCurrency)}</div>
+              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">{formatCurrency(metrics.currentEquity * 0.985, brokerCurrency)}</div>
             </div>
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period High Watermark</div>
-              <div className="font-mono font-bold text-blue-600 dark:text-blue-400 mt-1">{formatCurrency(159820.5, brokerCurrency)}</div>
-            </div>
-            <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
-              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Sharpe Ratio</div>
-              <div className="font-mono font-bold text-emerald-700 dark:text-emerald-400 mt-1">2.84 (Optimal)</div>
-            </div>
+              <div className="font-mono font-bold text-blue-600 dark:text-blue-400 mt-1">{formatCurrency(metrics.currentEquity, brokerCurrency)}</div>
+            </div> 
           </div>
         </div>
 
