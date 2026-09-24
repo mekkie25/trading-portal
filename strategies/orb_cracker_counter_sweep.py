@@ -1,52 +1,42 @@
-"""
-strategies/orb_cracker_counter_sweep.py
-"""
-from foundation import session_config
+from strategies.base import StrategySignal
 
 class ORBCracker:
-    def __init__(self, instrument_config):
-        self.stops = {
-            'NASDAQ': 50,
-            'US30': 50,
-            'GOLD': 40,
-            'SPY': 5
-        }
-        self.rr = instrument_config.get('risk_reward', 2.0)
-        self.instrument = instrument_config['name']
-
-    def evaluate(self, current_time, data_1m, session_levels):
-        ny_session = session_config.get_session('New_York')
-        if not self._is_active_window(current_time, ny_session.start_time):
+    def evaluate(self, symbol: str, data_5m, session_levels: dict) -> StrategySignal | None:
+        if data_5m is None or len(data_5m) < 10:
             return None
 
-        orb_high, orb_low = session_levels['orb_high'], session_levels['orb_low']
-        candle = data_1m.iloc[-1]
-        vwap = data_1m['session_vwap'].iloc[-1]
-        ema_200 = data_1m['ema_200'].iloc[-1]
+        orb_h = session_levels.get('orb_high')
+        orb_l = session_levels.get('orb_low')
+        if not orb_h or not orb_l:
+            return None
 
-        # Break ORB High, Reject VWAP/200, Close Bearish
-        if candle['high'] > orb_high and (candle['high'] >= vwap or candle['high'] >= ema_200) and candle['close'] < candle['open']:
-            return self._execute('SHORT', candle)
+        curr = data_5m.iloc[-1]
+        ema_200 = data_5m['close'].ewm(span=200, adjust=False).mean().iloc[-1]
 
-        # Break ORB Low, Reject VWAP/200, Close Bullish
-        if candle['low'] < orb_low and (candle['low'] <= vwap or candle['low'] <= ema_200) and candle['close'] > candle['open']:
-            return self._execute('LONG', candle)
+        if curr['high'] > orb_h and curr['high'] >= ema_200 and curr['close'] < curr['open']:
+            sl = float(curr['high'])
+            return StrategySignal(
+                strategy="ORB_CRACKER",
+                symbol=symbol,
+                direction="SELL",
+                entry_price=float(curr['close']),
+                stop_loss=sl,
+                take_profit=float(curr['close'] - 1.5 * abs(sl - curr['close'])),
+                confidence=0.81,
+                reason="ORB Cracker counter-pulse rejection off 200 EMA"
+            )
 
-    def _is_active_window(self, current_time, ny_start):
-        # Active only from 09:30 to 10:00 local NY time
-        elapsed = (current_time - ny_start).seconds / 60
-        return 0 <= elapsed <= 30
+        if curr['low'] < orb_l and curr['low'] <= ema_200 and curr['close'] > curr['open']:
+            sl = float(curr['low'])
+            return StrategySignal(
+                strategy="ORB_CRACKER",
+                symbol=symbol,
+                direction="BUY",
+                entry_price=float(curr['close']),
+                stop_loss=sl,
+                take_profit=float(curr['close'] + 1.5 * abs(curr['close'] - sl)),
+                confidence=0.81,
+                reason="ORB Cracker counter-pulse rejection off 200 EMA"
+            )
 
-    def _execute(self, direction, candle):
-        stop_points = self.stops.get(self.instrument, 30)
-        entry_price = candle['close']
-        
-        sl = entry_price + stop_points if direction == 'SHORT' else entry_price - stop_points
-        tp = entry_price - (stop_points * self.rr) if direction == 'SHORT' else entry_price + (stop_points * self.rr)
-        
-        return {
-            'direction': direction,
-            'stop_loss': sl,
-            'target': tp,
-            'breakeven_trigger': 0.80
-        }
+        return None

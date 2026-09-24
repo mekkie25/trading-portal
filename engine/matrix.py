@@ -24,6 +24,10 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+# --- CONNECT MODULAR STRATEGY MANAGER ---
+from strategies.base import StrategySignal
+from strategies.strategy_manager import StrategyManager
+
 # IPC Helper to transmit telemetry to server.ts
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
     msg = json.dumps({
@@ -123,17 +127,29 @@ class ConfigManager:
     DERIV_API_TOKEN: str = os.getenv("DERIV_API_TOKEN", "")
     DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3"
 
-    # --- ASSET UNIVERSE SPECIFICATIONS ---
+    # --- ASSET UNIVERSE SPECIFICATIONS (STRICT 7 ALLOWED ONLY) ---
+    SYMBOL_MAP: Dict[str, str] = {
+        "GOLD": "frxXAUUSD",
+        "US30": "US30",
+        "NAS100": "NAS100",
+        "GERMAN30": "GERMAN30",
+        "EURUSD": "frxEURUSD",
+        "USDJPY": "frxUSDJPY",
+        "GBPUSD": "frxGBPUSD"
+    }
+
     ASSETS: Dict[str, AssetConfig] = {
-        "R_100": AssetConfig("R_100", "Volatility 100 Index", 0.01, 1.0, 1.0, 2000.0, 100, True),
-        "R_75": AssetConfig("R_75", "Volatility 75 Index", 0.01, 1.0, 1.0, 2000.0, 100, True),
-        "R_50": AssetConfig("R_50", "Volatility 50 Index", 0.01, 1.0, 1.0, 2000.0, 100, True),
-        "1HZ10V": AssetConfig("1HZ10V", "Volatility 10 (1s) Index", 0.01, 1.0, 1.0, 2000.0, 100, True),
-        "frxXAUUSD": AssetConfig("frxXAUUSD", "Gold / USD", 0.01, 1.0, 1.0, 1000.0, 50, False),
+        "frxXAUUSD": AssetConfig("frxXAUUSD", "Gold (XAU/USD)", 0.01, 1.0, 1.0, 1000.0, 50, False),
+        "US30": AssetConfig("US30", "Dow Jones 30", 0.1, 1.0, 1.0, 2000.0, 100, False),
+        "NAS100": AssetConfig("NAS100", "Nasdaq 100", 0.1, 1.0, 1.0, 2000.0, 100, False),
+        "GERMAN30": AssetConfig("GERMAN30", "DAX 40", 0.1, 1.0, 1.0, 2000.0, 100, False),
         "frxEURUSD": AssetConfig("frxEURUSD", "EUR / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
+        "frxUSDJPY": AssetConfig("frxUSDJPY", "USD / JPY", 0.001, 100000.0, 1.0, 1000.0, 100, False),
+        "frxGBPUSD": AssetConfig("frxGBPUSD", "GBP / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
     }
 
     # --- RISK CONTROL PARAMETERS ---
+    
     MAX_ACCOUNT_RISK_PER_TRADE: float = 0.015    # 1.5% max account risk
     DAILY_DRAWDOWN_KILL_SWITCH: float = 0.05    # 5.0% hard daily equity drop limit
     MAX_CONCURRENT_TRADES: int = 4
@@ -798,7 +814,7 @@ class CloudExecutionEngine:
 # 11. MASTER EVENT LOOP & SYSTEM ORCHESTRATOR
 # ==============================================================================
 
-class MatrixEngineMaster:
+    class MatrixEngineMaster:
     """Main Orchestrator tying together Data Engine, Strategies, and Risk Control."""
 
     def __init__(self):
@@ -806,6 +822,7 @@ class MatrixEngineMaster:
         self.matrix = MultiTimeframeMatrix(self.deriv_client)
         self.risk_state: Optional[RiskState] = None
         self.execution_engine: Optional[CloudExecutionEngine] = None
+        self.strategy_mgr = StrategyManager()
 
     async def start(self) -> None:
         """Initializes WebSocket connection and enters main execution loop."""
@@ -847,14 +864,46 @@ class MatrixEngineMaster:
 
                 await self.matrix.sync_all_assets()
 
-                last_signal: Optional[TradeSignal] = None
+                last_signal: Optional[StrategySignal] = None
                 for symbol in ConfigManager.ASSETS.keys():
                     tf_data = self.matrix.matrix.get(symbol, {})
-                    vp = self.matrix.volume_profiles.get(symbol)
+                    m5_data = tf_data.get("M5")
+                    h1_data = tf_data.get("H1")
 
-                    signal = StrategyEvaluator.evaluate_symbol(symbol, tf_data, vp)
+                    if m5_data is None or m5_data.empty:
+                        continue
+
+                    # Build required structural levels for the 8 strategies
+                    h1_high = float(h1_data['high'].tail(24).max()) if h1_data is not None and not h1_data.empty else float(m5_data['high'].max())
+                    h1_low = float(h1_data['low'].tail(24).min()) if h1_data is not None and not h1_data.empty else float(m5_data['low'].min())
+                    latest_close = float(m5_data.iloc[-1]['close'])
+
+                    session_levels = {
+                        "asia_high": h1_high,
+                        "asia_low": h1_low,
+                        "daily_eq": (h1_high + h1_low) / 2.0,
+                        "pdh": h1_high,
+                        "pdl": h1_low,
+                        "daily_pivot": (h1_high + h1_low + latest_close) / 3.0,
+                        "pivot_r1": (2.0 * ((h1_high + h1_low + latest_close) / 3.0)) - h1_low,
+                        "pivot_s1": (2.0 * ((h1_high + h1_low + latest_close) / 3.0)) - h1_high,
+                        "orb_high": float(m5_data['high'].tail(3).max()),
+                        "orb_low": float(m5_data['low'].tail(3).min()),
+                    }
+
+                    # Map Deriv symbol (e.g. frxXAUUSD) to standard strategy asset name (e.g. GOLD)
+                    clean_asset = symbol
+                    for friendly_name, deriv_sym in ConfigManager.SYMBOL_MAP.items():
+                        if deriv_sym == symbol or friendly_name == symbol:
+                            clean_asset = friendly_name
+                            break
+
+                    # Evaluate across the 8 strategies
+                    signal = self.strategy_mgr.evaluate_all(clean_asset, m5_data, session_levels)
                     if signal:
-                        log.info(f"VALID SIGNAL DETECTED: {signal.setup_type.value} on {signal.symbol} ({signal.direction})")
+                        log.info(f"STRATEGY SIGNAL: [{signal.strategy}] on {signal.symbol} ({signal.direction}) | Reason: {signal.reason}")
+                        # Remap to Deriv trading symbol for execution
+                        signal.symbol = ConfigManager.SYMBOL_MAP.get(signal.symbol, signal.symbol)
                         await self.execution_engine.process_signal(signal)
                         last_signal = signal
 
@@ -876,6 +925,8 @@ class MatrixEngineMaster:
             except Exception as e:
                 log.error(f"Error in main event loop: {str(e)}", exc_info=True)
                 await asyncio.sleep(5)
+
+                
 
 # ==============================================================================
 # 12. CLOUD ENTRY POINT

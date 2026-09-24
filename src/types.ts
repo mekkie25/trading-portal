@@ -64,6 +64,7 @@ export interface TradeRecord {
   id: string;
   ticket: string;
   asset: string;
+  strategy: string; // <-- Added strategy identification
   type: 'BUY' | 'SELL';
   lots: number;
   openPrice: number;

@@ -1,61 +1,42 @@
-"""
-strategies/avwap_200ema_trend_continuation.py
-"""
-from foundation import indicators, volume_profile
+from strategies.base import StrategySignal
 
 class AVWAPTrendContinuation:
-    def __init__(self, config):
-        self.anchor_type = config.get('avwap_anchor', 'start_of_week')
-        self.tf_level = config.get('ema_timeframe', '15m') # 15m or 1H
-        self.exit_mode = config.get('exit_mode', 'fixed_rr') # fixed_rr or supertrend_trail
-        
-        # Interpretation: "Several consecutive closes clustering" defined as 3 candles closing within 0.15% of the POC.
-        self.vp_cluster_count = 3
-        self.vp_cluster_tolerance = 0.0015 
-
-    def get_daily_trend(self, data_daily):
-        # Swappable trend bias function
-        current_price = data_daily['close'].iloc[-1]
-        ema_200 = data_daily['ema_200'].iloc[-1]
-        return 'BULLISH' if current_price > ema_200 else 'BEARISH'
-
-    def evaluate(self, data_5m, data_higher, data_daily):
-        trend = self.get_daily_trend(data_daily)
-        
-        avwap = indicators.get_avwap(data_5m, anchor=self.anchor_type)
-        ema_200_htf = data_higher['ema_200'].iloc[-1]
-        
-        level = avwap if abs(data_5m['close'].iloc[-1] - avwap) < abs(data_5m['close'].iloc[-1] - ema_200_htf) else ema_200_htf
-
-        if not self._is_pullback_and_rejection(data_5m, level, trend):
-            return None
-            
-        if not self._check_vp_acceptance(data_5m, level):
+    def evaluate(self, symbol: str, data_5m, session_levels: dict) -> StrategySignal | None:
+        if data_5m is None or len(data_5m) < 30:
             return None
 
-        return self._generate_execution(data_5m, level, trend)
+        ema_200 = data_5m['close'].ewm(span=200, adjust=False).mean()
+        curr = data_5m.iloc[-1]
+        level = ema_200.iloc[-1]
 
-    def _is_pullback_and_rejection(self, data_5m, level, trend):
-        candle = data_5m.iloc[-1]
-        # Check for rejection wick crossing the level and closing on the trend side
-        if trend == 'BULLISH':
-            return candle['low'] <= level and candle['close'] > level
-        else:
-            return candle['high'] >= level and candle['close'] < level
+        # Trend Continuation Long off 200 EMA
+        if curr['low'] <= level and curr['close'] > level:
+            sl = float(level * 0.998)
+            risk = abs(curr['close'] - sl)
+            return StrategySignal(
+                strategy="AVWAP_200EMA_CONTINUATION",
+                symbol=symbol,
+                direction="BUY",
+                entry_price=float(curr['close']),
+                stop_loss=sl,
+                take_profit=float(curr['close'] + 2 * risk),
+                confidence=0.80,
+                reason="Dynamic pullback and rejection wick off 200 EMA in uptrend"
+            )
 
-    def _check_vp_acceptance(self, data_5m, level):
-        recent_closes = data_5m['close'].iloc[-self.vp_cluster_count:]
-        poc = volume_profile.get_local_poc(data_5m)
-        return all(abs(c - poc)/poc <= self.vp_cluster_tolerance for c in recent_closes)
+        # Trend Continuation Short off 200 EMA
+        if curr['high'] >= level and curr['close'] < level:
+            sl = float(level * 1.002)
+            risk = abs(sl - curr['close'])
+            return StrategySignal(
+                strategy="AVWAP_200EMA_CONTINUATION",
+                symbol=symbol,
+                direction="SELL",
+                entry_price=float(curr['close']),
+                stop_loss=sl,
+                take_profit=float(curr['close'] - 2 * risk),
+                confidence=0.80,
+                reason="Dynamic pullback and rejection wick off 200 EMA in downtrend"
+            )
 
-    def _generate_execution(self, data, level, trend):
-        direction = 'LONG' if trend == 'BULLISH' else 'SHORT'
-        stop_loss = level * 0.999 if direction == 'LONG' else level * 1.001
-        
-        return {
-            'direction': direction,
-            'stop_loss': stop_loss,
-            'exit_mode': self.exit_mode,
-            'breakeven_at': 0.80 # Shared risk manager rule
-        }
-    
+        return None

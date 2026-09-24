@@ -429,6 +429,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
               <tr className="border-b border-slate-200 dark:border-[#1a2030] bg-white dark:bg-[#08090d]/50 text-black dark:text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
                 <th className="py-4 px-5">Ticket #</th>
                 <th className="py-4 px-4">Instrument</th>
+                <th className="py-4 px-4">Strategy</th> {/* Added header */}
                 <th className="py-4 px-4">Direction</th>
                 <th className="py-4 px-4">Lots</th>
                 <th className="py-4 px-4">Open Fill</th>
@@ -453,6 +454,11 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                     </td>
                     <td className="py-3.5 px-4 font-semibold text-black dark:text-white">
                       {trade.asset}
+                      {/* Strategy Tag Cell */}
+                    <td className="py-3.5 px-4">
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
+                        {trade.strategy || 'DERIV_CORE'}
+                      </span>
                     </td>
                     <td className="py-3.5 px-4">
                       <span className={`inline-flex items-center gap-1 font-mono font-bold px-2 py-0.5 rounded text-[10px] ${
