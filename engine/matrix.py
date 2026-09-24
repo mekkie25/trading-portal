@@ -65,84 +65,7 @@ CONFIG_FILE = "bot_config.json"
 TELEMETRY_FILE = "bot_telemetry.json"
 
 # ==============================================================================
-# 1. WHATSAPP NOTIFICATION ENGINE
-# ==============================================================================
-
-class WhatsAppNotifier:
-    """Sends instant alerts directly to your personal WhatsApp via CallMeBot."""
-    def __init__(self):
-        self.phone = os.getenv("WHATSAPP_PHONE", "").strip()
-        self.api_key = os.getenv("WHATSAPP_API_KEY", "").strip()
-        self.enabled = bool(self.phone and self.api_key)
-        if self.enabled:
-            log.info(f"WhatsApp Notification Engine Online for {self.phone}")
-        else:
-            log.info("WhatsApp Alerts standby (Set WHATSAPP_PHONE & WHATSAPP_API_KEY in Railway to activate).")
-
-    async def send_alert(self, message: str) -> bool:
-        if not self.enabled:
-            return False
-        try:
-            clean_phone = self.phone.replace("+", "").replace(" ", "").strip()
-            encoded_text = urllib.parse.quote(message)
-            url = f"https://api.callmebot.com/whatsapp.php?phone={clean_phone}&text={encoded_text}&apikey={self.api_key}"
-
-            def _call():
-                req = urllib.request.Request(url, headers={"User-Agent": "NexusMatrix/1.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    return resp.read().decode('utf-8', errors='ignore')
-
-            res = await asyncio.to_thread(_call)
-            return "Message Sent" in res or "ok" in res.lower()
-        except Exception as e:
-            log.warning(f"Could not send WhatsApp alert: {e}")
-            return False
-
-whatsapp = WhatsAppNotifier()
-
-# ==============================================================================
-# 2. ADVANCED TELEMETRY & UI CONFIGURATION I/O HELPERS
-# ==============================================================================
-
-def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
-    """Outputs structured telemetry line for server.ts IPC process reader."""
-    msg = json.dumps({
-        "balance": balance,
-        "equity": equity,
-        "regime": regime,
-        "active_setup": active_setup,
-        "ai_verdict": ai_verdict
-    })
-    print(f"[MATRIX_TELEMETRY] {msg}", flush=True)
-
-def write_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str) -> None:
-    """Persists telemetry to bot_telemetry.json for the React frontend."""
-    data = {
-        "balance": balance,
-        "equity": equity,
-        "regime": regime,
-        "active_setup": active_setup,
-        "ai_verdict": ai_verdict,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-    try:
-        with open(TELEMETRY_FILE, "w") as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        log.error(f"Failed to write telemetry: {e}")
-
-def read_ui_config() -> dict:
-    """Reads live slider and loss ceiling values set on the website dashboard."""
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-# ==============================================================================
-# 3. ADVANCED LOGGING SYSTEM
+# 1. ADVANCED LOGGING SYSTEM (INITIALIZED FIRST)
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
@@ -183,6 +106,83 @@ def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", 
 log = setup_logger()
 
 # ==============================================================================
+# 2. WHATSAPP NOTIFICATION ENGINE (CallMeBot)
+# ==============================================================================
+
+class WhatsAppNotifier:
+    """Sends instant alerts directly to your personal WhatsApp via CallMeBot."""
+    def __init__(self):
+        self.phone = os.getenv("WHATSAPP_PHONE", "").strip()
+        self.api_key = os.getenv("WHATSAPP_API_KEY", "").strip()
+        self.enabled = bool(self.phone and self.api_key)
+        if self.enabled:
+            log.info(f"WhatsApp Notification Engine Online for {self.phone}")
+        else:
+            log.info("WhatsApp Alerts standby (Set WHATSAPP_PHONE & WHATSAPP_API_KEY in Railway to activate).")
+
+    async def send_alert(self, message: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            clean_phone = self.phone.replace("+", "").replace(" ", "").strip()
+            encoded_text = urllib.parse.quote(message)
+            url = f"https://api.callmebot.com/whatsapp.php?phone={clean_phone}&text={encoded_text}&apikey={self.api_key}"
+
+            def _call():
+                req = urllib.request.Request(url, headers={"User-Agent": "NexusMatrix/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    return resp.read().decode('utf-8', errors='ignore')
+
+            res = await asyncio.to_thread(_call)
+            return "Message Sent" in res or "ok" in res.lower()
+        except Exception as e:
+            log.warning(f"Could not send WhatsApp alert: {e}")
+            return False
+
+whatsapp = WhatsAppNotifier()
+
+# ==============================================================================
+# 3. ADVANCED TELEMETRY & UI CONFIGURATION I/O HELPERS
+# ==============================================================================
+
+def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
+    """Outputs structured telemetry line for server.ts IPC process reader."""
+    msg = json.dumps({
+        "balance": balance,
+        "equity": equity,
+        "regime": regime,
+        "active_setup": active_setup,
+        "ai_verdict": ai_verdict
+    })
+    print(f"[MATRIX_TELEMETRY] {msg}", flush=True)
+
+def write_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str) -> None:
+    """Persists telemetry to bot_telemetry.json for the React frontend."""
+    data = {
+        "balance": balance,
+        "equity": equity,
+        "regime": regime,
+        "active_setup": active_setup,
+        "ai_verdict": ai_verdict,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    try:
+        with open(TELEMETRY_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        log.error(f"Failed to write telemetry: {e}")
+
+def read_ui_config() -> dict:
+    """Reads live slider and loss ceiling values set on the website dashboard."""
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+# ==============================================================================
 # 4. GLOBAL CONSTANTS & ASSET CONFIGURATION (STRICT 7 ALLOWED ONLY)
 # ==============================================================================
 
@@ -211,7 +211,6 @@ class ConfigManager:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3"
 
-    # Strictly 7 Whitelisted Tradable Assets mapped to Deriv official OTC/Forex symbols
     SYMBOL_MAP: Dict[str, str] = {
         "GOLD": "frxXAUUSD",
         "US30": "OTC_DJI",
@@ -274,7 +273,6 @@ class DerivCloudClient:
         return getattr(self.ws, "open", False)
 
     async def get_authenticated_ws_url(self) -> str:
-        """Deriv New API Architecture: Uses REST + OTP handshake to obtain pre-authenticated WS URL."""
         api_base = "https://api.derivws.com"
         try:
             headers = {
@@ -314,7 +312,7 @@ class DerivCloudClient:
                 return ws_url
 
         except Exception as e:
-            log.warning(f"Deriv REST+OTP handshake warning: {e}. Trying standard connection.")
+            log.warning(f"Deriv REST+OTP handshake warning: {e}. Trying fallback.")
 
         return f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
 
@@ -432,7 +430,8 @@ class DerivCloudClient:
                 df['tick_volume'] = 1
 
             return df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
-        except Exception:
+        except Exception as e:
+            log.error(f"Exception during candle fetch ({symbol}): {e}")
             return pd.DataFrame()
 
     async def get_live_quote(self, symbol: str) -> Tuple[float, float, float]:
@@ -461,10 +460,6 @@ class DerivCloudClient:
         sl_price: float, 
         tp_price: float
     ) -> Optional[Dict[str, Any]]:
-        """
-        ATOMIC BRACKET EXECUTION: Bundles SL and TP bounds directly into the proposal.
-        The trade enters the market fully protected at the exact millisecond of purchase.
-        """
         if not await self.ensure_connected():
             return None
 
@@ -734,14 +729,12 @@ class InstitutionalRiskEngine:
         }
 
         # Targeted Red-Folder Windows (NFP & CPI announcements: 5 min before and after)
-        # Note: We do NOT block; we apply News Armor (cut size by 50% and enforce tight spread)
         self.RED_FOLDER_WINDOWS = [
-            (dtime(12, 25), dtime(12, 35)),  # US CPI / NFP release window (12:30 UTC)
-            (dtime(17, 55), dtime(18, 5))    # FOMC Rate Decision announcement (18:00 UTC)
+            (dtime(12, 25), dtime(12, 35)),
+            (dtime(17, 55), dtime(18, 5))
         ]
 
     def sync_ui_config(self) -> None:
-        """Dynamically syncs user interface controls from bot_config.json."""
         cfg = read_ui_config()
         if not cfg:
             return
@@ -755,7 +748,6 @@ class InstitutionalRiskEngine:
         self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
 
     def is_red_folder_active(self) -> bool:
-        """Checks if current time is inside a high-impact red folder release window."""
         now_utc = datetime.now(timezone.utc).time()
         for start, end in self.RED_FOLDER_WINDOWS:
             if start <= now_utc <= end:
@@ -771,7 +763,6 @@ class InstitutionalRiskEngine:
         return True, ""
 
     def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
-        """Returns True if price has reached 80% of the distance from entry to Take Profit."""
         total_target_distance = abs(tp - entry)
         if total_target_distance <= 0:
             return False
@@ -786,7 +777,6 @@ class InstitutionalRiskEngine:
 
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
-        """Computes M5, H4, D1 candle averages and identifies market consolidation."""
         def get_atr(df: pd.DataFrame, period: int = 14) -> float:
             if df is None or df.empty or len(df) < 2:
                 return 0.0
@@ -822,7 +812,6 @@ class InstitutionalRiskEngine:
         }
 
     def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
-        """Spread Gatekeeper: Checks if bid-ask spread is acceptable."""
         spread = abs(current_ask - current_bid)
         max_allowed = self.max_absolute_spread.get(symbol, 5.0)
         
@@ -835,25 +824,17 @@ class InstitutionalRiskEngine:
         return True, "Spread optimal", spread
 
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        """
-        Adapts dynamically to ANY account size:
-        - Micro-Account Mode (R100 / $5-$10): Uses broker min stake to build small deposits.
-        - News Armor: Halves risk during red folder windows to absorb slippage.
-        """
         equity = current_equity if current_equity > 0 else 10051.99
         active_risk_pct = self.risk_per_trade_pct
 
-        # 1. Consecutive Loss Protection
         if self.consecutive_losses >= 3:
             active_risk_pct = active_risk_pct * 0.5
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
-        # 2. News Armor: Halve risk during high-impact red folder events
         if self.is_red_folder_active():
             active_risk_pct = active_risk_pct * 0.5
             log.info(f"NEWS ARMOR ENGAGED: Red folder window active. Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
 
-        # 3. Dynamic Weekly Buffer Budgeting
         if self.max_weekly_loss_usd > 0:
             weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
             remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
@@ -869,7 +850,6 @@ class InstitutionalRiskEngine:
         else:
             max_weekly_allowed_dollars = float('inf')
 
-        # 4. Dynamic Daily Buffer Budgeting
         if self.max_daily_loss_usd > 0:
             remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
             max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
@@ -882,9 +862,6 @@ class InstitutionalRiskEngine:
         denom = sl_distance * point_value
         calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
 
-        # Micro-Account Growth Rule:
-        # If balance is small (e.g. R100 or $5-$10) and standard % is tiny, clamp to min_stake
-        # so the trade can actually execute and build up small deposits!
         if calculated_stake < min_stake and equity >= min_stake:
             log.info(f"MICRO-ACCOUNT GROWTH MODE: Small equity ({equity:.2f}). Using minimum broker stake ({min_stake}).")
             calculated_stake = min_stake
@@ -905,18 +882,15 @@ class InstitutionalRiskEngine:
         min_stake: float,
         max_stake: float
     ) -> Tuple[bool, str, dict]:
-        """Pre-trade verification checking loss limits, spread, news, and lot sizing."""
         self.sync_ui_config()
 
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
 
-        # Sector Correlation Limit Gate
         sector_ok, sector_msg = self.check_sector_exposure(symbol)
         if not sector_ok:
             return False, sector_msg, {}
 
-        # Ceilings
         if self.current_daily_loss >= self.max_daily_loss_usd:
             return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
 
@@ -938,7 +912,6 @@ class InstitutionalRiskEngine:
             target_distance = sl_distance * self.risk_to_reward
             final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
 
-        # Spread Gate (Primary shield during news volatility)
         spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
         if not spread_ok:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
@@ -1177,9 +1150,7 @@ class CloudExecutionEngine:
 
         log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total Stake: ${total_stake} | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
 
-        # Fill Contract A (50% size at TP1)
         res_a = await self.deriv.execute_atomic_order(bp['symbol'], bp['direction'], half_stake, bp['entry_price'], bp['stop_loss'], tp1_price)
-        # Fill Contract B (50% runner at TP2)
         res_b = await self.deriv.execute_atomic_order(bp['symbol'], bp['direction'], half_stake, bp['entry_price'], bp['stop_loss'], tp2_price)
 
         if res_a or res_b:
@@ -1300,12 +1271,10 @@ class MatrixEngineMaster:
         """Daily 21:00 SAST Flusher: Flattens all open positions every night (zero overnight/weekend risk)."""
         while True:
             try:
-                # Johannesburg (SAST) is UTC+2
                 now_sast = datetime.now(timezone.utc) + timedelta(hours=2)
                 hour = now_sast.hour
                 minute = now_sast.minute
 
-                # Trigger at 21:00 SAST (9:00 PM) every night
                 if hour == 21 and minute == 0 and len(self.risk_mgr.open_positions) > 0:
                     log.warning(f"🌆 21:00 SAST LOCKDOWN: Flattening {len(self.risk_mgr.open_positions)} open positions to cash.")
                     for cid, pos in list(self.risk_mgr.open_positions.items()):
@@ -1335,7 +1304,7 @@ class MatrixEngineMaster:
                 last_signal: Optional[Any] = None
 
                 for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
-                    await asyncio.sleep(0.20)  # Gentle delay between assets
+                    await asyncio.sleep(0.20)
 
                     m5_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.M5, count=60)
                     h4_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.H4, count=30)
