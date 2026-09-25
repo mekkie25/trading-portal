@@ -460,7 +460,66 @@ class DerivCloudClient:
         sl_price: float, 
         tp_price: float
     ) -> Optional[Dict[str, Any]]:
+        """
+        ATOMIC BRACKET EXECUTION: Bundles SL and TP bounds directly into the proposal.
+        The trade enters the market fully protected at the exact millisecond of purchase.
+        """
         if not await self.ensure_connected():
+            return None
+
+        contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
+        asset_cfg = ConfigManager.ASSETS.get(symbol)
+        multiplier = asset_cfg.default_multiplier if asset_cfg else 100
+
+        sl_pts = abs(entry_price - sl_price)
+        tp_pts = abs(tp_price - entry_price)
+
+        proposal_req = {
+            "proposal": 1,
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": ConfigManager.BASE_ACCOUNT_CURRENCY,
+            "underlying_symbol": symbol,
+            "multiplier": multiplier,
+            "limit_order": {
+                "stop_loss": round(sl_pts, 2),
+                "take_profit": round(tp_pts, 2)
+            },
+            "req_id": self._get_next_req_id()
+        }
+
+        try:
+            async with self._lock:
+                await self.ws.send(json.dumps(proposal_req))
+                prop_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
+
+                if "error" in prop_res:
+                    log.error(f"Deriv Trade Proposal Error ({symbol}): {prop_res['error']['message']}")
+                    return None
+
+                proposal_id = prop_res.get("proposal", {}).get("id")
+                if not proposal_id:
+                    return None
+
+                buy_req = {
+                    "buy": proposal_id,
+                    "price": stake,
+                    "req_id": self._get_next_req_id()
+                }
+                await self.ws.send(json.dumps(buy_req))
+                buy_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
+
+                if "error" in buy_res:
+                    log.error(f"Deriv Purchase Execution Error ({symbol}): {buy_res['error']['message']}")
+                    return None
+
+                contract_info = buy_res.get("buy", {})
+                log.info(f"DERIV ATOMIC BRACKET ORDER FILLED | {symbol} | ID: {contract_info.get('contract_id')} | Stake: ${stake} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
+                return contract_info
+
+        except Exception as e:
+            log.error(f"Exception during Deriv order execution ({symbol}): {e}")
             return None
 
         contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
