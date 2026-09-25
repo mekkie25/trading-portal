@@ -38,17 +38,16 @@ class RiskManager:
         # Weekly Growth Goal Engine
         self.weekly_deposit_baseline: float = 0.0
         self.weekly_goal_target: float = 0.0
-
-        # Spread Gate Thresholds
-        self.max_spread_to_sl_ratio: float = 0.15
-        self.max_absolute_spread = {
-            "frxXAUUSD": 0.50,
-            "OTC_DJI": 4.5,
-            "OTC_NDX": 2.5,
-            "OTC_GDAXI": 3.0,
-            "frxEURUSD": 0.0003,
-            "frxUSDJPY": 0.035,
-            "frxGBPUSD": 0.00035
+        # Standard Baseline Spreads & Dynamic +70% Tolerance Bands
+        self.max_spread_to_sl_ratio: float = 0.30
+        self.spread_ranges = {
+            "frxXAUUSD": {"standard": 0.80, "max_allowed": 1.36},       # Gold: 0.80 -> 1.36 USD
+            "OTC_DJI":   {"standard": 4.50, "max_allowed": 7.65},       # US30: 4.5 -> 7.65 pts
+            "OTC_NDX":   {"standard": 2.00, "max_allowed": 3.40},       # NAS100: 2.0 -> 3.40 pts
+            "OTC_GDAXI": {"standard": 2.50, "max_allowed": 4.25},       # DAX40: 2.5 -> 4.25 pts
+            "frxEURUSD": {"standard": 0.00010, "max_allowed": 0.00017}, # EUR/USD: 1.0 -> 1.7 pips
+            "frxUSDJPY": {"standard": 0.012, "max_allowed": 0.0204},    # USD/JPY: 1.2 -> 2.04 pips
+            "frxGBPUSD": {"standard": 0.00014, "max_allowed": 0.00024}  # GBP/USD: 1.4 -> 2.38 pips
         }
 
         # Sector Correlation Grouping (Max 1 open position per sector)
@@ -153,19 +152,24 @@ class RiskManager:
             "range_low": round(range_low, 4),
             "range_span": round(range_span, 4),
         }
-
-    def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
+def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
+        """Evaluates live spread against the standard baseline + 70% dynamic range."""
         spread = abs(current_ask - current_bid)
-        max_allowed = self.max_absolute_spread.get(symbol, 5.0)
-        
-        # News protection: During high-impact news, spreads blow out. If spread is too wide, pause.
-        if spread > max_allowed:
-            return False, f"Spread ({spread:.4f}) exceeds safety ceiling ({max_allowed:.4f})", spread
+        range_cfg = self.spread_ranges.get(symbol)
+
+        if range_cfg:
+            std_spread = range_cfg["standard"]
+            max_allowed = range_cfg["max_allowed"]  # Standard + 70%
+            if spread > max_allowed:
+                return False, f"Spread ({spread:.5f}) exceeded +70% range [{std_spread:.5f} to {max_allowed:.5f}]", spread
+        else:
+            if spread > 5.0:
+                return False, f"Spread ({spread:.4f}) exceeds default ceiling (5.0)", spread
 
         if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
-            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
+            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
 
-        return True, "Spread optimal", spread
+        return True, "Spread optimal (within +70% range)", spread
 
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
         """
