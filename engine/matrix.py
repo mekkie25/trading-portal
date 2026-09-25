@@ -470,20 +470,20 @@ class DerivCloudClient:
         sl_pts = abs(entry_price - sl_price)
         tp_pts = abs(tp_price - entry_price)
 
-        proposal_req = {
+       proposal_req = {
             "proposal": 1,
             "amount": stake,
             "basis": "stake",
             "contract_type": contract_type,
             "currency": ConfigManager.BASE_ACCOUNT_CURRENCY,
-            "symbol": symbol,
+            "underlying_symbol": symbol,
             "multiplier": multiplier,
             "limit_order": {
                 "stop_loss": round(sl_pts, 2),
                 "take_profit": round(tp_pts, 2)
             },
             "req_id": self._get_next_req_id()
-        }
+        } 
 
         try:
             async with self._lock:
