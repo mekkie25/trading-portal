@@ -529,7 +529,7 @@ class DerivCloudClient:
         sl_pts = abs(entry_price - sl_price)
         tp_pts = abs(tp_price - entry_price)
 
-       proposal_req = {
+        proposal_req = {
             "proposal": 1,
             "amount": stake,
             "basis": "stake",
