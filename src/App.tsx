@@ -46,26 +46,24 @@ const safeStorage = {
   },
 };
 
-// Recalculates metrics from the active list of trades
-function computeMetricsFromTrades(tradesList: TradeRecord[], currentBalance: number, currentEquity: number, deposits: number): TopMetrics {
-  const totalTrades = tradesList.length;
-  const wins = tradesList.filter(t => t.status === 'WIN').length;
-  const losses = tradesList.filter(t => t.status === 'LOSS').length;
-  const netProfit = tradesList.reduce((acc, t) => acc + (t.pnl || 0), 0);
+function recalculateLedgerMetrics(tradesList: TradeRecord[], prev: TopMetrics): TopMetrics {
+  const safeList = Array.isArray(tradesList) ? tradesList : [];
+  const totalTrades = safeList.length;
+  const wins = safeList.filter(t => t && t.status === 'WIN').length;
+  const losses = safeList.filter(t => t && t.status === 'LOSS').length;
+  const netProfit = safeList.reduce((acc, t) => acc + (t?.pnl || 0), 0);
   const winRate = totalTrades > 0 ? Number(((wins / totalTrades) * 100).toFixed(1)) : 0;
-  const netProfitPct = deposits > 0 ? Number(((netProfit / deposits) * 100).toFixed(1)) : 0;
+  const deposits = prev.totalInjections > 0 ? prev.totalInjections : 10000;
+  const netProfitPct = Number(((netProfit / deposits) * 100).toFixed(1));
 
   return {
+    ...prev,
     netProfit: Number(netProfit.toFixed(2)),
     netProfitPct,
     winRate,
     totalTrades,
     winningTrades: wins,
     losingTrades: losses,
-    totalInjections: deposits,
-    currentEquity: Number(currentEquity.toFixed(2)),
-    currentBalance: Number(currentBalance.toFixed(2)),
-    unrealizedPnL: Number((currentEquity - currentBalance).toFixed(2)),
   };
 }
 
@@ -113,7 +111,8 @@ export default function App() {
   });
 
   const [metrics, setMetrics] = useState<TopMetrics>(() => {
-    return computeMetricsFromTrades(trades, 10051.99, 10051.99, 10000);
+    const cached = safeStorage.getItem('2gs_metrics', INITIAL_METRICS);
+    return recalculateLedgerMetrics(INITIAL_TRADES, cached);
   });
 
   const handleSaveBotSettings = async (newSettings: BotSettings) => {
@@ -126,35 +125,39 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newSettings),
       });
-    } catch (err) {
-      console.warn('Config push fallback:', err);
-    }
+    } catch {}
   };
 
+  // STABLE TELEMETRY SYNC (Zero Infinite Loops)
   const syncBrokerTelemetry = useCallback(async () => {
     try {
       const res = await fetch('/api/broker/telemetry');
-      if (res.ok) {
-        const json = await res.json();
-        if (json.status === 'success' && json.data) {
-          const d = json.data;
-          setBrokerConfig(prev => ({
+      if (!res.ok) return;
+      const json = await res.json();
+      if (json.status === 'success' && json.data) {
+        const d = json.data;
+        setBrokerConfig(prev => ({
+          ...prev,
+          connected: d.connected ?? prev.connected,
+          currency: d.currency ?? prev.currency ?? 'USD',
+          accountNumber: d.accountNumber || prev.accountNumber,
+        }));
+
+        setMetrics(prev => {
+          const liveBal = typeof d.balance === 'number' && d.balance > 0 ? d.balance : prev.currentBalance;
+          const liveEq = typeof d.equity === 'number' && d.equity > 0 ? d.equity : prev.currentEquity;
+          const deposits = typeof d.totalDeposits === 'number' ? d.totalDeposits : prev.totalInjections;
+          return {
             ...prev,
-            connected: d.connected ?? prev.connected,
-            currency: d.currency ?? prev.currency ?? 'USD',
-            accountNumber: d.accountNumber || prev.accountNumber,
-          }));
-
-          const liveBalance = d.balance ?? metrics.currentBalance;
-          const liveEquity = d.equity ?? metrics.currentEquity;
-          const deposits = d.totalDeposits || 10000;
-
-          // Recompute metrics based on current active ledger
-          setMetrics(computeMetricsFromTrades(trades, liveBalance, liveEquity, deposits));
-        }
+            currentBalance: liveBal,
+            currentEquity: liveEq,
+            totalInjections: deposits,
+            unrealizedPnL: Number((liveEq - liveBal).toFixed(2)),
+          };
+        });
       }
     } catch {}
-  }, [trades, metrics.currentBalance, metrics.currentEquity]);
+  }, []);
 
   useEffect(() => {
     syncBrokerTelemetry();
@@ -162,25 +165,23 @@ export default function App() {
     return () => clearInterval(interval);
   }, [syncBrokerTelemetry]);
 
-  // DELETE SINGLE TRADE: Immediately removes and recalculates metrics
+  // DELETE SINGLE TRADE: Recalculates metrics immediately without reloading
   const handleDeleteTrade = async (tradeId: string) => {
-    const updated = trades.filter(t => t.id !== tradeId);
+    const updated = trades.filter(t => t && t.id !== tradeId);
     setTrades(updated);
     safeStorage.setItem('2gs_trades', updated);
-
-    // Immediately recalculate dashboard stats
-    setMetrics(computeMetricsFromTrades(updated, metrics.currentBalance, metrics.currentEquity, metrics.totalInjections));
+    setMetrics(prev => recalculateLedgerMetrics(updated, prev));
 
     try {
       await fetch(`/api/journal/${tradeId}`, { method: 'DELETE' });
     } catch {}
   };
 
-  // WIPE ENTIRE JOURNAL: Immediately zeroes out metrics and clears trades
+  // WIPE ENTIRE JOURNAL: Resets ledger to 0
   const handleResetJournal = async () => {
     setTrades([]);
     safeStorage.setItem('2gs_trades', []);
-    setMetrics(computeMetricsFromTrades([], metrics.currentBalance, metrics.currentEquity, metrics.totalInjections));
+    setMetrics(prev => recalculateLedgerMetrics([], prev));
 
     try {
       await fetch('/api/journal/reset', { method: 'POST' });
@@ -191,7 +192,7 @@ export default function App() {
     const updated = [newTrade, ...trades];
     setTrades(updated);
     safeStorage.setItem('2gs_trades', updated);
-    setMetrics(computeMetricsFromTrades(updated, metrics.currentBalance, metrics.currentEquity, metrics.totalInjections));
+    setMetrics(prev => recalculateLedgerMetrics(updated, prev));
   };
 
   const [branding, setBranding] = useState<SiteBrandingConfig>(() => {
@@ -266,6 +267,7 @@ export default function App() {
               currentEquity={metrics.currentEquity}
               riskPerTradePct={botSettings.riskPerTradePct}
               themeMode={themeMode}
+              activeTrades={trades}
             />
           )}
 
