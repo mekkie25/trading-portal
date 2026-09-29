@@ -1267,7 +1267,8 @@ class CloudExecutionEngine:
             for res, target in [(res_a, tp1_price), (res_b, tp2_price)]:
                 if res and res.get("position_id"):
                     pid = str(res["position_id"])
-                    self.ctrader._save_position_strategy(pid, strategy_name) = {
+                    self.ctrader._save_position_strategy(pid, strategy_name)
+                    self.risk.open_positions[pid] = {
                         "symbol": bp['symbol'],
                         "direction": bp['direction'],
                         "entry_price": bp['entry_price'],
