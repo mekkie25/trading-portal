@@ -21,13 +21,12 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 # Silence library warning in terminal
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Ensure project root is in Python search path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -39,7 +38,6 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
-# Modular Strategy Framework
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 
@@ -48,7 +46,7 @@ TELEMETRY_FILE = "bot_telemetry.json"
 TRADES_DB_FILE = "trades_db.json"
 
 # ==============================================================================
-# 1. ADVANCED INSTITUTIONAL LOGGING SYSTEM
+# 1. ADVANCED LOGGING SYSTEM
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
@@ -117,7 +115,7 @@ class WhatsAppNotifier:
 whatsapp = WhatsAppNotifier()
 
 # ==============================================================================
-# 3. ADVANCED TELEMETRY & UI I/O HELPERS
+# 3. TELEMETRY & UI I/O HELPERS
 # ==============================================================================
 
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
@@ -219,7 +217,7 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 5. NATIVE CTRADER OPEN API CLIENT (WITH AUTO-ACCOUNT RESOLUTION)
+# 5. NATIVE CTRADER OPEN API CLIENT (WITH DIRECT HTTP & PROTOBUF RESOLVER)
 # ==============================================================================
 
 class CTraderClient:
@@ -253,17 +251,48 @@ class CTraderClient:
             return False
         return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
+    def fetch_real_account_id_from_http(self) -> Optional[int]:
+        """Directly queries Spotware API to map login number (e.g. 41425) to ctidTraderAccountId."""
+        try:
+            url = f"https://api.spotware.com/connect/tradingaccounts?access_token={self.access_token}"
+            req = urllib.request.Request(url, headers={"User-Agent": "NexusMatrix/1.0"})
+            with urllib.request.urlopen(req, timeout=7) as resp:
+                data = json.loads(resp.read().decode())
+                accounts = data.get("data", [])
+                log.info(f"Spotware Accounts API returned {len(accounts)} account(s) for your token.")
+                for acc in accounts:
+                    a_id = acc.get("accountId")
+                    a_num = acc.get("accountNumber")
+                    log.info(f"-> Account: Login #{a_num} | ctidTraderAccountId: #{a_id} | Live: {acc.get('live')}")
+                    if self.account_id in (a_id, a_num):
+                        log.info(f"MATCH FOUND! Auto-binding account #{a_id} (Login #{a_num})")
+                        return a_id
+                if accounts:
+                    is_live = (ConfigManager.ENV == "live")
+                    matching = [a for a in accounts if a.get("live", False) == is_live]
+                    chosen = matching[0] if matching else accounts[0]
+                    log.info(f"Auto-selected account: Login #{chosen.get('accountNumber')} -> ctidTraderAccountId #{chosen.get('accountId')}")
+                    return chosen.get("accountId")
+        except Exception as e:
+            log.warning(f"Direct Spotware HTTP account query note: {e}")
+        return None
+
     async def connect(self) -> bool:
         if not self.client_id or not self.client_secret or not self.access_token:
             log.critical("Missing cTrader credentials in Railway environment variables.")
             return False
+
+        # Attempt to auto-resolve 41425 to the internal accountId
+        resolved_id = await asyncio.to_thread(self.fetch_real_account_id_from_http)
+        if resolved_id:
+            self.account_id = resolved_id
 
         try:
             log.info(f"Connecting to Fusion Markets cTrader ({ConfigManager.ENV.upper()}): {self.ws_url}...")
             self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
             asyncio.create_task(self._listen_loop())
 
-            # 1. Application Authorization (ProtoOAApplicationAuthReq: 2100)
+            # 1. Application Auth (2100)
             app_auth_res = await self._send_and_wait(2100, {
                 "clientId": self.client_id,
                 "clientSecret": self.client_secret
@@ -272,40 +301,7 @@ class CTraderClient:
                 log.critical(f"cTrader App Auth failed: {app_auth_res}")
                 return False
 
-            # 2. Automatically Resolve Account ID (ProtoOAGetAccountListByAccessTokenReq: 2149)
-            acc_list_res = await self._send_and_wait(2149, {
-                "accessToken": self.access_token
-            })
-
-            target_ctid = None
-            if acc_list_res and "ctidTraderAccount" in acc_list_res.get("payload", {}):
-                accounts = acc_list_res["payload"]["ctidTraderAccount"]
-                log.info(f"Found {len(accounts)} account(s) linked to your Access Token.")
-
-                for acc in accounts:
-                    c_id = acc.get("ctidTraderAccountId")
-                    t_login = acc.get("traderLogin")
-                    log.info(f"Detected Account -> Login: #{t_login} | ctidTraderAccountId: #{c_id} (isLive: {acc.get('isLive')})")
-
-                    if self.account_id in (c_id, t_login):
-                        target_ctid = c_id
-                        log.info(f"Successfully matched Login #{t_login} to internal ctidTraderAccountId #{target_ctid}!")
-                        break
-
-                if not target_ctid and accounts:
-                    is_live_env = (ConfigManager.ENV == "live")
-                    matching = [a for a in accounts if a.get("isLive", False) == is_live_env]
-                    chosen = matching[0] if matching else accounts[0]
-                    target_ctid = chosen.get("ctidTraderAccountId")
-                    log.info(f"Auto-selected account: Login #{chosen.get('traderLogin')} -> ctidTraderAccountId #{target_ctid}")
-
-            if target_ctid:
-                self.account_id = target_ctid
-            elif not self.account_id:
-                log.critical("Could not find any active cTrader account linked to this token.")
-                return False
-
-            # 3. Account Authorization (ProtoOAAccountAuthReq: 2102)
+            # 2. Account Auth (2102)
             acc_auth_res = await self._send_and_wait(2102, {
                 "ctidTraderAccountId": self.account_id,
                 "accessToken": self.access_token
@@ -317,7 +313,7 @@ class CTraderClient:
 
             self.is_authorized = True
 
-            # 4. Pull Live Account Balance, Digits & Currency (ProtoOATraderReq: 2121)
+            # 3. Pull Live Balance & Digits (2121)
             trader_res = await self._send_and_wait(2121, {
                 "ctidTraderAccountId": self.account_id
             })
@@ -329,7 +325,7 @@ class CTraderClient:
                 self.last_known_equity = self.last_known_balance
                 log.info(f"--- CTRADER / FUSION ONLINE --- Balance: {self.last_known_balance:,.2f}")
 
-            # 5. Discover Broker Symbols & Map IDs (ProtoOASymbolsListReq: 2114)
+            # 4. Discover Broker Symbols & Map IDs (2114)
             await self._discover_symbols()
             return True
 

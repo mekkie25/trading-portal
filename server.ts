@@ -433,7 +433,7 @@ const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN!;
 
 async function startServer() {
   const app = express();
-   startDerivGateway();
+  //startDerivGateway();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   app.use(express.json());
