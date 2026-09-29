@@ -3,25 +3,6 @@
 ================================================================================
 NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (CTRADER OPEN API / FUSION MARKETS)
 ================================================================================
-Architecture: Institutional Multi-Strategy Quantitative Execution Engine
-Components:   - All-Day Execution Engine for Fusion Markets (cTrader Open API)
-              - Dynamic Micro-Account Scaling (Handles R100, R1,000, up to $100k+)
-              - AI Intuition & Target-Pacing Sizer (Gemini AI Quality Multiplier)
-              - Daily Profit Target Runway Allocator (e.g. R500 Target on R1,000 Balance)
-              - Automatic Symbol Discovery & Dynamic ID Resolution
-              - Dual-Stage OAuth Handshake (App Auth 2100 + Account Auth 2102)
-              - Daily 21:00 SAST End-of-Day Position Flusher (Zero Overnight Risk)
-              - Instant Personal WhatsApp Alerts Engine (CallMeBot Integration)
-              - Twin-Position 50/50 Partial Scaling (Bank Half at TP1, Trail TP2)
-              - Order Flow & Volume Profile Analyzer (POC, VAH, VAL, Cumulative Delta)
-              - Quantitative Math Engine (EMA, ATR, Bollinger Bands, RSI)
-              - Temporal Clock & Session Manager (Asian, London, NY)
-              - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
-              - Live Bid/Ask Spread Gatekeeper & News Armor Protection
-              - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
-              - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
-Deployment:   Headless Linux / Railway / Cloud VPS / Docker Container
-================================================================================
 """
 
 import sys
@@ -31,6 +12,7 @@ import json
 import math
 import logging
 import asyncio
+import warnings
 import websockets
 import urllib.request
 import urllib.parse
@@ -41,6 +23,9 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
+
+# Silence library warning in terminal
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Ensure project root is in Python search path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -58,7 +43,6 @@ except ImportError:
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 
-# File paths for IPC, telemetry, and trade history
 CONFIG_FILE = "bot_config.json"
 TELEMETRY_FILE = "bot_telemetry.json"
 TRADES_DB_FILE = "trades_db.json"
@@ -68,13 +52,6 @@ TRADES_DB_FILE = "trades_db.json"
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
-    grey = "\x1b[38;20m"
-    yellow = "\x1b[33;20m"
-    red = "\x1b[31;20m"
-    bold_red = "\x1b[31;1m"
-    green = "\x1b[32;20m"
-    cyan = "\x1b[36;20m"
-    reset = "\x1b[0m"
     fmt = "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-20s | %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
@@ -109,7 +86,6 @@ log = setup_logger()
 # ==============================================================================
 
 class WhatsAppNotifier:
-    """Sends instant alerts directly to your personal WhatsApp via CallMeBot."""
     def __init__(self):
         self.phone = os.getenv("WHATSAPP_PHONE", "").strip()
         self.api_key = os.getenv("WHATSAPP_API_KEY", "").strip()
@@ -145,7 +121,6 @@ whatsapp = WhatsAppNotifier()
 # ==============================================================================
 
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
-    """Outputs structured telemetry line for server.ts IPC process reader."""
     msg = json.dumps({
         "balance": balance,
         "equity": equity,
@@ -156,7 +131,6 @@ def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str
     print(f"[MATRIX_TELEMETRY] {msg}", flush=True)
 
 def write_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str) -> None:
-    """Persists telemetry to bot_telemetry.json for the React frontend."""
     data = {
         "balance": balance,
         "equity": equity,
@@ -172,7 +146,6 @@ def write_telemetry(balance: float, equity: float, regime: str, active_setup: st
         log.error(f"Failed to write telemetry: {e}")
 
 def read_ui_config() -> dict:
-    """Reads live slider and target values set on the website dashboard."""
     if not os.path.exists(CONFIG_FILE):
         return {}
     try:
@@ -182,7 +155,6 @@ def read_ui_config() -> dict:
         return {}
 
 def read_trade_history() -> List[dict]:
-    """Reads closed trade records to analyze historical edge per pair and strategy."""
     if not os.path.exists(TRADES_DB_FILE):
         return []
     try:
@@ -192,7 +164,7 @@ def read_trade_history() -> List[dict]:
         return []
 
 # ==============================================================================
-# 4. GLOBAL CONSTANTS & ASSET CONFIGURATION (STRICT 7 ALLOWED ONLY)
+# 4. CONFIGURATION & CTRADER PROTOCOL DEFINITIONS
 # ==============================================================================
 
 class CTraderTrendbarPeriod(Enum):
@@ -215,7 +187,6 @@ class AssetConfig:
     sector: str
 
 class ConfigManager:
-    # 5 Railway Environment Variables from Fusion Markets cTrader Setup
     CLIENT_ID: str = os.getenv("CTRADER_CLIENT_ID", "").strip()
     CLIENT_SECRET: str = os.getenv("CTRADER_CLIENT_SECRET", "").strip()
     ACCESS_TOKEN: str = os.getenv("CTRADER_ACCESS_TOKEN", "").strip()
@@ -227,7 +198,6 @@ class ConfigManager:
     WS_PORT = 5036
     WS_URL = f"wss://{WS_HOST}:{WS_PORT}"
 
-    # Friendly Strategy Tickers to standard Fusion Markets symbol names
     SYMBOL_ALIASES: Dict[str, List[str]] = {
         "GOLD": ["XAUUSD", "GOLD", "XAUUSD.spot"],
         "US30": ["US30", "DJ30", "US30.cash", "WS30"],
@@ -249,7 +219,7 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 5. NATIVE CTRADER OPEN API CLIENT (WEBSOCKET JSON PROTOCOL)
+# 5. NATIVE CTRADER OPEN API CLIENT (WITH AUTO-ACCOUNT RESOLUTION)
 # ==============================================================================
 
 class CTraderClient:
@@ -264,12 +234,11 @@ class CTraderClient:
         self.is_authorized: bool = False
         self.last_known_balance: float = 1000.0
         self.last_known_equity: float = 1000.0
-        self.account_currency: str = "USD"
         self.money_digits: int = 2
 
-        self.symbol_map: Dict[str, int] = {}                  # "XAUUSD" -> symbolId
-        self.symbol_details: Dict[int, dict] = {}              # symbolId -> metadata
-        self.live_quotes: Dict[int, Tuple[float, float]] = {}  # symbolId -> (bid, ask)
+        self.symbol_map: Dict[str, int] = {}
+        self.symbol_details: Dict[int, dict] = {}
+        self.live_quotes: Dict[int, Tuple[float, float]] = {}
 
         self._pending_requests: Dict[str, asyncio.Future] = {}
         self._msg_counter: int = 0
@@ -285,7 +254,7 @@ class CTraderClient:
         return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
     async def connect(self) -> bool:
-        if not self.client_id or not self.client_secret or not self.access_token or not self.account_id:
+        if not self.client_id or not self.client_secret or not self.access_token:
             log.critical("Missing cTrader credentials in Railway environment variables.")
             return False
 
@@ -303,18 +272,52 @@ class CTraderClient:
                 log.critical(f"cTrader App Auth failed: {app_auth_res}")
                 return False
 
-            # 2. Account Authorization (ProtoOAAccountAuthReq: 2102)
+            # 2. Automatically Resolve Account ID (ProtoOAGetAccountListByAccessTokenReq: 2149)
+            acc_list_res = await self._send_and_wait(2149, {
+                "accessToken": self.access_token
+            })
+
+            target_ctid = None
+            if acc_list_res and "ctidTraderAccount" in acc_list_res.get("payload", {}):
+                accounts = acc_list_res["payload"]["ctidTraderAccount"]
+                log.info(f"Found {len(accounts)} account(s) linked to your Access Token.")
+
+                for acc in accounts:
+                    c_id = acc.get("ctidTraderAccountId")
+                    t_login = acc.get("traderLogin")
+                    log.info(f"Detected Account -> Login: #{t_login} | ctidTraderAccountId: #{c_id} (isLive: {acc.get('isLive')})")
+
+                    if self.account_id in (c_id, t_login):
+                        target_ctid = c_id
+                        log.info(f"Successfully matched Login #{t_login} to internal ctidTraderAccountId #{target_ctid}!")
+                        break
+
+                if not target_ctid and accounts:
+                    is_live_env = (ConfigManager.ENV == "live")
+                    matching = [a for a in accounts if a.get("isLive", False) == is_live_env]
+                    chosen = matching[0] if matching else accounts[0]
+                    target_ctid = chosen.get("ctidTraderAccountId")
+                    log.info(f"Auto-selected account: Login #{chosen.get('traderLogin')} -> ctidTraderAccountId #{target_ctid}")
+
+            if target_ctid:
+                self.account_id = target_ctid
+            elif not self.account_id:
+                log.critical("Could not find any active cTrader account linked to this token.")
+                return False
+
+            # 3. Account Authorization (ProtoOAAccountAuthReq: 2102)
             acc_auth_res = await self._send_and_wait(2102, {
                 "ctidTraderAccountId": self.account_id,
                 "accessToken": self.access_token
             })
             if not acc_auth_res or acc_auth_res.get("payloadType") != 2103:
-                log.critical(f"cTrader Account Auth failed: {acc_auth_res}")
+                err_desc = acc_auth_res.get("payload", {}).get("description") if acc_auth_res else "No response"
+                log.critical(f"cTrader Account Auth failed for ID {self.account_id}: {err_desc}")
                 return False
 
             self.is_authorized = True
 
-            # 3. Pull Account Balance, Digits & Currency (ProtoOATraderReq: 2121)
+            # 4. Pull Live Account Balance, Digits & Currency (ProtoOATraderReq: 2121)
             trader_res = await self._send_and_wait(2121, {
                 "ctidTraderAccountId": self.account_id
             })
@@ -324,9 +327,9 @@ class CTraderClient:
                 raw_bal = float(t_info.get("balance", 0))
                 self.last_known_balance = raw_bal / (10 ** self.money_digits)
                 self.last_known_equity = self.last_known_balance
-                log.info(f"--- CTRADER / FUSION ONLINE --- Balance: {self.last_known_balance:,.2f} (Account Currency)")
+                log.info(f"--- CTRADER / FUSION ONLINE --- Balance: {self.last_known_balance:,.2f}")
 
-            # 4. Discover Broker Symbols & Map IDs (ProtoOASymbolsListReq: 2114)
+            # 5. Discover Broker Symbols & Map IDs (ProtoOASymbolsListReq: 2114)
             await self._discover_symbols()
             return True
 
@@ -358,7 +361,6 @@ class CTraderClient:
                 target_ids.append(resolved_id)
                 log.info(f"Mapped Whitelist Asset: {friendly} -> Symbol ID {resolved_id} ({self.symbol_details[resolved_id]['name']})")
 
-        # Subscribe to live spot feeds for our targets (ProtoOASubscribeSpotsReq: 2127)
         if target_ids:
             await self._send(2127, {
                 "ctidTraderAccountId": self.account_id,
@@ -408,12 +410,10 @@ class CTraderClient:
                 ptype = msg.get("payloadType")
                 payload = msg.get("payload", {})
 
-                # Heartbeat Response (ProtoHeartbeatEvent: 51)
                 if ptype == 51:
                     await self._send(51, {})
                     continue
 
-                # Live Spot Event (ProtoOASpotEvent: 2131)
                 if ptype == 2131:
                     sid = payload.get("symbolId")
                     bid = payload.get("bid")
@@ -425,7 +425,6 @@ class CTraderClient:
                         new_ask = (ask / (10 ** digits)) if ask else prev[1]
                         self.live_quotes[sid] = (new_bid, new_ask)
 
-                # Route message to waiting future
                 if client_id and client_id in self._pending_requests:
                     self._pending_requests[client_id].set_result(msg)
 
@@ -460,7 +459,6 @@ class CTraderClient:
             return pd.DataFrame()
 
         now_ms = int(time.time() * 1000)
-        # Approximate historical time window
         from_ms = now_ms - (count * 60 * 1000 * 10)
 
         res = await self._send_and_wait(2137, {
@@ -511,14 +509,13 @@ class CTraderClient:
         if not sid or not self.is_authorized:
             return None
 
-        trade_side = 1 if direction.upper() == "BUY" else 2 # 1=BUY, 2=SELL
-        # Volume in cTrader is represented in cents of base currency (0.01 lot = 100,000 cents)
+        trade_side = 1 if direction.upper() == "BUY" else 2
         volume_cents = int(round(lots * 10000000))
 
         order_payload = {
             "ctidTraderAccountId": self.account_id,
             "symbolId": sid,
-            "orderType": 1, # MARKET
+            "orderType": 1,
             "tradeSide": trade_side,
             "volume": volume_cents,
             "stopLoss": round(stop_loss, 5),
@@ -527,7 +524,7 @@ class CTraderClient:
         }
 
         res = await self._send_and_wait(2106, order_payload, timeout=8.0)
-        if res and res.get("payloadType") == 2126: # ProtoOAExecutionEvent
+        if res and res.get("payloadType") == 2126:
             deal = res.get("payload", {}).get("deal", {})
             pos_id = res.get("payload", {}).get("position", {}).get("positionId")
             log.info(f"CTRADER ORDER FILLED | {direction} {symbol_name} | Position #{pos_id} | Lots: {lots:.2f} | SL: {stop_loss} | TP: {take_profit}")
@@ -542,7 +539,6 @@ class CTraderClient:
         return None
 
     async def update_position_sl(self, position_id: int, new_sl: float) -> bool:
-        """Amends active position Stop Loss to Break-Even."""
         res = await self._send_and_wait(2107, {
             "ctidTraderAccountId": self.account_id,
             "positionId": position_id,
@@ -551,7 +547,6 @@ class CTraderClient:
         return bool(res and res.get("payloadType") == 2126)
 
     async def close_position(self, position_id: int, volume_cents: int) -> bool:
-        """Market closes position (used by 21:00 SAST Flusher)."""
         res = await self._send_and_wait(2111, {
             "ctidTraderAccountId": self.account_id,
             "positionId": position_id,
@@ -560,7 +555,7 @@ class CTraderClient:
         return bool(res and res.get("payloadType") == 2126)
 
 # ==============================================================================
-# 6. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
+# 6. QUANT MATH & VOLATILITY ANALYZER
 # ==============================================================================
 
 class MathEngine:
@@ -569,23 +564,12 @@ class MathEngine:
         high = df['high']
         low = df['low']
         close = df['close'].shift(1)
-        tr1 = high - low
-        tr2 = (high - close).abs()
-        tr3 = (low - close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        tr = pd.concat([high - low, (high - close).abs(), (low - close).abs()], axis=1).max(axis=1)
         return tr.rolling(window=period).mean()
 
     @staticmethod
     def calculate_ema(series: pd.Series, period: int) -> pd.Series:
         return series.ewm(span=period, adjust=False).mean()
-
-    @staticmethod
-    def calculate_bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        sma = series.rolling(window=period).mean()
-        std = series.rolling(window=period).std()
-        upper = sma + (std * std_dev)
-        lower = sma - (std * std_dev)
-        return upper, sma, lower
 
     @staticmethod
     def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -596,34 +580,7 @@ class MathEngine:
         return 100 - (100 / (1 + rs))
 
 # ==============================================================================
-# 7. TEMPORAL CLOCK & SESSION MANAGER
-# ==============================================================================
-
-class MarketSession(Enum):
-    ASIAN = "ASIAN"
-    LONDON = "LONDON"
-    NEW_YORK = "NEW_YORK"
-    OVERLAP_LONDON_NY = "OVERLAP_LONDON_NY"
-    CLOSED = "CLOSED"
-
-class TemporalSessionManager:
-    @staticmethod
-    def get_current_session() -> MarketSession:
-        now_utc = datetime.now(timezone.utc)
-        hour = now_utc.hour
-        if 0 <= hour < 7:
-            return MarketSession.ASIAN
-        elif 7 <= hour < 12:
-            return MarketSession.LONDON
-        elif 12 <= hour < 16:
-            return MarketSession.OVERLAP_LONDON_NY
-        elif 16 <= hour < 21:
-            return MarketSession.NEW_YORK
-        else:
-            return MarketSession.CLOSED
-
-# ==============================================================================
-# 8. ORDER FLOW & VOLUME PROFILE ANALYZER
+# 7. ORDER FLOW & VOLUME PROFILE ANALYZER
 # ==============================================================================
 
 @dataclass
@@ -684,7 +641,7 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 9. AI INTUITION & INSTITUTIONAL RISK MANAGEMENT ENGINE
+# 8. INSTITUTIONAL RISK ENGINE & DYNAMIC LOT SIZER
 # ==============================================================================
 
 class InstitutionalRiskEngine:
@@ -696,22 +653,12 @@ class InstitutionalRiskEngine:
         self.risk_to_reward: float = 2.0
         self.max_daily_trades: int = 4
         self.max_daily_loss_usd: float = 2500.0
-        self.max_weekly_loss_usd: float = 6500.0
-        self.max_monthly_loss_usd: float = 15000.0
 
-        # Daily & Weekly Growth Goal Tracking
-        self.weekly_deposit_baseline: float = 0.0
-        self.weekly_goal_target: float = 0.0
         self.daily_goal_target: float = 0.0
-
         self.trades_taken_today: int = 0
         self.consecutive_losses: int = 0
-        self.current_daily_loss: float = 0.0
-        self.current_weekly_loss: float = 0.0
-        self.current_monthly_loss: float = 0.0
         self.open_positions: Dict[str, dict] = {}
 
-        # Standard Baseline Spreads & Dynamic Tolerance Bands
         self.max_spread_to_sl_ratio: float = 0.30
         self.spread_ranges = {
             "GOLD": {"standard": 0.30, "max_allowed": 0.85},
@@ -723,7 +670,6 @@ class InstitutionalRiskEngine:
             "GBPUSD": {"standard": 0.00014, "max_allowed": 0.00030}
         }
 
-        # Sector Correlation Grouping (Max 1 open position per sector)
         self.SECTOR_MAP = {
             "US30": "EQUITY_INDEX",
             "NAS100": "EQUITY_INDEX",
@@ -734,7 +680,6 @@ class InstitutionalRiskEngine:
             "USDJPY": "FOREX_MAJORS"
         }
 
-        # High Impact Red-Folder Event Windows (CPI/NFP/FOMC)
         self.RED_FOLDER_WINDOWS = [
             (dtime(12, 25), dtime(12, 35)),
             (dtime(17, 55), dtime(18, 5))
@@ -749,12 +694,6 @@ class InstitutionalRiskEngine:
         self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
         self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
-        self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
-        self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
-        self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
-
-        self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline))
-        self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target))
         self.daily_goal_target = float(cfg.get("dailyGoalTarget", self.daily_goal_target))
 
     def is_red_folder_active(self) -> bool:
@@ -782,8 +721,7 @@ class InstitutionalRiskEngine:
         else:
             current_progress = entry - current_price
 
-        progress_ratio = current_progress / total_target_distance
-        return progress_ratio >= 0.80
+        return (current_progress / total_target_distance) >= 0.80
 
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
@@ -835,7 +773,7 @@ class InstitutionalRiskEngine:
                 return False, f"Spread ({spread:.4f}) exceeds default ceiling (5.0)", spread
 
         if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
-            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
+            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
 
         return True, "Spread optimal", spread
 
@@ -846,42 +784,26 @@ class InstitutionalRiskEngine:
         symbol: str,
         ai_quality_factor: float = 1.0
     ) -> float:
-        """
-        DYNAMIC SIZING FOR ANY ACCOUNT SIZE (R100, R1,000, R10,000, OR USD):
-        - Dynamically paces risk according to daily goal target and remaining trades.
-        - Applies AI Intuition quality factor (0.5x on marginal setups, up to 1.5x on A+ setups).
-        - Enforces micro-account minimums (0.01 lot) so small deposits can grow.
-        """
         equity = current_equity if current_equity > 0 else 1000.0
         active_risk_pct = self.risk_per_trade_pct
 
-        # 1. Target Pacing Intuition:
-        # If daily goal is set (e.g. 500 on a 1,000 account) and max trades is 4:
         trades_left_today = max(1, self.max_daily_trades - self.trades_taken_today)
         if self.daily_goal_target > 0:
             target_per_trade = self.daily_goal_target / trades_left_today
             suggested_risk = target_per_trade / self.risk_to_reward
             suggested_pct = (suggested_risk / equity) * 100.0
-            # Blend user set risk with goal-paced risk
             active_risk_pct = min(max(active_risk_pct, suggested_pct * 0.8), active_risk_pct * 1.5)
 
-        # 2. Consecutive Loss Circuit
         if self.consecutive_losses >= 3:
             active_risk_pct = active_risk_pct * 0.5
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
-        # 3. News Armor Protection
         if self.is_red_folder_active():
             active_risk_pct = active_risk_pct * 0.5
-            log.info(f"NEWS ARMOR ENGAGED: Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
 
-        # 4. Multiply by AI Intuition Score (0.5x to 1.5x)
         active_risk_pct = active_risk_pct * ai_quality_factor
-
-        # 5. Calculate cash at risk
         risk_cash = equity * (active_risk_pct / 100.0)
 
-        # Pip value computation based on asset configuration
         cfg = ConfigManager.ASSETS.get(symbol)
         pip_size = cfg.pip_size if cfg else 0.0001
         contract_size = cfg.contract_size if cfg else 100000.0
@@ -889,7 +811,6 @@ class InstitutionalRiskEngine:
         max_lots = cfg.max_lots if cfg else 50.0
 
         pips_at_risk = (sl_distance / pip_size) if pip_size > 0 else 10.0
-        # Value of 1 pip for 1.0 standard lot
         pip_value_per_lot = pip_size * contract_size
 
         if pip_value_per_lot * pips_at_risk > 0:
@@ -897,14 +818,11 @@ class InstitutionalRiskEngine:
         else:
             calculated_lots = min_lots
 
-        # Micro-Account Growth Safeguard:
-        # If the account is small (R100 or $5) and math yields 0.003, set to broker min (0.01 lot)
         if calculated_lots < min_lots:
             log.info(f"MICRO-ACCOUNT GROWTH MODE: Small balance ({equity:,.2f}). Sizing to broker minimum ({min_lots} lots).")
             calculated_lots = min_lots
 
         final_lots = round(max(min(calculated_lots, max_lots), min_lots), 2)
-        log.info(f"Dynamic Sizer: Equity {equity:,.2f} | Risk {active_risk_pct:.2f}% | AI Factor {ai_quality_factor}x | Lots: {final_lots}")
         return final_lots
 
     def validate_pre_trade(
@@ -959,54 +877,11 @@ class InstitutionalRiskEngine:
         }
         return True, "Approved", blueprint
 
-# Backward compatibility alias
-RiskState = InstitutionalRiskEngine
-RiskManager = InstitutionalRiskEngine
-
 # ==============================================================================
-# 10. PRESERVED STRATEGY EVALUATOR MATRIX
-# ==============================================================================
-
-class SetupType(Enum):
-    LIQUIDITY_SWEEP_REVERSAL = "SETUP_1_LIQUIDITY_SWEEP"
-    ORDER_BLOCK_MITIGATION = "SETUP_2_ORDER_BLOCK"
-    FAIR_VALUE_GAP_FILL = "SETUP_3_FVG_REFILL"
-    VOLUME_PROFILE_POC_BOUNCE = "SETUP_4_POC_BOUNCE"
-    DYNAMIC_TREND_CONTINUATION = "SETUP_5_TREND_CONTINUATION"
-    VOLATILITY_EXPANSION_BREAKOUT = "SETUP_6_VOL_EXPANSION"
-    MEAN_REVERSION_EXTREME = "SETUP_7_MEAN_REVERSION"
-    OPENING_RANGE_SWEEP = "SETUP_8_ORB_SWEEP"
-    GRUBBER_KICK = "SETUP_9_GRUBBER_KICK"
-
-@dataclass
-class TradeSignal:
-    symbol: str
-    direction: str
-    setup_type: SetupType
-    entry_price: float
-    sl: float
-    tp1: float
-    tp2: float
-    confidence_score: float
-    reasoning: str
-
-    @property
-    def stop_loss(self) -> float:
-        return self.sl
-
-    @property
-    def take_profit(self) -> float:
-        return self.tp1
-
-# ==============================================================================
-# 11. GEMINI AI OVERSEER & INTUITION QUALITY GRADER
+# 9. GEMINI AI OVERSEER & INTUITION QUALITY GRADER
 # ==============================================================================
 
 class AIOverseer:
-    """
-    Intelligent Overseer that uses market context, account size, daily targets,
-    and historical performance to provide intuitive quality multipliers (0.5x to 1.5x).
-    """
     def __init__(self):
         self.api_key = ConfigManager.GEMINI_API_KEY
         if self.api_key and GENAI_AVAILABLE:
@@ -1036,7 +911,6 @@ class AIOverseer:
         tp = getattr(signal, 'take_profit', None) or getattr(signal, 'tp1', 0.0)
         reason = getattr(signal, 'reason', getattr(signal, 'reasoning', ''))
 
-        # Analyze past win rate of this strategy on this symbol from real trade history
         relevant_trades = [t for t in history if t.get('asset') == symbol or t.get('strategy') == strategy_name]
         wins = [t for t in relevant_trades if t.get('status') == 'WIN']
         hist_win_rate = (len(wins) / len(relevant_trades) * 100) if relevant_trades else 50.0
@@ -1072,7 +946,7 @@ class AIOverseer:
         return True, 1.0, "Approved by Quantitative Edge"
 
 # ==============================================================================
-# 12. CLOUD EXECUTION ENGINE (TWIN 50/50 PARTIAL SCALING)
+# 10. CLOUD EXECUTION ENGINE (TWIN 50/50 PARTIAL SCALING)
 # ==============================================================================
 
 class CloudExecutionEngine:
@@ -1094,7 +968,6 @@ class CloudExecutionEngine:
 
         quote, bid, ask = await self.ctrader.get_live_quote(symbol)
 
-        # 1. Ask AI Intuition Brain to grade setup quality
         history = read_trade_history()
         trades_left = max(1, self.risk.max_daily_trades - self.risk.trades_taken_today)
         ai_approved, quality_mult, ai_notes = await self.ai_overseer.evaluate_trade_intuition(
@@ -1105,7 +978,6 @@ class CloudExecutionEngine:
             log.info(f"AI INTUITION REJECTED TRADE: {ai_notes}")
             return False
 
-        # 2. Risk Gatekeeper Validation & Dynamic Lot Sizing
         is_ok, reason, bp = self.risk.validate_pre_trade(
             symbol=symbol,
             direction=direction,
@@ -1124,7 +996,6 @@ class CloudExecutionEngine:
 
         is_dry_run = getattr(signal, 'is_dry_run', False) or bp.get("is_dry_run", False)
 
-        # 3. Simulator Paper Trading
         if is_dry_run:
             msg = (
                 f"🔵 *[SIMULATED TRADE]*\n"
@@ -1141,7 +1012,6 @@ class CloudExecutionEngine:
             await whatsapp.send_alert(msg)
             return True
 
-        # 4. TWIN 50/50 PARTIAL SCALING ON FUSION CTRADER:
         total_lots = bp['lots']
         half_lots = round(max(total_lots / 2.0, 0.01), 2)
         sl_distance = abs(bp['entry_price'] - bp['stop_loss'])
@@ -1150,9 +1020,7 @@ class CloudExecutionEngine:
 
         log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total: {total_lots} Lots | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
 
-        # Send Order A (Banks 50% profit at 1:1)
         res_a = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp1_price)
-        # Send Order B (Runner targeting TP2)
         res_b = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp2_price)
 
         if res_a or res_b:
@@ -1190,7 +1058,7 @@ class CloudExecutionEngine:
         return False
 
 # ==============================================================================
-# 13. MASTER SYSTEM ORCHESTRATOR & CONCURRENT EVENT LOOPS
+# 11. MASTER SYSTEM ORCHESTRATOR & CONCURRENT EVENT LOOPS
 # ==============================================================================
 
 class MatrixEngineMaster:
@@ -1211,10 +1079,6 @@ class MatrixEngineMaster:
         self.execution_engine = CloudExecutionEngine(self.ctrader, self.risk_mgr)
         log.info(f"SYSTEM READY. Initial Account Balance: {balance:,.2f}")
 
-        # Concurrently launch:
-        # 1. Paced 60-second market scan loop
-        # 2. Fast 3-second 80% R:R position supervisor
-        # 3. Daily 21:00 SAST End-of-Day position flusher
         await asyncio.gather(
             self._market_scan_loop(),
             self._position_supervisor_loop(),
@@ -1222,7 +1086,6 @@ class MatrixEngineMaster:
         )
 
     async def _position_supervisor_loop(self) -> None:
-        """In-Flight Position Supervisor: Evaluates live exits and shifts SL to break-even at 80% R:R."""
         while True:
             try:
                 for pid, pos in list(self.risk_mgr.open_positions.items()):
@@ -1237,28 +1100,25 @@ class MatrixEngineMaster:
                     if quote <= 0:
                         continue
 
-                    # 1. Notify if Stop Loss hit
                     sl_hit = (direction == "BUY" and quote <= sl) or (direction == "SELL" and quote >= sl)
                     if sl_hit:
                         if be_moved:
                             sl_msg = f"⚪ *[EXIT AT BREAK-EVEN]*\n• Asset: {sym}\n• Closed at Entry: {quote}\n• P&L: 0.00 (Risk-Free Exit)"
                         else:
-                            sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit: {quote}\n• Stop loss respected. Capital protected."
+                            sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit: {quote}\n• Capital protected."
                         log.info(f"Position #{pid} exited at SL/BE on {sym}")
                         await whatsapp.send_alert(sl_msg)
                         self.risk_mgr.open_positions.pop(pid, None)
                         continue
 
-                    # 2. Notify if Take Profit hit
                     tp_hit = (direction == "BUY" and quote >= tp) or (direction == "SELL" and quote <= tp)
                     if tp_hit:
-                        tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote}\n• Target reached! Profit banked."
+                        tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote}\n• Profit banked."
                         log.info(f"Position #{pid} exited at TP on {sym}")
                         await whatsapp.send_alert(tp_msg)
                         self.risk_mgr.open_positions.pop(pid, None)
                         continue
 
-                    # 3. Move Stop Loss to Break-Even at 80% Progress
                     if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
                         log.info(f"80% R:R PROGRESS HIT ON {sym} (Position #{pid})! Moving SL to Break-Even.")
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
@@ -1273,7 +1133,6 @@ class MatrixEngineMaster:
                 await asyncio.sleep(5.0)
 
     async def _daily_eod_flusher_loop(self) -> None:
-        """Daily 21:00 SAST Flusher: Flattens all positions to cash every night."""
         while True:
             try:
                 now_sast = datetime.now(timezone.utc) + timedelta(hours=2)
@@ -1288,7 +1147,7 @@ class MatrixEngineMaster:
                     flushed_count = len(self.risk_mgr.open_positions)
                     self.risk_mgr.open_positions.clear()
 
-                    eod_msg = f"🌆 *[DAILY 21:00 SAST LOCKDOWN]*\n• Flattened {flushed_count} open trades to cash.\n• Zero overnight holding risk.\n• Standing by for tomorrow's London session."
+                    eod_msg = f"🌆 *[DAILY 21:00 SAST LOCKDOWN]*\n• Flattened {flushed_count} open trades to cash.\n• Zero overnight holding risk."
                     await whatsapp.send_alert(eod_msg)
                     await asyncio.sleep(65.0)
 
@@ -1298,7 +1157,6 @@ class MatrixEngineMaster:
                 await asyncio.sleep(30.0)
 
     async def _market_scan_loop(self) -> None:
-        """Paced 60-Second Scan Loop: Evaluates setups all day across the 7 assets."""
         while True:
             try:
                 start_time = time.time()
@@ -1317,10 +1175,8 @@ class MatrixEngineMaster:
                     if m5_df.empty:
                         continue
 
-                    # Multi-Timeframe ATRs and Consolidation Detection
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
 
-                    # Compute local Volume Profile (POC, VAH, VAL)
                     vp = OrderFlowAnalyzer.compute_volume_profile(m5_df, num_bins=30)
                     self.volume_profiles[friendly_name] = vp
 
@@ -1346,7 +1202,6 @@ class MatrixEngineMaster:
                         "val": vp.value_area_low
                     }
 
-                    # Evaluate modular quantitative strategies
                     signal = self.strategy_mgr.evaluate_all(friendly_name, m5_df, session_levels)
 
                     if signal:
@@ -1362,7 +1217,6 @@ class MatrixEngineMaster:
                 emit_telemetry(balance, equity, regime_status, active_setup_str, verdict_str)
                 write_telemetry(balance, equity, regime_status, active_setup_str, verdict_str)
 
-                # Respect broker rate limits and candle closures
                 elapsed = time.time() - start_time
                 await asyncio.sleep(max(1.0, 60.0 - elapsed))
 
@@ -1373,7 +1227,7 @@ class MatrixEngineMaster:
                 await asyncio.sleep(5)
 
 # ==============================================================================
-# 14. CLOUD ENTRY POINT
+# 12. CLOUD ENTRY POINT
 # ==============================================================================
 
 def start_bot() -> None:
