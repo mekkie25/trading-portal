@@ -147,7 +147,7 @@ function loadTradesFromDisk(): any[] {
       id: "deal-10140528-1",
       ticket: "#41425-GBP",
       asset: "GBPUSD",
-      strategy: "cTrader Deal",
+      strategy: "EMA_9_25_CROSS",
       type: "BUY",
       lots: 0.02,
       openPrice: 1.33520,
