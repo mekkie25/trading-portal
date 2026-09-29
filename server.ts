@@ -16,13 +16,21 @@ interface BotGatewayConfig {
   currency: string;
   updatedAt: string;
   version: number;
+  weeklyDepositBaseline?: number;
+  weeklyGoalTarget?: number;
+  dailyGoalTarget?: number;
 }
 
-// Server-side risk limit configuration. Source of truth for the kill switch.
+// Server-side risk limit configuration. This is the SOURCE OF TRUTH for the
+// kill switch. The frontend AdvancedLimits UI reads/writes this via
+// /api/limits, but the numbers that actually block trades are computed here,
+// on the server, from real closed trades — never trusted from the browser.
 interface RiskLimitsConfig {
   maxDailyLossUsd: number;
   maxWeeklyLossUsd: number;
   maxMonthlyLossUsd: number;
+  maxDailyDrawdownPct?: number;
+  autoLiquidateAllOnTrip?: boolean;
   breakerAction: 'HALT_CLOSE_ALL' | 'HALT_PREVENT_NEW' | 'REDUCE_SIZE_50' | 'ALERT_ONLY';
 }
 
@@ -67,6 +75,9 @@ interface BrokerTelemetry {
   }>;
 }
 
+const BOT_CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
+const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
+
 // Default state
 let activeBotConfig: BotGatewayConfig = {
   masterExecution: true,
@@ -78,6 +89,9 @@ let activeBotConfig: BotGatewayConfig = {
   currency: 'USD',
   updatedAt: new Date().toISOString(),
   version: 1,
+  weeklyDepositBaseline: 10,
+  weeklyGoalTarget: 20,
+  dailyGoalTarget: 5
 };
 
 const botPlacedContractIds = new Set<string>();
@@ -101,8 +115,38 @@ let riskLimits: RiskLimitsConfig = {
   maxDailyLossUsd: 10,
   maxWeeklyLossUsd: 25,
   maxMonthlyLossUsd: 50,
+  maxDailyDrawdownPct: 20.0,
+  autoLiquidateAllOnTrip: false,
   breakerAction: 'HALT_PREVENT_NEW',
 };
+
+// =========================================================================
+// LOAD PERSISTENT BOT CONFIG & LIMITS FROM DISK ON STARTUP
+// =========================================================================
+if (fs.existsSync(BOT_CONFIG_FILE)) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8'));
+    activeBotConfig = { ...activeBotConfig, ...saved };
+    if (saved.maxDailyLoss !== undefined || saved.maxDailyLossUsd !== undefined) {
+      riskLimits.maxDailyLossUsd = saved.maxDailyLoss ?? saved.maxDailyLossUsd;
+    }
+    if (saved.maxWeeklyLoss !== undefined || saved.maxWeeklyLossUsd !== undefined) {
+      riskLimits.maxWeeklyLossUsd = saved.maxWeeklyLoss ?? saved.maxWeeklyLossUsd;
+    }
+    if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) {
+      riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
+    }
+    if (saved.maxDailyDrawdownPct !== undefined) {
+      riskLimits.maxDailyDrawdownPct = saved.maxDailyDrawdownPct;
+    }
+    if (saved.autoLiquidateAllOnTrip !== undefined) {
+      riskLimits.autoLiquidateAllOnTrip = saved.autoLiquidateAllOnTrip;
+    }
+    console.log('✅ Loaded persistent bot targets & risk limits from bot_config.json');
+  } catch (e) {
+    console.error('Failed to load bot_config.json on startup:', e);
+  }
+}
 
 let riskState: RiskState = {
   currentDailyLossUsd: 0,
@@ -112,11 +156,6 @@ let riskState: RiskState = {
   activeTripScope: 'NONE',
   lastTriggerReason: undefined,
 };
-
-// =========================================================================
-// JOURNAL & PERMANENT DISK STORAGE (trades_db.json)
-// =========================================================================
-const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
 
 function saveTradesToDisk(tradesList: any[]) {
   try {
@@ -140,42 +179,7 @@ function loadTradesFromDisk(): any[] {
   } catch (e) {
     console.error('Failed to load trades from disk:', e);
   }
-
-  // Pre-seed with actual cTrader execution history if file is empty
-  const seedTrades = [
-    {
-      id: "deal-10140528-1",
-      ticket: "#41425-GBP",
-      asset: "GBPUSD",
-      strategy: "EMA_9_25_CROSS",
-      type: "BUY",
-      lots: 0.02,
-      openPrice: 1.33520,
-      closePrice: 1.33700,
-      pnl: 0.36,
-      openTime: "2026-09-29 12:45:00",
-      closeTime: "2026-09-29 12:50:32",
-      status: "WIN",
-      source: "Fusion cTrader"
-    },
-    {
-      id: "deal-10140528-2",
-      ticket: "#41425-AUD",
-      asset: "AUDUSD",
-      strategy: "Manual Deal",
-      type: "SELL",
-      lots: 0.01,
-      openPrice: 0.68940,
-      closePrice: 0.68994,
-      pnl: -0.54,
-      openTime: "2026-09-29 12:35:00",
-      closeTime: "2026-09-29 12:47:10",
-      status: "LOSS",
-      source: "Fusion cTrader"
-    }
-  ];
-  saveTradesToDisk(seedTrades);
-  return seedTrades;
+  return [];
 }
 
 // Recomputes real daily/weekly/monthly realized loss from actual closed trades
@@ -190,9 +194,10 @@ function recomputeRiskState() {
   let weeklyLoss = 0;
   let monthlyLoss = 0;
 
-  const currentTrades = loadTradesFromDisk();
+  const diskTrades = loadTradesFromDisk();
+  const tradesToScan = diskTrades.length > 0 ? diskTrades : allTrades;
 
-  for (const t of currentTrades) {
+  for (const t of tradesToScan) {
     if (typeof t.pnl !== 'number' || t.pnl >= 0) continue;
     const closeTime = t.closeTime ? new Date(t.closeTime) : null;
     if (!closeTime || isNaN(closeTime.getTime())) continue;
@@ -279,6 +284,11 @@ function sendDerivRequest(payload: Record<string, any>, timeoutMs = 15000): Prom
   });
 }
 
+// Old Deriv Gateway decommissioned (stops Cloudflare HTML error spam in Railway)
+async function startDerivGateway() {
+  // Standby - bot communicates directly with Fusion Markets via engine/matrix.py
+}
+
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -296,20 +306,24 @@ async function startServer() {
     next();
   });
 
-  // Initial load
-  allTrades = loadTradesFromDisk();
-  activeBrokerTelemetry.trades = allTrades;
+  // Load saved trades on startup
+  const savedTrades = loadTradesFromDisk();
+  if (savedTrades.length > 0) {
+    activeBrokerTelemetry.trades = savedTrades;
+  }
 
   // =========================================================================
   // API ENDPOINTS
   // =========================================================================
 
-  // A. GET ALL TRADES (Reads directly from disk on every single request so journal never lags)
+  // A. GET ALL TRADES (Always reloads fresh from disk so journal reflects real trades)
   app.get('/api/journal', async (req, res) => {
     try {
       const diskTrades = loadTradesFromDisk();
-      activeBrokerTelemetry.trades = diskTrades;
-      res.status(200).json(diskTrades);
+      if (diskTrades.length > 0) {
+        activeBrokerTelemetry.trades = diskTrades;
+      }
+      res.status(200).json(activeBrokerTelemetry.trades);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch journal entries" });
     }
@@ -337,11 +351,12 @@ async function startServer() {
     trades = trades.filter(t => t.id !== tradeId && t.ticket !== tradeId);
     saveTradesToDisk(trades);
     activeBrokerTelemetry.trades = trades;
+    allTrades = allTrades.filter(t => t.id !== tradeId && t.ticket !== tradeId);
     recomputeRiskState();
     res.json({ status: 'success', message: `Trade ${tradeId} deleted permanently.` });
   });
 
-  // D. WIPE ENTIRE JOURNAL (Triggered by "Wipe Entire Journal")
+  // D. WIPE ENTIRE JOURNAL
   app.post('/api/journal/reset', (req, res) => {
     journalCutoffTime = new Date().toISOString();
     activeBrokerTelemetry.trades = [];
@@ -372,7 +387,7 @@ async function startServer() {
     });
   });
 
-  // G. UPDATE BOT CONFIGURATION
+  // G. UPDATE & PERSIST BOT CONFIGURATION
   app.post('/api/bot/config', (req, res) => {
     try {
       const config = req.body;
@@ -397,24 +412,18 @@ async function startServer() {
       if (typeof trailingStopActive === 'boolean') activeBotConfig.trailingStopActive = trailingStopActive;
       if (typeof autoBreakevenPips === 'number') activeBotConfig.autoBreakevenPips = autoBreakevenPips;
       if (typeof currency === 'string') activeBotConfig.currency = currency;
+      if (typeof weeklyDepositBaseline === 'number') activeBotConfig.weeklyDepositBaseline = weeklyDepositBaseline;
+      if (typeof weeklyGoalTarget === 'number') activeBotConfig.weeklyGoalTarget = weeklyGoalTarget;
+      if (typeof dailyGoalTarget === 'number') activeBotConfig.dailyGoalTarget = dailyGoalTarget;
 
       activeBotConfig.updatedAt = new Date().toISOString();
 
-      // Read current config and merge
-      const existingConfig = fs.existsSync('bot_config.json') 
-        ? JSON.parse(fs.readFileSync('bot_config.json', 'utf8')) 
+      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) 
+        ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) 
         : {};
 
-      const merged = {
-        ...existingConfig,
-        ...config,
-        masterExecution: activeBotConfig.masterExecution,
-        riskPerTradePct: activeBotConfig.riskPerTradePct,
-        riskToReward: activeBotConfig.riskToReward,
-        maxDailyTrades: activeBotConfig.maxDailyTrades,
-      };
-
-      fs.writeFileSync('bot_config.json', JSON.stringify(merged, null, 2));
+      const merged = { ...existingConfig, ...activeBotConfig, ...config };
+      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(merged, null, 2));
 
       res.json({ 
         status: 'success', 
@@ -429,7 +438,7 @@ async function startServer() {
     }
   });
     
-  // H. GET / UPDATE RISK LIMITS
+  // H. GET RISK LIMITS
   app.get('/api/limits', (req, res) => {
     recomputeRiskState();
     res.json({
@@ -438,14 +447,25 @@ async function startServer() {
     });
   });
 
+  // I. UPDATE & PERSIST RISK LIMITS (Fixed clean route, no nested duplicates)
   app.post('/api/limits', (req, res) => {
     try {
-      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, breakerAction, resetBreaker } = req.body;
+      const {
+        maxDailyLossUsd,
+        maxWeeklyLossUsd,
+        maxMonthlyLossUsd,
+        maxDailyDrawdownPct,
+        autoLiquidateAllOnTrip,
+        breakerAction,
+        resetBreaker,
+      } = req.body;
 
       if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
       if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
       if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
-      
+      if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
+      if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
+
       const validActions = ['HALT_CLOSE_ALL', 'HALT_PREVENT_NEW', 'REDUCE_SIZE_50', 'ALERT_ONLY'];
       if (typeof breakerAction === 'string' && validActions.includes(breakerAction)) {
         riskLimits.breakerAction = breakerAction as RiskLimitsConfig['breakerAction'];
@@ -458,22 +478,28 @@ async function startServer() {
         activeBotConfig.masterExecution = true;
       }
 
-      const currentConfig = fs.existsSync('bot_config.json') 
-        ? JSON.parse(fs.readFileSync('bot_config.json', 'utf8')) 
+      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) 
+        ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) 
         : {};
 
       const updatedConfig = {
-        ...currentConfig,
+        ...existingConfig,
         maxDailyLoss: riskLimits.maxDailyLossUsd,
+        maxDailyLossUsd: riskLimits.maxDailyLossUsd,
         maxWeeklyLoss: riskLimits.maxWeeklyLossUsd,
+        maxWeeklyLossUsd: riskLimits.maxWeeklyLossUsd,
         maxMonthlyLoss: riskLimits.maxMonthlyLossUsd,
+        maxMonthlyLossUsd: riskLimits.maxMonthlyLossUsd,
+        maxDailyDrawdownPct: riskLimits.maxDailyDrawdownPct,
+        autoLiquidateAllOnTrip: riskLimits.autoLiquidateAllOnTrip,
         breakerAction: riskLimits.breakerAction,
       };
 
-      fs.writeFileSync('bot_config.json', JSON.stringify(updatedConfig, null, 2));
+      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(updatedConfig, null, 2));
 
       res.json({
         status: 'success',
+        message: 'Risk limits updated and saved permanently to bot_config.json',
         data: { ...riskLimits, ...riskState },
       });
     } catch (error: any) {
@@ -481,13 +507,13 @@ async function startServer() {
     }
   });
 
-  // I. GET RISK STATUS
+  // J. GET RISK STATUS
   app.get('/api/risk/status', (req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
   });
 
-  // J. BOT TRADE DISPATCH (Gated by Kill Switch)
+  // K. BOT TRADE DISPATCH
   app.post('/api/bot/trade', async (req, res) => {
     recomputeRiskState();
 
@@ -508,7 +534,7 @@ async function startServer() {
     res.json({ status: 'success', message: 'Order dispatched to matrix engine.', data: { symbol, direction, lots } });
   });
 
-  // K. GET LIVE TELEMETRY
+  // L. GET LIVE TELEMETRY
   app.get('/api/broker/telemetry', (req, res) => {
     recomputeRiskState();
     res.json({
@@ -517,48 +543,10 @@ async function startServer() {
     });
   });
 
-  // L. RECEIVE LIVE TELEMETRY (Pushed from matrix.py or browser)
+  // M. RECEIVE LIVE TELEMETRY
   app.post('/api/broker/telemetry', (req, res) => {
-    const {
-      provider,
-      accountNumber,
-      server,
-      currency,
-      balance,
-      equity,
-      floatingPnL,
-      netProfit,
-      winRate,
-      totalTrades,
-      winningTrades,
-      losingTrades,
-      lastPingMs,
-      openPositions,
-      connected,
-    } = req.body;
-
-    if (provider !== undefined) activeBrokerTelemetry.provider = provider;
-    if (accountNumber !== undefined) activeBrokerTelemetry.accountNumber = accountNumber;
-    if (server !== undefined) activeBrokerTelemetry.server = server;
-    if (currency !== undefined) {
-      activeBrokerTelemetry.currency = currency.toUpperCase();
-      activeBotConfig.currency = currency.toUpperCase();
-    }
-    if (typeof balance === 'number') activeBrokerTelemetry.balance = balance;
-    if (typeof equity === 'number') activeBrokerTelemetry.equity = equity;
-    if (typeof floatingPnL === 'number') activeBrokerTelemetry.floatingPnL = floatingPnL;
-    if (typeof netProfit === 'number') activeBrokerTelemetry.netProfit = netProfit;
-    if (typeof winRate === 'number') activeBrokerTelemetry.winRate = winRate;
-    if (typeof totalTrades === 'number') activeBrokerTelemetry.totalTrades = totalTrades;
-    if (typeof winningTrades === 'number') activeBrokerTelemetry.winningTrades = winningTrades;
-    if (typeof losingTrades === 'number') activeBrokerTelemetry.losingTrades = losingTrades;
-    if (typeof lastPingMs === 'number') activeBrokerTelemetry.lastPingMs = lastPingMs;
-    if (Array.isArray(openPositions)) activeBrokerTelemetry.openPositions = openPositions;
-    if (typeof connected === 'boolean') activeBrokerTelemetry.connected = connected;
-
-    activeBrokerTelemetry.lastSyncTime = new Date().toISOString();
-    activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-
+    const payload = req.body;
+    activeBrokerTelemetry = { ...activeBrokerTelemetry, ...payload, lastHeartbeat: new Date().toISOString() };
     res.json({
       status: 'success',
       message: 'Telemetry updated',
