@@ -313,7 +313,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
                 onChange={(e) => setLocalBranding({ ...localBranding, customInitials: e.target.value })}
                 id="branding-initials-input"
                 className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono uppercase focus:outline-none focus:border-blue-500"
-                placeholder="e.g. TP or 2GS or leave empty to use icon"
+                placeholder="e.g. TP or leave empty"
               />
               <p className="text-[11px] text-slate-500">
                 If provided, this monogram appears in the header badge. Leave blank to show vector icon.
@@ -384,7 +384,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
             <div>
               <h2 className="text-base font-bold text-slate-900 dark:text-white">Appearance & Color Palette</h2>
               <p className="text-xs text-slate-600 dark:text-slate-400">
-                Switch between refined 2GS dark grayish mode (#0d1017) and crisp high-contrast light mode.
+                Switch between refined dark grayish mode (#0d1017) and crisp high-contrast light mode.
               </p>
             </div>
           </div>
@@ -420,7 +420,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
 
         <div className="pt-2 text-xs text-slate-600 dark:text-slate-400 flex items-center gap-2">
           <span>Dark Mode Tone:</span>
-          <span className="font-semibold text-slate-800 dark:text-slate-200">2GS Charcoal-Gray (#0d1017)</span>
+          <span className="font-semibold text-slate-800 dark:text-slate-200">MI6 Charcoal-Gray (#0d1017)</span>
           <span>•</span>
           <span>Light Mode:</span>
           <span className="font-semibold text-slate-800 dark:text-slate-200">High-Contrast Slate-900 Text</span>
@@ -655,7 +655,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
         </form>
       </motion.section>
 
-      {/* 7. VS Code / Python / MT5 Bot Target Dispatch Script */}
+      {/* 7. Real-Time cTrader Cloud Gateway Health */}
       <motion.section 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
@@ -663,33 +663,38 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
         transition={{ duration: 0.4 }}
         className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-4"
       >
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-[#212838]">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
-              <Terminal className="w-5 h-5" />
+            <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+              <ShieldCheck className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-slate-900 dark:text-white">VS Code & Python Integration Code</h2>
+              <h2 className="text-base font-bold text-slate-900 dark:text-white">Cloud Engine Status</h2>
               <p className="text-xs text-slate-600 dark:text-slate-400">
-                Copy this code into your VS Code environment to listen for target updates and control your MT5 bot.
+                Nexus Matrix is hosted 24/7 on Railway and communicates directly with Fusion Markets via cTrader Open API.
               </p>
             </div>
           </div>
-
-          <button
-            type="button"
-            onClick={handleCopyScript}
-            className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-2 transition-all shadow-sm cursor-pointer"
-          >
-            <Copy className="w-3.5 h-3.5" />
-            <span>{copiedScript ? 'Copied to Clipboard!' : 'Copy Script for VS Code'}</span>
-          </button>
+          <span className="text-xs font-mono font-bold px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 border border-emerald-500/20">
+            AUTONOMOUS RUNTIME
+          </span>
         </div>
 
-        <div className="p-4 rounded-xl bg-slate-950 text-slate-300 font-mono text-xs overflow-x-auto border border-slate-800 leading-relaxed">
-          <pre>{pythonScript}</pre>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs font-mono">
+          <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838]">
+            <div className="text-slate-500 text-[10px] uppercase">Broker Protocol</div>
+            <div className="font-bold text-slate-900 dark:text-white mt-1">cTrader WebSocket (JSON)</div>
+          </div>
+          <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838]">
+            <div className="text-slate-500 text-[10px] uppercase">Execution Host</div>
+            <div className="font-bold text-slate-900 dark:text-white mt-1">Railway Cloud Container</div>
+          </div>
+          <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838]">
+            <div className="text-slate-500 text-[10px] uppercase">Local Bridge Required?</div>
+            <div className="font-bold text-emerald-600 dark:text-emerald-400 mt-1">No (Fully Cloud-Native)</div>
+          </div>
         </div>
-      </motion.section>
+      </motion.section> 
     </div>
   );
 };

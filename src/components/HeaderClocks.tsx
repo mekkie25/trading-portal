@@ -206,7 +206,7 @@ export const HeaderClocks: React.FC<SessionClockProps> = ({
       </div>
 
       {/* Global Session Clocks (White bubbles in light mode with clear borders) */}
-      <div className="hidden lg:flex items-center gap-2.5">
+      <div className="flex items-center gap-2 overflow-x-auto max-w-[55vw] py-1 scrollbar-none">
         {/* New York Clock */}
         <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#151922] border border-slate-300 dark:border-[#212838] shadow-xs">
           <div className="flex flex-col">
