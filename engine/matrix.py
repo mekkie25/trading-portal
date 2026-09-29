@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (DERIV CLOUD WEBSOCKET EDITION)
+NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (CTRADER OPEN API / FUSION MARKETS)
 ================================================================================
 Architecture: Institutional Multi-Strategy Quantitative Execution Engine
-Components:   - All-Day Unrestricted Execution (Trade Anytime Setup Appears)
+Components:   - All-Day Execution Engine for Fusion Markets (cTrader Open API)
+              - Dynamic Micro-Account Scaling (Handles R100, R1,000, up to $100k+)
+              - AI Intuition & Target-Pacing Sizer (Gemini AI Quality Multiplier)
+              - Daily Profit Target Runway Allocator (e.g. R500 Target on R1,000 Balance)
+              - Automatic Symbol Discovery & Dynamic ID Resolution
+              - Dual-Stage OAuth Handshake (App Auth 2100 + Account Auth 2102)
               - Daily 21:00 SAST End-of-Day Position Flusher (Zero Overnight Risk)
               - Instant Personal WhatsApp Alerts Engine (CallMeBot Integration)
               - Twin-Position 50/50 Partial Scaling (Bank Half at TP1, Trail TP2)
-              - Modular Strategies & Strategy Manager Integration
-              - Native Asynchronous Deriv Cloud WebSocket & REST API
-              - Gemini AI Overseer & Pre-Trade Prompt Verification
-              - Order Flow Analyzer (POC, VAH, VAL, Cumulative Volume Delta)
+              - Order Flow & Volume Profile Analyzer (POC, VAH, VAL, Cumulative Delta)
               - Quantitative Math Engine (EMA, ATR, Bollinger Bands, RSI)
               - Temporal Clock & Session Manager (Asian, London, NY)
               - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
-              - Range & Consolidation Detection Engine
               - Live Bid/Ask Spread Gatekeeper & News Armor Protection
-              - Dynamic Auto Lot Sizing with Weekly Runway Budgeting
               - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
-              - Atomic Bracket Proposal Execution (No Naked Trades)
               - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
-              - Paced 60-Second Scan Cadence (Anti-Rate-Limiting Architecture)
-Deployment:   Headless Linux / Cloud VPS / Docker Container / Railway
+Deployment:   Headless Linux / Railway / Cloud VPS / Docker Container
 ================================================================================
 """
 
@@ -42,7 +40,7 @@ import numpy as np
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 
 # Ensure project root is in Python search path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -60,12 +58,13 @@ except ImportError:
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 
-# File paths for IPC and UI configuration
+# File paths for IPC, telemetry, and trade history
 CONFIG_FILE = "bot_config.json"
 TELEMETRY_FILE = "bot_telemetry.json"
+TRADES_DB_FILE = "trades_db.json"
 
 # ==============================================================================
-# 1. ADVANCED LOGGING SYSTEM (INITIALIZED FIRST)
+# 1. ADVANCED INSTITUTIONAL LOGGING SYSTEM
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
@@ -82,7 +81,7 @@ class InstitutionalFormatter(logging.Formatter):
     def format(self, record):
         return logging.Formatter(self.fmt, datefmt=self.datefmt).format(record)
 
-def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_deriv.log", level=logging.INFO) -> logging.Logger:
+def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_ctrader.log", level=logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.handlers.clear()
@@ -142,7 +141,7 @@ class WhatsAppNotifier:
 whatsapp = WhatsAppNotifier()
 
 # ==============================================================================
-# 3. ADVANCED TELEMETRY & UI CONFIGURATION I/O HELPERS
+# 3. ADVANCED TELEMETRY & UI I/O HELPERS
 # ==============================================================================
 
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
@@ -173,7 +172,7 @@ def write_telemetry(balance: float, equity: float, regime: str, active_setup: st
         log.error(f"Failed to write telemetry: {e}")
 
 def read_ui_config() -> dict:
-    """Reads live slider and loss ceiling values set on the website dashboard."""
+    """Reads live slider and target values set on the website dashboard."""
     if not os.path.exists(CONFIG_FILE):
         return {}
     try:
@@ -182,432 +181,383 @@ def read_ui_config() -> dict:
     except Exception:
         return {}
 
+def read_trade_history() -> List[dict]:
+    """Reads closed trade records to analyze historical edge per pair and strategy."""
+    if not os.path.exists(TRADES_DB_FILE):
+        return []
+    try:
+        with open(TRADES_DB_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
 # ==============================================================================
 # 4. GLOBAL CONSTANTS & ASSET CONFIGURATION (STRICT 7 ALLOWED ONLY)
 # ==============================================================================
 
-class DerivGranularity(Enum):
-    M1 = 60
-    M5 = 300
-    M15 = 900
-    H1 = 3600
-    H4 = 14400
-    D1 = 86400
+class CTraderTrendbarPeriod(Enum):
+    M1 = 1
+    M5 = 5
+    M15 = 7
+    H1 = 9
+    H4 = 10
+    D1 = 12
 
 @dataclass
 class AssetConfig:
-    symbol: str               # Official Deriv symbol identifier
+    symbol: str
     display_name: str
     pip_size: float
-    point_value: float
-    min_stake: float
-    max_stake: float
-    default_multiplier: int
-    is_synthetic: bool
+    contract_size: float
+    min_lots: float
+    max_lots: float
+    lot_step: float
+    sector: str
 
 class ConfigManager:
-    DERIV_APP_ID: str = os.getenv("DERIV_APP_ID", "")
-    DERIV_API_TOKEN: str = os.getenv("DERIV_API_TOKEN", "")
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3"
+    # 5 Railway Environment Variables from Fusion Markets cTrader Setup
+    CLIENT_ID: str = os.getenv("CTRADER_CLIENT_ID", "").strip()
+    CLIENT_SECRET: str = os.getenv("CTRADER_CLIENT_SECRET", "").strip()
+    ACCESS_TOKEN: str = os.getenv("CTRADER_ACCESS_TOKEN", "").strip()
+    ACCOUNT_ID: int = int(os.getenv("CTRADER_ACCOUNT_ID", "0").strip() or 0)
+    ENV: str = os.getenv("CTRADER_ENV", "demo").lower().strip()
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
 
-    SYMBOL_MAP: Dict[str, str] = {
-        "GOLD": "frxXAUUSD",
-        "US30": "OTC_DJI",
-        "NAS100": "OTC_NDX",
-        "GERMAN30": "OTC_GDAXI",
-        "EURUSD": "frxEURUSD",
-        "USDJPY": "frxUSDJPY",
-        "GBPUSD": "frxGBPUSD"
+    WS_HOST = "live.ctraderapi.com" if ENV == "live" else "demo.ctraderapi.com"
+    WS_PORT = 5036
+    WS_URL = f"wss://{WS_HOST}:{WS_PORT}"
+
+    # Friendly Strategy Tickers to standard Fusion Markets symbol names
+    SYMBOL_ALIASES: Dict[str, List[str]] = {
+        "GOLD": ["XAUUSD", "GOLD", "XAUUSD.spot"],
+        "US30": ["US30", "DJ30", "US30.cash", "WS30"],
+        "NAS100": ["NAS100", "US100", "USTEC", "NAS100.cash"],
+        "GERMAN30": ["DE40", "GER40", "GER30", "DE40.cash"],
+        "EURUSD": ["EURUSD"],
+        "USDJPY": ["USDJPY"],
+        "GBPUSD": ["GBPUSD"]
     }
 
     ASSETS: Dict[str, AssetConfig] = {
-        "frxXAUUSD": AssetConfig("frxXAUUSD", "Gold (XAU/USD)", 0.01, 1.0, 1.0, 1000.0, 50, False),
-        "OTC_DJI": AssetConfig("OTC_DJI", "Wall Street 30 (US30)", 0.1, 1.0, 1.0, 2000.0, 100, False),
-        "OTC_NDX": AssetConfig("OTC_NDX", "US Tech 100 (NAS100)", 0.1, 1.0, 1.0, 2000.0, 100, False),
-        "OTC_GDAXI": AssetConfig("OTC_GDAXI", "Germany 40 (DAX40)", 0.1, 1.0, 1.0, 2000.0, 100, False),
-        "frxEURUSD": AssetConfig("frxEURUSD", "EUR / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
-        "frxUSDJPY": AssetConfig("frxUSDJPY", "USD / JPY", 0.001, 100000.0, 1.0, 1000.0, 100, False),
-        "frxGBPUSD": AssetConfig("frxGBPUSD", "GBP / USD", 0.0001, 100000.0, 1.0, 1000.0, 100, False),
-    }
-
-    MAX_ACCOUNT_RISK_PER_TRADE: float = 0.01
-    DAILY_DRAWDOWN_KILL_SWITCH: float = 0.05
-    MAX_CONCURRENT_TRADES: int = 4
-    BASE_ACCOUNT_CURRENCY: str = "USD"
-
-    TIMEFRAMES: Dict[str, DerivGranularity] = {
-        "M1": DerivGranularity.M1,
-        "M5": DerivGranularity.M5,
-        "M15": DerivGranularity.M15,
-        "H1": DerivGranularity.H1,
-        "H4": DerivGranularity.H4,
-        "D1": DerivGranularity.D1
+        "GOLD": AssetConfig("XAUUSD", "Gold Spot (XAU/USD)", 0.01, 100.0, 0.01, 20.0, 0.01, "PRECIOUS_METAL"),
+        "US30": AssetConfig("US30", "Wall Street 30 (Dow Jones)", 1.0, 1.0, 0.01, 50.0, 0.01, "EQUITY_INDEX"),
+        "NAS100": AssetConfig("NAS100", "US Tech 100 (NASDAQ)", 0.1, 1.0, 0.01, 50.0, 0.01, "EQUITY_INDEX"),
+        "GERMAN30": AssetConfig("DE40", "Germany 40 (DAX40)", 0.1, 1.0, 0.01, 50.0, 0.01, "EQUITY_INDEX"),
+        "EURUSD": AssetConfig("EURUSD", "EUR / USD", 0.0001, 100000.0, 0.01, 50.0, 0.01, "FOREX_MAJORS"),
+        "USDJPY": AssetConfig("USDJPY", "USD / JPY", 0.01, 100000.0, 0.01, 50.0, 0.01, "FOREX_MAJORS"),
+        "GBPUSD": AssetConfig("GBPUSD", "GBP / USD", 0.0001, 100000.0, 0.01, 50.0, 0.01, "FOREX_MAJORS"),
     }
 
 # ==============================================================================
-# 5. NATIVE DERIV CLOUD WEBSOCKET CLIENT (REST+OTP COMPATIBLE)
+# 5. NATIVE CTRADER OPEN API CLIENT (WEBSOCKET JSON PROTOCOL)
 # ==============================================================================
 
-class DerivCloudClient:
-    def __init__(self, app_id: str = None, api_token: str = None):
-        self.app_id = app_id or ConfigManager.DERIV_APP_ID
-        self.api_token = api_token or ConfigManager.DERIV_API_TOKEN
-        self.ws_url = f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
+class CTraderClient:
+    def __init__(self):
+        self.ws_url = ConfigManager.WS_URL
+        self.account_id = ConfigManager.ACCOUNT_ID
+        self.client_id = ConfigManager.CLIENT_ID
+        self.client_secret = ConfigManager.CLIENT_SECRET
+        self.access_token = ConfigManager.ACCESS_TOKEN
+
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_authorized: bool = False
-        self.last_known_balance: float = 10051.99
-        self.account_info: Dict[str, Any] = {}
-        self._req_id_counter: int = 0
+        self.last_known_balance: float = 1000.0
+        self.last_known_equity: float = 1000.0
+        self.account_currency: str = "USD"
+        self.money_digits: int = 2
+
+        self.symbol_map: Dict[str, int] = {}                  # "XAUUSD" -> symbolId
+        self.symbol_details: Dict[int, dict] = {}              # symbolId -> metadata
+        self.live_quotes: Dict[int, Tuple[float, float]] = {}  # symbolId -> (bid, ask)
+
+        self._pending_requests: Dict[str, asyncio.Future] = {}
+        self._msg_counter: int = 0
         self._lock = asyncio.Lock()
 
-    def _get_next_req_id(self) -> int:
-        self._req_id_counter += 1
-        return self._req_id_counter
+    def _next_id(self) -> str:
+        self._msg_counter += 1
+        return f"req_{self._msg_counter}_{int(time.time()*1000)}"
 
     def is_connection_open(self) -> bool:
         if self.ws is None:
             return False
-        if hasattr(self.ws, "state"):
-            return getattr(self.ws.state, "name", "") == "OPEN"
-        return getattr(self.ws, "open", False)
-
-    async def get_authenticated_ws_url(self) -> str:
-        api_base = "https://api.derivws.com"
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.api_token}",
-                "Deriv-App-ID": str(self.app_id),
-                "User-Agent": "NexusMatrix/1.0"
-            }
-            
-            def _fetch_accounts():
-                req = urllib.request.Request(f"{api_base}/trading/v1/options/accounts", headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    return json.loads(resp.read().decode())
-
-            accounts_data = await asyncio.to_thread(_fetch_accounts)
-            accounts = accounts_data.get("data", [])
-            if not accounts:
-                raise ValueError("No accounts returned from Deriv.")
-
-            demo_acc = next((a for a in accounts if a.get("account_type") == "demo"), accounts[0])
-            account_id = demo_acc.get("account_id") or demo_acc.get("loginid") or demo_acc.get("id")
-            log.info(f"Targeting Deriv Account: {account_id}")
-
-            def _fetch_otp():
-                otp_req = urllib.request.Request(
-                    f"{api_base}/trading/v1/options/accounts/{account_id}/otp",
-                    data=b"{}",
-                    headers={**headers, "Content-Type": "application/json"},
-                    method="POST"
-                )
-                with urllib.request.urlopen(otp_req, timeout=10) as resp:
-                    return json.loads(resp.read().decode())
-
-            otp_res = await asyncio.to_thread(_fetch_otp)
-            ws_url = otp_res.get("data", {}).get("url")
-            if ws_url:
-                log.info("Obtained pre-authenticated WebSocket URL via Deriv OTP handshake.")
-                return ws_url
-
-        except Exception as e:
-            log.warning(f"Deriv REST+OTP handshake warning: {e}. Trying fallback.")
-
-        return f"{ConfigManager.DERIV_WS_URL}?app_id={self.app_id}"
+        return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
     async def connect(self) -> bool:
-        if not self.app_id or not self.api_token:
-            log.critical("Missing DERIV_APP_ID or DERIV_API_TOKEN environment variable.")
+        if not self.client_id or not self.client_secret or not self.access_token or not self.account_id:
+            log.critical("Missing cTrader credentials in Railway environment variables.")
             return False
 
         try:
-            ws_url = await self.get_authenticated_ws_url()
-            log.info(f"Connecting to Deriv WebSocket: {ws_url.split('?')[0]}...")
-            self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=20)
+            log.info(f"Connecting to Fusion Markets cTrader ({ConfigManager.ENV.upper()}): {self.ws_url}...")
+            self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
+            asyncio.create_task(self._listen_loop())
 
-            if "otp=" in ws_url:
-                self.is_authorized = True
-                req = {"balance": 1, "req_id": self._get_next_req_id()}
-                await self.ws.send(json.dumps(req))
-                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
-                val = float(res.get("balance", {}).get("balance", 0.0))
-                if val > 0:
-                    self.last_known_balance = val
-                log.info(f"--- DERIV CLOUD ONLINE (NEW API) --- Balance: {self.last_known_balance} USD")
-                return True
+            # 1. Application Authorization (ProtoOAApplicationAuthReq: 2100)
+            app_auth_res = await self._send_and_wait(2100, {
+                "clientId": self.client_id,
+                "clientSecret": self.client_secret
+            })
+            if not app_auth_res or app_auth_res.get("payloadType") != 2101:
+                log.critical(f"cTrader App Auth failed: {app_auth_res}")
+                return False
 
-            auth_payload = {"authorize": self.api_token, "req_id": self._get_next_req_id()}
-            await self.ws.send(json.dumps(auth_payload))
-            res_data = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
-
-            if "error" in res_data:
-                log.critical(f"Deriv Auth Failed: {res_data['error']['message']}")
+            # 2. Account Authorization (ProtoOAAccountAuthReq: 2102)
+            acc_auth_res = await self._send_and_wait(2102, {
+                "ctidTraderAccountId": self.account_id,
+                "accessToken": self.access_token
+            })
+            if not acc_auth_res or acc_auth_res.get("payloadType") != 2103:
+                log.critical(f"cTrader Account Auth failed: {acc_auth_res}")
                 return False
 
             self.is_authorized = True
-            bal_val = float(res_data.get("authorize", {}).get("balance", 0.0))
-            if bal_val > 0:
-                self.last_known_balance = bal_val
-            log.info(f"--- DERIV CLOUD ONLINE --- Balance: {self.last_known_balance} USD")
+
+            # 3. Pull Account Balance, Digits & Currency (ProtoOATraderReq: 2121)
+            trader_res = await self._send_and_wait(2121, {
+                "ctidTraderAccountId": self.account_id
+            })
+            if trader_res and "trader" in trader_res.get("payload", {}):
+                t_info = trader_res["payload"]["trader"]
+                self.money_digits = t_info.get("moneyDigits", 2)
+                raw_bal = float(t_info.get("balance", 0))
+                self.last_known_balance = raw_bal / (10 ** self.money_digits)
+                self.last_known_equity = self.last_known_balance
+                log.info(f"--- CTRADER / FUSION ONLINE --- Balance: {self.last_known_balance:,.2f} (Account Currency)")
+
+            # 4. Discover Broker Symbols & Map IDs (ProtoOASymbolsListReq: 2114)
+            await self._discover_symbols()
             return True
 
         except Exception as e:
-            log.error(f"Failed to connect to Deriv WebSocket Cloud: {str(e)}")
+            log.error(f"Failed to connect to cTrader Gateway: {e}")
             self.is_authorized = False
             return False
 
-    async def ensure_connected(self) -> bool:
-        if not self.is_connection_open() or not self.is_authorized:
-            log.warning("Deriv WebSocket connection dropped. Reconnecting...")
-            return await self.connect()
-        return True
+    async def _discover_symbols(self):
+        res = await self._send_and_wait(2114, {
+            "ctidTraderAccountId": self.account_id,
+            "includeArchivedSymbols": False
+        })
+        if not res or "symbol" not in res.get("payload", {}):
+            return
 
-    async def ping(self) -> bool:
-        if not await self.ensure_connected():
-            return False
+        symbols_list = res["payload"]["symbol"]
+        for s in symbols_list:
+            sid = s.get("symbolId")
+            sname = s.get("symbolName", "").upper()
+            digits = s.get("digits", 5)
+            self.symbol_map[sname] = sid
+            self.symbol_details[sid] = {"name": sname, "digits": digits}
+
+        target_ids = []
+        for friendly, aliases in ConfigManager.SYMBOL_ALIASES.items():
+            resolved_id = self.resolve_symbol_id(friendly)
+            if resolved_id:
+                target_ids.append(resolved_id)
+                log.info(f"Mapped Whitelist Asset: {friendly} -> Symbol ID {resolved_id} ({self.symbol_details[resolved_id]['name']})")
+
+        # Subscribe to live spot feeds for our targets (ProtoOASubscribeSpotsReq: 2127)
+        if target_ids:
+            await self._send(2127, {
+                "ctidTraderAccountId": self.account_id,
+                "symbolId": target_ids
+            })
+
+    def resolve_symbol_id(self, friendly_name: str) -> Optional[int]:
+        aliases = ConfigManager.SYMBOL_ALIASES.get(friendly_name.upper(), [friendly_name.upper()])
+        for a in aliases:
+            if a in self.symbol_map:
+                return self.symbol_map[a]
+        for sname, sid in self.symbol_map.items():
+            for a in aliases:
+                if a in sname:
+                    return sid
+        return None
+
+    async def _send(self, payload_type: int, payload: dict, client_msg_id: str = None) -> str:
+        msg_id = client_msg_id or self._next_id()
+        data = {
+            "clientMsgId": msg_id,
+            "payloadType": payload_type,
+            "payload": payload
+        }
+        await self.ws.send(json.dumps(data))
+        return msg_id
+
+    async def _send_and_wait(self, payload_type: int, payload: dict, timeout: float = 10.0) -> Optional[dict]:
+        msg_id = self._next_id()
+        fut = asyncio.get_event_loop().create_future()
+        self._pending_requests[msg_id] = fut
         try:
-            async with self._lock:
-                req = {"ping": 1, "req_id": self._get_next_req_id()}
-                await self.ws.send(json.dumps(req))
-                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
-                data = json.loads(res)
-                return data.get("ping") == "pong"
+            await self._send(payload_type, payload, client_msg_id=msg_id)
+            return await asyncio.wait_for(fut, timeout=timeout)
         except Exception as e:
-            log.error(f"Deriv Ping Error: {e}")
-            return False
+            log.warning(f"Request timeout or error (payloadType {payload_type}): {e}")
+            return None
+        finally:
+            self._pending_requests.pop(msg_id, None)
 
-    async def get_balance(self) -> float:
-        if not await self.ensure_connected():
-            return self.last_known_balance
+    async def _listen_loop(self):
         try:
-            async with self._lock:
-                req = {"balance": 1, "req_id": self._get_next_req_id()}
-                await self.ws.send(json.dumps(req))
-                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
-                val = float(res.get("balance", {}).get("balance", 0.0))
-                if val > 0:
-                    self.last_known_balance = val
-                return self.last_known_balance
-        except Exception:
-            return self.last_known_balance
+            while self.is_connection_open():
+                raw = await self.ws.recv()
+                msg = json.loads(raw)
+                client_id = msg.get("clientMsgId")
+                ptype = msg.get("payloadType")
+                payload = msg.get("payload", {})
 
-    async def fetch_ohlc_candles(self, symbol: str, granularity: DerivGranularity, count: int = 100) -> pd.DataFrame:
-        if not await self.ensure_connected():
+                # Heartbeat Response (ProtoHeartbeatEvent: 51)
+                if ptype == 51:
+                    await self._send(51, {})
+                    continue
+
+                # Live Spot Event (ProtoOASpotEvent: 2131)
+                if ptype == 2131:
+                    sid = payload.get("symbolId")
+                    bid = payload.get("bid")
+                    ask = payload.get("ask")
+                    if sid and (bid or ask):
+                        prev = self.live_quotes.get(sid, (0.0, 0.0))
+                        digits = self.symbol_details.get(sid, {}).get("digits", 5)
+                        new_bid = (bid / (10 ** digits)) if bid else prev[0]
+                        new_ask = (ask / (10 ** digits)) if ask else prev[1]
+                        self.live_quotes[sid] = (new_bid, new_ask)
+
+                # Route message to waiting future
+                if client_id and client_id in self._pending_requests:
+                    self._pending_requests[client_id].set_result(msg)
+
+        except Exception as e:
+            log.warning(f"cTrader WebSocket listener closed: {e}")
+            self.is_authorized = False
+
+    async def get_balance_and_equity(self) -> Tuple[float, float]:
+        if not self.is_authorized:
+            return self.last_known_balance, self.last_known_equity
+        try:
+            res = await self._send_and_wait(2121, {"ctidTraderAccountId": self.account_id}, timeout=4.0)
+            if res and "trader" in res.get("payload", {}):
+                raw_bal = float(res["payload"]["trader"].get("balance", 0))
+                self.last_known_balance = raw_bal / (10 ** self.money_digits)
+                self.last_known_equity = self.last_known_balance
+        except Exception:
+            pass
+        return self.last_known_balance, self.last_known_equity
+
+    async def get_live_quote(self, symbol_name: str) -> Tuple[float, float, float]:
+        sid = self.resolve_symbol_id(symbol_name)
+        if not sid or sid not in self.live_quotes:
+            return 0.0, 0.0, 0.0
+        bid, ask = self.live_quotes[sid]
+        mid = (bid + ask) / 2.0
+        return mid, bid, ask
+
+    async def fetch_ohlc_candles(self, symbol_name: str, period: CTraderTrendbarPeriod, count: int = 60) -> pd.DataFrame:
+        sid = self.resolve_symbol_id(symbol_name)
+        if not sid or not self.is_authorized:
             return pd.DataFrame()
 
-        request_payload = {
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": count,
-            "end": "latest",
-            "granularity": granularity.value,
-            "style": "candles",
-            "req_id": self._get_next_req_id()
-        }
+        now_ms = int(time.time() * 1000)
+        # Approximate historical time window
+        from_ms = now_ms - (count * 60 * 1000 * 10)
 
-        try:
-            async with self._lock:
-                await self.ws.send(json.dumps(request_payload))
-                response = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
-                data = json.loads(response)
+        res = await self._send_and_wait(2137, {
+            "ctidTraderAccountId": self.account_id,
+            "symbolId": sid,
+            "period": period.value,
+            "fromTimestamp": from_ms,
+            "toTimestamp": now_ms
+        }, timeout=8.0)
 
-            if "error" in data:
-                return pd.DataFrame()
-
-            candles = data.get("candles", [])
-            if not candles:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(candles)
-            df.rename(columns={'epoch': 'time'}, inplace=True)
-            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-            
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            if 'tick_volume' not in df.columns:
-                df['tick_volume'] = 1
-
-            return df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
-        except Exception as e:
-            log.error(f"Exception during candle fetch ({symbol}): {e}")
+        if not res or "trendbar" not in res.get("payload", {}):
             return pd.DataFrame()
 
-    async def get_live_quote(self, symbol: str) -> Tuple[float, float, float]:
-        """Fetches live spot price, bid, and ask for precise spread checking."""
-        if not await self.ensure_connected():
-            return 0.0, 0.0, 0.0
-        try:
-            async with self._lock:
-                req = {"ticks": symbol, "req_id": self._get_next_req_id()}
-                await self.ws.send(json.dumps(req))
-                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
-                tick = res.get("tick", {})
-                quote = float(tick.get("quote", 0.0))
-                bid = float(tick.get("bid", quote))
-                ask = float(tick.get("ask", quote))
-                return quote, bid, ask
-        except Exception:
-            return 0.0, 0.0, 0.0
+        bars = res["payload"]["trendbar"]
+        if not bars:
+            return pd.DataFrame()
 
-    async def execute_atomic_order(
-        self, 
-        symbol: str, 
-        direction: str, 
-        stake: float, 
-        entry_price: float,
-        sl_price: float, 
-        tp_price: float
-    ) -> Optional[Dict[str, Any]]:
-        """
-        ATOMIC BRACKET EXECUTION: Bundles SL and TP bounds directly into the proposal.
-        The trade enters the market fully protected at the exact millisecond of purchase.
-        """
-        if not await self.ensure_connected():
+        candles = []
+        for b in bars:
+            low = float(b.get("low", 0)) / 100000.0
+            open_p = (float(b.get("low", 0)) + float(b.get("deltaOpen", 0))) / 100000.0
+            close_p = (float(b.get("low", 0)) + float(b.get("deltaClose", 0))) / 100000.0
+            high_p = (float(b.get("low", 0)) + float(b.get("deltaHigh", 0))) / 100000.0
+            t_sec = b.get("utcTimestampInMinutes", 0) * 60
+
+            candles.append({
+                "time": pd.to_datetime(t_sec, unit="s", utc=True),
+                "open": open_p,
+                "high": high_p,
+                "low": low,
+                "close": close_p,
+                "tick_volume": b.get("volume", 1)
+            })
+
+        df = pd.DataFrame(candles)
+        df.sort_values("time", inplace=True)
+        return df.tail(count)
+
+    async def execute_market_order(
+        self,
+        symbol_name: str,
+        direction: str,
+        lots: float,
+        stop_loss: float,
+        take_profit: float
+    ) -> Optional[dict]:
+        sid = self.resolve_symbol_id(symbol_name)
+        if not sid or not self.is_authorized:
             return None
 
-        contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
-        asset_cfg = ConfigManager.ASSETS.get(symbol)
-        multiplier = asset_cfg.default_multiplier if asset_cfg else 100
+        trade_side = 1 if direction.upper() == "BUY" else 2 # 1=BUY, 2=SELL
+        # Volume in cTrader is represented in cents of base currency (0.01 lot = 100,000 cents)
+        volume_cents = int(round(lots * 10000000))
 
-        sl_pts = abs(entry_price - sl_price)
-        tp_pts = abs(tp_price - entry_price)
-
-        proposal_req = {
-            "proposal": 1,
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": contract_type,
-            "currency": ConfigManager.BASE_ACCOUNT_CURRENCY,
-            "underlying_symbol": symbol,
-            "multiplier": multiplier,
-            "limit_order": {
-                "stop_loss": round(sl_pts, 2),
-                "take_profit": round(tp_pts, 2)
-            },
-            "req_id": self._get_next_req_id()
+        order_payload = {
+            "ctidTraderAccountId": self.account_id,
+            "symbolId": sid,
+            "orderType": 1, # MARKET
+            "tradeSide": trade_side,
+            "volume": volume_cents,
+            "stopLoss": round(stop_loss, 5),
+            "takeProfit": round(take_profit, 5),
+            "comment": "NexusMatrix"
         }
 
-        try:
-            async with self._lock:
-                await self.ws.send(json.dumps(proposal_req))
-                prop_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
+        res = await self._send_and_wait(2106, order_payload, timeout=8.0)
+        if res and res.get("payloadType") == 2126: # ProtoOAExecutionEvent
+            deal = res.get("payload", {}).get("deal", {})
+            pos_id = res.get("payload", {}).get("position", {}).get("positionId")
+            log.info(f"CTRADER ORDER FILLED | {direction} {symbol_name} | Position #{pos_id} | Lots: {lots:.2f} | SL: {stop_loss} | TP: {take_profit}")
+            return {
+                "deal_id": deal.get("dealId"),
+                "position_id": pos_id,
+                "volume": volume_cents,
+                "lots": lots
+            }
+        elif res and "errorMessage" in res.get("payload", {}):
+            log.error(f"cTrader Order Error: {res['payload']['errorMessage']}")
+        return None
 
-                if "error" in prop_res:
-                    log.error(f"Deriv Trade Proposal Error ({symbol}): {prop_res['error']['message']}")
-                    return None
+    async def update_position_sl(self, position_id: int, new_sl: float) -> bool:
+        """Amends active position Stop Loss to Break-Even."""
+        res = await self._send_and_wait(2107, {
+            "ctidTraderAccountId": self.account_id,
+            "positionId": position_id,
+            "stopLoss": round(new_sl, 5)
+        }, timeout=6.0)
+        return bool(res and res.get("payloadType") == 2126)
 
-                proposal_id = prop_res.get("proposal", {}).get("id")
-                if not proposal_id:
-                    return None
-
-                buy_req = {
-                    "buy": proposal_id,
-                    "price": stake,
-                    "req_id": self._get_next_req_id()
-                }
-                await self.ws.send(json.dumps(buy_req))
-                buy_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
-
-                if "error" in buy_res:
-                    log.error(f"Deriv Purchase Execution Error ({symbol}): {buy_res['error']['message']}")
-                    return None
-
-                contract_info = buy_res.get("buy", {})
-                log.info(f"DERIV ATOMIC BRACKET ORDER FILLED | {symbol} | ID: {contract_info.get('contract_id')} | Stake: ${stake} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
-                return contract_info
-
-        except Exception as e:
-            log.error(f"Exception during Deriv order execution ({symbol}): {e}")
-            return None
-
-        contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
-        asset_cfg = ConfigManager.ASSETS.get(symbol)
-        multiplier = asset_cfg.default_multiplier if asset_cfg else 100
-
-        sl_pts = abs(entry_price - sl_price)
-        tp_pts = abs(tp_price - entry_price)
-
-        proposal_req = {
-            "proposal": 1,
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": contract_type,
-            "currency": ConfigManager.BASE_ACCOUNT_CURRENCY,
-            "underlying_symbol": symbol,
-            "multiplier": multiplier,
-            "limit_order": {
-                "stop_loss": round(sl_pts, 2),
-                "take_profit": round(tp_pts, 2)
-            },
-            "req_id": self._get_next_req_id()
-        } 
-
-        try:
-            async with self._lock:
-                await self.ws.send(json.dumps(proposal_req))
-                prop_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
-
-                if "error" in prop_res:
-                    log.error(f"Deriv Trade Proposal Error ({symbol}): {prop_res['error']['message']}")
-                    return None
-
-                proposal_id = prop_res.get("proposal", {}).get("id")
-                if not proposal_id:
-                    return None
-
-                buy_req = {
-                    "buy": proposal_id,
-                    "price": stake,
-                    "req_id": self._get_next_req_id()
-                }
-                await self.ws.send(json.dumps(buy_req))
-                buy_res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10.0))
-
-                if "error" in buy_res:
-                    log.error(f"Deriv Purchase Execution Error ({symbol}): {buy_res['error']['message']}")
-                    return None
-
-                contract_info = buy_res.get("buy", {})
-                log.info(f"DERIV ATOMIC BRACKET ORDER FILLED | {symbol} | ID: {contract_info.get('contract_id')} | Stake: ${stake} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
-                return contract_info
-
-        except Exception as e:
-            log.error(f"Exception during Deriv order execution ({symbol}): {e}")
-            return None
-
-    async def update_contract_stop_loss(self, contract_id: str, new_sl_pts: float) -> bool:
-        """Sends live order amendment to move Stop Loss to break-even."""
-        try:
-            async with self._lock:
-                req = {
-                    "contract_update": 1,
-                    "contract_id": int(contract_id),
-                    "limit_order": {"stop_loss": round(new_sl_pts, 2)},
-                    "req_id": self._get_next_req_id()
-                }
-                await self.ws.send(json.dumps(req))
-                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=5.0))
-                return "error" not in res
-        except Exception:
-            return False
-
-    async def close_market_contract(self, contract_id: str) -> bool:
-        """Market closes an active contract immediately (Used by 21:00 SAST Flusher)."""
-        try:
-            async with self._lock:
-                req = {
-                    "sell": int(contract_id),
-                    "price": 0,
-                    "req_id": self._get_next_req_id()
-                }
-                await self.ws.send(json.dumps(req))
-                res = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=8.0))
-                return "sold" in res or "error" not in res
-        except Exception as e:
-            log.error(f"Error market closing contract {contract_id}: {e}")
-            return False
+    async def close_position(self, position_id: int, volume_cents: int) -> bool:
+        """Market closes position (used by 21:00 SAST Flusher)."""
+        res = await self._send_and_wait(2111, {
+            "ctidTraderAccountId": self.account_id,
+            "positionId": position_id,
+            "volume": volume_cents
+        }, timeout=8.0)
+        return bool(res and res.get("payloadType") == 2126)
 
 # ==============================================================================
 # 6. QUANTITATIVE MATH ENGINE & STATISTICAL INDICATORS
@@ -619,11 +569,9 @@ class MathEngine:
         high = df['high']
         low = df['low']
         close = df['close'].shift(1)
-        
         tr1 = high - low
         tr2 = (high - close).abs()
         tr3 = (low - close).abs()
-        
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         return tr.rolling(window=period).mean()
 
@@ -660,13 +608,9 @@ class MarketSession(Enum):
 
 class TemporalSessionManager:
     @staticmethod
-    def get_current_session(is_synthetic: bool = False) -> MarketSession:
-        if is_synthetic:
-            return MarketSession.NEW_YORK
-
+    def get_current_session() -> MarketSession:
         now_utc = datetime.now(timezone.utc)
         hour = now_utc.hour
-
         if 0 <= hour < 7:
             return MarketSession.ASIAN
         elif 7 <= hour < 12:
@@ -697,7 +641,6 @@ class OrderFlowAnalyzer:
 
         price_min = df['low'].min()
         price_max = df['high'].max()
-        
         if price_min == price_max:
             return VolumeProfileNode(price_min, price_max, price_min, 0.0)
 
@@ -709,10 +652,10 @@ class OrderFlowAnalyzer:
             candle_avg = (row['high'] + row['low'] + row['close']) / 3.0
             bin_idx = np.digitize(candle_avg, bins) - 1
             bin_idx = min(max(bin_idx, 0), num_bins - 2)
-            
+
             vol = row.get('tick_volume', 1)
             vol_distribution[bin_idx] += vol
-            
+
             close_range = row['high'] - row['low']
             delta_ratio = ((row['close'] - row['low']) / close_range - 0.5) * 2.0 if close_range > 0 else 0.0
             delta_distribution[bin_idx] += vol * delta_ratio
@@ -722,11 +665,11 @@ class OrderFlowAnalyzer:
 
         total_vol = np.sum(vol_distribution)
         target_vol = total_vol * 0.70
-        
+
         sorted_indices = np.argsort(vol_distribution)[::-1]
         cum_vol = 0.0
         va_indices = []
-        
+
         for idx in sorted_indices:
             cum_vol += vol_distribution[idx]
             va_indices.append(idx)
@@ -741,7 +684,7 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 9. INSTITUTIONAL RISK MANAGEMENT ENGINE (NEWS ARMOR & RUNWAY BUDGETING)
+# 9. AI INTUITION & INSTITUTIONAL RISK MANAGEMENT ENGINE
 # ==============================================================================
 
 class InstitutionalRiskEngine:
@@ -755,7 +698,12 @@ class InstitutionalRiskEngine:
         self.max_daily_loss_usd: float = 2500.0
         self.max_weekly_loss_usd: float = 6500.0
         self.max_monthly_loss_usd: float = 15000.0
-        
+
+        # Daily & Weekly Growth Goal Tracking
+        self.weekly_deposit_baseline: float = 0.0
+        self.weekly_goal_target: float = 0.0
+        self.daily_goal_target: float = 0.0
+
         self.trades_taken_today: int = 0
         self.consecutive_losses: int = 0
         self.current_daily_loss: float = 0.0
@@ -763,31 +711,30 @@ class InstitutionalRiskEngine:
         self.current_monthly_loss: float = 0.0
         self.open_positions: Dict[str, dict] = {}
 
-        # Spread Gate Thresholds
-        self.max_spread_to_sl_ratio: float = 0.15
-        self.max_absolute_spread = {
-            "frxXAUUSD": 0.50,
-            "OTC_DJI": 4.5,
-            "OTC_NDX": 2.5,
-            "OTC_GDAXI": 3.0,
-            "frxEURUSD": 0.0003,
-            "frxUSDJPY": 0.035,
-            "frxGBPUSD": 0.00035
+        # Standard Baseline Spreads & Dynamic Tolerance Bands
+        self.max_spread_to_sl_ratio: float = 0.30
+        self.spread_ranges = {
+            "GOLD": {"standard": 0.30, "max_allowed": 0.85},
+            "US30": {"standard": 2.50, "max_allowed": 6.50},
+            "NAS100": {"standard": 1.50, "max_allowed": 3.80},
+            "GERMAN30": {"standard": 1.80, "max_allowed": 4.50},
+            "EURUSD": {"standard": 0.00010, "max_allowed": 0.00025},
+            "USDJPY": {"standard": 0.012, "max_allowed": 0.025},
+            "GBPUSD": {"standard": 0.00014, "max_allowed": 0.00030}
         }
 
         # Sector Correlation Grouping (Max 1 open position per sector)
         self.SECTOR_MAP = {
-            "OTC_DJI": "EQUITY_INDEX",
-            "OTC_NDX": "EQUITY_INDEX",
-            "OTC_GDAXI": "EQUITY_INDEX",
-            "frxXAUUSD": "PRECIOUS_METAL",
+            "US30": "EQUITY_INDEX",
+            "NAS100": "EQUITY_INDEX",
+            "GERMAN30": "EQUITY_INDEX",
             "GOLD": "PRECIOUS_METAL",
-            "frxEURUSD": "FOREX_MAJORS",
-            "frxGBPUSD": "FOREX_MAJORS",
-            "frxUSDJPY": "FOREX_MAJORS"
+            "EURUSD": "FOREX_MAJORS",
+            "GBPUSD": "FOREX_MAJORS",
+            "USDJPY": "FOREX_MAJORS"
         }
 
-        # Targeted Red-Folder Windows (NFP & CPI announcements: 5 min before and after)
+        # High Impact Red-Folder Event Windows (CPI/NFP/FOMC)
         self.RED_FOLDER_WINDOWS = [
             (dtime(12, 25), dtime(12, 35)),
             (dtime(17, 55), dtime(18, 5))
@@ -805,6 +752,10 @@ class InstitutionalRiskEngine:
         self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
         self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
         self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
+
+        self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline))
+        self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target))
+        self.daily_goal_target = float(cfg.get("dailyGoalTarget", self.daily_goal_target))
 
     def is_red_folder_active(self) -> bool:
         now_utc = datetime.now(timezone.utc).time()
@@ -872,60 +823,89 @@ class InstitutionalRiskEngine:
 
     def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
         spread = abs(current_ask - current_bid)
-        max_allowed = self.max_absolute_spread.get(symbol, 5.0)
-        
-        if spread > max_allowed:
-            return False, f"Spread ({spread:.4f}) exceeds threshold ({max_allowed:.4f})", spread
+        range_cfg = self.spread_ranges.get(symbol)
+
+        if range_cfg:
+            std_spread = range_cfg["standard"]
+            max_allowed = range_cfg["max_allowed"]
+            if spread > max_allowed:
+                return False, f"Spread ({spread:.5f}) exceeds tolerance ceiling ({max_allowed:.5f})", spread
+        else:
+            if spread > 5.0:
+                return False, f"Spread ({spread:.4f}) exceeds default ceiling (5.0)", spread
 
         if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
             return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max allowed: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
 
         return True, "Spread optimal", spread
 
-    def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        equity = current_equity if current_equity > 0 else 10051.99
+    def calculate_smart_lot_size(
+        self,
+        current_equity: float,
+        sl_distance: float,
+        symbol: str,
+        ai_quality_factor: float = 1.0
+    ) -> float:
+        """
+        DYNAMIC SIZING FOR ANY ACCOUNT SIZE (R100, R1,000, R10,000, OR USD):
+        - Dynamically paces risk according to daily goal target and remaining trades.
+        - Applies AI Intuition quality factor (0.5x on marginal setups, up to 1.5x on A+ setups).
+        - Enforces micro-account minimums (0.01 lot) so small deposits can grow.
+        """
+        equity = current_equity if current_equity > 0 else 1000.0
         active_risk_pct = self.risk_per_trade_pct
 
+        # 1. Target Pacing Intuition:
+        # If daily goal is set (e.g. 500 on a 1,000 account) and max trades is 4:
+        trades_left_today = max(1, self.max_daily_trades - self.trades_taken_today)
+        if self.daily_goal_target > 0:
+            target_per_trade = self.daily_goal_target / trades_left_today
+            suggested_risk = target_per_trade / self.risk_to_reward
+            suggested_pct = (suggested_risk / equity) * 100.0
+            # Blend user set risk with goal-paced risk
+            active_risk_pct = min(max(active_risk_pct, suggested_pct * 0.8), active_risk_pct * 1.5)
+
+        # 2. Consecutive Loss Circuit
         if self.consecutive_losses >= 3:
             active_risk_pct = active_risk_pct * 0.5
             log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
 
+        # 3. News Armor Protection
         if self.is_red_folder_active():
             active_risk_pct = active_risk_pct * 0.5
-            log.info(f"NEWS ARMOR ENGAGED: Red folder window active. Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
+            log.info(f"NEWS ARMOR ENGAGED: Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
 
-        if self.max_weekly_loss_usd > 0:
-            weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
-            remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
+        # 4. Multiply by AI Intuition Score (0.5x to 1.5x)
+        active_risk_pct = active_risk_pct * ai_quality_factor
 
-            if weekly_used_ratio >= 0.90:
-                active_risk_pct = min(active_risk_pct, 0.10)
-            elif weekly_used_ratio >= 0.75:
-                active_risk_pct = min(active_risk_pct, 0.25)
-            elif weekly_used_ratio >= 0.50:
-                active_risk_pct = min(active_risk_pct, 0.50)
+        # 5. Calculate cash at risk
+        risk_cash = equity * (active_risk_pct / 100.0)
 
-            max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
+        # Pip value computation based on asset configuration
+        cfg = ConfigManager.ASSETS.get(symbol)
+        pip_size = cfg.pip_size if cfg else 0.0001
+        contract_size = cfg.contract_size if cfg else 100000.0
+        min_lots = cfg.min_lots if cfg else 0.01
+        max_lots = cfg.max_lots if cfg else 50.0
+
+        pips_at_risk = (sl_distance / pip_size) if pip_size > 0 else 10.0
+        # Value of 1 pip for 1.0 standard lot
+        pip_value_per_lot = pip_size * contract_size
+
+        if pip_value_per_lot * pips_at_risk > 0:
+            calculated_lots = risk_cash / (pips_at_risk * pip_value_per_lot)
         else:
-            max_weekly_allowed_dollars = float('inf')
+            calculated_lots = min_lots
 
-        if self.max_daily_loss_usd > 0:
-            remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
-            max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
-        else:
-            max_daily_allowed_dollars = float('inf')
+        # Micro-Account Growth Safeguard:
+        # If the account is small (R100 or $5) and math yields 0.003, set to broker min (0.01 lot)
+        if calculated_lots < min_lots:
+            log.info(f"MICRO-ACCOUNT GROWTH MODE: Small balance ({equity:,.2f}). Sizing to broker minimum ({min_lots} lots).")
+            calculated_lots = min_lots
 
-        base_risk_dollars = equity * (active_risk_pct / 100.0)
-        final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars, max_daily_allowed_dollars)
-
-        denom = sl_distance * point_value
-        calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
-
-        if calculated_stake < min_stake and equity >= min_stake:
-            log.info(f"MICRO-ACCOUNT GROWTH MODE: Small equity ({equity:.2f}). Using minimum broker stake ({min_stake}).")
-            calculated_stake = min_stake
-
-        return round(max(min(calculated_stake, max_stake), min_stake), 2)
+        final_lots = round(max(min(calculated_lots, max_lots), min_lots), 2)
+        log.info(f"Dynamic Sizer: Equity {equity:,.2f} | Risk {active_risk_pct:.2f}% | AI Factor {ai_quality_factor}x | Lots: {final_lots}")
+        return final_lots
 
     def validate_pre_trade(
         self,
@@ -937,9 +917,7 @@ class InstitutionalRiskEngine:
         current_bid: float,
         current_ask: float,
         current_equity: float,
-        point_value: float,
-        min_stake: float,
-        max_stake: float
+        ai_quality_factor: float = 1.0
     ) -> Tuple[bool, str, dict]:
         self.sync_ui_config()
 
@@ -949,15 +927,6 @@ class InstitutionalRiskEngine:
         sector_ok, sector_msg = self.check_sector_exposure(symbol)
         if not sector_ok:
             return False, sector_msg, {}
-
-        if self.current_daily_loss >= self.max_daily_loss_usd:
-            return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
-
-        if self.current_weekly_loss >= self.max_weekly_loss_usd:
-            return False, f"Weekly loss ceiling breached (-${self.current_weekly_loss:.2f})", {}
-
-        if self.current_monthly_loss >= self.max_monthly_loss_usd:
-            return False, f"Monthly loss ceiling breached (-${self.current_monthly_loss:.2f})", {}
 
         if self.trades_taken_today >= self.max_daily_trades:
             return False, f"Daily trade quota reached ({self.trades_taken_today}/{self.max_daily_trades})", {}
@@ -976,74 +945,26 @@ class InstitutionalRiskEngine:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
 
         adjusted_sl = (stop_loss - spread_pts) if direction.upper() == "BUY" else (stop_loss + spread_pts)
-        stake = self.calculate_lot_size(current_equity, sl_distance, point_value, min_stake, max_stake)
-        if stake <= 0:
-            return False, "Calculated stake is 0", {}
+        lots = self.calculate_smart_lot_size(current_equity, sl_distance, symbol, ai_quality_factor)
 
         blueprint = {
             "symbol": symbol,
             "direction": direction.upper(),
-            "stake": stake,
+            "lots": lots,
             "entry_price": entry_price,
-            "stop_loss": round(adjusted_sl, 4),
-            "take_profit": round(final_tp, 4),
-            "spread_points": round(spread_pts, 4),
+            "stop_loss": round(adjusted_sl, 5),
+            "take_profit": round(final_tp, 5),
+            "spread_points": round(spread_pts, 5),
             "is_dry_run": self.dry_run
         }
         return True, "Approved", blueprint
 
-# Backward compatibility aliases
+# Backward compatibility alias
 RiskState = InstitutionalRiskEngine
 RiskManager = InstitutionalRiskEngine
 
 # ==============================================================================
-# 10. MARKET DATA PIPELINE & MULTI-TIMEFRAME MATRIX
-# ==============================================================================
-
-class MarketDataPipeline:
-    def __init__(self, deriv_client: DerivCloudClient):
-        self.deriv = deriv_client
-
-    async def get_enriched_dataframe(self, symbol: str, granularity: DerivGranularity, count: int = 300) -> pd.DataFrame:
-        df = await self.deriv.fetch_ohlc_candles(symbol, granularity, count)
-        if df.empty or len(df) < 50:
-            return pd.DataFrame()
-
-        df['atr'] = MathEngine.calculate_atr(df, period=14)
-        df['ema_20'] = MathEngine.calculate_ema(df['close'], period=20)
-        df['ema_50'] = MathEngine.calculate_ema(df['close'], period=50)
-        df['ema_200'] = MathEngine.calculate_ema(df['close'], period=200)
-        df['rsi'] = MathEngine.calculate_rsi(df['close'], period=14)
-        
-        bb_upper, bb_mid, bb_lower = MathEngine.calculate_bollinger_bands(df['close'], 20, 2.0)
-        df['bb_upper'] = bb_upper
-        df['bb_lower'] = bb_lower
-
-        return df
-
-class MultiTimeframeMatrix:
-    def __init__(self, deriv_client: DerivCloudClient):
-        self.pipeline = MarketDataPipeline(deriv_client)
-        self.matrix: Dict[str, Dict[str, pd.DataFrame]] = {}
-        self.volume_profiles: Dict[str, VolumeProfileNode] = {}
-
-    async def sync_symbol(self, symbol: str) -> None:
-        self.matrix[symbol] = {}
-        for tf_name, granularity in ConfigManager.TIMEFRAMES.items():
-            df = await self.pipeline.get_enriched_dataframe(symbol, granularity, count=150)
-            if not df.empty:
-                self.matrix[symbol][tf_name] = df
-
-        if "M15" in self.matrix[symbol] and not self.matrix[symbol]["M15"].empty:
-            vp = OrderFlowAnalyzer.compute_volume_profile(self.matrix[symbol]["M15"], num_bins=30)
-            self.volume_profiles[symbol] = vp
-
-    async def sync_all_assets(self) -> None:
-        tasks = [self.sync_symbol(sym) for sym in ConfigManager.ASSETS.keys()]
-        await asyncio.gather(*tasks)
-
-# ==============================================================================
-# 11. PRESERVED ORIGINAL STRATEGY SETUPS & EVALUATOR MATRIX
+# 10. PRESERVED STRATEGY EVALUATOR MATRIX
 # ==============================================================================
 
 class SetupType(Enum):
@@ -1077,55 +998,35 @@ class TradeSignal:
     def take_profit(self) -> float:
         return self.tp1
 
-class StrategyEvaluator:
-    @staticmethod
-    def evaluate_symbol(symbol: str, tf_data: Dict[str, pd.DataFrame], vp: Optional[VolumeProfileNode]) -> Optional[TradeSignal]:
-        m5 = tf_data.get("M5")
-        h1 = tf_data.get("H1")
-        if m5 is None or h1 is None or m5.empty or h1.empty:
-            return None
-
-        last_m5 = m5.iloc[-1]
-        prev_m5 = m5.iloc[-2]
-        last_h1 = h1.iloc[-1]
-        
-        current_price = float(last_m5['close'])
-        atr = float(last_m5['atr']) if 'atr' in last_m5 and not np.isnan(last_m5['atr']) else current_price * 0.005
-
-        h1_high = h1['high'].tail(20).max()
-        h1_low = h1['low'].tail(20).min()
-
-        if prev_m5['low'] < h1_low and last_m5['close'] > h1_low and last_m5.get('rsi', 50) < 35:
-            sl = current_price - (1.5 * atr)
-            tp1 = current_price + (2.0 * atr)
-            tp2 = current_price + (4.0 * atr)
-            return TradeSignal(symbol, "BUY", SetupType.LIQUIDITY_SWEEP_REVERSAL, current_price, sl, tp1, tp2, 0.85, f"Bullish sweep of H1 low ({h1_low:.2f})")
-
-        if prev_m5['high'] > h1_high and last_m5['close'] < h1_high and last_m5.get('rsi', 50) > 65:
-            sl = current_price + (1.5 * atr)
-            tp1 = current_price - (2.0 * atr)
-            tp2 = current_price - (4.0 * atr)
-            return TradeSignal(symbol, "SELL", SetupType.LIQUIDITY_SWEEP_REVERSAL, current_price, sl, tp1, tp2, 0.85, f"Bearish sweep of H1 high ({h1_high:.2f})")
-
-        return None
-
 # ==============================================================================
-# 12. AI OVERSEER & CLOUD EXECUTION (TWIN POSITION 50/50 PARTIAL SCALING)
+# 11. GEMINI AI OVERSEER & INTUITION QUALITY GRADER
 # ==============================================================================
 
 class AIOverseer:
+    """
+    Intelligent Overseer that uses market context, account size, daily targets,
+    and historical performance to provide intuitive quality multipliers (0.5x to 1.5x).
+    """
     def __init__(self):
         self.api_key = ConfigManager.GEMINI_API_KEY
         if self.api_key and GENAI_AVAILABLE:
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel('gemini-1.5-flash')
-            log.info("Gemini AI Overseer initialized successfully.")
+            log.info("Gemini AI Intuition & Overseer Engine initialized.")
         else:
             self.model = None
 
-    async def validate_trade(self, signal: Any, current_balance: float, spread_pts: float) -> bool:
+    async def evaluate_trade_intuition(
+        self,
+        signal: Any,
+        balance: float,
+        daily_target: float,
+        trades_left: int,
+        candle_stats: dict,
+        history: List[dict]
+    ) -> Tuple[bool, float, str]:
         if not self.model:
-            return True
+            return True, 1.0, "Rule-based pass (AI Standby)"
 
         direction = getattr(signal, 'direction', 'BUY')
         symbol = getattr(signal, 'symbol', 'UNKNOWN')
@@ -1135,28 +1036,55 @@ class AIOverseer:
         tp = getattr(signal, 'take_profit', None) or getattr(signal, 'tp1', 0.0)
         reason = getattr(signal, 'reason', getattr(signal, 'reasoning', ''))
 
+        # Analyze past win rate of this strategy on this symbol from real trade history
+        relevant_trades = [t for t in history if t.get('asset') == symbol or t.get('strategy') == strategy_name]
+        wins = [t for t in relevant_trades if t.get('status') == 'WIN']
+        hist_win_rate = (len(wins) / len(relevant_trades) * 100) if relevant_trades else 50.0
+
         prompt = (
-            f"You are a quant risk manager. Validate: {direction} {symbol} | Strategy: {strategy_name} | "
-            f"Entry: {entry} | SL: {sl} | TP: {tp} | Spread: {spread_pts} pts | "
-            f"Reason: {reason} | Balance: ${current_balance:.2f}. Reply ONLY 'APPROVED' or 'REJECTED'."
+            f"You are the Lead Quantitative Risk Manager & Trade Intuition Engine for an automated fund.\n"
+            f"EVALUATE THIS TRADE SETUP:\n"
+            f"- Instrument: {symbol} | Direction: {direction} | Strategy: {strategy_name}\n"
+            f"- Entry: {entry} | SL: {sl} | TP: {tp} | Reason: {reason}\n"
+            f"- Account Balance: {balance:,.2f} | Daily Profit Goal: {daily_target:,.2f} | Trades Left Today: {trades_left}\n"
+            f"- Market Regime: {'RANGING' if candle_stats.get('is_ranging') else 'TRENDING'} | M5 ATR: {candle_stats.get('m5_candle_avg')}\n"
+            f"- Historical Edge on this Pair: {hist_win_rate:.1f}% win rate across {len(relevant_trades)} closed trades\n\n"
+            f"Provide an intuitive decision in EXACT JSON format:\n"
+            f'{{"verdict": "APPROVED" or "REJECTED", "quality_multiplier": 0.5 to 1.5, "reasoning": "brief summary"}}\n'
+            f"Note: If it is an A+ confluence setup, grant 1.2 to 1.5 multiplier. If marginal, grant 0.6 to 0.8. If dangerous, REJECT."
         )
+
         try:
             res = await asyncio.to_thread(self.model.generate_content, prompt)
-            return "APPROVED" in res.text.strip().upper()
-        except Exception:
-            return True
+            text = res.text.strip()
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            if start != -1 and end != 0:
+                data = json.loads(text[start:end])
+                approved = data.get("verdict", "APPROVED").upper() == "APPROVED"
+                multiplier = float(data.get("quality_multiplier", 1.0))
+                multiplier = max(0.5, min(multiplier, 1.5))
+                reasoning = data.get("reasoning", "AI Validated")
+                return approved, multiplier, reasoning
+        except Exception as e:
+            log.warning(f"AI Intuition fallback: {e}")
+
+        return True, 1.0, "Approved by Quantitative Edge"
+
+# ==============================================================================
+# 12. CLOUD EXECUTION ENGINE (TWIN 50/50 PARTIAL SCALING)
+# ==============================================================================
 
 class CloudExecutionEngine:
-    def __init__(self, deriv_client: DerivCloudClient, risk_mgr: InstitutionalRiskEngine):
-        self.deriv = deriv_client
+    def __init__(self, ctrader_client: CTraderClient, risk_mgr: InstitutionalRiskEngine):
+        self.ctrader = ctrader_client
         self.risk = risk_mgr
         self.ai_overseer = AIOverseer()
 
-    async def process_signal(self, signal: Any, current_balance: float) -> bool:
+    async def process_signal(self, signal: Any, current_balance: float, candle_stats: dict) -> bool:
         symbol = getattr(signal, 'symbol')
         direction = getattr(signal, 'direction')
         entry = getattr(signal, 'entry_price')
-        
         sl = getattr(signal, 'stop_loss', None) or getattr(signal, 'sl', 0.0)
         tp = getattr(signal, 'take_profit', None) or getattr(signal, 'tp1', None)
 
@@ -1164,12 +1092,20 @@ class CloudExecutionEngine:
         if isinstance(strategy_name, Enum):
             strategy_name = strategy_name.value
 
-        quote, bid, ask = await self.deriv.get_live_quote(symbol)
-        asset_cfg = ConfigManager.ASSETS.get(symbol)
-        pt_val = asset_cfg.point_value if asset_cfg else 1.0
-        min_stk = asset_cfg.min_stake if asset_cfg else 1.0
-        max_stk = asset_cfg.max_stake if asset_cfg else 1000.0
+        quote, bid, ask = await self.ctrader.get_live_quote(symbol)
 
+        # 1. Ask AI Intuition Brain to grade setup quality
+        history = read_trade_history()
+        trades_left = max(1, self.risk.max_daily_trades - self.risk.trades_taken_today)
+        ai_approved, quality_mult, ai_notes = await self.ai_overseer.evaluate_trade_intuition(
+            signal, current_balance, self.risk.daily_goal_target, trades_left, candle_stats, history
+        )
+
+        if not ai_approved:
+            log.info(f"AI INTUITION REJECTED TRADE: {ai_notes}")
+            return False
+
+        # 2. Risk Gatekeeper Validation & Dynamic Lot Sizing
         is_ok, reason, bp = self.risk.validate_pre_trade(
             symbol=symbol,
             direction=direction,
@@ -1179,63 +1115,73 @@ class CloudExecutionEngine:
             current_bid=bid,
             current_ask=ask,
             current_equity=current_balance,
-            point_value=pt_val,
-            min_stake=min_stk,
-            max_stake=max_stk
+            ai_quality_factor=quality_mult
         )
 
         if not is_ok:
             log.warning(f"ORDER BLOCKED BY RISK GATE: {reason}")
             return False
 
-        if not await self.ai_overseer.validate_trade(signal, current_balance, bp.get("spread_points", 0.0)):
-            return False
-
         is_dry_run = getattr(signal, 'is_dry_run', False) or bp.get("is_dry_run", False)
 
-        # SIMULATOR PAPER TRADE
+        # 3. Simulator Paper Trading
         if is_dry_run:
-            msg = f"🔵 *[SIMULATED TRADE]*\n• Asset: {bp['symbol']}\n• Strategy: {strategy_name}\n• Dir: {bp['direction']}\n• Stake: ${bp['stake']}\n• Entry: {bp['entry_price']}\n• SL: {bp['stop_loss']}\n• TP: {bp['take_profit']}"
-            log.info(f"[SIMULATOR DRY-RUN] Approved: {bp['direction']} {bp['symbol']} | Strategy: {strategy_name} | Stake: ${bp['stake']}")
+            msg = (
+                f"🔵 *[SIMULATED TRADE]*\n"
+                f"• Asset: {bp['symbol']}\n"
+                f"• Strategy: {strategy_name}\n"
+                f"• Direction: {bp['direction']}\n"
+                f"• Lots: {bp['lots']}\n"
+                f"• Entry: {bp['entry_price']}\n"
+                f"• SL: {bp['stop_loss']}\n"
+                f"• TP: {bp['take_profit']}\n"
+                f"• AI Intuition: {ai_notes}"
+            )
+            log.info(f"[SIMULATOR] Approved: {bp['direction']} {bp['symbol']} | Lots: {bp['lots']} | Strategy: {strategy_name}")
             await whatsapp.send_alert(msg)
             return True
 
-        # TWIN-POSITION 50/50 PARTIAL SCALING EXECUTION:
-        total_stake = bp['stake']
-        half_stake = round(max(total_stake / 2.0, min_stk), 2)
+        # 4. TWIN 50/50 PARTIAL SCALING ON FUSION CTRADER:
+        total_lots = bp['lots']
+        half_lots = round(max(total_lots / 2.0, 0.01), 2)
         sl_distance = abs(bp['entry_price'] - bp['stop_loss'])
-        tp1_price = round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 4)
+        tp1_price = round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 5)
         tp2_price = bp['take_profit']
 
-        log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total Stake: ${total_stake} | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
+        log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total: {total_lots} Lots | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
 
-        res_a = await self.deriv.execute_atomic_order(bp['symbol'], bp['direction'], half_stake, bp['entry_price'], bp['stop_loss'], tp1_price)
-        res_b = await self.deriv.execute_atomic_order(bp['symbol'], bp['direction'], half_stake, bp['entry_price'], bp['stop_loss'], tp2_price)
+        # Send Order A (Banks 50% profit at 1:1)
+        res_a = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp1_price)
+        # Send Order B (Runner targeting TP2)
+        res_b = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp2_price)
 
         if res_a or res_b:
             self.risk.trades_taken_today += 1
-            for res, target_price in [(res_a, tp1_price), (res_b, tp2_price)]:
-                if res:
-                    cid = str(res.get('contract_id'))
-                    self.risk.open_positions[cid] = {
+            for res, target in [(res_a, tp1_price), (res_b, tp2_price)]:
+                if res and res.get("position_id"):
+                    pid = str(res["position_id"])
+                    self.risk.open_positions[pid] = {
                         "symbol": bp['symbol'],
                         "direction": bp['direction'],
                         "entry_price": bp['entry_price'],
                         "stop_loss": bp['stop_loss'],
-                        "take_profit": target_price,
+                        "take_profit": target,
+                        "volume_cents": res["volume"],
+                        "lots": res["lots"],
                         "is_be_moved": False
                     }
 
             whatsapp_msg = (
-                f"🟢 *[DERIV LIVE ORDER FILLED]*\n"
+                f"🟢 *[FUSION MARKETS CTRADER ORDER FILLED]*\n"
                 f"• Asset: {bp['symbol']}\n"
                 f"• Strategy: {strategy_name}\n"
                 f"• Direction: {bp['direction']}\n"
-                f"• Twin Stakes: 2x ${half_stake}\n"
+                f"• Twin Lots: 2x {half_lots} ({total_lots} Total)\n"
                 f"• Entry: {bp['entry_price']}\n"
                 f"• Stop Loss: {bp['stop_loss']}\n"
                 f"• TP1 (Bank 50%): {tp1_price}\n"
                 f"• TP2 (Runner): {tp2_price}\n"
+                f"• AI Intuition: {ai_notes}\n"
                 f"• 80% R:R Break-Even Active."
             )
             await whatsapp.send_alert(whatsapp_msg)
@@ -1249,22 +1195,22 @@ class CloudExecutionEngine:
 
 class MatrixEngineMaster:
     def __init__(self):
-        self.deriv_client = DerivCloudClient()
-        self.matrix = MultiTimeframeMatrix(self.deriv_client)
+        self.ctrader = CTraderClient()
         self.strategy_mgr = StrategyManager()
         self.risk_mgr = InstitutionalRiskEngine()
         self.execution_engine: Optional[CloudExecutionEngine] = None
+        self.volume_profiles: Dict[str, VolumeProfileNode] = {}
 
     async def start(self) -> None:
-        log.info("Starting Nexus Matrix Trading Engine (Deriv Cloud Edition)...")
-        if not await self.deriv_client.connect():
-            log.critical("Failed to connect to Deriv Cloud. Exiting.")
+        log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Open API Edition)...")
+        if not await self.ctrader.connect():
+            log.critical("Failed to connect to cTrader Open API. Please check your Railway environment variables.")
             return
 
-        balance = await self.deriv_client.get_balance()
-        self.execution_engine = CloudExecutionEngine(self.deriv_client, self.risk_mgr)
-        log.info(f"SYSTEM READY. Initial Account Balance: ${balance:.2f} USD")
-        
+        balance, equity = await self.ctrader.get_balance_and_equity()
+        self.execution_engine = CloudExecutionEngine(self.ctrader, self.risk_mgr)
+        log.info(f"SYSTEM READY. Initial Account Balance: {balance:,.2f}")
+
         # Concurrently launch:
         # 1. Paced 60-second market scan loop
         # 2. Fast 3-second 80% R:R position supervisor
@@ -1276,10 +1222,10 @@ class MatrixEngineMaster:
         )
 
     async def _position_supervisor_loop(self) -> None:
-        """In-Flight Position Supervisor: Evaluates live exits (SL, TP, BE) and shifts SL at 80% R:R."""
+        """In-Flight Position Supervisor: Evaluates live exits and shifts SL to break-even at 80% R:R."""
         while True:
             try:
-                for cid, pos in list(self.risk_mgr.open_positions.items()):
+                for pid, pos in list(self.risk_mgr.open_positions.items()):
                     sym = pos["symbol"]
                     direction = pos["direction"]
                     entry = pos["entry_price"]
@@ -1287,38 +1233,38 @@ class MatrixEngineMaster:
                     tp = pos["take_profit"]
                     be_moved = pos.get("is_be_moved", False)
 
-                    quote, _, _ = await self.deriv_client.get_live_quote(sym)
+                    quote, _, _ = await self.ctrader.get_live_quote(sym)
                     if quote <= 0:
                         continue
 
-                    # 1. NOTIFY IF STOP LOSS HIT
+                    # 1. Notify if Stop Loss hit
                     sl_hit = (direction == "BUY" and quote <= sl) or (direction == "SELL" and quote >= sl)
                     if sl_hit:
                         if be_moved:
-                            sl_msg = f"⚪ *[EXIT AT BREAK-EVEN]*\n• Asset: {sym}\n• Closed at Entry: {quote:.2f}\n• P&L: $0.00 (Risk-Free Exit)\n• Capital 100% Protected."
+                            sl_msg = f"⚪ *[EXIT AT BREAK-EVEN]*\n• Asset: {sym}\n• Closed at Entry: {quote}\n• P&L: 0.00 (Risk-Free Exit)"
                         else:
-                            sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote:.2f}\n• Stop Loss was respected. Risk gate active."
-                        log.info(f"Contract #{cid} exited at SL/BE on {sym}")
+                            sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit: {quote}\n• Stop loss respected. Capital protected."
+                        log.info(f"Position #{pid} exited at SL/BE on {sym}")
                         await whatsapp.send_alert(sl_msg)
-                        self.risk_mgr.open_positions.pop(cid, None)
+                        self.risk_mgr.open_positions.pop(pid, None)
                         continue
 
-                    # 2. NOTIFY IF TAKE PROFIT HIT
+                    # 2. Notify if Take Profit hit
                     tp_hit = (direction == "BUY" and quote >= tp) or (direction == "SELL" and quote <= tp)
                     if tp_hit:
-                        tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote:.2f}\n• Target reached! Profit banked."
-                        log.info(f"Contract #{cid} exited at TP on {sym}")
+                        tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote}\n• Target reached! Profit banked."
+                        log.info(f"Position #{pid} exited at TP on {sym}")
                         await whatsapp.send_alert(tp_msg)
-                        self.risk_mgr.open_positions.pop(cid, None)
+                        self.risk_mgr.open_positions.pop(pid, None)
                         continue
 
-                    # 3. MOVE SL TO BREAK-EVEN AT 80% PROGRESS
+                    # 3. Move Stop Loss to Break-Even at 80% Progress
                     if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
-                        log.info(f"80% R:R TARGET HIT ON {sym} (Contract #{cid})! Moving Stop Loss to Break-Even.")
-                        success = await self.deriv_client.update_contract_stop_loss(cid, new_sl_pts=0.01)
+                        log.info(f"80% R:R PROGRESS HIT ON {sym} (Position #{pid})! Moving SL to Break-Even.")
+                        success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
                         if success:
                             pos["is_be_moved"] = True
-                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 80% of TP!\n• Stop Loss moved to Break-Even.\n• Trade is now 100% Risk-Free."
+                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 80% of TP!\n• Stop Loss moved to Entry ({entry}).\n• Trade is now 100% Risk-Free."
                             await whatsapp.send_alert(alert)
 
                 await asyncio.sleep(3.0)
@@ -1327,7 +1273,7 @@ class MatrixEngineMaster:
                 await asyncio.sleep(5.0)
 
     async def _daily_eod_flusher_loop(self) -> None:
-        """Daily 21:00 SAST Flusher: Flattens all open positions every night (zero overnight/weekend risk)."""
+        """Daily 21:00 SAST Flusher: Flattens all positions to cash every night."""
         while True:
             try:
                 now_sast = datetime.now(timezone.utc) + timedelta(hours=2)
@@ -1335,16 +1281,15 @@ class MatrixEngineMaster:
                 minute = now_sast.minute
 
                 if hour == 21 and minute == 0 and len(self.risk_mgr.open_positions) > 0:
-                    log.warning(f"🌆 21:00 SAST LOCKDOWN: Flattening {len(self.risk_mgr.open_positions)} open positions to cash.")
-                    for cid, pos in list(self.risk_mgr.open_positions.items()):
-                        await self.deriv_client.close_market_contract(cid)
-                    
+                    log.warning(f"🌆 21:00 SAST LOCKDOWN: Closing {len(self.risk_mgr.open_positions)} open positions to cash.")
+                    for pid, pos in list(self.risk_mgr.open_positions.items()):
+                        await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100000))
+
                     flushed_count = len(self.risk_mgr.open_positions)
                     self.risk_mgr.open_positions.clear()
-                    
-                    eod_msg = f"🌆 *[DAILY 21:00 SAST LOCKDOWN]*\n• Flattened {flushed_count} open trades to cash.\n• Zero overnight holding risk.\n• Bot standing by for morning session."
+
+                    eod_msg = f"🌆 *[DAILY 21:00 SAST LOCKDOWN]*\n• Flattened {flushed_count} open trades to cash.\n• Zero overnight holding risk.\n• Standing by for tomorrow's London session."
                     await whatsapp.send_alert(eod_msg)
-                    
                     await asyncio.sleep(65.0)
 
                 await asyncio.sleep(10.0)
@@ -1357,22 +1302,28 @@ class MatrixEngineMaster:
         while True:
             try:
                 start_time = time.time()
-                current_balance = await self.deriv_client.get_balance()
+                balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
 
                 last_signal: Optional[Any] = None
 
-                for friendly_name, deriv_symbol in ConfigManager.SYMBOL_MAP.items():
+                for friendly_name in ConfigManager.SYMBOL_ALIASES.keys():
                     await asyncio.sleep(0.20)
 
-                    m5_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.M5, count=60)
-                    h4_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.H4, count=30)
-                    d1_df = await self.deriv_client.fetch_ohlc_candles(deriv_symbol, DerivGranularity.D1, count=15)
+                    m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=60)
+                    h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
+                    d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=15)
 
                     if m5_df.empty:
                         continue
 
+                    # Multi-Timeframe ATRs and Consolidation Detection
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
+
+                    # Compute local Volume Profile (POC, VAH, VAL)
+                    vp = OrderFlowAnalyzer.compute_volume_profile(m5_df, num_bins=30)
+                    self.volume_profiles[friendly_name] = vp
+
                     recent_high = float(m5_df['high'].tail(24).max())
                     recent_low = float(m5_df['low'].tail(24).min())
                     latest_close = float(m5_df.iloc[-1]['close'])
@@ -1390,29 +1341,28 @@ class MatrixEngineMaster:
                         "orb_low": float(m5_df['low'].tail(3).min()),
                         "is_ranging": candle_stats["is_ranging"],
                         "range_span": candle_stats["range_span"],
+                        "poc": vp.poc_price,
+                        "vah": vp.value_area_high,
+                        "val": vp.value_area_low
                     }
 
+                    # Evaluate modular quantitative strategies
                     signal = self.strategy_mgr.evaluate_all(friendly_name, m5_df, session_levels)
-
-                    if not signal:
-                        vp = self.matrix.volume_profiles.get(deriv_symbol)
-                        signal = StrategyEvaluator.evaluate_symbol(deriv_symbol, {"M5": m5_df, "H1": m5_df}, vp)
 
                     if signal:
                         last_signal = signal
-                        signal.symbol = ConfigManager.SYMBOL_MAP.get(signal.symbol, signal.symbol)
-                        await self.execution_engine.process_signal(signal, current_balance)
+                        await self.execution_engine.process_signal(signal, balance, candle_stats)
 
                 regime_status = "ACTIVE" if self.risk_mgr.master_execution else "HALTED"
                 active_setup_str = getattr(last_signal, 'strategy', getattr(last_signal, 'setup_type', 'NONE')) if last_signal else "NONE"
                 if isinstance(active_setup_str, Enum):
                     active_setup_str = active_setup_str.value
-                verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Scanning all day. 21:00 SAST EOD Flusher active."
+                verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Scanning all day on Fusion Markets cTrader."
 
-                emit_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
-                write_telemetry(current_balance, current_balance, regime_status, active_setup_str, verdict_str)
+                emit_telemetry(balance, equity, regime_status, active_setup_str, verdict_str)
+                write_telemetry(balance, equity, regime_status, active_setup_str, verdict_str)
 
-                # Paced 60-second cycle: Only scan once per minute to respect candle closures and broker rate limits
+                # Respect broker rate limits and candle closures
                 elapsed = time.time() - start_time
                 await asyncio.sleep(max(1.0, 60.0 - elapsed))
 
