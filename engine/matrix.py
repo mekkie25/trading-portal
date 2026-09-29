@@ -407,7 +407,7 @@ class CTraderClient:
                             "status": "WIN" if real_pnl > 0 else "LOSS",
                             "source": "cTrader Deal"
                         })
-                        
+
         except Exception as e:
             log.error(f"Failed to connect to cTrader Gateway: {e}")
             self.is_authorized = False
@@ -573,13 +573,14 @@ class CTraderClient:
         return df.tail(count)
 
     async def execute_market_order(
-        self,
-        symbol_name: str,
-        direction: str,
-        lots: float,
-        stop_loss: float,
-        take_profit: float
-    ) -> Optional[dict]:
+    self,
+    symbol_name: str,
+    direction: str,
+    lots: float,
+    stop_loss: float,
+    take_profit: float,
+    strategy_name: str = "QUANT_STRATEGY"
+) -> Optional[dict]:
         sid = self.resolve_symbol_id(symbol_name)
         if not sid or not self.is_authorized:
             return None
@@ -595,7 +596,7 @@ class CTraderClient:
             "volume": volume_cents,
             "stopLoss": round(stop_loss, 5),
             "takeProfit": round(take_profit, 5),
-            "comment": "NexusMatrix"
+            "comment": f"NX_{symbol_name}"
         }
 
         res = await self._send_and_wait(2106, order_payload, timeout=8.0)
@@ -859,26 +860,61 @@ class InstitutionalRiskEngine:
         symbol: str,
         ai_quality_factor: float = 1.0
     ) -> float:
-        equity = current_equity if current_equity > 0 else 1000.0
-        active_risk_pct = self.risk_per_trade_pct
+        equity = current_equity if current_equity > 0 else 10.0
+        baseline = self.weekly_deposit_baseline if self.weekly_deposit_baseline > 0 else 10.0
 
-        trades_left_today = max(1, self.max_daily_trades - self.trades_taken_today)
-        if self.daily_goal_target > 0:
-            target_per_trade = self.daily_goal_target / trades_left_today
-            suggested_risk = target_per_trade / self.risk_to_reward
-            suggested_pct = (suggested_risk / equity) * 100.0
-            active_risk_pct = min(max(active_risk_pct, suggested_pct * 0.8), active_risk_pct * 1.5)
+        # =====================================================================
+        # 1. 4-TIER AUTOMATIC CAPITAL PROGRESSION
+        # =====================================================================
+        if equity < 60.0:
+            # TIER 1: Micro-Flip Stage ($10 to $60)
+            stage_name = "TIER 1 (MICRO-FLIP)"
+            base_risk_pct = 25.0  # Aggressive sizing to escape the 0.01 floor
+        elif 60.0 <= equity < 200.0:
+            # TIER 2: Acceleration Stage ($60 to $200)
+            stage_name = "TIER 2 (ACCELERATION)"
+            base_risk_pct = 12.5  # Stepping down risk as capital expands
+        elif 200.0 <= equity < 1000.0:
+            # TIER 3: Compounding Stage ($200 to $1,000)
+            stage_name = "TIER 3 (COMPOUNDING)"
+            base_risk_pct = 5.0   # $10 - $25 risk per trade
+        else:
+            # TIER 4: Institutional Wealth Preservation Stage ($1,000+)
+            stage_name = "TIER 4 (WEALTH PRESERVATION)"
+            base_risk_pct = 1.5   # 1.5% of $1,000 is $15 (equals entire Tier 1 deposit!)
 
-        if self.consecutive_losses >= 3:
-            active_risk_pct = active_risk_pct * 0.5
-            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
+        # Allow user's UI portal slider to act as an override ceiling if desired
+        if self.risk_per_trade_pct > 0:
+            active_risk_pct = min(base_risk_pct, self.risk_per_trade_pct)
+        else:
+            active_risk_pct = base_risk_pct
 
+        # =====================================================================
+        # 2. THE PARACHUTE: DYNAMIC DRAWDOWN & STREAK THROTTLE
+        # =====================================================================
+        # If we take losses and drop below baseline deposit, step risk down
+        if self.consecutive_losses == 1:
+            active_risk_pct *= 0.70  # Trim 30% after first loss
+            log.info(f"DEFENSE THROTTLE 1: Single loss detected. Risk lowered to {active_risk_pct:.1f}%")
+        elif self.consecutive_losses == 2:
+            active_risk_pct *= 0.50  # Halve risk after second loss
+            log.info(f"DEFENSE THROTTLE 2: Two consecutive losses. Risk halved to {active_risk_pct:.1f}%")
+        elif self.consecutive_losses >= 3:
+            active_risk_pct *= 0.25  # Cut risk to absolute survival minimum
+            log.info(f"DEFENSE THROTTLE 3: Drawdown circuit active. Capital protection engaged at {active_risk_pct:.1f}%")
+
+        # News Armor Throttle
         if self.is_red_folder_active():
-            active_risk_pct = active_risk_pct * 0.5
+            active_risk_pct *= 0.50
+            log.info("NEWS ARMOR: Halving risk during high-impact news window.")
 
-        active_risk_pct = active_risk_pct * ai_quality_factor
-        risk_cash = equity * (active_risk_pct / 100.0)
+        # =====================================================================
+        # 3. AI INTUITION MODULATOR
+        # =====================================================================
+        final_risk_pct = active_risk_pct * ai_quality_factor
+        risk_cash = equity * (final_risk_pct / 100.0)
 
+        # Pip value math
         cfg = ConfigManager.ASSETS.get(symbol)
         pip_size = cfg.pip_size if cfg else 0.0001
         contract_size = cfg.contract_size if cfg else 100000.0
@@ -893,11 +929,17 @@ class InstitutionalRiskEngine:
         else:
             calculated_lots = min_lots
 
-        if calculated_lots < min_lots:
-            log.info(f"MICRO-ACCOUNT GROWTH MODE: Small balance ({equity:,.2f}). Sizing to broker minimum ({min_lots} lots).")
+        # Micro-Account floor protection
+        if calculated_lots < min_lots and equity >= 5.0:
             calculated_lots = min_lots
 
         final_lots = round(max(min(calculated_lots, max_lots), min_lots), 2)
+
+        log.info(
+            f"Stage: {stage_name} | Equity: ${equity:.2f} | Base Risk: {base_risk_pct}% | "
+            f"Loss Streak: {self.consecutive_losses} | AI Factor: {ai_quality_factor}x | "
+            f"Final Risk: {final_risk_pct:.1f}% (${risk_cash:.2f}) | Lots: {final_lots}"
+        )
         return final_lots
 
     def validate_pre_trade(
@@ -1095,8 +1137,8 @@ class CloudExecutionEngine:
 
         log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total: {total_lots} Lots | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
 
-        res_a = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp1_price)
-        res_b = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp2_price)
+        res_a = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp1_price, strategy_name)
+        res_b = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp2_price, strategy_name)
 
         if res_a or res_b:
             self.risk.trades_taken_today += 1

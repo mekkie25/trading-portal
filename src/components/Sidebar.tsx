@@ -6,8 +6,7 @@ import {
   CalendarDays, 
   LineChart, 
   Settings as SettingsIcon,
-  Bot,
-  ExternalLink
+  Bot
 } from 'lucide-react';
 import { TabId, ThemeMode } from '../types';
 
@@ -39,7 +38,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, botAc
       label: 'Trade Journal',
       icon: BookOpen,
       badge: 'LIVE',
-      subtext: 'Google Sheets & PDF export',
+      subtext: 'cTrader history & PDF export',
     },
     {
       id: 'limits',
@@ -65,13 +64,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, botAc
       id: 'settings',
       label: 'Settings & Broker API',
       icon: SettingsIcon,
-      subtext: 'Dark/light, MT5 & Sheets sync',
+      subtext: 'Dark/light, cTrader & API config',
     },
   ];
 
   return (
     <aside className="w-64 bg-white dark:bg-[#10131a] border-r border-slate-300 dark:border-[#212838] flex flex-col justify-between shrink-0 h-full select-none transition-colors duration-200">
-      {/* Navigation Group */}
       <div className="p-4">
         <div className="px-3 py-2 text-[10px] uppercase font-bold tracking-wider text-black dark:text-slate-400 flex items-center justify-between">
           <span>PORTAL MODULES</span>
@@ -95,7 +93,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, botAc
                     : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#151922] border border-transparent'
                 }`}
               >
-                {/* Active Indicator Bar */}
                 {isActive && (
                   <div className="absolute left-0 top-2.5 bottom-2.5 w-1 rounded-r bg-blue-600" />
                 )}
@@ -135,9 +132,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, botAc
         </nav>
       </div>
 
-      {/* Footer Info & Broker Connection Reference */}
       <div className="p-4 border-t border-slate-300 dark:border-[#212838] space-y-3 bg-white dark:bg-[#10131a]">
-        {/* Risk & Execution status card */}
         <div className="p-3 rounded-xl bg-white dark:bg-[#151922] border border-slate-300 dark:border-[#212838] shadow-xs">
           <div className="flex items-center justify-between text-xs">
             <span className="text-black dark:text-slate-400 flex items-center gap-1.5 text-[11px] font-medium">
@@ -154,23 +149,19 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, botAc
             </span>
           </div>
           <div className="mt-2 text-[10px] text-black dark:text-slate-400 font-mono flex justify-between">
-            <span>Daily Drawdown:</span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-semibold">0.82% / 3.50%</span>
+            <span>Execution Gateway:</span>
+            <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Fusion Markets</span>
           </div>
         </div>
 
-        {/* External Gateway Reference Link */}
-        <a
-          href="https://www.2gs-trading.com/"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center justify-between px-3.5 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#151922] dark:hover:bg-[#1c222e] border border-slate-300 dark:border-[#212838] text-black dark:text-slate-400 hover:text-black dark:hover:text-slate-200 transition-colors text-xs shadow-xs"
-        >
-          <span className="flex items-center gap-1.5 text-[11px] font-medium">
-            <span>2GS Ecosystem</span>
+        {/* Clean System Status Card (Replaces 2GS External Link) */}
+        <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#151922] border border-slate-200 dark:border-[#212838] text-slate-700 dark:text-slate-300 text-xs">
+          <span className="flex items-center gap-2 text-[11px] font-medium">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span className="font-semibold text-slate-900 dark:text-white">Trading Core Online</span>
           </span>
-          <ExternalLink className="w-3.5 h-3.5 text-slate-500" />
-        </a>
+          <span className="text-[10px] font-mono text-blue-600 dark:text-blue-400 font-bold">cTrader API</span>
+        </div>
       </div>
     </aside>
   );

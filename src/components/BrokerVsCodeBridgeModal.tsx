@@ -131,7 +131,7 @@ export const BrokerVsCodeBridgeModal: React.FC<BrokerVsCodeBridgeModalProps> = (
   };
 
   const pythonBotCode = `"""
-2GS Trading Portal - VS Code & Broker Real-Time Bridge
+Trading Portal - VS Code & Broker Real-Time Bridge
 Requirements: pip install requests MetaTrader5
 Run this in your VS Code terminal to sync your trading bot directly!
 """
@@ -206,11 +206,11 @@ if __name__ == "__main__":
 `;
 
   const mql5Code = `//+------------------------------------------------------------------+
-//| 2GS Trading Portal WebRequest Bridge (MQL5 EA)                   |
+//| Trading Portal WebRequest Bridge (MQL5 EA)                  |
 //| Paste into your MT5 Expert Advisor to read Bot Targets & Send    |
 //+------------------------------------------------------------------+
-#property copyright "2GS Trading Portal"
-#property link      "https://www.2gs-trading.com"
+#property copyright "Trading Portal"
+#property link      ""
 #property version   "1.00"
 
 input string PortalUrl = "${currentOrigin}";
@@ -219,7 +219,7 @@ input int    SyncTimerSec = 3;
 int OnInit()
 {
    EventSetTimer(SyncTimerSec);
-   Print("2GS Portal Bridge EA initialized.");
+   Print("Portal Bridge EA initialized.");
    return(INIT_SUCCEEDED);
 }
 

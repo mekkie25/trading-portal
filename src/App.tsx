@@ -10,13 +10,11 @@ import { SettingsView } from './components/views/SettingsView';
 import { BrokerVsCodeBridgeModal } from './components/BrokerVsCodeBridgeModal';
 
 import { 
-  INITIAL_METRICS, 
   INITIAL_BOT_SETTINGS, 
   INITIAL_ADVANCED_LIMITS, 
-  INITIAL_TRADES,
-  INITIAL_BROKER_CONFIG,
-  INITIAL_GOOGLE_SHEETS_CONFIG,
-  INITIAL_BRANDING_CONFIG
+  INITIAL_BROKER_CONFIG, 
+  INITIAL_GOOGLE_SHEETS_CONFIG, 
+  INITIAL_BRANDING_CONFIG 
 } from './data/mockTradingData';
 import { 
   TabId, 
@@ -26,8 +24,8 @@ import {
   TradeRecord, 
   ThemeMode, 
   BrokerConfig, 
-  GoogleSheetsConfig,
-  SiteBrandingConfig
+  GoogleSheetsConfig, 
+  SiteBrandingConfig 
 } from './types';
 
 const safeStorage = {
@@ -48,12 +46,13 @@ const safeStorage = {
 
 function recalculateLedgerMetrics(tradesList: TradeRecord[], prev: TopMetrics): TopMetrics {
   const safeList = Array.isArray(tradesList) ? tradesList : [];
-  const totalTrades = safeList.length;
-  const wins = safeList.filter(t => t && t.status === 'WIN').length;
-  const losses = safeList.filter(t => t && t.status === 'LOSS').length;
-  const netProfit = safeList.reduce((acc, t) => acc + (t?.pnl || 0), 0);
+  const closedTrades = safeList.filter(t => t && t.status !== 'OPEN');
+  const totalTrades = closedTrades.length;
+  const wins = closedTrades.filter(t => t && t.status === 'WIN').length;
+  const losses = closedTrades.filter(t => t && t.status === 'LOSS').length;
+  const netProfit = closedTrades.reduce((acc, t) => acc + (t?.pnl || 0), 0);
   const winRate = totalTrades > 0 ? Number(((wins / totalTrades) * 100).toFixed(1)) : 0;
-  const deposits = prev.totalInjections > 0 ? prev.totalInjections : 10000;
+  const deposits = prev.totalInjections > 0 ? prev.totalInjections : 10;
   const netProfitPct = Number(((netProfit / deposits) * 100).toFixed(1));
 
   return {
@@ -91,7 +90,12 @@ export default function App() {
   };
 
   const [brokerConfig, setBrokerConfig] = useState<BrokerConfig>(() => {
-    return safeStorage.getItem('portal_broker_config', INITIAL_BROKER_CONFIG);
+    return safeStorage.getItem('portal_broker_config', {
+      ...INITIAL_BROKER_CONFIG,
+      provider: 'Fusion Markets cTrader',
+      connected: true,
+      currency: 'USD',
+    });
   });
 
   const [sheetsConfig, setSheetsConfig] = useState<GoogleSheetsConfig>(() => {
@@ -99,36 +103,91 @@ export default function App() {
   });
 
   const [botSettings, setBotSettings] = useState<BotSettings>(() => {
-    return safeStorage.getItem('bot_settings', INITIAL_BOT_SETTINGS);
-  });
-
-  const [limits, setLimits] = useState<AdvancedLimits>(() => {
-    return safeStorage.getItem('limits', INITIAL_ADVANCED_LIMITS);
-  });
-
-  const [trades, setTrades] = useState<TradeRecord[]>(() => {
-    return safeStorage.getItem('portal_trades', []);
-  });
-
-  const [metrics, setMetrics] = useState<TopMetrics>(() => {
-    return safeStorage.getItem('portal_metrics', {
-      netProfit: -0.18,
-      netProfitPct: -1.8,
-      winRate: 50.0,
-      totalTrades: 2,
-      winningTrades: 1,
-      losingTrades: 1,
-      totalInjections: 10.0,
-      currentEquity: 9.82,
-      currentBalance: 9.82,
-      unrealizedPnL: 0.0,
+    return safeStorage.getItem('portal_bot_settings', {
+      ...INITIAL_BOT_SETTINGS,
+      riskPerTradePct: 25.0,
     });
   });
 
+  const [limits, setLimits] = useState<AdvancedLimits>(() => {
+    return safeStorage.getItem('portal_limits', {
+      ...INITIAL_ADVANCED_LIMITS,
+      maxDailyLossUsd: 10,
+      maxWeeklyLossUsd: 25,
+      maxMonthlyLossUsd: 50,
+    });
+  });
+
+  const [trades, setTrades] = useState<TradeRecord[]>([]);
+
+  const [metrics, setMetrics] = useState<TopMetrics>({
+    netProfit: -0.18,
+    netProfitPct: -1.8,
+    winRate: 50.0,
+    totalTrades: 2,
+    winningTrades: 1,
+    losingTrades: 1,
+    totalInjections: 10.0,
+    currentEquity: 9.82,
+    currentBalance: 9.82,
+    unrealizedPnL: 0.0,
+  });
+
+  // Pull real closed trades from /api/journal
+  const fetchJournalTrades = useCallback(async () => {
+    try {
+      const res = await fetch('/api/journal');
+      if (res.ok) {
+        const liveTrades = await res.json();
+        if (Array.isArray(liveTrades) && liveTrades.length > 0) {
+          setTrades(liveTrades);
+          setMetrics(prev => recalculateLedgerMetrics(liveTrades, prev));
+        }
+      }
+    } catch (err) {
+      console.warn('Could not fetch journal:', err);
+    }
+  }, []);
+
+  const syncBrokerTelemetry = useCallback(async () => {
+    try {
+      const res = await fetch('/api/broker/telemetry');
+      if (!res.ok) return;
+      const json = await res.json();
+      if (json.status === 'success' && json.data) {
+        const d = json.data;
+        setBrokerConfig(prev => ({
+          ...prev,
+          connected: true,
+          currency: d.currency ?? prev.currency ?? 'USD',
+          accountNumber: d.accountNumber || prev.accountNumber,
+        }));
+
+        setMetrics(prev => {
+          const liveBal = typeof d.balance === 'number' && d.balance > 0 ? d.balance : prev.currentBalance;
+          const liveEq = typeof d.equity === 'number' && d.equity > 0 ? d.equity : prev.currentEquity;
+          return {
+            ...prev,
+            currentBalance: liveBal,
+            currentEquity: liveEq,
+            unrealizedPnL: Number((liveEq - liveBal).toFixed(2)),
+          };
+        });
+      }
+      await fetchJournalTrades();
+    } catch {}
+  }, [fetchJournalTrades]);
+
+  useEffect(() => {
+    syncBrokerTelemetry();
+    fetchJournalTrades();
+    const interval = setInterval(syncBrokerTelemetry, 6000);
+    return () => clearInterval(interval);
+  }, [syncBrokerTelemetry, fetchJournalTrades]);
+
   const handleSaveBotSettings = async (newSettings: BotSettings) => {
     setBotSettings(newSettings);
-    safeStorage.setItem('bot_settings', newSettings);
-
+    safeStorage.setItem('portal_bot_settings', newSettings);
     try {
       await fetch('/api/bot/config', {
         method: 'POST',
@@ -138,82 +197,34 @@ export default function App() {
     } catch {}
   };
 
-  // STABLE TELEMETRY SYNC (Zero Infinite Loops)
-  const syncBrokerTelemetry = useCallback(async () => {
-    try {
-      // 1. Sync live telemetry
-      const res = await fetch('/api/broker/telemetry');
-      if (res.ok) {
-        const json = await res.json();
-        if (json.status === 'success' && json.data) {
-          const d = json.data;
-          setBrokerConfig(prev => ({
-            ...prev,
-            connected: true,
-            currency: d.currency ?? 'USD',
-            accountNumber: d.accountNumber || prev.accountNumber,
-          }));
-
-          setMetrics(prev => {
-            const liveBal = typeof d.balance === 'number' && d.balance > 0 ? d.balance : prev.currentBalance;
-            const liveEq = typeof d.equity === 'number' && d.equity > 0 ? d.equity : prev.currentEquity;
-            return {
-              ...prev,
-              currentBalance: liveBal,
-              currentEquity: liveEq,
-              unrealizedPnL: Number((liveEq - liveBal).toFixed(2)),
-            };
-          });
-        }
-      }
-
-      // 2. Sync real closed trade records into Trade Journal & Dashboard
-      const journalRes = await fetch('/api/journal');
-      if (journalRes.ok) {
-        const liveTrades = await journalRes.json();
-        if (Array.isArray(liveTrades) && liveTrades.length > 0) {
-          setTrades(liveTrades);
-          safeStorage.setItem('portal_trades', liveTrades);
-          setMetrics(prev => recalculateLedgerMetrics(liveTrades, prev));
-        }
-      }
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    syncBrokerTelemetry();
-    const interval = setInterval(syncBrokerTelemetry, 8000);
-    return () => clearInterval(interval);
-  }, [syncBrokerTelemetry]);
-
-  // DELETE SINGLE TRADE: Recalculates metrics immediately without reloading
   const handleDeleteTrade = async (tradeId: string) => {
-    const updated = trades.filter(t => t && t.id !== tradeId);
+    const updated = trades.filter(t => t && t.id !== tradeId && t.ticket !== tradeId);
     setTrades(updated);
-    safeStorage.setItem('trades', updated);
     setMetrics(prev => recalculateLedgerMetrics(updated, prev));
-
     try {
       await fetch(`/api/journal/${tradeId}`, { method: 'DELETE' });
     } catch {}
   };
 
-  // WIPE ENTIRE JOURNAL: Resets ledger to 0
   const handleResetJournal = async () => {
     setTrades([]);
-    safeStorage.setItem('trades', []);
     setMetrics(prev => recalculateLedgerMetrics([], prev));
-
     try {
       await fetch('/api/journal/reset', { method: 'POST' });
     } catch {}
   };
 
-  const handleAddTrade = (newTrade: TradeRecord) => {
+  const handleAddTrade = async (newTrade: TradeRecord) => {
     const updated = [newTrade, ...trades];
     setTrades(updated);
-    safeStorage.setItem('trades', updated);
     setMetrics(prev => recalculateLedgerMetrics(updated, prev));
+    try {
+      await fetch('/api/journal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newTrade),
+      });
+    } catch {}
   };
 
   const [branding, setBranding] = useState<SiteBrandingConfig>(() => {
@@ -318,9 +329,4 @@ export default function App() {
         botSettings={botSettings}
         brokerConfig={brokerConfig}
         metrics={metrics}
-        themeMode={themeMode}
-        onSyncTelemetry={syncBrokerTelemetry}
-      />
-    </div>
-  );
-}
+        theme

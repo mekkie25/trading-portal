@@ -24,7 +24,7 @@ import {
   Terminal,
   Zap,
   Activity,
-  Award
+  Calendar
 } from 'lucide-react';
 import { TopMetrics, BotSettings, ThemeMode, TradeRecord, StrategyExecutionMode } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -52,14 +52,15 @@ interface DashboardViewProps {
 }
 
 const STRATEGY_METADATA = [
+  { id: "EMA_9_25_CROSS", name: "9/25 EMA Cross", asset: "Forex & Gold", desc: "Dynamic Crossover & Trail" },
   { id: "GRUBBER_KICK", name: "Grubber Kick", asset: "US30", desc: "3-Rule AMD Equilibrium Sweep" },
   { id: "STRATEGY_513", name: "513 Strategy", asset: "Multi-Asset", desc: "5/13 EMA Cross + Daily Flip" },
   { id: "ORB_LIQUIDITY_SWEEP", name: "ORB Liquidity Sweep", asset: "Multi-Asset", desc: "Asia High/Low Fakeout Reversal" },
   { id: "AVWAP_200EMA_CONTINUATION", name: "AVWAP / 200 EMA", asset: "Indices & Gold", desc: "Dynamic Trend Pullback Hold" },
   { id: "PDH_PDL_FAILED_BREAKOUT", name: "PDH/PDL Trap", asset: "Multi-Asset", desc: "Previous Daily High/Low Trap" },
-  { id: "EMA_9_25_CROSS", name: "9/25 EMA Cross", asset: "Forex & Gold", desc: "Dynamic Crossover & Trail" },
   { id: "ORB_CRACKER", name: "ORB Cracker", asset: "NAS, US30, Gold", desc: "NYSE Open Counter-Sweep" },
   { id: "OES_4H_ORDER_BLOCK", name: "OES 4H Order Block", asset: "Multi-Asset", desc: "Institutional 4H Zone Retest" },
+  { id: "MANUAL_TRADE", name: "Manual / Discretionary", asset: "All Pairs", desc: "Trader manual execution" },
 ];
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -110,7 +111,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const isDark = themeMode === 'dark';
 
-  // Strategy performance mapped directly from real trades
+  // Strategy performance leaderboard mapped directly from real trade records
   const strategyStats = useMemo(() => {
     const statsMap: Record<string, { trades: number; wins: number; losses: number; pnl: number }> = {};
     STRATEGY_METADATA.forEach(s => {
@@ -118,7 +119,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     });
 
     trades.forEach(t => {
-      const id = t.strategy || 'OTHER';
+      const id = t.strategy || 'MANUAL_TRADE';
       if (!statsMap[id]) statsMap[id] = { trades: 0, wins: 0, losses: 0, pnl: 0 };
       statsMap[id].trades += 1;
       if (t.status === 'WIN') statsMap[id].wins += 1;
@@ -129,43 +130,69 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return statsMap;
   }, [trades]);
 
-  // Dynamic cTrader-style equity curve with Green/Red markers for wins & losses
+  // DAILY-GROUPED CUMULATIVE EQUITY TRAJECTORY:
+  // X-Axis = Day/Date. Green Dot = Profitable Day, Red Dot = Negative Day.
   const chartData = useMemo(() => {
     const startingBal = metrics.totalInjections > 0 ? metrics.totalInjections : 10.0;
     
-    // Sort closed trades ascending by time
+    // 1. Group closed trades by Date (YYYY-MM-DD)
+    const dailyMap = new Map<string, { dateLabel: string; netPnL: number; count: number }>();
+
     const sortedTrades = [...trades].filter(t => t.status !== 'OPEN').sort((a, b) => {
       return new Date(a.closeTime || a.openTime).getTime() - new Date(b.closeTime || b.openTime).getTime();
+    });
+
+    sortedTrades.forEach(tr => {
+      const dateRaw = tr.closeTime || tr.openTime || new Date().toISOString();
+      const dateKey = dateRaw.slice(0, 10); // "YYYY-MM-DD"
+      
+      // Format friendly date like "29 Sep"
+      const dateObj = new Date(dateKey);
+      const friendlyDate = isNaN(dateObj.getTime())
+        ? dateKey
+        : dateObj.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+
+      if (!dailyMap.has(dateKey)) {
+        dailyMap.set(dateKey, { dateLabel: friendlyDate, netPnL: 0, count: 0 });
+      }
+      const dayData = dailyMap.get(dateKey)!;
+      dayData.netPnL += (tr.pnl || 0);
+      dayData.count += 1;
     });
 
     const labels: string[] = ['Start'];
     const equityPoints: number[] = [startingBal];
     const pointColors: string[] = ['#3b82f6'];
-    const pointRadii: number[] = [3];
+    const pointRadii: number[] = [4];
+    const dayStats: Array<{ pnl: number; count: number }> = [{ pnl: 0, count: 0 }];
 
     let runningEquity = startingBal;
 
-    if (sortedTrades.length === 0) {
-      labels.push('Current');
+    if (dailyMap.size === 0) {
+      labels.push('Today');
       equityPoints.push(metrics.currentEquity > 0 ? metrics.currentEquity : startingBal);
       pointColors.push('#3b82f6');
-      pointRadii.push(4);
+      pointRadii.push(5);
+      dayStats.push({ pnl: 0, count: 0 });
     } else {
-      sortedTrades.forEach((tr, idx) => {
-        runningEquity += (tr.pnl || 0);
+      dailyMap.forEach((day) => {
+        runningEquity += day.netPnL;
         const cleanEq = Number(runningEquity.toFixed(2));
-        labels.push(tr.asset || `T${idx + 1}`);
+        
+        labels.push(day.dateLabel);
         equityPoints.push(cleanEq);
+        dayStats.push({ pnl: day.netPnL, count: day.count });
 
-        if (tr.status === 'WIN' || (tr.pnl || 0) > 0) {
-          pointColors.push('#10b981'); // Green for win
-          pointRadii.push(6);
-        } else if (tr.status === 'LOSS' || (tr.pnl || 0) < 0) {
-          pointColors.push('#ef4444'); // Red for loss
-          pointRadii.push(6);
+        // GREEN DOT if day was profitable, RED DOT if day was negative
+        if (day.netPnL > 0) {
+          pointColors.push('#10b981'); // Green = Winning Day
+          pointRadii.push(7);
+        } else if (day.netPnL < 0) {
+          pointColors.push('#ef4444'); // Red = Losing Day
+          pointRadii.push(7);
         } else {
-          pointColors.push('#94a3b8');
-          pointRadii.push(4);
+          pointColors.push('#94a3b8'); // Gray = Breakeven
+          pointRadii.push(5);
         }
       });
     }
@@ -174,7 +201,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       labels,
       datasets: [
         {
-          label: 'Live Account Equity',
+          label: 'Daily Cumulative Equity',
           data: equityPoints,
           borderColor: '#2563eb',
           backgroundColor: (context: any) => {
@@ -191,10 +218,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           pointBorderColor: '#ffffff',
           pointBorderWidth: 2,
           pointRadius: pointRadii,
-          pointHoverRadius: 7,
+          pointHoverRadius: 8,
           fill: true,
           tension: 0.2,
-        },
+          dayStats,
+        } as any,
       ],
     };
   }, [trades, metrics.currentEquity, metrics.totalInjections]);
@@ -207,12 +235,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       legend: { display: false },
       tooltip: {
         callbacks: {
-          label: (context) => ` Equity: ${formatCurrency(context.parsed.y ?? 0, brokerCurrency)}`,
+          title: (items) => `Date: ${items[0]?.label}`,
+          label: (context: any) => {
+            const eq = context.parsed.y ?? 0;
+            const idx = context.dataIndex;
+            const dataset = context.dataset as any;
+            const stat = dataset?.dayStats?.[idx];
+            if (idx === 0) return ` Starting Capital: ${formatCurrency(eq, brokerCurrency)}`;
+            const pnlStr = stat ? ` | Day P&L: ${stat.pnl >= 0 ? '+' : ''}${formatCurrency(stat.pnl, brokerCurrency)} (${stat.count} deals)` : '';
+            return ` Equity: ${formatCurrency(eq, brokerCurrency)}${pnlStr}`;
+          },
         },
       },
     },
     scales: {
-      x: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000' } },
+      x: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000', font: { weight: 'bold' } } },
       y: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000', callback: (v) => `$${Number(v).toFixed(2)}` } },
     },
   };
@@ -343,73 +380,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* WEEKLY GROWTH GOAL & TARGET MILESTONE CARD */}
-      <motion.div 
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6 space-y-4"
-      >
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-[#1a2030]">
-          <div>
-            <h2 className="text-base font-bold text-black dark:text-white tracking-tight flex items-center gap-2">
-              <Target className="w-4 h-4 text-emerald-500" />
-              Weekly Account Growth Target & Goal Tracker
-            </h2>
-            <p className="text-xs text-black dark:text-slate-400 mt-0.5">
-              Set your starting baseline and target goal. Micro-Account scaling supports any deposit size (from R100 / $5).
-            </p>
-          </div>
-          <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-full border border-emerald-500/20">
-            Micro-Account Auto-Scaler Active
-          </span>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
-          <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-            <label className="text-[11px] font-bold text-slate-500 uppercase">Starting Baseline</label>
-            <input
-              type="number"
-              value={formSettings.weeklyDepositBaseline || ''}
-              onChange={(e) => setFormSettings({ ...formSettings, weeklyDepositBaseline: parseFloat(e.target.value) || 0 })}
-              className="w-full px-3 py-1.5 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-black dark:text-white text-sm"
-            />
-          </div>
-
-          <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-            <label className="text-[11px] font-bold text-slate-500 uppercase">Target Goal for Week</label>
-            <input
-              type="number"
-              value={formSettings.weeklyGoalTarget || ''}
-              onChange={(e) => setFormSettings({ ...formSettings, weeklyGoalTarget: parseFloat(e.target.value) || 0 })}
-              className="w-full px-3 py-1.5 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-emerald-600 dark:text-emerald-400 text-sm"
-            />
-          </div>
-
-          <div className="space-y-1.5 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-            <div className="flex justify-between items-center">
-              <span className="text-[11px] font-bold text-slate-500 uppercase">Goal Progress</span>
-              <span className="font-mono font-bold text-blue-600 dark:text-blue-400">{goalPct}%</span>
-            </div>
-            <div className="w-full bg-slate-200 dark:bg-slate-800 rounded-full h-2.5 overflow-hidden mt-2">
-              <div className="bg-emerald-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${goalPct}%` }}></div>
-            </div>
-            <div className="text-[10px] text-slate-500 mt-1">
-              {goalPct >= 100 ? '🎉 Goal Achieved!' : `${formatCurrency(remainingToGoal, brokerCurrency)} needed to reach goal`}
-            </div>
-          </div>
-
-          <div className="flex items-center justify-end p-2">
-            <button
-              type="button"
-              onClick={handleSave}
-              className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-xs transition-colors cursor-pointer"
-            >
-              Lock In Weekly Goal
-            </button>
-          </div>
-        </div>
-      </motion.div>
-
       {/* STRATEGY CONTROL CENTER & PERFORMANCE LEADERBOARD */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
@@ -423,10 +393,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Strategy Performance & 3-Way Execution Mode Switch
             </h2>
             <p className="text-xs text-black dark:text-slate-400 mt-0.5">
-              Set each strategy to <strong className="text-emerald-600 dark:text-emerald-400">LIVE</strong> (Real Capital), <strong className="text-blue-600 dark:text-blue-400">SIMULATOR</strong> (Paper Trading / Dry-Run), or <strong className="text-rose-600">OFF</strong>.
+              Tracks performance per strategy in real time. Switch any strategy between <strong className="text-emerald-600 dark:text-emerald-400">LIVE</strong>, <strong className="text-blue-600 dark:text-blue-400">SIMULATOR</strong>, or <strong className="text-rose-600">OFF</strong>.
             </p>
           </div>
-          <span className="text-xs font-mono text-slate-500">8 Modular Engines Loaded</span>
+          <span className="text-xs font-mono text-slate-500">Tracked by Strategy Name</span>
         </div>
 
         <div className="overflow-x-auto">
@@ -497,7 +467,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       {stats.trades}
                     </td>
                     <td className="py-3 px-3 text-center font-mono font-semibold">
-                      <span className={Number(wr) >= 50 ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400'}>
+                      <span className={Number(wr) >= 50 ? 'text-emerald-600 dark:text-emerald-400 font-bold' : 'text-slate-400'}>
                         {wr}% ({stats.wins}W/{stats.losses}L)
                       </span>
                     </td>
@@ -514,26 +484,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Main Split: Cumulative Equity Trajectory + Bot Controls */}
+      {/* Main Split: Daily Grouped Equity Curve + Bot Target Controls */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-1 lg:grid-cols-12 gap-6"
       >
-        {/* Real Equity Curve with Green/Red Dots */}
+        {/* Cumulative Equity Curve by Day with Green/Red Dots */}
         <div className="lg:col-span-8 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div>
               <div className="flex items-center gap-2.5">
-                <h2 className="text-base font-bold text-black dark:text-white tracking-tight">
-                  Cumulative Equity Trajectory
+                <h2 className="text-base font-bold text-black dark:text-white tracking-tight flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-blue-600" />
+                  Daily Cumulative Equity Trajectory
                 </h2>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 font-bold">
-                  LIVE FUSION FEED
+                  DAILY PACED
                 </span>
               </div>
               <p className="text-xs text-black dark:text-slate-400 mt-1">
-                Real-time mark-to-market trajectory. <span className="text-emerald-500 font-bold">● Green</span> = Winning Deal, <span className="text-rose-500 font-bold">● Red</span> = Losing Deal.
+                Timeline by trading day. <span className="text-emerald-500 font-bold">● Green Dot</span> = Profitable Day, <span className="text-rose-500 font-bold">● Red Dot</span> = Negative Day.
               </p>
             </div>
 
@@ -548,8 +519,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <div className="grid grid-cols-3 gap-3 pt-4 mt-auto border-t border-slate-200 dark:border-[#1a2030] text-center text-xs shrink-0">
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
-              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Deals Executed</div>
-              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">{trades.length} Closed Deals</div>
+              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Total Deals</div>
+              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">{trades.length} Deals</div>
             </div>
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Current Balance</div>
@@ -586,7 +557,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <form onSubmit={handleSave} className="flex-1 flex flex-col justify-between mt-4 space-y-5">
             <div className="space-y-4">
-              {/* Master Execution Armed Toggle */}
               <div className="p-4 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
                 <div>
                   <div className="flex items-center gap-2">
@@ -610,7 +580,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </label>
               </div>
 
-              {/* RISK PER TRADE: ADJUSTABLE UP TO 100% */}
+              {/* RISK PER TRADE SLIDER (UP TO 100%) */}
               <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-bold flex items-center gap-1.5">
