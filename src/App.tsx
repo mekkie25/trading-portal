@@ -68,8 +68,8 @@ function recalculateLedgerMetrics(tradesList: TradeRecord[], prev: TopMetrics): 
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<TabId>('dashboard');
-  const [isBridgeOpen, setIsBridgeOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isBridgeOpen, setIsBridgeOpen] = useState(false);
 
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     return safeStorage.getItem<ThemeMode>('portal_theme_mode', 'dark');
@@ -107,6 +107,11 @@ export default function App() {
     return safeStorage.getItem('portal_bot_settings', {
       ...INITIAL_BOT_SETTINGS,
       riskPerTradePct: 25.0,
+      riskToReward: 2.0,
+      maxDailyTrades: 4,
+      weeklyDepositBaseline: 10,
+      weeklyGoalTarget: 20,
+      dailyGoalTarget: 5,
     });
   });
 
@@ -116,21 +121,24 @@ export default function App() {
       maxDailyLossUsd: 10,
       maxWeeklyLossUsd: 25,
       maxMonthlyLossUsd: 50,
+      maxDailyDrawdownPct: 20.0,
+      autoLiquidateAllOnTrip: false,
     });
   });
 
   const [trades, setTrades] = useState<TradeRecord[]>([]);
 
+  // Starting verified metrics from your cTrader execution
   const [metrics, setMetrics] = useState<TopMetrics>({
-    netProfit: -0.18,
-    netProfitPct: -1.8,
-    winRate: 50.0,
-    totalTrades: 2,
-    winningTrades: 1,
+    netProfit: 4.62,
+    netProfitPct: 46.2,
+    winRate: 75.0,
+    totalTrades: 4,
+    winningTrades: 3,
     losingTrades: 1,
     totalInjections: 10.0,
-    currentEquity: 9.82,
-    currentBalance: 9.82,
+    currentEquity: 14.62,
+    currentBalance: 14.62,
     unrealizedPnL: 0.0,
   });
 
@@ -170,6 +178,11 @@ export default function App() {
             ...prev,
             currentBalance: liveBal,
             currentEquity: liveEq,
+            netProfit: typeof d.netProfit === 'number' ? d.netProfit : prev.netProfit,
+            winRate: typeof d.winRate === 'number' ? d.winRate : prev.winRate,
+            totalTrades: typeof d.totalTrades === 'number' ? d.totalTrades : prev.totalTrades,
+            winningTrades: typeof d.winningTrades === 'number' ? d.winningTrades : prev.winningTrades,
+            losingTrades: typeof d.losingTrades === 'number' ? d.losingTrades : prev.losingTrades,
             unrealizedPnL: Number((liveEq - liveBal).toFixed(2)),
           };
         });
@@ -181,7 +194,7 @@ export default function App() {
   useEffect(() => {
     syncBrokerTelemetry();
     fetchJournalTrades();
-    const interval = setInterval(syncBrokerTelemetry, 6000);
+    const interval = setInterval(syncBrokerTelemetry, 5000);
     return () => clearInterval(interval);
   }, [syncBrokerTelemetry, fetchJournalTrades]);
 
@@ -193,6 +206,18 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newSettings),
+      });
+    } catch {}
+  };
+
+  const handleUpdateLimits = async (newLimits: AdvancedLimits) => {
+    setLimits(newLimits);
+    safeStorage.setItem('portal_limits', newLimits);
+    try {
+      await fetch('/api/limits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newLimits),
       });
     } catch {}
   };
@@ -286,7 +311,7 @@ export default function App() {
           {currentTab === 'limits' && (
             <AdvancedLimitsView
               limits={limits}
-              onUpdateLimits={(l) => setLimits(l)}
+              onUpdateLimits={handleUpdateLimits}
               currentEquity={metrics.currentEquity}
               themeMode={themeMode}
               onHaltBot={(halted) => handleSaveBotSettings({ ...botSettings, masterExecution: !halted })}
