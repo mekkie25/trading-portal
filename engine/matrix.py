@@ -370,6 +370,44 @@ class CTraderClient:
             await self._discover_symbols()
             return True
 
+            # 5. Automatically Sync Real cTrader Closed Deals History (ProtoOADealListReq: 2133)
+            now_ms = int(time.time() * 1000)
+            from_ms = now_ms - (30 * 86400 * 1000) # Past 30 days
+            deal_res = await self._send_and_wait(2133, {
+                "ctidTraderAccountId": self.account_id,
+                "fromTimestamp": from_ms,
+                "toTimestamp": now_ms,
+                "maxRows": 100
+            }, timeout=8.0)
+
+            if deal_res and "deal" in deal_res.get("payload", {}):
+                deals = deal_res["payload"]["deal"]
+                log.info(f"Retrieved {len(deals)} historical deal(s) from cTrader account.")
+                for d in deals:
+                    pos_det = d.get("closePositionDetail")
+                    if pos_det: # It's a closed deal
+                        pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0)
+                        real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
+                        t_time = datetime.fromtimestamp(d.get("executionTimestamp", 0) / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                        sym_info = self.symbol_details.get(d.get("symbolId"), {})
+                        sym_name = sym_info.get("name", "FOREX")
+                        
+                        save_trade_record({
+                            "id": f"deal-{d.get('dealId')}",
+                            "ticket": f"#{d.get('dealId')}",
+                            "asset": sym_name,
+                            "strategy": "cTrader Deal",
+                            "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
+                            "lots": round(d.get("filledVolume", 0) / 10000000.0, 2),
+                            "openPrice": pos_det.get("entryPrice", 0),
+                            "closePrice": d.get("executionPrice", 0),
+                            "pnl": real_pnl,
+                            "openTime": t_time,
+                            "closeTime": t_time,
+                            "status": "WIN" if real_pnl > 0 else "LOSS",
+                            "source": "cTrader Deal"
+                        })
+                        
         except Exception as e:
             log.error(f"Failed to connect to cTrader Gateway: {e}")
             self.is_authorized = False

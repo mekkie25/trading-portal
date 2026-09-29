@@ -99,25 +99,35 @@ export default function App() {
   });
 
   const [botSettings, setBotSettings] = useState<BotSettings>(() => {
-    return safeStorage.getItem('2gs_bot_settings', INITIAL_BOT_SETTINGS);
+    return safeStorage.getItem('bot_settings', INITIAL_BOT_SETTINGS);
   });
 
   const [limits, setLimits] = useState<AdvancedLimits>(() => {
-    return safeStorage.getItem('2gs_limits', INITIAL_ADVANCED_LIMITS);
+    return safeStorage.getItem('limits', INITIAL_ADVANCED_LIMITS);
   });
 
   const [trades, setTrades] = useState<TradeRecord[]>(() => {
-    return safeStorage.getItem('2gs_trades', INITIAL_TRADES);
+    return safeStorage.getItem('portal_trades', []);
   });
 
   const [metrics, setMetrics] = useState<TopMetrics>(() => {
-    const cached = safeStorage.getItem('2gs_metrics', INITIAL_METRICS);
-    return recalculateLedgerMetrics(INITIAL_TRADES, cached);
+    return safeStorage.getItem('portal_metrics', {
+      netProfit: -0.18,
+      netProfitPct: -1.8,
+      winRate: 50.0,
+      totalTrades: 2,
+      winningTrades: 1,
+      losingTrades: 1,
+      totalInjections: 10.0,
+      currentEquity: 9.82,
+      currentBalance: 9.82,
+      unrealizedPnL: 0.0,
+    });
   });
 
   const handleSaveBotSettings = async (newSettings: BotSettings) => {
     setBotSettings(newSettings);
-    safeStorage.setItem('2gs_bot_settings', newSettings);
+    safeStorage.setItem('bot_settings', newSettings);
 
     try {
       await fetch('/api/bot/config', {
@@ -131,30 +141,41 @@ export default function App() {
   // STABLE TELEMETRY SYNC (Zero Infinite Loops)
   const syncBrokerTelemetry = useCallback(async () => {
     try {
+      // 1. Sync live telemetry
       const res = await fetch('/api/broker/telemetry');
-      if (!res.ok) return;
-      const json = await res.json();
-      if (json.status === 'success' && json.data) {
-        const d = json.data;
-        setBrokerConfig(prev => ({
-          ...prev,
-          connected: d.connected ?? prev.connected,
-          currency: d.currency ?? prev.currency ?? 'USD',
-          accountNumber: d.accountNumber || prev.accountNumber,
-        }));
-
-        setMetrics(prev => {
-          const liveBal = typeof d.balance === 'number' && d.balance > 0 ? d.balance : prev.currentBalance;
-          const liveEq = typeof d.equity === 'number' && d.equity > 0 ? d.equity : prev.currentEquity;
-          const deposits = typeof d.totalDeposits === 'number' ? d.totalDeposits : prev.totalInjections;
-          return {
+      if (res.ok) {
+        const json = await res.json();
+        if (json.status === 'success' && json.data) {
+          const d = json.data;
+          setBrokerConfig(prev => ({
             ...prev,
-            currentBalance: liveBal,
-            currentEquity: liveEq,
-            totalInjections: deposits,
-            unrealizedPnL: Number((liveEq - liveBal).toFixed(2)),
-          };
-        });
+            connected: true,
+            currency: d.currency ?? 'USD',
+            accountNumber: d.accountNumber || prev.accountNumber,
+          }));
+
+          setMetrics(prev => {
+            const liveBal = typeof d.balance === 'number' && d.balance > 0 ? d.balance : prev.currentBalance;
+            const liveEq = typeof d.equity === 'number' && d.equity > 0 ? d.equity : prev.currentEquity;
+            return {
+              ...prev,
+              currentBalance: liveBal,
+              currentEquity: liveEq,
+              unrealizedPnL: Number((liveEq - liveBal).toFixed(2)),
+            };
+          });
+        }
+      }
+
+      // 2. Sync real closed trade records into Trade Journal & Dashboard
+      const journalRes = await fetch('/api/journal');
+      if (journalRes.ok) {
+        const liveTrades = await journalRes.json();
+        if (Array.isArray(liveTrades) && liveTrades.length > 0) {
+          setTrades(liveTrades);
+          safeStorage.setItem('portal_trades', liveTrades);
+          setMetrics(prev => recalculateLedgerMetrics(liveTrades, prev));
+        }
       }
     } catch {}
   }, []);
@@ -169,7 +190,7 @@ export default function App() {
   const handleDeleteTrade = async (tradeId: string) => {
     const updated = trades.filter(t => t && t.id !== tradeId);
     setTrades(updated);
-    safeStorage.setItem('2gs_trades', updated);
+    safeStorage.setItem('trades', updated);
     setMetrics(prev => recalculateLedgerMetrics(updated, prev));
 
     try {
@@ -180,7 +201,7 @@ export default function App() {
   // WIPE ENTIRE JOURNAL: Resets ledger to 0
   const handleResetJournal = async () => {
     setTrades([]);
-    safeStorage.setItem('2gs_trades', []);
+    safeStorage.setItem('trades', []);
     setMetrics(prev => recalculateLedgerMetrics([], prev));
 
     try {
@@ -191,7 +212,7 @@ export default function App() {
   const handleAddTrade = (newTrade: TradeRecord) => {
     const updated = [newTrade, ...trades];
     setTrades(updated);
-    safeStorage.setItem('2gs_trades', updated);
+    safeStorage.setItem('trades', updated);
     setMetrics(prev => recalculateLedgerMetrics(updated, prev));
   };
 

@@ -16,20 +16,17 @@ import { Line } from 'react-chartjs-2';
 import { 
   TrendingUp, 
   Target, 
-  ArrowUpRight, 
   Coins, 
   Wallet, 
   Sliders, 
   CheckCircle2, 
   Percent,
-  Layers,
-  Code,
   Terminal,
-  Copy,
-  Zap
+  Zap,
+  Activity,
+  Award
 } from 'lucide-react';
 import { TopMetrics, BotSettings, ThemeMode, TradeRecord, StrategyExecutionMode } from '../../types';
-import { EQUITY_TIMEFRAME_DATA } from '../../data/mockTradingData';
 import { formatCurrency } from '../../utils/currency';
 
 ChartJS.register(
@@ -75,11 +72,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   brokerCurrency = 'USD',
   onOpenBridge,
 }) => {
-  const [timeframe, setTimeframe] = useState<'7D' | '30D' | '90D' | 'YTD' | 'ALL'>('30D');
   const [formSettings, setFormSettings] = useState<BotSettings>(botSettings);
   const [saveToast, setSaveToast] = useState<string | null>(null);
-  const [showJsonPayload, setShowJsonPayload] = useState(false);
-  const [copiedJson, setCopiedJson] = useState(false);
 
   React.useEffect(() => {
     setFormSettings(botSettings);
@@ -110,13 +104,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       lastAppliedTimestamp: timestamp,
     };
     onSaveBotSettings(updated);
-    setSaveToast(`Settings and Weekly Goal saved at ${timestamp}!`);
-    setTimeout(() => setSaveToast(null), 4000);
+    setSaveToast(`Risk and Targets saved at ${timestamp}!`);
+    setTimeout(() => setSaveToast(null), 3500);
   };
 
   const isDark = themeMode === 'dark';
 
-  // Strategy performance statistics
+  // Strategy performance mapped directly from real trades
   const strategyStats = useMemo(() => {
     const statsMap: Record<string, { trades: number; wins: number; losses: number; pnl: number }> = {};
     STRATEGY_METADATA.forEach(s => {
@@ -135,99 +129,96 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return statsMap;
   }, [trades]);
 
-  // Scaled trajectory chart
+  // Dynamic cTrader-style equity curve with Green/Red markers for wins & losses
   const chartData = useMemo(() => {
-    const data = EQUITY_TIMEFRAME_DATA[timeframe] || EQUITY_TIMEFRAME_DATA['30D'];
-    const liveEquity = metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99;
-    const liveBalance = metrics.currentBalance > 0 ? metrics.currentBalance : liveEquity;
+    const startingBal = metrics.totalInjections > 0 ? metrics.totalInjections : 10.0;
     
-    const factor = liveEquity / 159820;
-    const scaledEquity = data.equity.map((val, idx) => {
-      if (idx === data.equity.length - 1) return liveEquity;
-      return Number((val * factor).toFixed(2));
-    });
-    
-    const scaledBalance = data.balance.map((val, idx) => {
-      if (idx === data.balance.length - 1) return liveBalance;
-      return Number((val * factor).toFixed(2));
+    // Sort closed trades ascending by time
+    const sortedTrades = [...trades].filter(t => t.status !== 'OPEN').sort((a, b) => {
+      return new Date(a.closeTime || a.openTime).getTime() - new Date(b.closeTime || b.openTime).getTime();
     });
 
+    const labels: string[] = ['Start'];
+    const equityPoints: number[] = [startingBal];
+    const pointColors: string[] = ['#3b82f6'];
+    const pointRadii: number[] = [3];
+
+    let runningEquity = startingBal;
+
+    if (sortedTrades.length === 0) {
+      labels.push('Current');
+      equityPoints.push(metrics.currentEquity > 0 ? metrics.currentEquity : startingBal);
+      pointColors.push('#3b82f6');
+      pointRadii.push(4);
+    } else {
+      sortedTrades.forEach((tr, idx) => {
+        runningEquity += (tr.pnl || 0);
+        const cleanEq = Number(runningEquity.toFixed(2));
+        labels.push(tr.asset || `T${idx + 1}`);
+        equityPoints.push(cleanEq);
+
+        if (tr.status === 'WIN' || (tr.pnl || 0) > 0) {
+          pointColors.push('#10b981'); // Green for win
+          pointRadii.push(6);
+        } else if (tr.status === 'LOSS' || (tr.pnl || 0) < 0) {
+          pointColors.push('#ef4444'); // Red for loss
+          pointRadii.push(6);
+        } else {
+          pointColors.push('#94a3b8');
+          pointRadii.push(4);
+        }
+      });
+    }
+
     return {
-      labels: data.labels,
+      labels,
       datasets: [
         {
-          label: 'Net Equity ($)',
-          data: scaledEquity,
+          label: 'Live Account Equity',
+          data: equityPoints,
           borderColor: '#2563eb',
           backgroundColor: (context: any) => {
             const chart = context.chart;
             const { ctx, chartArea } = chart;
             if (!chartArea) return null;
             const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-            gradient.addColorStop(0, 'rgba(37, 99, 235, 0.22)');
-            gradient.addColorStop(0.7, 'rgba(37, 99, 235, 0.03)');
+            gradient.addColorStop(0, 'rgba(37, 99, 235, 0.28)');
             gradient.addColorStop(1, 'rgba(37, 99, 235, 0.0)');
             return gradient;
           },
           borderWidth: 2.5,
-          pointBackgroundColor: '#2563eb',
-          pointBorderColor: isDark ? '#0f1118' : '#ffffff',
+          pointBackgroundColor: pointColors,
+          pointBorderColor: '#ffffff',
           pointBorderWidth: 2,
-          pointRadius: 3.5,
-          pointHoverRadius: 6,
-          pointHoverBackgroundColor: '#3b82f6',
-          pointHoverBorderColor: '#ffffff',
+          pointRadius: pointRadii,
+          pointHoverRadius: 7,
           fill: true,
-          tension: 0.25,
-        },
-        {
-          label: 'Account Balance ($)',
-          data: scaledBalance,
-          borderColor: isDark ? '#64748b' : '#94a3b8',
-          borderDash: [4, 4],
-          backgroundColor: 'transparent',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          fill: false,
-          tension: 0.15,
+          tension: 0.2,
         },
       ],
     };
-  }, [timeframe, isDark, metrics.currentEquity, metrics.currentBalance]);
+  }, [trades, metrics.currentEquity, metrics.totalInjections]);
 
   const chartOptions: ChartOptions<'line'> = {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
     plugins: {
-      legend: {
-        position: 'top' as const,
-        align: 'end' as const,
-        labels: { color: isDark ? '#94a3b8' : '#000000', font: { size: 11, family: "'Oswald', sans-serif" } },
-      },
+      legend: { display: false },
       tooltip: {
         callbacks: {
-          label: (context) => ` ${context.dataset.label}: ${formatCurrency(context.parsed.y ?? 0, brokerCurrency)}`,
+          label: (context) => ` Equity: ${formatCurrency(context.parsed.y ?? 0, brokerCurrency)}`,
         },
       },
     },
     scales: {
       x: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000' } },
-      y: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000', callback: (v) => `$${Number(v).toLocaleString()}` } },
+      y: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000', callback: (v) => `$${Number(v).toFixed(2)}` } },
     },
   };
 
-  const botTargetJson = JSON.stringify(formSettings, null, 2);
-
-  const handleCopyJson = () => {
-    navigator.clipboard.writeText(botTargetJson);
-    setCopiedJson(true);
-    setTimeout(() => setCopiedJson(false), 3000);
-  };
-
-  // Goal metrics calculations
-  const startBaseline = formSettings.weeklyDepositBaseline || (metrics.currentEquity > 0 ? metrics.currentEquity : 100);
-  const goalTarget = formSettings.weeklyGoalTarget || (startBaseline * 1.5);
+  const startBaseline = formSettings.weeklyDepositBaseline || (metrics.totalInjections > 0 ? metrics.totalInjections : 10);
+  const goalTarget = formSettings.weeklyGoalTarget || (startBaseline * 2);
   const currentEq = metrics.currentEquity > 0 ? metrics.currentEquity : startBaseline;
   const targetDiff = goalTarget - startBaseline;
   const currentDiff = currentEq - startBaseline;
@@ -256,7 +247,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Live Core
             </span>
           </h1>
-          <p className="text-sm text-black dark:text-slate-400 mt-1">
+          <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
             Real-time equity growth, goal pacing, and 3-way strategy execution controls.
           </p>
         </div>
@@ -282,7 +273,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="p-6 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs flex flex-col justify-between">
           <div className="flex items-center justify-between text-black dark:text-slate-400">
             <span className="text-xs font-semibold uppercase tracking-wider">Net Profit</span>
-            <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/20">
+            <div className={`p-2.5 rounded-xl ${metrics.netProfit >= 0 ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400' : 'bg-rose-500/10 text-rose-600'}`}>
               <TrendingUp className="w-4 h-4" />
             </div>
           </div>
@@ -326,10 +317,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <div className="mt-4">
             <div className="text-3xl font-bold font-mono text-black dark:text-white tracking-tight">
-              {formatCurrency(metrics.totalInjections, brokerCurrency)}
+              {formatCurrency(metrics.totalInjections > 0 ? metrics.totalInjections : 10.0, brokerCurrency)}
             </div>
             <div className="flex items-center gap-2 mt-2 text-xs text-black dark:text-slate-400">
-              <span>Audited Base Capital</span>
+              <span>Deposited Base Capital</span>
             </div>
           </div>
         </div>
@@ -378,7 +369,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <label className="text-[11px] font-bold text-slate-500 uppercase">Starting Baseline</label>
             <input
               type="number"
-              placeholder="e.g. 100 or 10000"
               value={formSettings.weeklyDepositBaseline || ''}
               onChange={(e) => setFormSettings({ ...formSettings, weeklyDepositBaseline: parseFloat(e.target.value) || 0 })}
               className="w-full px-3 py-1.5 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-black dark:text-white text-sm"
@@ -389,7 +379,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <label className="text-[11px] font-bold text-slate-500 uppercase">Target Goal for Week</label>
             <input
               type="number"
-              placeholder="e.g. 300 or 12000"
               value={formSettings.weeklyGoalTarget || ''}
               onChange={(e) => setFormSettings({ ...formSettings, weeklyGoalTarget: parseFloat(e.target.value) || 0 })}
               className="w-full px-3 py-1.5 bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] rounded-lg font-mono font-bold text-emerald-600 dark:text-emerald-400 text-sm"
@@ -525,12 +514,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Main Split: Cumulative Equity Chart + Bot Controls */}
+      {/* Main Split: Cumulative Equity Trajectory + Bot Controls */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-1 lg:grid-cols-12 gap-6"
       >
+        {/* Real Equity Curve with Green/Red Dots */}
         <div className="lg:col-span-8 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div>
@@ -538,27 +528,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <h2 className="text-base font-bold text-black dark:text-white tracking-tight">
                   Cumulative Equity Trajectory
                 </h2>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
-                  REAL FEED
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 font-bold">
+                  LIVE FUSION FEED
                 </span>
               </div>
               <p className="text-xs text-black dark:text-slate-400 mt-1">
-                Marked-to-market performance anchored to live account balance ({brokerCurrency}).
+                Real-time mark-to-market trajectory. <span className="text-emerald-500 font-bold">● Green</span> = Winning Deal, <span className="text-rose-500 font-bold">● Red</span> = Losing Deal.
               </p>
             </div>
 
-            <div className="flex items-center bg-white dark:bg-[#08090d] p-1 rounded-xl border border-slate-300 dark:border-[#1a2030] self-start sm:self-auto">
-              {(['7D', '30D', '90D', 'YTD', 'ALL'] as const).map((tf) => (
-                <button
-                  key={tf}
-                  onClick={() => setTimeframe(tf)}
-                  className={`px-3 py-1.5 text-xs font-mono font-semibold rounded-lg transition-all cursor-pointer ${
-                    timeframe === tf ? 'bg-blue-600 text-white shadow-xs' : 'text-black dark:text-slate-400 hover:text-black dark:hover:text-white'
-                  }`}
-                >
-                  {tf}
-                </button>
-              ))}
+            <div className="flex items-center gap-3 text-xs font-mono">
+              <span className="text-slate-500">Starting Balance: <strong className="text-black dark:text-white">{formatCurrency(metrics.totalInjections > 0 ? metrics.totalInjections : 10.0, brokerCurrency)}</strong></span>
             </div>
           </div>
 
@@ -568,25 +548,25 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <div className="grid grid-cols-3 gap-3 pt-4 mt-auto border-t border-slate-200 dark:border-[#1a2030] text-center text-xs shrink-0">
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
-              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period Drawdown Low</div>
-              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">
-                {formatCurrency(metrics.currentEquity > 0 ? metrics.currentEquity * 0.985 : 9900, brokerCurrency)}
-              </div>
+              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Deals Executed</div>
+              <div className="font-mono font-bold text-black dark:text-slate-300 mt-1">{trades.length} Closed Deals</div>
             </div>
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
-              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Period High Watermark</div>
+              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Current Balance</div>
               <div className="font-mono font-bold text-blue-600 dark:text-blue-400 mt-1">
-                {formatCurrency(metrics.currentEquity > 0 ? metrics.currentEquity : 10051.99, brokerCurrency)}
+                {formatCurrency(metrics.currentBalance, brokerCurrency)}
               </div>
             </div>
             <div className="p-3 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] shadow-xs">
-              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Sharpe Ratio</div>
-              <div className="font-mono font-bold text-emerald-700 dark:text-emerald-400 mt-1">2.84 (Optimal)</div>
+              <div className="text-[10px] text-black dark:text-slate-400 uppercase font-semibold">Net P&L</div>
+              <div className={`font-mono font-bold mt-1 ${metrics.netProfit >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                {formatCurrency(metrics.netProfit, brokerCurrency)}
+              </div>
             </div>
           </div>
         </div>
 
-        {/* Bot Controls */}
+        {/* Bot Controls with 0.1% to 100% Risk Slider + Direct Type Input */}
         <div className="lg:col-span-4 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div className="flex items-center gap-2.5">
@@ -598,36 +578,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   Bot Target Controls
                 </h2>
                 <p className="text-[11px] text-black dark:text-slate-400">
-                  Global limits and sizing rules
+                  Global risk limits and sizing rules
                 </p>
               </div>
             </div>
-
-            <button
-              type="button"
-              onClick={() => setShowJsonPayload(!showJsonPayload)}
-              className="p-1.5 rounded-lg text-black dark:text-slate-400 hover:text-black dark:hover:text-slate-200 text-xs cursor-pointer"
-              title="Inspect JSON"
-            >
-              <Code className="w-4 h-4" />
-            </button>
           </div>
-
-          {showJsonPayload && (
-            <div className="my-3 p-3 rounded-xl bg-slate-950 text-slate-300 font-mono text-[11px] border border-slate-800 space-y-2">
-              <div className="flex items-center justify-between text-[10px] text-slate-400">
-                <span>bot_config.json</span>
-                <button type="button" onClick={handleCopyJson} className="text-blue-400 flex items-center gap-1">
-                  <Copy className="w-3 h-3" />
-                  <span>{copiedJson ? 'Copied' : 'Copy'}</span>
-                </button>
-              </div>
-              <pre className="overflow-x-auto text-[10px] max-h-40">{botTargetJson}</pre>
-            </div>
-          )}
 
           <form onSubmit={handleSave} className="flex-1 flex flex-col justify-between mt-4 space-y-5">
             <div className="space-y-4">
+              {/* Master Execution Armed Toggle */}
               <div className="p-4 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
                 <div>
                   <div className="flex items-center gap-2">
@@ -651,24 +610,43 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </label>
               </div>
 
-              <div className="space-y-1.5">
+              {/* RISK PER TRADE: ADJUSTABLE UP TO 100% */}
+              <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
                 <div className="flex items-center justify-between text-xs">
-                  <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
-                    <Percent className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Base Risk Per Trade
+                  <label className="text-black dark:text-slate-300 font-bold flex items-center gap-1.5">
+                    <Percent className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Risk Per Trade (Up to 100%)
                   </label>
-                  <span className="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">{formSettings.riskPerTradePct.toFixed(1)}%</span>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min="0.1"
+                      max="100.0"
+                      step="0.5"
+                      value={formSettings.riskPerTradePct}
+                      onChange={(e) => setFormSettings({ ...formSettings, riskPerTradePct: parseFloat(e.target.value) || 0.1 })}
+                      className="w-16 px-2 py-0.5 rounded bg-white dark:bg-[#151922] border border-slate-300 dark:border-[#212838] font-mono text-xs font-bold text-blue-600 dark:text-blue-400 text-right"
+                    />
+                    <span className="font-mono text-xs font-bold text-blue-600">%</span>
+                  </div>
                 </div>
+
                 <input
                   type="range"
-                  min="0.1"
-                  max="5.0"
-                  step="0.1"
+                  min="0.5"
+                  max="100.0"
+                  step="0.5"
                   value={formSettings.riskPerTradePct}
                   onChange={(e) => setFormSettings({ ...formSettings, riskPerTradePct: parseFloat(e.target.value) || 0.5 })}
-                  className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                  className="w-full h-2 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
                 />
+                <div className="flex justify-between text-[10px] font-mono text-slate-500">
+                  <span>0.5% (Conservative)</span>
+                  <span>50% (Aggressive)</span>
+                  <span>100% (Max)</span>
+                </div>
               </div>
 
+              {/* Target R:R */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
@@ -686,6 +664,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white"
                 />
               </div>
+
+              {/* Max Daily Trades */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
+                    <Activity className="w-3.5 h-3.5 text-amber-500" /> Max Daily Trades Quota
+                  </label>
+                  <span className="font-mono text-xs font-bold text-amber-600 dark:text-amber-400">{formSettings.maxDailyTrades} Trades</span>
+                </div>
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  value={formSettings.maxDailyTrades}
+                  onChange={(e) => setFormSettings({ ...formSettings, maxDailyTrades: parseInt(e.target.value, 10) || 4 })}
+                  className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white"
+                />
+              </div>
             </div>
 
             <button
@@ -693,7 +689,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-xs flex items-center justify-center gap-2 cursor-pointer mt-4"
             >
               <CheckCircle2 className="w-4 h-4" />
-              <span>Apply & Push to Bot Gateway</span>
+              <span>Broadcast Custom Limits to Engine</span>
             </button>
           </form>
         </div>
