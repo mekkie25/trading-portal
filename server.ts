@@ -575,7 +575,6 @@ async function startServer() {
       const line = chunk.toString().trim();
       if (line.includes('[MATRIX_TELEMETRY]')) {
         try {
-         try {
           const jsonStr = line.split('[MATRIX_TELEMETRY]')[1].trim();
           const telem = JSON.parse(jsonStr);
           activeBrokerTelemetry.balance = telem.balance;
@@ -587,7 +586,9 @@ async function startServer() {
           if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
           activeBrokerTelemetry.connected = true;
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-        } catch {} 
+        } catch (e) {
+          // Ignore parsing errors on partial logs
+        }
       }
       console.log(`[Python Engine] ${line}`);
     });
@@ -600,7 +601,7 @@ async function startServer() {
       console.warn(`⚠️ Python Bot process exited with code ${code}. Restarting in 5s...`);
       setTimeout(launchPythonBot, 5000);
     });
-  }
+  } 
 
   launchPythonBot();
 
