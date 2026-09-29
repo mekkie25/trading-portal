@@ -292,6 +292,67 @@ class CTraderClient:
             return False
         return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
+    async def sync_deals_from_ctrader(self) -> List[dict]:
+        """Automatically queries cTrader for all closed deals and syncs trades_db.json."""
+        if not self.is_authorized:
+            return []
+        try:
+            now_ms = int(time.time() * 1000)
+            from_ms = now_ms - (30 * 86400 * 1000) # Past 30 days
+            deal_res = await self._send_and_wait(2133, {
+                "ctidTraderAccountId": self.account_id,
+                "fromTimestamp": from_ms,
+                "toTimestamp": now_ms,
+                "maxRows": 100
+            }, timeout=6.0)
+
+            if not deal_res or "deal" not in deal_res.get("payload", {}):
+                return []
+
+            deals = deal_res["payload"]["deal"]
+            synced_trades = []
+
+            for d in deals:
+                pos_det = d.get("closePositionDetail")
+                if pos_det:
+                    pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0) + pos_det.get("swap", 0)
+                    real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
+                    t_ms = d.get("executionTimestamp", 0)
+                    t_time = datetime.fromtimestamp(t_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if t_ms else ""
+
+                    sid = d.get("symbolId")
+                    sym_info = self.symbol_details.get(sid, {})
+                    sym_name = sym_info.get("name", "EURUSD")
+
+                    comment = d.get("comment", "")
+                    strategy = comment if comment and comment != "NexusMatrix" else "STRATEGY_513"
+
+                    lots = round(d.get("filledVolume", 0) / 10000000.0, 2)
+                    open_p = pos_det.get("entryPrice", 0)
+                    close_p = d.get("executionPrice", 0)
+
+                    record = {
+                        "id": f"deal-{d.get('dealId')}",
+                        "ticket": f"#{d.get('dealId')}",
+                        "asset": sym_name,
+                        "strategy": strategy,
+                        "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
+                        "lots": lots if lots > 0 else 0.02,
+                        "openPrice": open_p,
+                        "closePrice": close_p,
+                        "pnl": real_pnl,
+                        "openTime": t_time,
+                        "closeTime": t_time,
+                        "status": "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "BREAKEVEN"),
+                        "source": "Fusion cTrader"
+                    }
+                    save_trade_record(record)
+                    synced_trades.append(record)
+            return synced_trades
+        except Exception as e:
+            log.warning(f"Error syncing deals from cTrader: {e}")
+            return []
+    
     def fetch_real_account_id_from_http(self) -> Optional[int]:
         """Queries Spotware API directly to map login number (e.g. 41425) to ctidTraderAccountId."""
         try:
@@ -1332,6 +1393,8 @@ class MatrixEngineMaster:
         while True:
             try:
                 start_time = time.time()
+                # Sync all newly closed cTrader deals into trades_db.json
+                await self.ctrader.sync_deals_from_ctrader()
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
 
@@ -1386,7 +1449,28 @@ class MatrixEngineMaster:
                     active_setup_str = active_setup_str.value
                 verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Scanning all day on Fusion Markets cTrader."
 
-                emit_telemetry(balance, equity, regime_status, active_setup_str, verdict_str)
+                # Compute actual live stats from closed trade history
+                history = read_trade_history()
+                closed_history = [t for t in history if t.get('status') in ('WIN', 'LOSS', 'BREAKEVEN')]
+                total_closed = len(closed_history)
+                wins = len([t for t in closed_history if t.get('status') == 'WIN'])
+                losses = len([t for t in closed_history if t.get('status') == 'LOSS'])
+                win_rate = round((wins / total_closed * 100.0), 1) if total_closed > 0 else 0.0
+                net_profit = round(sum(t.get('pnl', 0.0) for t in closed_history), 2)
+
+                telem_msg = json.dumps({
+                    "balance": balance,
+                    "equity": equity,
+                    "regime": regime_status,
+                    "active_setup": active_setup_str,
+                    "ai_verdict": verdict_str,
+                    "netProfit": net_profit,
+                    "winRate": win_rate,
+                    "totalTrades": total_closed,
+                    "winningTrades": wins,
+                    "losingTrades": losses
+                })
+                print(f"[MATRIX_TELEMETRY] {telem_msg}", flush=True)
                 write_telemetry(balance, equity, regime_status, active_setup_str, verdict_str)
 
                 elapsed = time.time() - start_time

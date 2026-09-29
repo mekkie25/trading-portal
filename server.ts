@@ -575,13 +575,19 @@ async function startServer() {
       const line = chunk.toString().trim();
       if (line.includes('[MATRIX_TELEMETRY]')) {
         try {
+         try {
           const jsonStr = line.split('[MATRIX_TELEMETRY]')[1].trim();
           const telem = JSON.parse(jsonStr);
           activeBrokerTelemetry.balance = telem.balance;
           activeBrokerTelemetry.equity = telem.equity;
+          if (telem.netProfit !== undefined) activeBrokerTelemetry.netProfit = telem.netProfit;
+          if (telem.winRate !== undefined) activeBrokerTelemetry.winRate = telem.winRate;
+          if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
+          if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
+          if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
           activeBrokerTelemetry.connected = true;
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-        } catch {}
+        } catch {} 
       }
       console.log(`[Python Engine] ${line}`);
     });
