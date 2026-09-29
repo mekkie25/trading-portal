@@ -133,7 +133,6 @@ export default function App() {
     unrealizedPnL: 0.0,
   });
 
-  // Pull real closed trades from /api/journal
   const fetchJournalTrades = useCallback(async () => {
     try {
       const res = await fetch('/api/journal');
@@ -329,4 +328,9 @@ export default function App() {
         botSettings={botSettings}
         brokerConfig={brokerConfig}
         metrics={metrics}
-        theme
+        themeMode={themeMode}
+        onSyncTelemetry={syncBrokerTelemetry}
+      />
+    </div>
+  );
+}
