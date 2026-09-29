@@ -3,6 +3,26 @@
 ================================================================================
 NEXUS MATRIX ALGORITHMIC TRADING SYSTEM (CTRADER OPEN API / FUSION MARKETS)
 ================================================================================
+Architecture: Institutional Multi-Strategy Quantitative Execution Engine
+Components:   - All-Day Execution Engine for Fusion Markets (cTrader Open API)
+              - Dynamic Micro-Account Scaling (Handles R100, R1,000, up to $100k+)
+              - AI Intuition & Target-Pacing Sizer (Gemini AI Quality Multiplier)
+              - Daily Profit Target Runway Allocator (e.g. R500 Target on R1,000 Balance)
+              - Automatic Token Sanitizer & Spotware Account ID Auto-Resolution
+              - Real-Time Trade Journal Synchronization (trades_db.json)
+              - Dual-Stage OAuth Handshake (App Auth 2100 + Account Auth 2102)
+              - Daily 21:00 SAST End-of-Day Position Flusher (Zero Overnight Risk)
+              - Instant Personal WhatsApp Alerts Engine (CallMeBot Integration)
+              - Twin-Position 50/50 Partial Scaling (Bank Half at TP1, Trail TP2)
+              - Order Flow & Volume Profile Analyzer (POC, VAH, VAL, Cumulative Delta)
+              - Quantitative Math Engine (EMA, ATR, Bollinger Bands, RSI)
+              - Temporal Clock & Session Manager (Asian, London, NY)
+              - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
+              - Live Bid/Ask Spread Gatekeeper & News Armor Protection
+              - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
+              - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
+Deployment:   Headless Linux / Railway / Cloud VPS / Docker Container
+================================================================================
 """
 
 import sys
@@ -21,12 +41,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 # Silence library warning in terminal
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# Ensure project root is in Python search path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -38,6 +59,7 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
+# Modular Strategy Framework
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 
@@ -46,7 +68,7 @@ TELEMETRY_FILE = "bot_telemetry.json"
 TRADES_DB_FILE = "trades_db.json"
 
 # ==============================================================================
-# 1. ADVANCED LOGGING SYSTEM
+# 1. ADVANCED INSTITUTIONAL LOGGING SYSTEM
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
@@ -115,7 +137,7 @@ class WhatsAppNotifier:
 whatsapp = WhatsAppNotifier()
 
 # ==============================================================================
-# 3. TELEMETRY & UI I/O HELPERS
+# 3. TELEMETRY, UI I/O & TRADE JOURNAL HELPERS
 # ==============================================================================
 
 def emit_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str):
@@ -161,6 +183,20 @@ def read_trade_history() -> List[dict]:
     except Exception:
         return []
 
+def save_trade_record(trade_data: dict) -> None:
+    """Appends or updates a live trade in trades_db.json so the Trade Journal reflects it."""
+    try:
+        trades = read_trade_history()
+        existing_idx = next((i for i, t in enumerate(trades) if t.get("ticket") == trade_data.get("ticket")), None)
+        if existing_idx is not None:
+            trades[existing_idx].update(trade_data)
+        else:
+            trades.insert(0, trade_data)
+        with open(TRADES_DB_FILE, "w") as f:
+            json.dump(trades, f, indent=2)
+    except Exception as e:
+        log.error(f"Failed to record trade to journal: {e}")
+
 # ==============================================================================
 # 4. CONFIGURATION & CTRADER PROTOCOL DEFINITIONS
 # ==============================================================================
@@ -187,7 +223,12 @@ class AssetConfig:
 class ConfigManager:
     CLIENT_ID: str = os.getenv("CTRADER_CLIENT_ID", "").strip()
     CLIENT_SECRET: str = os.getenv("CTRADER_CLIENT_SECRET", "").strip()
-    ACCESS_TOKEN: str = os.getenv("CTRADER_ACCESS_TOKEN", "").strip()
+
+    # Automatically clean any accidental "AT:" prefix, "Bearer", or spaces from token
+    _raw_token: str = os.getenv("CTRADER_ACCESS_TOKEN", "").strip()
+    _cleaned_token: str = _raw_token.replace("AT:", "").replace("Bearer", "").strip()
+    ACCESS_TOKEN: str = "".join(_cleaned_token.split())
+
     ACCOUNT_ID: int = int(os.getenv("CTRADER_ACCOUNT_ID", "0").strip() or 0)
     ENV: str = os.getenv("CTRADER_ENV", "demo").lower().strip()
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
@@ -217,7 +258,7 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 5. NATIVE CTRADER OPEN API CLIENT (WITH DIRECT HTTP & PROTOBUF RESOLVER)
+# 5. NATIVE CTRADER OPEN API CLIENT (WITH SPOTWARE ACCOUNT AUTO-RESOLVER)
 # ==============================================================================
 
 class CTraderClient:
@@ -252,7 +293,7 @@ class CTraderClient:
         return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
     def fetch_real_account_id_from_http(self) -> Optional[int]:
-        """Directly queries Spotware API to map login number (e.g. 41425) to ctidTraderAccountId."""
+        """Queries Spotware API directly to map login number (e.g. 41425) to ctidTraderAccountId."""
         try:
             url = f"https://api.spotware.com/connect/tradingaccounts?access_token={self.access_token}"
             req = urllib.request.Request(url, headers={"User-Agent": "NexusMatrix/1.0"})
@@ -274,7 +315,7 @@ class CTraderClient:
                     log.info(f"Auto-selected account: Login #{chosen.get('accountNumber')} -> ctidTraderAccountId #{chosen.get('accountId')}")
                     return chosen.get("accountId")
         except Exception as e:
-            log.warning(f"Direct Spotware HTTP account query note: {e}")
+            log.warning(f"Spotware HTTP account query: {e}")
         return None
 
     async def connect(self) -> bool:
@@ -282,7 +323,7 @@ class CTraderClient:
             log.critical("Missing cTrader credentials in Railway environment variables.")
             return False
 
-        # Attempt to auto-resolve 41425 to the internal accountId
+        # Attempt to auto-resolve account ID
         resolved_id = await asyncio.to_thread(self.fetch_real_account_id_from_http)
         if resolved_id:
             self.account_id = resolved_id
@@ -292,7 +333,7 @@ class CTraderClient:
             self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
             asyncio.create_task(self._listen_loop())
 
-            # 1. Application Auth (2100)
+            # 1. Application Auth (ProtoOAApplicationAuthReq: 2100)
             app_auth_res = await self._send_and_wait(2100, {
                 "clientId": self.client_id,
                 "clientSecret": self.client_secret
@@ -301,7 +342,7 @@ class CTraderClient:
                 log.critical(f"cTrader App Auth failed: {app_auth_res}")
                 return False
 
-            # 2. Account Auth (2102)
+            # 2. Account Auth (ProtoOAAccountAuthReq: 2102)
             acc_auth_res = await self._send_and_wait(2102, {
                 "ctidTraderAccountId": self.account_id,
                 "accessToken": self.access_token
@@ -313,7 +354,7 @@ class CTraderClient:
 
             self.is_authorized = True
 
-            # 3. Pull Live Balance & Digits (2121)
+            # 3. Pull Live Balance & Digits (ProtoOATraderReq: 2121)
             trader_res = await self._send_and_wait(2121, {
                 "ctidTraderAccountId": self.account_id
             })
@@ -325,7 +366,7 @@ class CTraderClient:
                 self.last_known_equity = self.last_known_balance
                 log.info(f"--- CTRADER / FUSION ONLINE --- Balance: {self.last_known_balance:,.2f}")
 
-            # 4. Discover Broker Symbols & Map IDs (2114)
+            # 4. Discover Broker Symbols & Map IDs (ProtoOASymbolsListReq: 2114)
             await self._discover_symbols()
             return True
 
@@ -942,7 +983,7 @@ class AIOverseer:
         return True, 1.0, "Approved by Quantitative Edge"
 
 # ==============================================================================
-# 10. CLOUD EXECUTION ENGINE (TWIN 50/50 PARTIAL SCALING)
+# 10. CLOUD EXECUTION ENGINE (TWIN 50/50 PARTIAL SCALING + JOURNAL RECORDING)
 # ==============================================================================
 
 class CloudExecutionEngine:
@@ -1021,6 +1062,8 @@ class CloudExecutionEngine:
 
         if res_a or res_b:
             self.risk.trades_taken_today += 1
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
             for res, target in [(res_a, tp1_price), (res_b, tp2_price)]:
                 if res and res.get("position_id"):
                     pid = str(res["position_id"])
@@ -1034,6 +1077,22 @@ class CloudExecutionEngine:
                         "lots": res["lots"],
                         "is_be_moved": False
                     }
+                    # Save open trade to Trade Journal Database
+                    save_trade_record({
+                        "id": f"pos-{pid}",
+                        "ticket": f"#{pid}",
+                        "asset": bp['symbol'],
+                        "strategy": strategy_name,
+                        "type": bp['direction'],
+                        "lots": res["lots"],
+                        "openPrice": bp['entry_price'],
+                        "closePrice": bp['entry_price'],
+                        "pnl": 0.0,
+                        "openTime": now_iso,
+                        "closeTime": "OPEN",
+                        "status": "OPEN",
+                        "source": "Fusion cTrader"
+                    })
 
             whatsapp_msg = (
                 f"🟢 *[FUSION MARKETS CTRADER ORDER FILLED]*\n"
@@ -1091,30 +1150,58 @@ class MatrixEngineMaster:
                     sl = pos["stop_loss"]
                     tp = pos["take_profit"]
                     be_moved = pos.get("is_be_moved", False)
+                    lots = pos.get("lots", 0.01)
 
                     quote, _, _ = await self.ctrader.get_live_quote(sym)
                     if quote <= 0:
                         continue
 
+                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+                    # 1. Stop Loss Hit
                     sl_hit = (direction == "BUY" and quote <= sl) or (direction == "SELL" and quote >= sl)
                     if sl_hit:
+                        pnl_calc = (quote - entry) if direction == "BUY" else (entry - quote)
+                        status_str = "BREAKEVEN" if be_moved else "LOSS"
+                        
+                        save_trade_record({
+                            "ticket": f"#{pid}",
+                            "closePrice": quote,
+                            "closeTime": now_str,
+                            "status": status_str,
+                            "pnl": round(pnl_calc * lots * 100, 2)
+                        })
+
                         if be_moved:
                             sl_msg = f"⚪ *[EXIT AT BREAK-EVEN]*\n• Asset: {sym}\n• Closed at Entry: {quote}\n• P&L: 0.00 (Risk-Free Exit)"
                         else:
                             sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit: {quote}\n• Capital protected."
+                        
                         log.info(f"Position #{pid} exited at SL/BE on {sym}")
                         await whatsapp.send_alert(sl_msg)
                         self.risk_mgr.open_positions.pop(pid, None)
                         continue
 
+                    # 2. Take Profit Hit
                     tp_hit = (direction == "BUY" and quote >= tp) or (direction == "SELL" and quote <= tp)
                     if tp_hit:
+                        pnl_calc = (quote - entry) if direction == "BUY" else (entry - quote)
+                        
+                        save_trade_record({
+                            "ticket": f"#{pid}",
+                            "closePrice": quote,
+                            "closeTime": now_str,
+                            "status": "WIN",
+                            "pnl": round(pnl_calc * lots * 100, 2)
+                        })
+
                         tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote}\n• Profit banked."
                         log.info(f"Position #{pid} exited at TP on {sym}")
                         await whatsapp.send_alert(tp_msg)
                         self.risk_mgr.open_positions.pop(pid, None)
                         continue
 
+                    # 3. Move Stop Loss to Break-Even at 80% Progress
                     if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
                         log.info(f"80% R:R PROGRESS HIT ON {sym} (Position #{pid})! Moving SL to Break-Even.")
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
@@ -1137,8 +1224,17 @@ class MatrixEngineMaster:
 
                 if hour == 21 and minute == 0 and len(self.risk_mgr.open_positions) > 0:
                     log.warning(f"🌆 21:00 SAST LOCKDOWN: Closing {len(self.risk_mgr.open_positions)} open positions to cash.")
+                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
                     for pid, pos in list(self.risk_mgr.open_positions.items()):
                         await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100000))
+                        save_trade_record({
+                            "ticket": f"#{pid}",
+                            "closePrice": pos.get("entry_price"),
+                            "closeTime": now_str,
+                            "status": "CLOSED_EOD",
+                            "pnl": 0.0
+                        })
 
                     flushed_count = len(self.risk_mgr.open_positions)
                     self.risk_mgr.open_positions.clear()
