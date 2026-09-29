@@ -69,6 +69,7 @@ function recalculateLedgerMetrics(tradesList: TradeRecord[], prev: TopMetrics): 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<TabId>('dashboard');
   const [isBridgeOpen, setIsBridgeOpen] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     return safeStorage.getItem<ThemeMode>('portal_theme_mode', 'dark');
@@ -243,6 +244,7 @@ export default function App() {
         brokerConfig={brokerConfig}
         branding={branding}
         onOpenBridge={() => setIsBridgeOpen(true)}
+        onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
       />
 
       <div className="flex flex-1 overflow-hidden">
@@ -251,6 +253,8 @@ export default function App() {
           onSelectTab={setCurrentTab}
           botActive={botSettings.masterExecution && !limits.breakerTriggered}
           themeMode={themeMode}
+          isOpen={isSidebarOpen}
+          onClose={() => setIsSidebarOpen(false)}
         />
 
         <main className={`flex-1 h-full overflow-hidden relative ${themeMode === 'dark' ? 'bg-[#07090e]' : 'bg-white'}`}>

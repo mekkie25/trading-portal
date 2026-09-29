@@ -268,6 +268,9 @@ class CTraderClient:
         self.client_id = ConfigManager.CLIENT_ID
         self.client_secret = ConfigManager.CLIENT_SECRET
         self.access_token = ConfigManager.ACCESS_TOKEN
+        self.notified_closed_deals = set()
+        self.position_strategies: Dict[str, str] = {}
+        self._load_position_strategies()
 
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_authorized: bool = False
@@ -283,6 +286,22 @@ class CTraderClient:
         self._msg_counter: int = 0
         self._lock = asyncio.Lock()
 
+    def _load_position_strategies(self):
+     try:
+         if os.path.exists("position_strategies.json"):
+             with open("position_strategies.json", "r") as f:
+                 self.position_strategies = json.load(f)
+     except Exception:
+         self.position_strategies = {}
+
+    def _save_position_strategy(self, position_id: str, strategy: str):
+        self.position_strategies[str(position_id)] = strategy
+        try:
+            with open("position_strategies.json", "w") as f:
+                json.dump(self.position_strategies, f)
+        except Exception:
+            pass    
+
     def _next_id(self) -> str:
         self._msg_counter += 1
         return f"req_{self._msg_counter}_{int(time.time()*1000)}"
@@ -293,65 +312,105 @@ class CTraderClient:
         return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
     async def sync_deals_from_ctrader(self) -> List[dict]:
-        """Automatically queries cTrader for all closed deals and syncs trades_db.json."""
-        if not self.is_authorized:
-            return []
-        try:
-            now_ms = int(time.time() * 1000)
-            from_ms = now_ms - (30 * 86400 * 1000) # Past 30 days
-            deal_res = await self._send_and_wait(2133, {
-                "ctidTraderAccountId": self.account_id,
-                "fromTimestamp": from_ms,
-                "toTimestamp": now_ms,
-                "maxRows": 100
-            }, timeout=6.0)
+     """Automatically queries cTrader for all closed deals and syncs trades_db.json."""
+     if not self.is_authorized:
+         return []
+     try:
+         now_ms = int(time.time() * 1000)
+         from_ms = now_ms - (30 * 86400 * 1000)
+         deal_res = await self._send_and_wait(2133, {
+             "ctidTraderAccountId": self.account_id,
+             "fromTimestamp": from_ms,
+             "toTimestamp": now_ms,
+             "maxRows": 100
+         }, timeout=6.0)
 
-            if not deal_res or "deal" not in deal_res.get("payload", {}):
-                return []
+         if not deal_res or "deal" not in deal_res.get("payload", {}):
+             return []
 
-            deals = deal_res["payload"]["deal"]
-            synced_trades = []
+         deals = deal_res["payload"]["deal"]
+         synced_trades = []
 
-            for d in deals:
-                pos_det = d.get("closePositionDetail")
-                if pos_det:
-                    pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0) + pos_det.get("swap", 0)
-                    real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
-                    t_ms = d.get("executionTimestamp", 0)
-                    t_time = datetime.fromtimestamp(t_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if t_ms else ""
+         for d in deals:
+             pos_det = d.get("closePositionDetail")
+             if pos_det:
+                 deal_id_str = str(d.get('dealId'))
+                 pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0) + pos_det.get("swap", 0)
+                 real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
+                 t_ms = d.get("executionTimestamp", 0)
+                 t_time = datetime.fromtimestamp(t_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if t_ms else ""
 
-                    sid = d.get("symbolId")
-                    sym_info = self.symbol_details.get(sid, {})
-                    sym_name = sym_info.get("name", "EURUSD")
+                 sid = d.get("symbolId")
+                 sym_info = self.symbol_details.get(sid, {})
+                 sym_name = sym_info.get("name", "FOREX")
 
-                    comment = d.get("comment", "")
-                    strategy = comment if comment and comment != "NexusMatrix" else "STRATEGY_513"
+                 # Identify strategy: Check in-memory map, order comment, or tag as manual
+                 pos_id_str = str(d.get("positionId", ""))
+                 strategy = self.position_strategies.get(pos_id_str)
+                 if not strategy:
+                     comment = d.get("comment", "")
+                     if comment and comment not in ("NexusMatrix", ""):
+                         strategy = comment
+                     else:
+                         strategy = "MANUAL_TRADE"
 
-                    lots = round(d.get("filledVolume", 0) / 10000000.0, 2)
-                    open_p = pos_det.get("entryPrice", 0)
-                    close_p = d.get("executionPrice", 0)
+                 lots = round(d.get("filledVolume", 0) / 10000000.0, 2)
+                 open_p = pos_det.get("entryPrice", 0)
+                 close_p = d.get("executionPrice", 0)
 
-                    record = {
-                        "id": f"deal-{d.get('dealId')}",
-                        "ticket": f"#{d.get('dealId')}",
-                        "asset": sym_name,
-                        "strategy": strategy,
-                        "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
-                        "lots": lots if lots > 0 else 0.02,
-                        "openPrice": open_p,
-                        "closePrice": close_p,
-                        "pnl": real_pnl,
-                        "openTime": t_time,
-                        "closeTime": t_time,
-                        "status": "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "BREAKEVEN"),
-                        "source": "Fusion cTrader"
-                    }
-                    save_trade_record(record)
-                    synced_trades.append(record)
-            return synced_trades
-        except Exception as e:
-            log.warning(f"Error syncing deals from cTrader: {e}")
-            return []
+                 record = {
+                     "id": f"deal-{deal_id_str}",
+                     "ticket": f"#{deal_id_str}",
+                     "asset": sym_name,
+                     "strategy": strategy,
+                     "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
+                     "lots": lots if lots > 0 else 0.02,
+                     "openPrice": open_p,
+                     "closePrice": close_p,
+                     "pnl": real_pnl,
+                     "openTime": t_time,
+                     "closeTime": t_time,
+                     "status": "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "BREAKEVEN"),
+                     "source": "Fusion cTrader"
+                 }
+                 save_trade_record(record)
+                 synced_trades.append(record)
+
+                 # WHATSAPP NOTIFICATION FOR CLOSED TRADES
+                 if deal_id_str not in self.notified_closed_deals:
+                     self.notified_closed_deals.add(deal_id_str)
+                     curr_balance = await self.get_balance()
+                     if real_pnl > 0:
+                         alert = (
+                             f"🎯 *[TAKE PROFIT REACHED / TRADE WON]*\n"
+                             f"• Asset: {sym_name}\n"
+                             f"• Strategy: {strategy}\n"
+                             f"• Profit Banked: +${real_pnl:.2f}\n"
+                             f"• Account Balance: ${curr_balance:.2f}\n"
+                             f"• Status: 100% Target Hit."
+                         )
+                     elif real_pnl < 0:
+                         alert = (
+                             f"🔴 *[STOP LOSS EXITED / TRADE CLOSED]*\n"
+                             f"• Asset: {sym_name}\n"
+                             f"• Strategy: {strategy}\n"
+                             f"• Realized Loss: -${abs(real_pnl):.2f}\n"
+                             f"• Account Balance: ${curr_balance:.2f}\n"
+                             f"• Stop Loss respected. Capital preserved."
+                         )
+                     else:
+                         alert = (
+                             f"⚪ *[EXIT AT BREAK-EVEN]*\n"
+                             f"• Asset: {sym_name}\n"
+                             f"• Strategy: {strategy}\n"
+                             f"• Result: $0.00 (Risk-Free Exit)"
+                         )
+                     await whatsapp.send_alert(alert)
+
+         return synced_trades
+     except Exception as e:
+         log.warning(f"Error syncing deals from cTrader: {e}")
+         return []
     
     def fetch_real_account_id_from_http(self) -> Optional[int]:
         """Queries Spotware API directly to map login number (e.g. 41425) to ctidTraderAccountId."""
@@ -1208,7 +1267,7 @@ class CloudExecutionEngine:
             for res, target in [(res_a, tp1_price), (res_b, tp2_price)]:
                 if res and res.get("position_id"):
                     pid = str(res["position_id"])
-                    self.risk.open_positions[pid] = {
+                    self.ctrader._save_position_strategy(pid, strategy_name) = {
                         "symbol": bp['symbol'],
                         "direction": bp['direction'],
                         "entry_price": bp['entry_price'],
