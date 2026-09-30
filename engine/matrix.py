@@ -40,6 +40,7 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from risk.risk_manager import RiskManager
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -58,6 +59,7 @@ except ImportError:
 
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
+from risk.risk_manager import RiskManager
 
 CONFIG_FILE = os.path.join(PROJECT_ROOT, "bot_config.json")
 TELEMETRY_FILE = os.path.join(PROJECT_ROOT, "bot_telemetry.json")
@@ -466,9 +468,10 @@ class CTraderClient:
                     }
                     save_trade_record(record)
                     synced_trades.append(record)
-
                     if deal_id_str not in self.notified_closed_deals:
                         self.notified_closed_deals.add(deal_id_str)
+                        if hasattr(self, 'risk_engine') and self.risk_engine:
+                            self.risk_engine.persistent_risk.record_trade_outcome(real_pnl)
                         curr_balance, _ = await self.get_balance_and_equity()
                         curr_sym = "$" if self.account_currency == "USD" else (self.account_currency + " ")
                         if real_pnl > 0:
@@ -901,23 +904,23 @@ class OrderFlowAnalyzer:
 # 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & STOP BOUNDARIES)
 # ==============================================================================
 
-class InstitutionalRiskEngine:
+   class InstitutionalRiskEngine:
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config_file = config_file
+        # Instantiate persistent risk manager (reads/writes risk_state.json)
+        self.persistent_risk = RiskManager(
+            config_file=config_file, 
+            state_file=os.path.join(PROJECT_ROOT, "risk_state.json")
+        )
+        
         self.master_execution: bool = True
         self.dry_run: bool = False
-        self.risk_per_trade_pct: float = GLOBAL_PARAMS.base_risk_per_trade_pct
         self.risk_to_reward: float = 2.0
-        self.max_daily_trades: int = GLOBAL_PARAMS.max_daily_trades
-        self.max_daily_loss_usd: float = 2500.0
-
         self.daily_goal_target: float = 0.0
         self.weekly_deposit_baseline: float = 10.0
         self.weekly_goal_target: float = 20.0
-        self.trades_taken_today: int = 0
-        self.consecutive_losses: int = 0
-        self.open_positions: Dict[str, dict] = {}
         
+        self.open_positions: Dict[str, dict] = {}
         self.last_signal_event: Dict[str, str] = {}
 
         self.max_spread_to_sl_ratio: float = 0.30
@@ -940,6 +943,23 @@ class InstitutionalRiskEngine:
             "GBPUSD": "FOREX_MAJORS",
             "USDJPY": "FOREX_MAJORS"
         }
+
+    @property
+    def trades_taken_today(self) -> int:
+        return self.persistent_risk.trades_taken_today
+
+    @trades_taken_today.setter
+    def trades_taken_today(self, val: int):
+        self.persistent_risk.trades_taken_today = val
+        self.persistent_risk.save_persistent_state()
+
+    @property
+    def consecutive_losses(self) -> int:
+        return self.persistent_risk.consecutive_losses
+
+    @property
+    def max_daily_trades(self) -> int:
+        return self.persistent_risk.max_daily_trades
 
     def sync_ui_config(self) -> None:
         cfg = read_ui_config()
@@ -1429,6 +1449,7 @@ class MatrixEngineMaster:
         self.ctrader = CTraderClient()
         self.strategy_mgr = StrategyManager()
         self.risk_mgr = InstitutionalRiskEngine()
+        self.ctrader.risk_engine = self.risk_mgr
         self.execution_engine: Optional[CloudExecutionEngine] = None
         self.volume_profiles: Dict[str, VolumeProfileNode] = {}
         self.frozen_opening_ranges: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -1561,21 +1582,22 @@ class MatrixEngineMaster:
                 log.error(f"Error in EOD Flusher: {e}")
                 await asyncio.sleep(30.0)
 
-    def _compute_frozen_opening_range(self, symbol: str, m5_df: pd.DataFrame) -> Tuple[float, float, bool]:
+    def _compute_frozen_opening_range(self, symbol: str, m5_df: pd.DataFrame) -> Tuple[float, float, bool, float, float, bool]:
         now = datetime.now(timezone.utc)
         today_str = now.strftime("%Y-%m-%d")
         cache_key = (symbol, today_str)
 
         if cache_key in self.frozen_opening_ranges:
             entry = self.frozen_opening_ranges[cache_key]
-            return entry['high'], entry['low'], True
+            return entry['high'], entry['low'], True, entry.get('cracker_high', entry['high']), entry.get('cracker_low', entry['low']), True
 
         times = MarketSessionManager.get_current_times(now)
         in_london = MarketSessionManager.is_in_london_open(now)
         in_ny = MarketSessionManager.is_in_ny_open(now)
 
         if not (in_london or in_ny):
-            return float(m5_df['high'].tail(12).max()), float(m5_df['low'].tail(12).min()), True
+            h, l = float(m5_df['high'].tail(12).max()), float(m5_df['low'].tail(12).min())
+            return h, l, True, h, l, True
 
         m5_df_time = pd.to_datetime(m5_df['time'])
         if in_london:
@@ -1587,16 +1609,25 @@ class MatrixEngineMaster:
 
         session_candles = m5_df[m5_df_time >= t_open_utc]
 
+        cracker_h = float(session_candles.head(1)['high'].max()) if len(session_candles) >= 1 else 0.0
+        cracker_l = float(session_candles.head(1)['low'].min()) if len(session_candles) >= 1 else 0.0
+        cracker_established = len(session_candles) >= 1
+
         if len(session_candles) < 3:
-            return 0.0, 0.0, False
+            return 0.0, 0.0, False, cracker_h, cracker_l, cracker_established
 
         first_3_candles = session_candles.head(3)
         orb_h = float(first_3_candles['high'].max())
         orb_l = float(first_3_candles['low'].min())
 
-        self.frozen_opening_ranges[cache_key] = {'high': orb_h, 'low': orb_l}
-        log.info(f"FROZEN 15M OPENING RANGE ESTABLISHED for {symbol}: High = {orb_h:.5f}, Low = {orb_l:.5f}")
-        return orb_h, orb_l, True
+        self.frozen_opening_ranges[cache_key] = {
+            'high': orb_h, 
+            'low': orb_l,
+            'cracker_high': cracker_h,
+            'cracker_low': cracker_l
+        }
+        log.info(f"FROZEN 15M OPENING RANGE for {symbol}: High = {orb_h:.5f}, Low = {orb_l:.5f} | 5M Cracker: High = {cracker_h:.5f}, Low = {cracker_l:.5f}")
+        return orb_h, orb_l, True, cracker_h, cracker_l, True
 
     async def _market_scan_loop(self) -> None:
         while True:
@@ -1668,7 +1699,8 @@ class MatrixEngineMaster:
                         asia_low = float(m5_df['low'].tail(36).min())
 
                     # True Frozen Opening Range
-                    orb_h, orb_l, orb_established = self._compute_frozen_opening_range(friendly_name, m5_df)
+                    # True Frozen Opening Range
+                    orb_h, orb_l, orb_established, cracker_h, cracker_l, cracker_established = self._compute_frozen_opening_range(friendly_name, m5_df)
 
                     session_levels = {
                         "asia_high": asia_high,
@@ -1682,6 +1714,9 @@ class MatrixEngineMaster:
                         "orb_high": orb_h,
                         "orb_low": orb_l,
                         "orb_established": orb_established,
+                        "cracker_orb_high": cracker_h,
+                        "cracker_orb_low": cracker_l,
+                        "cracker_orb_established": cracker_established,
                         "is_ranging": candle_stats["is_ranging"],
                         "range_span": candle_stats["range_span"],
                         "poc": vp.poc_price,

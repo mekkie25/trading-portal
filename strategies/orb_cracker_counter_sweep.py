@@ -31,10 +31,10 @@ class ORBCracker:
             diagnostics["reason"] = "Outside NYSE Open Cracker window (15:30 - 16:30 SAST)"
             return None
 
-        orb_h = session_levels.get('orb_high')
-        orb_l = session_levels.get('orb_low')
+        orb_h = session_levels.get('cracker_orb_high', session_levels.get('orb_high'))
+        orb_l = session_levels.get('cracker_orb_low', session_levels.get('orb_low'))
         if not orb_h or not orb_l:
-            diagnostics["reason"] = "Opening range levels not established"
+            diagnostics["reason"] = "Cracker opening range levels not established"
             return None
 
         curr_bar = data_5m.iloc[-1]

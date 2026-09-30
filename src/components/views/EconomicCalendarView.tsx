@@ -177,7 +177,7 @@ export const EconomicCalendarView: React.FC<EconomicCalendarViewProps> = ({ them
               {/* Timing Badge specifically in South African Standard Time */}
               <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-between text-xs">
                 <span className="flex items-center gap-1.5 font-bold text-blue-600 dark:text-blue-400 font-mono">
-                  <Clock className="w-4 h-4" /> 20:00 SAST (8:00 PM South African Time)
+                  <Clock className="w-4 h-4" /> {activeRelease.time || '20:00 SAST'} (South African Time)
                 </span>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-rose-500 text-white font-mono font-bold">
                   HIGH IMPACT
