@@ -11,10 +11,7 @@ import {
 import { 
   Maximize2, 
   Minimize2, 
-  RefreshCw,
-  Layers,
-  Activity,
-  Target
+  RefreshCw
 } from 'lucide-react';
 import { ThemeMode, TradeRecord } from '../../types';
 
@@ -28,18 +25,17 @@ interface LiveFeedViewProps {
 interface AssetOption {
   symbol: string;
   name: string;
-  derivSymbol: string;
   decimals: number;
 }
 
 const ASSET_LIST: AssetOption[] = [
-  { symbol: 'US30', name: 'Wall Street 30 (Dow Jones)', derivSymbol: 'OTC_DJI', decimals: 1 },
-  { symbol: 'GOLD', name: 'Gold Spot / U.S. Dollar', derivSymbol: 'frxXAUUSD', decimals: 2 },
-  { symbol: 'NAS100', name: 'US Tech 100 (NASDAQ)', derivSymbol: 'OTC_NDX', decimals: 1 },
-  { symbol: 'GERMAN30', name: 'Germany 40 (DAX40)', derivSymbol: 'OTC_GDAXI', decimals: 1 },
-  { symbol: 'EURUSD', name: 'Euro / U.S. Dollar', derivSymbol: 'frxEURUSD', decimals: 5 },
-  { symbol: 'USDJPY', name: 'U.S. Dollar / Japanese Yen', derivSymbol: 'frxUSDJPY', decimals: 3 },
-  { symbol: 'GBPUSD', name: 'British Pound / U.S. Dollar', derivSymbol: 'frxGBPUSD', decimals: 5 },
+  { symbol: 'US30', name: 'Wall Street 30 (Dow Jones)', decimals: 1 },
+  { symbol: 'GOLD', name: 'Gold Spot / U.S. Dollar', decimals: 2 },
+  { symbol: 'NAS100', name: 'US Tech 100 (NASDAQ)', decimals: 1 },
+  { symbol: 'GERMAN30', name: 'Germany 40 (DAX40)', decimals: 1 },
+  { symbol: 'EURUSD', name: 'Euro / U.S. Dollar', decimals: 5 },
+  { symbol: 'USDJPY', name: 'U.S. Dollar / Japanese Yen', decimals: 3 },
+  { symbol: 'GBPUSD', name: 'British Pound / U.S. Dollar', decimals: 5 },
 ];
 
 function calculateEMASeries(candles: { time: UTCTimestamp; close: number }[], period: number) {
@@ -66,13 +62,12 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
   themeMode = 'dark',
   activeTrades = []
 }) => {
-  const [selectedAsset, setSelectedAsset] = useState<AssetOption>(ASSET_LIST[0]); // US30 default
-  const [selectedInterval, setSelectedInterval] = useState<string>('5'); // 5M default
+  const [selectedAsset, setSelectedAsset] = useState<AssetOption>(ASSET_LIST[0]);
+  const [selectedInterval, setSelectedInterval] = useState<string>('5');
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [lastPrice, setLastPrice] = useState<number>(0);
 
-  // Indicators toggle
   const [showEma20, setShowEma20] = useState(true);
   const [showEma50, setShowEma50] = useState(true);
   const [showEma200, setShowEma200] = useState(true);
@@ -84,7 +79,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
   const chartApiRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
 
-  // Fullscreen Handler
   const toggleFullscreen = () => {
     if (!chartWrapperRef.current) return;
     if (!document.fullscreenElement) {
@@ -100,7 +94,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
     return () => document.removeEventListener('fullscreenchange', handleFsChange);
   }, []);
 
-  // Fetch real Deriv historical candles and initialize chart
   useEffect(() => {
     if (!chartContainerRef.current) return;
     const container = chartContainerRef.current;
@@ -108,7 +101,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
 
     const isLight = themeMode !== 'dark';
 
-    // 1. Initialize Lightweight Chart Engine
     const chart = createChart(container, {
       width: container.clientWidth,
       height: container.clientHeight || 560,
@@ -120,12 +112,8 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
         vertLines: { color: isLight ? '#f1f5f9' : '#141a26' },
         horzLines: { color: isLight ? '#f1f5f9' : '#141a26' },
       },
-      crosshair: {
-        mode: 1, // Magnet crosshair
-      },
-      rightPriceScale: {
-        borderColor: isLight ? '#cbd5e1' : '#212838',
-      },
+      crosshair: { mode: 1 },
+      rightPriceScale: { borderColor: isLight ? '#cbd5e1' : '#212838' },
       timeScale: {
         borderColor: isLight ? '#cbd5e1' : '#212838',
         timeVisible: true,
@@ -135,7 +123,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
 
     chartApiRef.current = chart;
 
-    // 2. Add Candlestick Series
     const candleSeries = chart.addCandlestickSeries({
       upColor: '#10b981',
       downColor: '#ef4444',
@@ -151,37 +138,22 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
     });
     candleSeriesRef.current = candleSeries;
 
-    // 3. Add Volume Histogram
     const volumeSeries = chart.addHistogramSeries({
       priceFormat: { type: 'volume' },
-      priceScaleId: '', // Overlay pane
+      priceScaleId: '',
     });
     volumeSeries.priceScale().applyOptions({
-      scaleMargins: {
-        top: 0.82,
-        bottom: 0,
-      },
+      scaleMargins: { top: 0.82, bottom: 0 },
     });
 
-    // 4. Indicator Line Series
     const ema20Series = chart.addLineSeries({ color: '#06b6d4', lineWidth: 1.5, title: 'EMA 20' });
     const ema50Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, title: 'EMA 50' });
     const ema200Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 2, title: 'EMA 200' });
 
-    // 5. Fetch REAL Candles from Deriv API Endpoint
-    const loadRealDerivData = async () => {
+    const loadRealData = async () => {
       setIsLoading(true);
       try {
-        let granularity = 300;
-        if (selectedInterval === '1') granularity = 60;
-        else if (selectedInterval === '5') granularity = 300;
-        else if (selectedInterval === '15') granularity = 900;
-        else if (selectedInterval === '30') granularity = 1800;
-        else if (selectedInterval === '60') granularity = 3600;
-        else if (selectedInterval === '240') granularity = 14400;
-        else if (selectedInterval === 'D') granularity = 86400;
-
-        const res = await fetch(`/api/market/candles?symbol=${encodeURIComponent(selectedAsset.derivSymbol)}&granularity=${granularity}&count=150`);
+        const res = await fetch(`/api/market/candles?symbol=${encodeURIComponent(selectedAsset.symbol)}`);
         if (!res.ok) return;
 
         const json = await res.json();
@@ -189,13 +161,12 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
 
         if (rawCandles.length === 0) return;
 
-        // Deduplicate and sort strictly ascending by epoch timestamp
         const seen = new Set<number>();
         const formattedCandles: any[] = [];
         const formattedVolume: any[] = [];
 
         rawCandles.forEach((c: any) => {
-          const t = Number(c.epoch || Math.floor(new Date(c.time).getTime() / 1000));
+          const t = Number(c.time);
           if (!seen.has(t) && !isNaN(t)) {
             seen.add(t);
             formattedCandles.push({
@@ -207,7 +178,7 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
             });
             formattedVolume.push({
               time: t as UTCTimestamp,
-              value: Number(c.tick_volume || c.volume || 100),
+              value: Number(c.volume || 100),
               color: Number(c.close) >= Number(c.open) ? 'rgba(16, 185, 129, 0.35)' : 'rgba(239, 68, 68, 0.35)',
             });
           }
@@ -216,7 +187,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
         formattedCandles.sort((a, b) => (a.time as number) - (b.time as number));
         formattedVolume.sort((a, b) => (a.time as number) - (b.time as number));
 
-        // Load into chart
         candleSeries.setData(formattedCandles);
         if (showVolume) volumeSeries.setData(formattedVolume);
 
@@ -224,12 +194,10 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
           setLastPrice(formattedCandles[formattedCandles.length - 1].close);
         }
 
-        // Compute EMAs from real data
         if (showEma20) ema20Series.setData(calculateEMASeries(formattedCandles, 20));
         if (showEma50) ema50Series.setData(calculateEMASeries(formattedCandles, 50));
         if (showEma200) ema200Series.setData(calculateEMASeries(formattedCandles, 200));
 
-        // 6. Draw Asia Session Range Levels (01:00 - 06:00 SAST)
         if (showAsiaLevels && formattedCandles.length > 20) {
           const recent = formattedCandles.slice(-40);
           const maxHigh = Math.max(...recent.map(c => c.high));
@@ -264,7 +232,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
           });
         }
 
-        // 7. Paint Live Trade Markers (Green BUY and Red SELL Arrows)
         if (activeTrades.length > 0) {
           const markers: any[] = [];
           activeTrades.forEach(tr => {
@@ -285,18 +252,15 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
           }
         }
       } catch (err) {
-        console.warn('Deriv candle feed poll error:', err);
+        console.warn('Candle feed poll error:', err);
       } finally {
         setIsLoading(false);
       }
     };
 
-    loadRealDerivData();
+    loadRealData();
+    const intervalId = window.setInterval(loadRealData, 4000);
 
-    // Poll live Deriv candle updates every 5 seconds
-    const intervalId = window.setInterval(loadRealDerivData, 5000);
-
-    // Responsive Resizer
     const handleResize = () => {
       if (chart && container) {
         chart.applyOptions({
@@ -317,7 +281,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
 
   return (
     <div className={`h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto ${isFullscreen ? '!p-0 !m-0 !max-w-none' : ''}`}>
-      {/* Header */}
       {!isFullscreen && (
         <motion.div 
           initial={{ opacity: 0, y: 15 }}
@@ -328,11 +291,11 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
             <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
               Live Charting Terminal
               <span className="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 font-medium font-mono">
-                TradingView Lightweight Engine
+                Fusion Markets cTrader Feed
               </span>
             </h1>
             <p className="text-sm text-black dark:text-slate-400 mt-1">
-              Powered by real Deriv market feeds. Clean vector candles, Asia session levels, and bot execution markers.
+              Synchronized directly with your live engine. Clean vector candles, Asia session boundaries, and trade execution markers.
             </p>
           </div>
 
@@ -349,7 +312,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
         </motion.div>
       )}
 
-      {/* Asset Switcher */}
       {!isFullscreen && (
         <div className="flex items-center gap-3 overflow-x-auto pb-1">
           {ASSET_LIST.map((asset) => {
@@ -374,14 +336,12 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
         </div>
       )}
 
-      {/* Main Lightweight Charts Frame */}
       <div 
         ref={chartWrapperRef} 
         className={`rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden flex flex-col relative ${
           isFullscreen ? 'w-screen h-screen !rounded-none !border-none' : 'min-h-[640px]'
         }`}
       >
-        {/* Top Controls Toolbar */}
         <div className="px-4 py-2.5 bg-white dark:bg-[#0b101a] border-b border-slate-200 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs shrink-0 select-none">
           <div className="flex items-center gap-3 flex-wrap">
             <span className="font-bold text-black dark:text-white font-mono text-sm">
@@ -396,9 +356,8 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
               <RefreshCw className="w-3.5 h-3.5 text-blue-500 animate-spin" />
             )}
 
-            {/* Timeframe Selector */}
             <div className="flex items-center bg-slate-100 dark:bg-[#08090d] p-0.5 rounded-lg border border-slate-300 dark:border-[#1a2030]">
-              {['1', '5', '15', '30', '60', '240', 'D'].map((tf) => (
+              {['1', '5', '15', '60', '240', 'D'].map((tf) => (
                 <button
                   key={tf}
                   onClick={() => setSelectedInterval(tf)}
@@ -412,7 +371,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
             </div>
           </div>
 
-          {/* Indicator Toggles */}
           <div className="flex items-center gap-1.5 flex-wrap text-[10px] font-mono">
             <button
               onClick={() => setShowAsiaLevels(!showAsiaLevels)}
@@ -455,7 +413,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
               VOL
             </button>
 
-            {/* Fullscreen Button */}
             <button
               onClick={toggleFullscreen}
               className="p-1 rounded-lg text-slate-500 hover:text-black dark:hover:text-white cursor-pointer ml-1"
@@ -466,7 +423,6 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
           </div>
         </div>
 
-        {/* The Native Lightweight Charts DOM Container */}
         <div 
           ref={chartContainerRef} 
           className="flex-1 w-full h-full min-h-[580px] bg-white dark:bg-[#07090e]"
