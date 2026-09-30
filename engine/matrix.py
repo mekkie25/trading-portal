@@ -1169,7 +1169,7 @@ class InstitutionalRiskEngine:
         if is_blackout:
             return False, f"Macro News Blackout: {blackout_reason}", {}
 
-        can_trade_day, day_reason = MarketSessionManager.get_day_of_week_policy()
+        can_trade_day, _, day_reason = MarketSessionManager.get_day_of_week_policy()
         if not can_trade_day:
             return False, f"Day-of-Week Policy: {day_reason}", {}
 
