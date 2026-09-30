@@ -1,7 +1,7 @@
 """
 strategies/strategy_manager.py
-Orchestrates the 8 quantitative strategies across the 7 whitelisted assets,
-respecting the 3-Way Mode Switch (LIVE | DRY_RUN | OFF).
+Orchestrates institutional quantitative strategies across the 7 whitelisted assets,
+passing multi-timeframe market feeds (M5, H4, D1) and enforcing the 3-Way Mode Switch.
 """
 import os
 import json
@@ -63,29 +63,32 @@ class StrategyManager:
         except Exception:
             return {}
 
-    def evaluate_all(self, symbol: str, data_5m, session_levels: dict) -> StrategySignal | None:
+    def evaluate_all(self, symbol: str, data_5m, data_h4, data_d1, session_levels: dict) -> StrategySignal | None:
         if symbol not in self.ALLOWED_ASSETS:
             return None
 
         strategy_modes = self._get_strategy_modes()
 
         for strat in self.strategies:
-            strat_name = strat.__class__.__name__
             try:
-                signal: StrategySignal | None = strat.evaluate(symbol, data_5m, session_levels)
+                # Check if strategy accepts multi-timeframe arguments
+                import inspect
+                sig = inspect.signature(strat.evaluate)
+                if len(sig.parameters) >= 5:
+                    signal = strat.evaluate(symbol, data_5m, data_h4, data_d1, session_levels)
+                else:
+                    signal = strat.evaluate(symbol, data_5m, session_levels)
+
                 if signal:
-                    # 1. Enforce strict asset boundary
                     permitted = self.STRATEGY_PERMITTED_ASSETS.get(signal.strategy, set())
                     if signal.symbol not in permitted:
                         continue
 
-                    # 2. Enforce 3-Way Mode Switch (LIVE | DRY_RUN | OFF)
                     mode = strategy_modes.get(signal.strategy, "LIVE")
                     if mode == "OFF":
-                        continue  # Strategy disabled by user in UI
+                        continue
                     
                     if mode == "DRY_RUN":
-                        # Mark signal for paper trading execution
                         setattr(signal, "is_dry_run", True)
                     else:
                         setattr(signal, "is_dry_run", False)
