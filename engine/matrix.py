@@ -4,21 +4,14 @@
 NEXUS MATRIX QUANTITATIVE ENGINE (CTRADER OPEN API / FUSION MARKETS)
 ================================================================================
 Architecture: Master-Grade Institutional Multi-Strategy Execution Engine
-Components:   - Native Account Currency Detection (USD, ZAR, EUR, GBP)
-              - Mathematically Exact Pip/Tick Dollar Value Parity Across All Pairs
-              - Broker Live Position Reconciliation (ProtoOAReconcile 2124)
-              - Runtime Asset Stop-Size Boundary Enforcement (Spec Section 5)
-              - True Frozen 15M Opening Range (London & NY Session Opens)
-              - Dynamic ORB Established Gatekeeper (No Blind Pre-ORB Trades)
-              - Zero-Amnesia Memory: Syncs Active Positions Directly From Broker
-              - Asset Independence: Independent Execution Across Whitelist Pairs
-              - Event-Driven Trigger Locks: Only Enters On Fresh Signal Candles
-              - Authentic Strategy Name Preservation in cTrader Comments
-              - Twin-Position 50/50 Smart Link (TP1 Moves Runner to BE via 2110)
-              - Multi-Timeframe Volatility Analytics (M5, H1, H4, D1)
-              - 21:00 SAST EOD Position Flusher (Zero Overnight Risk)
-              - High-Impact Macro News Armor & Spread Defense
-              - Personal WhatsApp Alerts Engine (CallMeBot)
+Components:   - Dynamic Multi-Currency Support (USD, ZAR, EUR) via core/fx.py
+              - Adaptive Volatility Engine Integration (ADR, AWR, AMR)
+              - 150 D1 Bar Volatility Context & Sunday-Night ISO Weekly Open
+              - Real Mark-to-Market Floating Equity Calculation
+              - Live Broker Position Reconciliation (ProtoOAReconcile 2124)
+              - Dynamic Breakeven Supervisor (80% R:R + 0.5x SL Distance)
+              - SuperTrend 5M Trailing Stop & Twin 50/50 Smart-Link Exits
+              - Institutional Drawdown Throttling & Auto Re-arming
 ================================================================================
 """
 
@@ -37,7 +30,7 @@ import urllib.error
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta, time as dtime
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any, Union, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -48,8 +41,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import core.session_config
-from core.session_config import MarketSessionManager, GLOBAL_PARAMS
+from core.session_config import MarketSessionManager, GLOBAL_PARAMS, TZ_SAST
 from core.indicators import calculate_supertrend
+from core.fx import get_fx_rate_to_account, FX_CONVERSION_ALIASES
+from core.volatility_engine import volatility_engine
 
 try:
     import google.generativeai as genai
@@ -257,6 +252,7 @@ class ConfigManager:
     WS_PORT = 5036
     WS_URL = f"wss://{WS_HOST}:{WS_PORT}"
 
+    # 7 Whitelist Execution Symbols
     SYMBOL_ALIASES: Dict[str, List[str]] = {
         "GOLD": ["XAUUSD", "GOLD", "XAUUSD.spot"],
         "US30": ["US30", "DJ30", "US30.cash", "WS30"],
@@ -298,15 +294,18 @@ class CTraderClient:
         self.last_known_balance: float = 1000.0
         self.last_known_equity: float = 1000.0
         self.money_digits: int = 2
-        self.account_currency: str = "USD"
+        self.account_currency: Optional[str] = None
 
         self.symbol_map: Dict[str, int] = {}
         self.symbol_details: Dict[int, dict] = {}
         self.live_quotes: Dict[int, Tuple[float, float]] = {}
+        self.quote_timestamps: Dict[int, float] = {}
+        self.asset_map: Dict[int, str] = {}
 
         self._pending_requests: Dict[str, asyncio.Future] = {}
         self._msg_counter: int = 0
         self._listen_task: Optional[asyncio.Task] = None
+        self.risk_engine: Optional[Any] = None
 
     def _load_position_strategies(self):
         strat_file = os.path.join(PROJECT_ROOT, "engine", "position_strategies.json")
@@ -344,6 +343,29 @@ class CTraderClient:
 
         log.warning("Connection lost to cTrader. Engaging Auto-Reconnect Shield...")
         return await self.connect()
+
+    async def ensure_account_currency(self) -> Optional[str]:
+        """Retries asset-list and trader queries every scan loop if account_currency is unresolved."""
+        if self.account_currency:
+            return self.account_currency
+        try:
+            if not self.asset_map:
+                asset_res = await self._send_and_wait(2112, {"ctidTraderAccountId": self.account_id}, timeout=4.0)
+                if asset_res and "asset" in asset_res.get("payload", {}):
+                    for a in asset_res["payload"]["asset"]:
+                        self.asset_map[int(a["assetId"])] = str(a["name"]).upper()
+
+            trader_res = await self._send_and_wait(2121, {"ctidTraderAccountId": self.account_id}, timeout=4.0)
+            if trader_res and "trader" in trader_res.get("payload", {}):
+                raw_asset_id = trader_res["payload"]["trader"].get("depositAssetId")
+                if str(raw_asset_id).isdigit() and int(raw_asset_id) in self.asset_map:
+                    self.account_currency = self.asset_map[int(raw_asset_id)]
+                    log.info(f"Account currency resolved on retry: {self.account_currency}")
+                else:
+                    self.account_currency = None
+        except Exception as e:
+            log.warning(f"Account currency resolution retry failed: {e}")
+        return self.account_currency
 
     async def reconcile_open_positions(self) -> List[dict]:
         """Queries cTrader directly (ProtoOAReconcileReq 2124) to track active trades."""
@@ -396,6 +418,7 @@ class CTraderClient:
                     "take_profit": tp,
                     "volume_cents": vol,
                     "lots": lots,
+                    "contract_size": contract_size,
                     "is_be_moved": bool(sl == entry and entry > 0)
                 })
 
@@ -472,7 +495,8 @@ class CTraderClient:
                         if hasattr(self, 'risk_engine') and self.risk_engine:
                             self.risk_engine.persistent_risk.record_trade_outcome(real_pnl)
                         curr_balance, _ = await self.get_balance_and_equity()
-                        curr_sym = "$" if self.account_currency == "USD" else (self.account_currency + " ")
+                        acc_str = self.account_currency or "USD"
+                        curr_sym = "$" if acc_str == "USD" else f"{acc_str} "
                         if real_pnl > 0:
                             alert = (
                                 f"🎯 *[TAKE PROFIT REACHED / TRADE WON]*\n"
@@ -574,6 +598,12 @@ class CTraderClient:
 
             self.is_authorized = True
 
+            # 1. Fetch broker asset list to map depositAssetId to currency strings
+            asset_res = await self._send_and_wait(2112, {"ctidTraderAccountId": self.account_id}, timeout=6.0)
+            if asset_res and "asset" in asset_res.get("payload", {}):
+                for a in asset_res["payload"]["asset"]:
+                    self.asset_map[int(a["assetId"])] = str(a["name"]).upper()
+
             trader_res = await self._send_and_wait(2121, {
                 "ctidTraderAccountId": self.account_id
             })
@@ -583,10 +613,15 @@ class CTraderClient:
                 raw_bal = float(t_info.get("balance", 0))
                 self.last_known_balance = raw_bal / (10 ** self.money_digits)
                 self.last_known_equity = self.last_known_balance
-                self.account_currency = str(t_info.get("depositAssetId", "USD")).upper()
-                if self.account_currency in ("1", "USD"):
-                    self.account_currency = "USD"
-                log.info(f"--- CTRADER ONLINE --- Currency: {self.account_currency} | Balance: {self.last_known_balance:,.2f}")
+                raw_asset_id = t_info.get("depositAssetId")
+                log.info(f"Raw depositAssetId received from cTrader: {raw_asset_id}")
+
+                if str(raw_asset_id).isdigit() and int(raw_asset_id) in self.asset_map:
+                    self.account_currency = self.asset_map[int(raw_asset_id)]
+                    log.info(f"--- CTRADER ONLINE --- Currency: {self.account_currency} | Balance: {self.last_known_balance:,.2f}")
+                else:
+                    self.account_currency = None
+                    log.error(f"CRITICAL: depositAssetId {raw_asset_id} not in broker asset_map. Account currency unknown: blocking all trades.")
 
             await self._discover_symbols()
             await self.sync_deals_from_ctrader()
@@ -622,14 +657,27 @@ class CTraderClient:
                 target_ids.append(resolved_id)
                 log.info(f"Mapped Whitelist Asset: {friendly} -> Symbol ID {resolved_id} ({self.symbol_details[resolved_id]['name']})")
 
+        # Subscribe to conversion pairs only if required by account currency
+        if self.account_currency == "ZAR":
+            zar_id = self.resolve_symbol_id("USDZAR", use_fx_aliases=True)
+            if zar_id and zar_id not in target_ids:
+                target_ids.append(zar_id)
+                log.info(f"Subscribed Conversion Pair: USDZAR -> Symbol ID {zar_id}")
+        elif self.account_currency == "EUR":
+            eur_id = self.resolve_symbol_id("EURUSD", use_fx_aliases=True)
+            if eur_id and eur_id not in target_ids:
+                target_ids.append(eur_id)
+                log.info(f"Subscribed Conversion Pair: EURUSD -> Symbol ID {eur_id}")
+
         if target_ids:
             await self._send(2127, {
                 "ctidTraderAccountId": self.account_id,
                 "symbolId": target_ids
             })
 
-    def resolve_symbol_id(self, friendly_name: str) -> Optional[int]:
-        aliases = ConfigManager.SYMBOL_ALIASES.get(friendly_name.upper(), [friendly_name.upper()])
+    def resolve_symbol_id(self, friendly_name: str, use_fx_aliases: bool = False) -> Optional[int]:
+        source_dict = FX_CONVERSION_ALIASES if use_fx_aliases else ConfigManager.SYMBOL_ALIASES
+        aliases = source_dict.get(friendly_name.upper(), [friendly_name.upper()])
         for a in aliases:
             if a in self.symbol_map:
                 return self.symbol_map[a]
@@ -685,6 +733,7 @@ class CTraderClient:
                         new_bid = (bid / (10 ** digits)) if bid else prev[0]
                         new_ask = (ask / (10 ** digits)) if ask else prev[1]
                         self.live_quotes[sid] = (new_bid, new_ask)
+                        self.quote_timestamps[sid] = time.time()
 
                 if client_id and client_id in self._pending_requests:
                     self._pending_requests[client_id].set_result(msg)
@@ -694,6 +743,7 @@ class CTraderClient:
             self.is_authorized = False
 
     async def get_balance_and_equity(self) -> Tuple[float, float]:
+        """Returns verified balance and mark-to-market live equity including floating PnL."""
         if not self.is_authorized:
             return self.last_known_balance, self.last_known_equity
         try:
@@ -701,7 +751,9 @@ class CTraderClient:
             if res and "trader" in res.get("payload", {}):
                 raw_bal = float(res["payload"]["trader"].get("balance", 0))
                 self.last_known_balance = raw_bal / (10 ** self.money_digits)
-                self.last_known_equity = self.last_known_balance
+                
+                floating_sum = sum(p.get("floatingPnL", 0.0) for p in self.risk_engine.open_positions.values()) if hasattr(self, 'risk_engine') and self.risk_engine else 0.0
+                self.last_known_equity = round(self.last_known_balance + floating_sum, 2)
         except Exception:
             pass
         return self.last_known_balance, self.last_known_equity
@@ -907,10 +959,7 @@ class InstitutionalRiskEngine:
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config_file = config_file
         # Instantiate persistent risk manager (reads/writes risk_state.json)
-        self.persistent_risk = RiskManager(
-            config_file=config_file, 
-            state_file=os.path.join(PROJECT_ROOT, "risk_state.json")
-        )
+        self.persistent_risk = RiskManager(config_file=config_file)
         
         self.master_execution: bool = True
         self.dry_run: bool = False
@@ -923,7 +972,7 @@ class InstitutionalRiskEngine:
         self.open_positions: Dict[str, dict] = {}
         self.last_signal_event: Dict[str, str] = {}
 
-        self.max_spread_to_sl_ratio: float = 0.30
+        self.max_spread_to_sl_ratio: float = GLOBAL_PARAMS.max_spread_to_sl_ratio
         self.spread_ranges = {
             "GOLD": {"standard": 0.30, "max_allowed": 0.85},
             "US30": {"standard": 2.50, "max_allowed": 6.50},
@@ -972,6 +1021,8 @@ class InstitutionalRiskEngine:
             return
         self.master_execution = cfg.get("masterExecution", self.master_execution)
         self.dry_run = cfg.get("dryRun", self.dry_run)
+        GLOBAL_PARAMS.adaptive_mode = bool(cfg.get("adaptiveMode", GLOBAL_PARAMS.adaptive_mode))
+        GLOBAL_PARAMS.min_rr = float(cfg.get("minRr", GLOBAL_PARAMS.min_rr))
         self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", getattr(self, 'risk_per_trade_pct', GLOBAL_PARAMS.base_risk_per_trade_pct)))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
         if "maxDailyTrades" in cfg:
@@ -1001,7 +1052,7 @@ class InstitutionalRiskEngine:
         return True, ""
 
     def validate_asset_stop_size(self, symbol: str, sl_distance: float) -> Tuple[bool, str]:
-        """Strict runtime enforcement of Spec Section 5 stop boundaries."""
+        """Strict runtime enforcement of Spec Section 5 legacy stop boundaries."""
         if symbol == "NAS100":
             if not (GLOBAL_PARAMS.nas100_stop_range[0] <= sl_distance <= GLOBAL_PARAMS.nas100_stop_range[2]):
                 return False, f"NAS100 Stop ({sl_distance:.1f} pts) outside spec [35-60 pts]"
@@ -1019,12 +1070,16 @@ class InstitutionalRiskEngine:
         if total_target_distance <= 0:
             return False
 
+        sl_distance = abs(entry - sl)
         if direction.upper() == "BUY":
             current_progress = current_price - entry
         else:
             current_progress = entry - current_price
 
-        return (current_progress / total_target_distance) >= GLOBAL_PARAMS.breakeven_trigger_ratio
+        # Spec Q2 Rule: Requires 80% progress to target AND at least 0.5x stop distance
+        target_condition = (current_progress / total_target_distance) >= GLOBAL_PARAMS.breakeven_trigger_ratio
+        noise_buffer_condition = current_progress >= (0.50 * sl_distance)
+        return bool(target_condition and noise_buffer_condition)
 
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
@@ -1086,32 +1141,19 @@ class InstitutionalRiskEngine:
         sl_distance: float,
         symbol: str,
         current_price: float = 1.0,
-        account_currency: str = "USD",
-        ai_quality_factor: float = 1.0
+        account_currency: Optional[str] = "USD",
+        ai_quality_factor: float = 1.0,
+        fx_rate_to_account: Optional[float] = 1.0
     ) -> float:
+        if fx_rate_to_account is None or fx_rate_to_account <= 0:
+            log.error(f"Sizing Engine Rejected: Missing or invalid FX conversion rate to {account_currency}.")
+            return 0.0
+
         equity = current_equity if current_equity > 0 else 10.0
 
-        if GLOBAL_PARAMS.micro_account_mode:
-            if equity < 60.0:
-                base_risk_pct = GLOBAL_PARAMS.micro_account_risk_pct
-            elif 60.0 <= equity < 200.0:
-                base_risk_pct = 12.5
-            elif 200.0 <= equity < 1000.0:
-                base_risk_pct = 5.0
-            else:
-                base_risk_pct = 1.0
-        else:
-            base_risk_pct = GLOBAL_PARAMS.base_risk_per_trade_pct
-
-        if self.consecutive_losses >= GLOBAL_PARAMS.consecutive_loss_threshold:
-            active_risk_pct = GLOBAL_PARAMS.consecutive_loss_risk_pct
-        else:
-            active_risk_pct = base_risk_pct
-
+        # Delegate sizing % entirely through unified RiskManager
         _, dow_mult, _ = MarketSessionManager.get_day_of_week_policy()
-        active_risk_pct *= dow_mult
-
-        final_risk_pct = active_risk_pct * ai_quality_factor
+        final_risk_pct = self.persistent_risk.combined_risk_pct(current_equity=equity, dow_mult=dow_mult, ai_factor=ai_quality_factor)
         risk_cash = equity * (final_risk_pct / 100.0)
 
         cfg = ConfigManager.ASSETS.get(symbol)
@@ -1119,32 +1161,21 @@ class InstitutionalRiskEngine:
         contract_size = cfg.contract_size if cfg else 100000.0
         min_lots = cfg.min_lots if cfg else 0.01
         max_lots = cfg.max_lots if cfg else 50.0
+        lot_step = cfg.lot_step if cfg else 0.01
 
         pips_at_risk = (sl_distance / pip_size) if pip_size > 0 else 10.0
-
-        if symbol == "USDJPY":
-            rate = current_price if current_price > 50 else 145.0
-            pip_value_usd_per_lot = (pip_size * contract_size) / rate
-        elif symbol in ("EURUSD", "GBPUSD"):
-            pip_value_usd_per_lot = pip_size * contract_size
-        elif symbol == "GOLD":
-            pip_value_usd_per_lot = pip_size * contract_size
-        else:
-            pip_value_usd_per_lot = pip_size * contract_size
-
-        if account_currency == "ZAR":
-            pip_value_per_lot = pip_value_usd_per_lot * 18.0
-        else:
-            pip_value_per_lot = pip_value_usd_per_lot
-
+        pip_value_per_lot = (pip_size * contract_size) * fx_rate_to_account
         risk_per_lot = pips_at_risk * pip_value_per_lot
 
-        if risk_per_lot > 0:
-            calculated_lots = risk_cash / risk_per_lot
-        else:
-            calculated_lots = min_lots
+        # Min-lot risk ceiling check (cannot exceed 1.5x risk_cash)
+        min_lot_ok, min_lot_msg = self.persistent_risk.validate_min_lot_risk(min_lots, risk_per_lot, risk_cash)
+        if not min_lot_ok:
+            return 0.0
 
-        final_lots = round(max(min(calculated_lots, max_lots), min_lots), 2)
+        raw_lots = risk_cash / (risk_per_lot + 1e-9)
+        # Broker step quantisation (round before floor to eliminate precision errors)
+        stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
+        final_lots = round(max(min(stepped_lots, max_lots), min_lots), 4)
         return final_lots
 
     def validate_pre_trade(
@@ -1157,10 +1188,17 @@ class InstitutionalRiskEngine:
         current_bid: float,
         current_ask: float,
         current_equity: float,
-        account_currency: str = "USD",
-        ai_quality_factor: float = 1.0
+        current_balance: float = 0.0,
+        account_currency: Optional[str] = "USD",
+        ai_quality_factor: float = 1.0,
+        fx_rate_to_account: Optional[float] = 1.0
     ) -> Tuple[bool, str, dict]:
         self.sync_ui_config()
+
+        # Multi-period equity drawdown check
+        can_trade, dd_reason = self.persistent_risk.can_trade_today(current_equity, current_balance)
+        if not can_trade:
+            return False, dd_reason, {}
 
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
@@ -1187,10 +1225,11 @@ class InstitutionalRiskEngine:
         if sl_distance <= 0:
             return False, "Invalid Stop Loss distance", {}
 
-        # RUNTIME ASSET STOP-SIZE BOUNDARY ENFORCEMENT
-        stop_ok, stop_msg = self.validate_asset_stop_size(symbol, sl_distance)
-        if not stop_ok:
-            return False, f"Stop Range Rejection: {stop_msg}", {}
+        # Skip legacy fixed checks when Volatility Engine is active
+        if not GLOBAL_PARAMS.adaptive_mode:
+            stop_ok, stop_msg = self.validate_asset_stop_size(symbol, sl_distance)
+            if not stop_ok:
+                return False, f"Stop Range Rejection: {stop_msg}", {}
 
         final_tp = take_profit
         if final_tp is None or final_tp == 0:
@@ -1201,8 +1240,14 @@ class InstitutionalRiskEngine:
         if not spread_ok:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
 
+        # Single spread accounting: adjusted SL reflects broker offset; no duplicate spread addition
         adjusted_sl = (stop_loss - spread_pts) if direction.upper() == "BUY" else (stop_loss + spread_pts)
-        lots = self.calculate_smart_lot_size(current_equity, sl_distance, symbol, entry_price, account_currency, ai_quality_factor)
+        effective_sl_dist = abs(entry_price - adjusted_sl)
+        lots = self.calculate_smart_lot_size(
+            current_equity, effective_sl_dist, symbol, entry_price, account_currency, ai_quality_factor, fx_rate_to_account
+        )
+        if lots <= 0.0:
+            return False, "Sizing Engine Rejected: Risk exceeds capital allowance.", {}
 
         blueprint = {
             "symbol": symbol,
@@ -1293,7 +1338,7 @@ class CloudExecutionEngine:
         self.risk = risk_mgr
         self.ai_overseer = AIOverseer()
 
-    async def process_signal(self, signal: Any, current_balance: float, candle_stats: dict) -> bool:
+    async def process_signal(self, signal: Any, current_balance: float, current_equity: float, candle_stats: dict) -> bool:
         symbol = getattr(signal, 'symbol')
         direction = getattr(signal, 'direction')
         entry = getattr(signal, 'entry_price')
@@ -1306,6 +1351,20 @@ class CloudExecutionEngine:
             strategy_name = strategy_name.value
 
         quote, bid, ask = await self.ctrader.get_live_quote(symbol)
+
+        def quote_lookup(pair: str) -> Optional[Tuple[float, float, float]]:
+            sid = self.ctrader.resolve_symbol_id(pair, use_fx_aliases=True)
+            if not sid or sid not in self.ctrader.live_quotes:
+                return None
+            b, a = self.ctrader.live_quotes[sid]
+            age = time.time() - self.ctrader.quote_timestamps.get(sid, 0.0)
+            return (b, a, age)
+
+        # Pure FX conversion
+        fx_rate = get_fx_rate_to_account(symbol, self.ctrader.account_currency, quote_lookup)
+        if fx_rate is None:
+            log.error(f"ORDER BLOCKED: Failed FX quote conversion for {symbol} to {self.ctrader.account_currency}.")
+            return False
 
         history = read_trade_history()
         trades_left = max(1, self.risk.max_daily_trades - self.risk.trades_taken_today)
@@ -1325,9 +1384,11 @@ class CloudExecutionEngine:
             take_profit=tp,
             current_bid=bid,
             current_ask=ask,
-            current_equity=current_balance,
+            current_equity=current_equity,
+            current_balance=current_balance,
             account_currency=self.ctrader.account_currency,
-            ai_quality_factor=quality_mult
+            ai_quality_factor=quality_mult,
+            fx_rate_to_account=fx_rate
         )
 
         if not is_ok:
@@ -1368,6 +1429,7 @@ class CloudExecutionEngine:
 
             pid_a = str(res_a["position_id"]) if res_a else None
             pid_b = str(res_b["position_id"]) if res_b else None
+            contract_size = ConfigManager.ASSETS[bp['symbol']].contract_size if bp['symbol'] in ConfigManager.ASSETS else 100000.0
 
             if pid_a:
                 self.ctrader._save_position_strategy(pid_a, strategy_name)
@@ -1380,6 +1442,7 @@ class CloudExecutionEngine:
                     "take_profit": tp1_price,
                     "volume_cents": res_a["volume"],
                     "lots": res_a["lots"],
+                    "contract_size": contract_size,
                     "is_be_moved": False,
                     "role": "CONTRACT_A_TP1",
                     "twin_partner_id": pid_b,
@@ -1412,6 +1475,7 @@ class CloudExecutionEngine:
                     "take_profit": tp2_price,
                     "volume_cents": res_b["volume"],
                     "lots": res_b["lots"],
+                    "contract_size": contract_size,
                     "is_be_moved": False,
                     "role": "CONTRACT_B_RUNNER",
                     "twin_partner_id": pid_a,
@@ -1477,7 +1541,7 @@ class MatrixEngineMaster:
 
         balance, equity = await self.ctrader.get_balance_and_equity()
         self.execution_engine = CloudExecutionEngine(self.ctrader, self.risk_mgr)
-        log.info(f"SYSTEM READY. Currency: {self.ctrader.account_currency} | Balance: {balance:,.2f}")
+        log.info(f"SYSTEM READY. Currency: {self.ctrader.account_currency or 'UNKNOWN'} | Balance: {balance:,.2f}")
 
         await asyncio.gather(
             self._market_scan_loop(),
@@ -1559,13 +1623,13 @@ class MatrixEngineMaster:
                                     )
                                     await whatsapp.send_alert(alert)
 
-                    # Standard 80% progress Breakeven Trigger
+                    # Dynamic Breakeven Trigger (Spec Q2: 80% to target AND at least 0.5x SL distance)
                     if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
-                        log.info(f"80% R:R PROGRESS HIT ON {sym} (Pos #{pid})! Moving SL to Break-Even.")
+                        log.info(f"DYNAMIC BREAKEVEN HIT ON {sym} (Pos #{pid})! Moving SL to Break-Even.")
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
                         if success:
                             pos["is_be_moved"] = True
-                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 80% of TP!\n• SL moved to Entry ({entry}).\n• Trade is now Risk-Free."
+                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} progressed >=80% of TP (and >=0.5x SL)!\n• SL moved to Entry ({entry}).\n• Trade is now Risk-Free."
                             await whatsapp.send_alert(alert)
 
                 await asyncio.sleep(2.0)
@@ -1576,7 +1640,7 @@ class MatrixEngineMaster:
     async def _daily_eod_flusher_loop(self) -> None:
         while True:
             try:
-                now_sast = datetime.now(timezone.utc) + timedelta(hours=2)
+                now_sast = datetime.now(timezone.utc).astimezone(TZ_SAST)
                 hour = now_sast.hour
                 minute = now_sast.minute
 
@@ -1659,6 +1723,29 @@ class MatrixEngineMaster:
                 start_time = time.time()
                 await self.ctrader.ensure_connection()
 
+                # 1. Resolve currency and check for currency-switch breaker
+                await self.ctrader.ensure_account_currency()
+                self.risk_mgr.persistent_risk.check_currency_change(self.ctrader.account_currency)
+
+                def quote_lookup(pair: str) -> Optional[Tuple[float, float, float]]:
+                    sid = self.ctrader.resolve_symbol_id(pair, use_fx_aliases=True)
+                    if not sid or sid not in self.ctrader.live_quotes:
+                        return None
+                    b, a = self.ctrader.live_quotes[sid]
+                    age = time.time() - self.ctrader.quote_timestamps.get(sid, 0.0)
+                    return (b, a, age)
+
+                # 2. Update mark-to-market floating P&L using ConfigManager.ASSETS contract size
+                for pid, p in self.risk_mgr.open_positions.items():
+                    q, bid, ask = await self.ctrader.get_live_quote(p["symbol"])
+                    if q > 0:
+                        pos_price = bid if p["direction"] == "BUY" else ask
+                        diff = (pos_price - p["entry_price"]) if p["direction"] == "BUY" else (p["entry_price"] - pos_price)
+                        c_size = ConfigManager.ASSETS[p["symbol"]].contract_size if p["symbol"] in ConfigManager.ASSETS else 100000.0
+                        fx_rate = get_fx_rate_to_account(p["symbol"], self.ctrader.account_currency, quote_lookup) or 1.0
+                        p["floatingPnL"] = round(diff * p["lots"] * c_size * fx_rate, 2)
+
+                # 3. Synchronize broker deals and live equity
                 broker_positions = await self.ctrader.reconcile_open_positions()
                 broker_pids = set()
                 for bp in broker_positions:
@@ -1683,15 +1770,25 @@ class MatrixEngineMaster:
                     if self.risk_mgr.has_active_position(friendly_name):
                         continue
 
+                    # 4. Multi-Timeframe Fetch: 150 D1 bars to support VolatilityEngine
                     m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
                     h1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H1, count=30)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
-                    d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=15)
+                    d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=150)
 
                     if m5_df.empty:
                         continue
 
                     update_candle_cache(friendly_name, m5_df)
+
+                    # 5. Volatility Computation BEFORE evaluate_all
+                    vol_metrics = {"valid": False}
+                    adr_val = None
+                    if GLOBAL_PARAMS.adaptive_mode:
+                        q_mid, _, _ = await self.ctrader.get_live_quote(friendly_name)
+                        vol_metrics = volatility_engine.compute_symbol_volatility(d1_df, m5_df, q_mid, friendly_name)
+                        if vol_metrics.get("valid", False):
+                            adr_val = vol_metrics["adr"]
 
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
                     vp = OrderFlowAnalyzer.compute_volume_profile(m5_df, num_bins=30)
@@ -1711,9 +1808,11 @@ class MatrixEngineMaster:
                     daily_pivot = (pdh + pdl + pdc) / 3.0
                     pivot_r1 = (2.0 * daily_pivot) - pdl
                     pivot_s1 = (2.0 * daily_pivot) - pdh
+                    pivot_r2 = daily_pivot + (pdh - pdl)
+                    pivot_s2 = daily_pivot - (pdh - pdl)
                     daily_eq = (pdh + pdl) / 2.0
 
-                    # True Asian Range (01:00 to 06:00 SAST / 23:00 to 04:00 UTC)
+                    # True Asian Range (01:00 to 06:00 SAST)
                     m5_df['utc_time'] = pd.to_datetime(m5_df['time'])
                     asia_candles = m5_df[(m5_df['utc_time'].dt.hour >= 23) | (m5_df['utc_time'].dt.hour < 4)]
                     if not asia_candles.empty:
@@ -1722,6 +1821,16 @@ class MatrixEngineMaster:
                     else:
                         asia_high = float(m5_df['high'].tail(36).max())
                         asia_low = float(m5_df['low'].tail(36).min())
+
+                    # Weekly Open: Shift D1 timestamp by +3h so Sunday-night (21:00/22:00 UTC) groups into Monday's ISO week
+                    weekly_open = float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open'])
+                    if not d1_df.empty:
+                        d1_times_shifted = pd.to_datetime(d1_df['time'], utc=True) + pd.Timedelta(hours=3)
+                        curr_week = d1_times_shifted.iloc[-1].isocalendar().week
+                        curr_year = d1_times_shifted.iloc[-1].isocalendar().year
+                        week_bars = d1_df[(d1_times_shifted.dt.isocalendar().week == curr_week) & (d1_times_shifted.dt.isocalendar().year == curr_year)]
+                        if not week_bars.empty:
+                            weekly_open = float(week_bars.iloc[0]['open'])
 
                     # Start-of-Week AVWAP anchor index
                     avwap_anchor_idx = 0
@@ -1742,12 +1851,17 @@ class MatrixEngineMaster:
                         "daily_pivot": daily_pivot,
                         "pivot_r1": pivot_r1,
                         "pivot_s1": pivot_s1,
+                        "pivot_r2": pivot_r2,
+                        "pivot_s2": pivot_s2,
                         "orb_high": orb_h,
                         "orb_low": orb_l,
                         "orb_established": orb_established,
                         "cracker_orb_high": cracker_h,
                         "cracker_orb_low": cracker_l,
                         "cracker_orb_established": cracker_established,
+                        "weekly_open": weekly_open,
+                        "d1_open": float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open']),
+                        "adr": adr_val,
                         "avwap_anchor_index": avwap_anchor_idx,
                         "is_ranging": candle_stats["is_ranging"],
                         "range_span": candle_stats["range_span"],
@@ -1756,6 +1870,7 @@ class MatrixEngineMaster:
                         "val": vp.value_area_low
                     }
 
+                    # 6. Evaluate Strategy Modules
                     signal = self.strategy_mgr.evaluate_all(
                         symbol=friendly_name, 
                         data_5m=m5_df, 
@@ -1765,6 +1880,27 @@ class MatrixEngineMaster:
                         data_h1=h1_df
                     )
 
+                    # 7. Adaptive Volatility Routing: Adapt FIRST, then filter
+                    if signal and GLOBAL_PARAMS.adaptive_mode:
+                        if not vol_metrics.get("valid", False):
+                            log.warning(f"Vol metrics invalid for {friendly_name}; skipping setup under adaptive_mode.")
+                            continue
+
+                        adapted = volatility_engine.adapt_signal(signal, vol_metrics, self.risk_mgr.risk_to_reward, session_levels)
+                        if not adapted:
+                            continue
+
+                        quote, bid, ask = await self.ctrader.get_live_quote(friendly_name)
+                        spread = abs(ask - bid)
+                        adapted_sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                        adapted_tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                        vol_ok, vol_msg = volatility_engine.evaluate_volatility_filters(
+                            vol_metrics, spread, adapted_sl_dist, adapted_tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                        )
+                        if not vol_ok:
+                            continue
+                        signal = adapted
+
                     if signal:
                         latest_candle_time = str(m5_df.iloc[-1]['time'])
                         event_key = f"{friendly_name}_{signal.strategy}_{latest_candle_time}"
@@ -1772,7 +1908,7 @@ class MatrixEngineMaster:
                         if self.risk_mgr.last_signal_event.get(friendly_name) != event_key:
                             self.risk_mgr.last_signal_event[friendly_name] = event_key
                             last_signal = signal
-                            await self.execution_engine.process_signal(signal, balance, candle_stats)
+                            await self.execution_engine.process_signal(signal, balance, equity, candle_stats)
 
                 regime_status = "ACTIVE" if self.risk_mgr.master_execution else "HALTED"
                 active_setup_str = getattr(last_signal, 'strategy', getattr(last_signal, 'setup_type', 'NONE')) if last_signal else "NONE"
@@ -1786,14 +1922,7 @@ class MatrixEngineMaster:
                     entry = p["entry_price"]
                     direction = p["direction"]
                     lots = p["lots"]
-                    cfg = ConfigManager.ASSETS.get(p["symbol"])
-                    contract_size = cfg.contract_size if cfg else 100000.0
-
-                    if q > 0:
-                        diff = (q - entry) if direction == "BUY" else (entry - q)
-                        floating = round(diff * lots * contract_size, 2)
-                    else:
-                        floating = 0.0
+                    c_size = ConfigManager.ASSETS[p["symbol"]].contract_size if p["symbol"] in ConfigManager.ASSETS else 100000.0
 
                     open_positions_telemetry.append({
                         "id": pid,
@@ -1806,7 +1935,7 @@ class MatrixEngineMaster:
                         "currentPrice": q,
                         "sl": p["stop_loss"],
                         "tp": p["take_profit"],
-                        "floatingPnL": floating,
+                        "floatingPnL": p.get("floatingPnL", 0.0),
                         "isRiskFree": p.get("is_be_moved", False)
                     })
 
@@ -1821,7 +1950,7 @@ class MatrixEngineMaster:
                 telem_msg = json.dumps({
                     "balance": balance,
                     "equity": equity,
-                    "currency": self.ctrader.account_currency,
+                    "currency": self.ctrader.account_currency or "UNKNOWN",
                     "regime": regime_status,
                     "active_setup": active_setup_str,
                     "ai_verdict": verdict_str,

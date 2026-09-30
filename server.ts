@@ -7,7 +7,13 @@ import { spawn } from 'child_process';
 interface BotGatewayConfig {
   masterExecution: boolean;
   riskPerTradePct: number;
-  riskToReward: number;
+  minRr: number;
+  adaptiveMode: boolean;
+  stopOnDailyGoalReached: boolean;
+  dailyGoalTarget: number;
+  weeklyGoalTarget: number;
+  monthlyGoalTarget: number;
+  weeklyDepositBaseline: number;
   maxDailyTrades: number;
   trailingStopActive: boolean;
   autoBreakevenPips: number;
@@ -15,9 +21,7 @@ interface BotGatewayConfig {
   updatedAt: string;
   version: number;
   strategyModes?: Record<string, string>;
-  weeklyDepositBaseline?: number;
-  weeklyGoalTarget?: number;
-  dailyGoalTarget?: number;
+  limitsConfirmedAt?: string;
 }
 
 interface RiskLimitsConfig {
@@ -26,7 +30,7 @@ interface RiskLimitsConfig {
   maxMonthlyLossUsd: number;
   maxDailyDrawdownPct?: number;
   autoLiquidateAllOnTrip?: boolean;
-  breakerAction: 'HALT_CLOSE_ALL' | 'HALT_PREVENT_NEW' | 'REDUCE_SIZE_50' | 'ALERT_ONLY';
+  breakerAction: 'HALT_PREVENT_NEW';
 }
 
 interface RiskState {
@@ -34,7 +38,7 @@ interface RiskState {
   currentWeeklyLossUsd: number;
   currentMonthlyLossUsd: number;
   breakerTriggered: boolean;
-  activeTripScope: 'NONE' | 'DAY' | 'WEEK' | 'MONTH';
+  activeTripScope: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'CURRENCY';
   lastTriggerReason?: string;
 }
 
@@ -77,6 +81,7 @@ const BOT_CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
 const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
 const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
 const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
+const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
 
 const SEED_TRADES = [
   {
@@ -143,8 +148,14 @@ const SEED_TRADES = [
 
 let activeBotConfig: BotGatewayConfig = {
   masterExecution: true,
-  riskPerTradePct: 25.0,
-  riskToReward: 2.0,
+  riskPerTradePct: 1.0,
+  minRr: 1.0,
+  adaptiveMode: false,
+  stopOnDailyGoalReached: false,
+  dailyGoalTarget: 5.0,
+  weeklyGoalTarget: 20.0,
+  monthlyGoalTarget: 50.0,
+  weeklyDepositBaseline: 10.0,
   maxDailyTrades: 4,
   trailingStopActive: true,
   autoBreakevenPips: 15,
@@ -160,17 +171,14 @@ let activeBotConfig: BotGatewayConfig = {
     "PDH_PDL_FAILED_BREAKOUT": "LIVE",
     "ORB_CRACKER": "DRY_RUN",
     "OES_4H_ORDER_BLOCK": "LIVE"
-  },
-  weeklyDepositBaseline: 10,
-  weeklyGoalTarget: 20,
-  dailyGoalTarget: 5
+  }
 };
 
 let riskLimits: RiskLimitsConfig = {
-  maxDailyLossUsd: 10,
-  maxWeeklyLossUsd: 25,
-  maxMonthlyLossUsd: 50,
-  maxDailyDrawdownPct: 20.0,
+  maxDailyLossUsd: 0.0,
+  maxWeeklyLossUsd: 0.0,
+  maxMonthlyLossUsd: 0.0,
+  maxDailyDrawdownPct: 5.0,
   autoLiquidateAllOnTrip: false,
   breakerAction: 'HALT_PREVENT_NEW',
 };
@@ -230,52 +238,19 @@ function loadTradesFromDisk(): any[] {
 }
 
 function recomputeRiskState() {
-  const now = new Date();
-  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const startOfWeek = new Date(startOfDay);
-  startOfWeek.setDate(startOfDay.getDate() - startOfDay.getDay());
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-  let dailyLoss = 0;
-  let weeklyLoss = 0;
-  let monthlyLoss = 0;
-
-  const currentTrades = loadTradesFromDisk();
-
-  for (const t of currentTrades) {
-    if (typeof t.pnl !== 'number' || t.pnl >= 0) continue;
-    const closeTime = t.closeTime ? new Date(t.closeTime) : null;
-    if (!closeTime || isNaN(closeTime.getTime())) continue;
-
-    const loss = Math.abs(t.pnl);
-    if (closeTime >= startOfDay) dailyLoss += loss;
-    if (closeTime >= startOfWeek) weeklyLoss += loss;
-    if (closeTime >= startOfMonth) monthlyLoss += loss;
-  }
-
-  riskState.currentDailyLossUsd = Number(dailyLoss.toFixed(2));
-  riskState.currentWeeklyLossUsd = Number(weeklyLoss.toFixed(2));
-  riskState.currentMonthlyLossUsd = Number(monthlyLoss.toFixed(2));
-
-  let scope: RiskState['activeTripScope'] = 'NONE';
-  let reason: string | undefined;
-
-  if (dailyLoss >= riskLimits.maxDailyLossUsd) {
-    scope = 'DAY';
-    reason = `Daily loss limit breached: -$${dailyLoss.toFixed(2)} vs ceiling -$${riskLimits.maxDailyLossUsd.toFixed(2)}.`;
-  } else if (weeklyLoss >= riskLimits.maxWeeklyLossUsd) {
-    scope = 'WEEK';
-    reason = `Weekly loss limit breached: -$${weeklyLoss.toFixed(2)} vs ceiling -$${riskLimits.maxWeeklyLossUsd.toFixed(2)}.`;
-  } else if (monthlyLoss >= riskLimits.maxMonthlyLossUsd) {
-    scope = 'MONTH';
-    reason = `Monthly loss limit breached: -$${monthlyLoss.toFixed(2)} vs ceiling -$${riskLimits.maxMonthlyLossUsd.toFixed(2)}.`;
-  }
-
-  if (scope !== 'NONE') {
-    riskState.breakerTriggered = true;
-    riskState.activeTripScope = scope;
-    riskState.lastTriggerReason = reason;
-    activeBotConfig.masterExecution = false;
+  // Display-only relay: Reads authoritative breaker state written exclusively by Python engine
+  try {
+    if (fs.existsSync(RISK_STATE_FILE)) {
+      const st = JSON.parse(fs.readFileSync(RISK_STATE_FILE, 'utf8'));
+      riskState.currentDailyLossUsd = st.current_daily_loss || 0;
+      riskState.currentWeeklyLossUsd = st.current_weekly_loss || 0;
+      riskState.currentMonthlyLossUsd = st.current_monthly_loss || 0;
+      riskState.breakerTriggered = Boolean(st.breaker_triggered);
+      riskState.activeTripScope = st.active_trip_scope || 'NONE';
+      riskState.lastTriggerReason = st.last_trigger_reason;
+    }
+  } catch (e) {
+    // Retain cached state on file lock
   }
 }
 
@@ -394,7 +369,20 @@ async function startServer() {
   app.post('/api/bot/config', (req, res) => {
     try {
       const config = req.body;
-      activeBotConfig = { ...activeBotConfig, ...config, updatedAt: new Date().toISOString() };
+      activeBotConfig = { 
+        ...activeBotConfig, 
+        ...config,
+        adaptiveMode: config.adaptiveMode !== undefined ? Boolean(config.adaptiveMode) : activeBotConfig.adaptiveMode,
+        minRr: config.minRr !== undefined ? Number(config.minRr) : activeBotConfig.minRr,
+        stopOnDailyGoalReached: config.stopOnDailyGoalReached !== undefined 
+          ? Boolean(config.stopOnDailyGoalReached) 
+          : (config.stop_on_daily_goal_reached !== undefined ? Boolean(config.stop_on_daily_goal_reached) : activeBotConfig.stopOnDailyGoalReached),
+        dailyGoalTarget: config.dailyGoalTarget !== undefined ? Number(config.dailyGoalTarget) : activeBotConfig.dailyGoalTarget,
+        weeklyGoalTarget: config.weeklyGoalTarget !== undefined ? Number(config.weeklyGoalTarget) : activeBotConfig.weeklyGoalTarget,
+        monthlyGoalTarget: config.monthlyGoalTarget !== undefined ? Number(config.monthlyGoalTarget) : activeBotConfig.monthlyGoalTarget,
+        updatedAt: new Date().toISOString() 
+      };
+
       const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
       fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify({ ...existingConfig, ...activeBotConfig }, null, 2));
       res.json({ status: 'success', config: activeBotConfig });
@@ -411,14 +399,20 @@ async function startServer() {
 
   app.post('/api/limits', (req, res) => {
     try {
-      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, breakerAction, resetBreaker } = req.body;
+      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, resetBreaker } = req.body;
 
       if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
       if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
       if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
       if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
       if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
-      if (breakerAction) riskLimits.breakerAction = breakerAction;
+
+      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
+      const confirmedPayload = { 
+        ...existingConfig, 
+        ...riskLimits, 
+        limitsConfirmedAt: new Date().toISOString() // Clears CURRENCY breaker in Python engine
+      };
 
       if (resetBreaker) {
         riskState.breakerTriggered = false;
@@ -427,9 +421,7 @@ async function startServer() {
         activeBotConfig.masterExecution = true;
       }
 
-      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify({ ...existingConfig, ...riskLimits }, null, 2));
-
+      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(confirmedPayload, null, 2));
       res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error?.message });
@@ -470,6 +462,7 @@ async function startServer() {
           const telem = JSON.parse(jsonStr);
           activeBrokerTelemetry.balance = telem.balance;
           activeBrokerTelemetry.equity = telem.equity;
+          if (telem.currency) activeBrokerTelemetry.currency = telem.currency;
           if (telem.netProfit !== undefined) activeBrokerTelemetry.netProfit = telem.netProfit;
           if (telem.winRate !== undefined) activeBrokerTelemetry.winRate = telem.winRate;
           if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;

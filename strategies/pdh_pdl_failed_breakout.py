@@ -4,6 +4,7 @@ Previous Daily High / Low (PDH/PDL) Failed Breakout Liquidity Trap (Spec Setup 3
 - Breakout beyond PDH or PDL within a configured liquidity buffer
 - 15M or 5M close back inside the previous day's range
 - CVD seller/buyer injection confirming institutional trap
+- Adaptive Buffers: Scales sweep buffer (8% ADR) under adaptive mode
 - SL at failed breakout peak; TP at Previous Day POC or opposite Value Area extreme
 """
 
@@ -15,6 +16,7 @@ try:
     from config.strategy_params import GLOBAL_PARAMS
 except ImportError:
     from core.session_config import GLOBAL_PARAMS
+
 
 class LiquidityTrap:
     def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
@@ -37,11 +39,17 @@ class LiquidityTrap:
         curr_bar = data_5m.iloc[-1]
         prev_bar = data_5m.iloc[-2]
 
-        buffer = GLOBAL_PARAMS.pdh_pdl_liquidity_buffer_pts
-        if symbol == "GOLD":
-            buffer = 1.50
-        elif symbol in ("EURUSD", "GBPUSD"):
-            buffer = 0.0015
+        adr = session_levels.get("adr")
+        if GLOBAL_PARAMS.adaptive_mode and adr is not None and adr > 0:
+            buffer = 0.08 * adr            # [PROPOSED]: 8% ADR liquidity sweep band
+        else:
+            buffer = GLOBAL_PARAMS.pdh_pdl_liquidity_buffer_pts
+            if symbol == "GOLD":
+                buffer = 1.50
+            elif symbol in ("EURUSD", "GBPUSD"):
+                buffer = 0.0015
+
+        pdr_range_height = abs(pdh - pdl)
 
         # CVD delta injection / absorption check
         cvd = calculate_cvd_absorption_proxy(data_5m, lookback=10)
@@ -72,6 +80,7 @@ class LiquidityTrap:
                 take_profit=tp2,
                 take_profit_1=tp1,
                 take_profit_2=tp2,
+                reference_range_height=pdr_range_height,
                 scale_out_fraction=0.50,
                 trail_mode="MOVE_TO_BE_80",
                 session="LONDON_OR_NY",
@@ -104,6 +113,7 @@ class LiquidityTrap:
                 take_profit=tp2,
                 take_profit_1=tp1,
                 take_profit_2=tp2,
+                reference_range_height=pdr_range_height,
                 scale_out_fraction=0.50,
                 trail_mode="MOVE_TO_BE_80",
                 session="LONDON_OR_NY",

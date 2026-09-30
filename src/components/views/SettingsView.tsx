@@ -8,20 +8,19 @@ import {
   CheckCircle2, 
   FileSpreadsheet, 
   Bot, 
-  Copy, 
   RefreshCw, 
   Database, 
   Terminal, 
-  ExternalLink,
-  ShieldCheck,
-  Zap,
-  Sliders,
-  Shield,
-  TrendingUp,
-  Sparkles,
-  Power,
-  PowerOff,
-  Palette
+  ShieldCheck, 
+  Zap, 
+  Sliders, 
+  Shield, 
+  TrendingUp, 
+  Sparkles, 
+  Power, 
+  PowerOff, 
+  Palette,
+  Target
 } from 'lucide-react';
 import { 
   ThemeMode, 
@@ -66,19 +65,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [localBroker, setLocalBroker] = useState<BrokerConfig>(brokerConfig);
   const [localSheets, setLocalSheets] = useState<GoogleSheetsConfig>(sheetsConfig);
   const [localBranding, setLocalBranding] = useState<SiteBrandingConfig>(branding);
+  const [localBotSettings, setLocalBotSettings] = useState<BotSettings>(botSettings);
   const [balanceInput, setBalanceInput] = useState(metrics.currentBalance.toString());
   const [equityInput, setEquityInput] = useState(metrics.currentEquity.toString());
   const [pingStatus, setPingStatus] = useState<string | null>(null);
-  const [copiedScript, setCopiedScript] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [brandingSaved, setBrandingSaved] = useState(false);
+  const [engineSaved, setEngineSaved] = useState(false);
 
-  // Sync props to state if updated externally
   React.useEffect(() => {
     setLocalBranding(branding);
   }, [branding]);
 
-  // Test broker ping
+  React.useEffect(() => {
+    setLocalBotSettings(botSettings);
+  }, [botSettings]);
+
   const handleTestBrokerPing = () => {
     setPingStatus('Pinging broker gateway...');
     setTimeout(() => {
@@ -94,6 +96,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setPingStatus(`Connected! Latency: ${ping}ms (${localBroker.server})`);
       setTimeout(() => setPingStatus(null), 4000);
     }, 600);
+  };
+
+  const handleSaveEngineSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await fetch('/api/bot/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(localBotSettings),
+      });
+      setEngineSaved(true);
+      setTimeout(() => setEngineSaved(false), 3000);
+    } catch (err) {
+      console.error('Failed to save engine settings:', err);
+    }
   };
 
   const handleSaveBroker = (e: React.FormEvent) => {
@@ -130,41 +147,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setTimeout(() => setBrandingSaved(false), 3000);
   };
 
-  const pythonScript = `"""
-Trading Portal VS Code Live Bridge
-Listening to web socket and broker updates from Trading Portal
-"""
-import json
-import time
-
-BOT_TARGETS = {
-    "master_execution": ${botSettings.masterExecution},
-    "risk_per_trade_pct": ${botSettings.riskPerTradePct},
-    "risk_to_reward": ${botSettings.riskToReward},
-    "max_daily_trades": ${botSettings.maxDailyTrades},
-    "trailing_stop": ${botSettings.trailingStopActive},
-    "breakeven_pips": ${botSettings.autoBreakevenPips}
-}
-
-BROKER_CONFIG = {
-    "provider": "${localBroker.provider}",
-    "account": "${localBroker.accountNumber}",
-    "server": "${localBroker.server}",
-    "gateway_url": "${localBroker.webhookUrl}"
-}
-
-print(f"[Trading Portal Bridge] Connected to account: {BROKER_CONFIG['account']}")
-print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target: 1:{BOT_TARGETS['risk_to_reward']}")
-
-# Dispatched directly to MT5 terminal or Deriv websocket loop
-`;
-
-  const handleCopyScript = () => {
-    navigator.clipboard.writeText(pythonScript);
-    setCopiedScript(true);
-    setTimeout(() => setCopiedScript(false), 3000);
-  };
-
   const isDark = themeMode === 'dark';
 
   return (
@@ -173,7 +155,6 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.35 }}
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200 dark:border-[#212838]"
       >
         <div>
@@ -184,7 +165,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
             </span>
           </h1>
           <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-            Customize site name and icon, engage master kill switch, configure broker feed, and manage data synchronization.
+            Engine volatility parameters, profit milestones, master kill switch, and broker configuration.
           </p>
         </div>
 
@@ -196,12 +177,11 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
         )}
       </motion.div>
 
-      {/* 1. Master Kill Switch & Bot Control (Prominent Card) */}
+      {/* 1. Master Kill Switch */}
       <motion.section 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
         className={`rounded-2xl p-6 border shadow-sm space-y-4 transition-colors ${
           botActive
             ? 'bg-white dark:bg-[#151922] border-slate-200 dark:border-[#212838]'
@@ -228,7 +208,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
               </div>
               <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
                 {botActive
-                  ? 'All algorithmic order executions, trailing stops, and webhook signals are operating normally.'
+                  ? 'All automated buy and sell orders, trailing stops, and risk gates are operating normally.'
                   : 'Emergency override engaged: The bot has been turned OFF. No automated buy or sell orders will be dispatched.'}
               </p>
             </div>
@@ -237,7 +217,6 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
           <button
             type="button"
             onClick={onToggleBotActive}
-            id="settings-kill-switch-btn"
             className={`px-5 py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer ${
               botActive
                 ? 'bg-rose-600 hover:bg-rose-500 text-white'
@@ -250,12 +229,154 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
         </div>
       </motion.section>
 
-      {/* 2. Site Branding & Customization (Name, Icon, Colors) */}
+      {/* 2. Quant Engine & Profit Objectives */}
       <motion.section 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
+        className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-5"
+      >
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-[#212838]">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
+              <Zap className="w-5 h-5" />
+            </div>
+            <div>
+              <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                Engine Volatility & Profit Milestones
+              </h2>
+              <p className="text-xs text-slate-600 dark:text-slate-400">
+                Minimum R:R threshold, dynamic ADR engine activation, and profit target pacing.
+              </p>
+            </div>
+          </div>
+
+          {engineSaved && (
+            <div className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400 font-semibold bg-emerald-500/10 px-3 py-1 rounded-xl border border-emerald-500/20">
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>Engine Settings Persisted</span>
+            </div>
+          )}
+        </div>
+
+        <form onSubmit={handleSaveEngineSettings} className="space-y-5 text-xs">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+            {/* Adaptive Mode Toggle */}
+            <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
+              <div>
+                <span className="font-bold text-slate-900 dark:text-white">Adaptive Volatility Engine (ADR)</span>
+                <p className="text-[11px] text-slate-500 mt-0.5">Scale stops and buffers to real-time ADR</p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={Boolean(localBotSettings.adaptiveMode)}
+                  onChange={(e) => setLocalBotSettings({ ...localBotSettings, adaptiveMode: e.target.checked })}
+                  className="sr-only peer"
+                />
+                <div className="w-11 h-6 bg-slate-300 dark:bg-slate-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+
+            {/* Stop on Daily Goal Toggle */}
+            <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
+              <div>
+                <span className="font-bold text-slate-900 dark:text-white">Auto-Halt on Daily Goal Reached</span>
+                <p className="text-[11px] text-slate-500 mt-0.5">Stop execution once daily target is banked</p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={Boolean(localBotSettings.stopOnDailyGoalReached)}
+                  onChange={(e) => setLocalBotSettings({ ...localBotSettings, stopOnDailyGoalReached: e.target.checked })}
+                  className="sr-only peer"
+                />
+                <div className="w-11 h-6 bg-slate-300 dark:bg-slate-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+          </div>
+
+          {/* Min R:R Input (No R:R slider!) */}
+          <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
+            <div>
+              <span className="font-bold text-slate-900 dark:text-white">Minimum Target R:R Filter (1 : R)</span>
+              <p className="text-[11px] text-slate-500 mt-0.5">Rejects any trade whose adapted structural target delivers less than this ratio</p>
+            </div>
+            <div className="flex items-center gap-1.5 font-mono">
+              <span className="font-bold text-slate-500">1 :</span>
+              <input
+                type="number"
+                step="0.1"
+                min="0.5"
+                max="5.0"
+                value={localBotSettings.minRr ?? 1.0}
+                onChange={(e) => setLocalBotSettings({ ...localBotSettings, minRr: parseFloat(e.target.value) || 1.0 })}
+                className="w-20 px-3 py-1.5 rounded-lg bg-white dark:bg-[#151922] border border-slate-300 dark:border-[#212838] font-bold text-slate-900 dark:text-white text-right"
+              />
+            </div>
+          </div>
+
+          {/* Profit Goal Display & Inputs */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+            <div className="space-y-1.5">
+              <label className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1">
+                <Target className="w-3.5 h-3.5 text-blue-600" /> Daily Profit Goal ($ / Base)
+              </label>
+              <input
+                type="number"
+                step="1"
+                min="0"
+                value={localBotSettings.dailyGoalTarget ?? 5}
+                onChange={(e) => setLocalBotSettings({ ...localBotSettings, dailyGoalTarget: parseFloat(e.target.value) || 0 })}
+                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1">
+                <TrendingUp className="w-3.5 h-3.5 text-indigo-500" /> Weekly Profit Goal ($ / Base)
+              </label>
+              <input
+                type="number"
+                step="5"
+                min="0"
+                value={localBotSettings.weeklyGoalTarget ?? 20}
+                onChange={(e) => setLocalBotSettings({ ...localBotSettings, weeklyGoalTarget: parseFloat(e.target.value) || 0 })}
+                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1">
+                <Layers className="w-3.5 h-3.5 text-emerald-500" /> Monthly Profit Goal ($ / Base)
+              </label>
+              <input
+                type="number"
+                step="10"
+                min="0"
+                value={localBotSettings.monthlyGoalTarget ?? 50}
+                onChange={(e) => setLocalBotSettings({ ...localBotSettings, monthlyGoalTarget: parseFloat(e.target.value) || 0 })}
+                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono"
+              />
+            </div>
+          </div>
+
+          <div className="pt-2 flex justify-end">
+            <button
+              type="submit"
+              className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-sm cursor-pointer"
+            >
+              Broadcast Engine Settings to Bot Config
+            </button>
+          </div>
+        </form>
+      </motion.section>
+
+      {/* 3. Site Branding */}
+      <motion.section 
+        initial={{ opacity: 0, y: 20 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true }}
         className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-5"
       >
         <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-[#212838]">
@@ -268,7 +389,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
                 Site Branding & Appearance Customization
               </h2>
               <p className="text-xs text-slate-600 dark:text-slate-400">
-                Customize the name of the site, select your badge icon or custom initials, and configure portal aesthetics.
+                Customize the name of the portal, select your badge icon or custom monogram.
               </p>
             </div>
           </div>
@@ -283,25 +404,18 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
 
         <form onSubmit={handleSaveBranding} className="space-y-5 text-xs">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-            {/* Site Name Customization */}
             <div className="space-y-1.5">
               <label className="font-semibold text-slate-700 dark:text-slate-300">
-                Site Name (Displayed in Header & Navigation)
+                Site Name (Displayed in Header)
               </label>
               <input
                 type="text"
                 value={localBranding.siteName}
                 onChange={(e) => setLocalBranding({ ...localBranding, siteName: e.target.value })}
-                id="branding-site-name-input"
                 className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-medium focus:outline-none focus:border-blue-500"
-                placeholder="e.g. Trading Portal"
               />
-              <p className="text-[11px] text-slate-500">
-                Changes the top banner and title across your terminal.
-              </p>
             </div>
 
-            {/* Custom Initials or Monogram */}
             <div className="space-y-1.5">
               <label className="font-semibold text-slate-700 dark:text-slate-300">
                 Custom Icon Monogram / Text (Optional)
@@ -311,55 +425,14 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
                 maxLength={4}
                 value={localBranding.customInitials || ''}
                 onChange={(e) => setLocalBranding({ ...localBranding, customInitials: e.target.value })}
-                id="branding-initials-input"
                 className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono uppercase focus:outline-none focus:border-blue-500"
-                placeholder="e.g. TP or leave empty"
               />
-              <p className="text-[11px] text-slate-500">
-                If provided, this monogram appears in the header badge. Leave blank to show vector icon.
-              </p>
-            </div>
-          </div>
-
-          {/* Icon Type Selection */}
-          <div className="space-y-2">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">
-              Select Site Icon (When Monogram is Blank)
-            </label>
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
-              {[
-                { id: 'chart', label: 'Chart', icon: TrendingUp },
-                { id: 'shield', label: 'Shield', icon: Shield },
-                { id: 'bot', label: 'Bot', icon: Bot },
-                { id: 'zap', label: 'Lightning', icon: Zap },
-                { id: 'terminal', label: 'Terminal', icon: Terminal },
-                { id: 'gemini', label: 'AI Spark', icon: Sparkles },
-              ].map((item) => {
-                const Icon = item.icon;
-                const isSelected = localBranding.iconType === item.id;
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => setLocalBranding({ ...localBranding, iconType: item.id as any })}
-                    className={`p-3 rounded-xl border flex flex-col items-center gap-1.5 transition-all cursor-pointer ${
-                      isSelected
-                        ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
-                        : 'bg-slate-50 dark:bg-[#0d1017] text-slate-700 dark:text-slate-300 border-slate-200 dark:border-[#212838] hover:border-blue-500/50'
-                    }`}
-                  >
-                    <Icon className="w-5 h-5" />
-                    <span className="text-[10px] font-semibold">{item.label}</span>
-                  </button>
-                );
-              })}
             </div>
           </div>
 
           <div className="pt-2 flex justify-end">
             <button
               type="submit"
-              id="save-branding-btn"
               className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-sm cursor-pointer"
             >
               Save Branding Settings
@@ -368,12 +441,11 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
         </form>
       </motion.section>
 
-      {/* 3. Appearance & Theme (Dark Mode / Light Mode with Full Contrast) */}
+      {/* 4. Appearance & Theme */}
       <motion.section 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
         className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-5"
       >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -384,12 +456,11 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
             <div>
               <h2 className="text-base font-bold text-slate-900 dark:text-white">Appearance & Color Palette</h2>
               <p className="text-xs text-slate-600 dark:text-slate-400">
-                Switch between refined dark grayish mode (#0d1017) and crisp high-contrast light mode.
+                Switch between dark charcoal gray (#10131a) and high-contrast light mode.
               </p>
             </div>
           </div>
 
-          {/* Theme Switcher Toggle */}
           <div className="flex items-center gap-2 bg-slate-100 dark:bg-[#0d1017] p-1 rounded-xl border border-slate-200 dark:border-[#212838]">
             <button
               type="button"
@@ -417,22 +488,13 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
             </button>
           </div>
         </div>
-
-        <div className="pt-2 text-xs text-slate-600 dark:text-slate-400 flex items-center gap-2">
-          <span>Dark Mode Tone:</span>
-          <span className="font-semibold text-slate-800 dark:text-slate-200">MI6 Charcoal-Gray (#0d1017)</span>
-          <span>•</span>
-          <span>Light Mode:</span>
-          <span className="font-semibold text-slate-800 dark:text-slate-200">High-Contrast Slate-900 Text</span>
-        </div>
       </motion.section>
 
-      {/* 4. Real Broker Connection (MetaTrader 5 / Deriv / Bridge) */}
+      {/* 5. Real Broker Connection */}
       <motion.section 
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
         className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-6"
       >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100 dark:border-[#212838]">
@@ -442,7 +504,7 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                Broker Connection & API Gateway
+                Broker Connection & Gateway
                 <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full ${
                   localBroker.connected 
                     ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' 
@@ -452,21 +514,19 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
                 </span>
               </h2>
               <p className="text-xs text-slate-600 dark:text-slate-400">
-                Connect directly to your MetaTrader 5 Expert Advisor or Deriv WebSocket gateway for real values.
+                Connected to Fusion Markets cTrader Open API.
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={handleTestBrokerPing}
-              className="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-[#0d1017] hover:bg-slate-200 dark:hover:bg-[#191f2c] border border-slate-200 dark:border-[#212838] text-slate-700 dark:text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>Test Broker Ping</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={handleTestBrokerPing}
+            className="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-[#0d1017] hover:bg-slate-200 dark:hover:bg-[#191f2c] border border-slate-200 dark:border-[#212838] text-slate-700 dark:text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Test Ping</span>
+          </button>
         </div>
 
         {pingStatus && (
@@ -483,10 +543,8 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
               onChange={(e) => setLocalBroker({ ...localBroker, provider: e.target.value as any })}
               className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-medium focus:outline-none focus:border-blue-500"
             >
-              <option value="MetaTrader 5">MetaTrader 5 (Direct Terminal Bridge)</option>
-              <option value="Deriv Synthetic">Deriv (Synthetic Volatility Indices)</option>
-              <option value="cTrader FIX">cTrader (Open API / FIX Engine)</option>
-              <option value="Interactive Brokers">Interactive Brokers (TWS Gateway)</option>
+              <option value="Fusion Markets cTrader">Fusion Markets (cTrader Open API)</option>
+              <option value="MetaTrader 5">MetaTrader 5</option>
             </select>
           </div>
 
@@ -497,29 +555,6 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
               value={localBroker.accountNumber}
               onChange={(e) => setLocalBroker({ ...localBroker, accountNumber: e.target.value })}
               className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono focus:outline-none focus:border-blue-500"
-              placeholder="e.g. 84920412"
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Broker Trading Server</label>
-            <input
-              type="text"
-              value={localBroker.server}
-              onChange={(e) => setLocalBroker({ ...localBroker, server: e.target.value })}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono focus:outline-none focus:border-blue-500"
-              placeholder="e.g. Deriv-Server-02 or MetaQuotes-Live"
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Webhook or Bridge Gateway URL</label>
-            <input
-              type="text"
-              value={localBroker.webhookUrl}
-              onChange={(e) => setLocalBroker({ ...localBroker, webhookUrl: e.target.value })}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono focus:outline-none focus:border-blue-500"
-              placeholder="http://127.0.0.1:8080/trade-gateway"
             />
           </div>
 
@@ -528,173 +563,11 @@ print(f"[Targets] Active Risk: {BOT_TARGETS['risk_per_trade_pct']}% | R:R Target
               type="submit"
               className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-sm cursor-pointer"
             >
-              Save Real Broker Configuration
+              Save Broker Config
             </button>
           </div>
         </form>
       </motion.section>
-
-      {/* 5. Live Account Balance Calibration */}
-      <motion.section 
-        initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
-        className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-5"
-      >
-        <div className="flex items-center gap-3 pb-3 border-b border-slate-100 dark:border-[#212838]">
-          <div className="p-2.5 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
-            <Database className="w-5 h-5" />
-          </div>
-          <div>
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">Account Capital Calibration</h2>
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              Directly synchronize your portal's balance and equity to match your live broker balance.
-            </p>
-          </div>
-        </div>
-
-        <form onSubmit={handleSaveMetrics} className="grid grid-cols-1 md:grid-cols-3 gap-5 text-xs">
-          <div className="space-y-1.5">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Live Account Equity ($ USD)</label>
-            <input
-              type="number"
-              step="0.01"
-              value={equityInput}
-              onChange={(e) => setEquityInput(e.target.value)}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono font-bold focus:outline-none focus:border-blue-500"
-            />
-            <span className="text-[10px] text-slate-500">Live floating equity used for drawdown calculation</span>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Live Account Balance ($ USD)</label>
-            <input
-              type="number"
-              step="0.01"
-              value={balanceInput}
-              onChange={(e) => setBalanceInput(e.target.value)}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono font-bold focus:outline-none focus:border-blue-500"
-            />
-            <span className="text-[10px] text-slate-500">Real balance without floating profit/loss</span>
-          </div>
-
-          <div className="space-y-1.5 flex flex-col justify-end">
-            <button
-              type="submit"
-              className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-sm cursor-pointer"
-            >
-              Apply Live Balance to Portal
-            </button>
-          </div>
-        </form>
-      </motion.section>
-
-      {/* 6. Google Sheets Sync Configuration */}
-      <motion.section 
-        initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
-        className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-6"
-      >
-        <div className="flex items-center gap-3 pb-3 border-b border-slate-100 dark:border-[#212838]">
-          <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
-            <FileSpreadsheet className="w-5 h-5" />
-          </div>
-          <div>
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">Google Sheets Real-Time Journal Sync</h2>
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              Connect your Google Sheet Apps Script webhook to automatically import and export closed trades.
-            </p>
-          </div>
-        </div>
-
-        <form onSubmit={handleSaveSheets} className="grid grid-cols-1 md:grid-cols-2 gap-5 text-xs">
-          <div className="space-y-1.5 md:col-span-2">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Google Sheet URL or Sheet ID</label>
-            <input
-              type="text"
-              value={localSheets.sheetUrlOrId}
-              onChange={(e) => setLocalSheets({ ...localSheets, sheetUrlOrId: e.target.value })}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono focus:outline-none focus:border-blue-500"
-              placeholder="https://docs.google.com/spreadsheets/d/your-sheet-id/edit"
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Target Sheet Tab Name</label>
-            <input
-              type="text"
-              value={localSheets.sheetTabName}
-              onChange={(e) => setLocalSheets({ ...localSheets, sheetTabName: e.target.value })}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono focus:outline-none focus:border-blue-500"
-              placeholder="LiveJournal_2026"
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="font-semibold text-slate-700 dark:text-slate-300">Webhook Key / Bearer Auth</label>
-            <input
-              type="text"
-              value={localSheets.apiKeyOrToken}
-              onChange={(e) => setLocalSheets({ ...localSheets, apiKeyOrToken: e.target.value })}
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] text-slate-900 dark:text-white font-mono focus:outline-none focus:border-blue-500"
-              placeholder="Optional Bearer token"
-            />
-          </div>
-
-          <div className="md:col-span-2 pt-2 flex justify-end">
-            <button
-              type="submit"
-              className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition-colors shadow-sm cursor-pointer"
-            >
-              Update Google Sheets Connection
-            </button>
-          </div>
-        </form>
-      </motion.section>
-
-      {/* 7. Real-Time cTrader Cloud Gateway Health */}
-      <motion.section 
-        initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.4 }}
-        className="rounded-2xl p-6 bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm space-y-4"
-      >
-        <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-[#212838]">
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
-              <ShieldCheck className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 className="text-base font-bold text-slate-900 dark:text-white">Cloud Engine Status</h2>
-              <p className="text-xs text-slate-600 dark:text-slate-400">
-                Nexus Matrix is hosted 24/7 on Railway and communicates directly with Fusion Markets via cTrader Open API.
-              </p>
-            </div>
-          </div>
-          <span className="text-xs font-mono font-bold px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 border border-emerald-500/20">
-            AUTONOMOUS RUNTIME
-          </span>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs font-mono">
-          <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838]">
-            <div className="text-slate-500 text-[10px] uppercase">Broker Protocol</div>
-            <div className="font-bold text-slate-900 dark:text-white mt-1">cTrader WebSocket (JSON)</div>
-          </div>
-          <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838]">
-            <div className="text-slate-500 text-[10px] uppercase">Execution Host</div>
-            <div className="font-bold text-slate-900 dark:text-white mt-1">Railway Cloud Container</div>
-          </div>
-          <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838]">
-            <div className="text-slate-500 text-[10px] uppercase">Local Bridge Required?</div>
-            <div className="font-bold text-emerald-600 dark:text-emerald-400 mt-1">No (Fully Cloud-Native)</div>
-          </div>
-        </div>
-      </motion.section> 
     </div>
   );
 };

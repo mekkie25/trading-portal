@@ -6,7 +6,7 @@ Opening Range Liquidity Sweep & Value Area Reversal (Spec Setup 1).
 - Price Action: Sweep of Asia H/L OR PDH/PDL OR 15M OR H/L
 - Location: At VAH, VAL, POC, or 200 EMA
 - Confirmation: 5M Bullish/Bearish Engulfing candle closing back inside 75% Value Area
-- CVD Absorption: Order absorption detected at the level
+- Adaptive Buffers: Scales sweep cushion (2% ADR) under adaptive mode
 - SL: Sweep wick extremum + buffer (2-5 pts/pips)
 - TP1: Point of Control (Close 50%), TP2: Opposite Value Area Extreme
 """
@@ -15,7 +15,12 @@ import pandas as pd
 from strategies.base import StrategySignal
 from core.session_config import MarketSessionManager
 from core.indicators import is_bullish_engulfing, is_bearish_engulfing, calculate_cvd_absorption_proxy
-from config.strategy_params import GLOBAL_PARAMS
+
+try:
+    from config.strategy_params import GLOBAL_PARAMS
+except ImportError:
+    from core.session_config import GLOBAL_PARAMS
+
 
 class ORBLiquiditySweep:
     def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
@@ -56,7 +61,13 @@ class ORBLiquiditySweep:
                 diagnostics["reason"] = "CVD absorption proxy did not confirm level absorption"
                 return None
 
-        buffer = 3.0 if symbol in ("US30", "NAS100") else (0.30 if symbol == "GOLD" else 0.0003)
+        adr = session_levels.get("adr")
+        if GLOBAL_PARAMS.adaptive_mode and adr is not None and adr > 0:
+            buffer = 0.02 * adr            # [PROPOSED]: 2% ADR sweep buffer
+        else:
+            buffer = 3.0 if symbol in ("US30", "NAS100") else (0.30 if symbol == "GOLD" else 0.0003)
+
+        orb_range_height = abs(orb_h - orb_l) if orb_h and orb_l else None
 
         # BULLISH REVERSAL (Sweep Lows -> Engulfing close back inside Value Area)
         swept_low = (prev_bar['low'] < al) or (prev_bar['low'] < pdl) or (prev_bar['low'] < orb_l)
@@ -80,6 +91,7 @@ class ORBLiquiditySweep:
                     take_profit=tp2,
                     take_profit_1=tp1,
                     take_profit_2=tp2,
+                    reference_range_height=orb_range_height,
                     scale_out_fraction=0.50,
                     trail_mode="MOVE_TO_BE_80",
                     session="LONDON_OR_NY",
@@ -110,6 +122,7 @@ class ORBLiquiditySweep:
                     take_profit=tp2,
                     take_profit_1=tp1,
                     take_profit_2=tp2,
+                    reference_range_height=orb_range_height,
                     scale_out_fraction=0.50,
                     trail_mode="MOVE_TO_BE_80",
                     session="LONDON_OR_NY",

@@ -4,7 +4,7 @@ trading-portal/strategies/orb_cracker_counter_sweep.py
 - Time: NYSE Session Open strictly (09:30 - 10:30 US/Eastern / 15:30 - 16:30 SAST)
 - Trigger: Initial momentum pulse breaks dedicated 5M Cracker ORB High or Low
 - Rejection: Counter-pulse rejects at 200 EMA or Session VWAP
-- Asset-Specific Stops (Spec Sec 5): NAS100 35-50 pts (max 60), US30 37-50 pts, Gold 12-40 pips
+- Adaptive Sizing: Adapts stop size (12-20% ADR) under adaptive mode
 - TP: Fixed R:R 1:1 to 1:2 (Move SL to BE at 80%)
 """
 
@@ -12,6 +12,12 @@ import pandas as pd
 from strategies.base import StrategySignal
 from core.session_config import MarketSessionManager
 from core.indicators import calculate_session_vwap
+
+try:
+    from config.strategy_params import GLOBAL_PARAMS
+except ImportError:
+    from core.session_config import GLOBAL_PARAMS
+
 
 class ORBCracker:
     def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
@@ -31,7 +37,7 @@ class ORBCracker:
             diagnostics["reason"] = "Outside NYSE Open Cracker window (15:30 - 16:30 SAST)"
             return None
 
-        # Dedicated 5M Cracker ORB verification (strictly no fallback to 15M ORB)
+        # Dedicated 5M Cracker ORB verification
         if not session_levels.get('cracker_orb_established', False):
             diagnostics["reason"] = "Cracker 5M Opening Range not yet established"
             return None
@@ -48,13 +54,18 @@ class ORBCracker:
         ema_200 = data_5m['close'].ewm(span=200, adjust=False).mean().iloc[-1]
         vwap = calculate_session_vwap(data_5m).iloc[-1]
 
-        # Asset-specific stop enforcement (Spec Sec 5)
+        adr = session_levels.get("adr")
+        use_adaptive = GLOBAL_PARAMS.adaptive_mode and adr is not None and adr > 0
+
+        # Asset-specific stop enforcement
         if symbol == "NAS100":
-            target_sl_pts = 45.0
+            target_sl_pts = (0.20 * adr) if use_adaptive else 45.0  # [PROPOSED]: 20% ADR
         elif symbol == "US30":
-            target_sl_pts = 45.0
+            target_sl_pts = (0.15 * adr) if use_adaptive else 45.0  # [PROPOSED]: 15% ADR
         else:  # GOLD
-            target_sl_pts = 2.50  # 25 pips ($2.50)
+            target_sl_pts = (0.12 * adr) if use_adaptive else 2.50  # [PROPOSED]: 12% ADR
+
+        cracker_range_height = abs(orb_h - orb_l)
 
         # BEARISH CRACKER: Upward pulse broke ORB High, rejected 200 EMA/VWAP, closed red
         if prev_bar['high'] > orb_h and (prev_bar['high'] >= ema_200 or prev_bar['high'] >= vwap):
@@ -73,6 +84,7 @@ class ORBCracker:
                     take_profit=tp,
                     take_profit_1=tp1,
                     take_profit_2=tp,
+                    reference_range_height=cracker_range_height,
                     scale_out_fraction=0.50,
                     trail_mode="MOVE_TO_BE_80",
                     session="NY_OPEN",
@@ -98,6 +110,7 @@ class ORBCracker:
                     take_profit=tp,
                     take_profit_1=tp1,
                     take_profit_2=tp,
+                    reference_range_height=cracker_range_height,
                     scale_out_fraction=0.50,
                     trail_mode="MOVE_TO_BE_80",
                     session="NY_OPEN",

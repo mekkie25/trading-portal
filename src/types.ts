@@ -53,16 +53,21 @@ export interface TopMetrics {
 export interface BotSettings {
   masterExecution: boolean;
   riskPerTradePct: number;
-  riskToReward: number;
+  minRr?: number;                          // Minimum acceptable target R:R (replaces R:R slider)
+  adaptiveMode?: boolean;                  // On = Volatility Engine, Off = Legacy Fixed
+  stopOnDailyGoalReached?: boolean;        // Optional toggle: auto-halt on daily target
   maxDailyTrades: number;
   trailingStopActive: boolean;
   autoBreakevenPips: number;
   currency?: string;
   lastAppliedTimestamp?: string;
   strategyModes: Record<string, StrategyExecutionMode>;
-  // Weekly Growth Goal System
-  weeklyDepositBaseline?: number; // Starting deposit (e.g. 100 ZAR or $10)
-  weeklyGoalTarget?: number;      // Target balance (e.g. 300 ZAR or $25)
+  
+  // Profit Goals
+  dailyGoalTarget?: number;
+  weeklyGoalTarget?: number;
+  monthlyGoalTarget?: number;
+  weeklyDepositBaseline?: number;
 }
 
 export interface TradeRecord {
@@ -94,7 +99,7 @@ export interface AdvancedLimits {
   currentOpenExposureLots: number;
   maxMarginUtilizationPct: number;
   trailingDrawdownLock: boolean;
-  breakerAction: 'HALT_CLOSE_ALL' | 'HALT_PREVENT_NEW' | 'REDUCE_SIZE_50' | 'ALERT_ONLY';
+  breakerAction: 'HALT_PREVENT_NEW';
   breakerTriggered: boolean;
   lastTriggerReason?: string;
   maxDailyLossUsd?: number;
@@ -105,7 +110,7 @@ export interface AdvancedLimits {
   currentMonthlyLossUsd?: number;
   maxOpenPositions?: number;
   autoLiquidateAllOnTrip?: boolean;
-  activeTripScope?: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'TOTAL';
+  activeTripScope?: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'CURRENCY';
   haltUntilTimestamp?: string;
 }
 

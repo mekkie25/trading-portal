@@ -7,16 +7,19 @@ Authoritative Spec:
 - Rule 1: Asia Range Test (After 06:00 SAST)
 - Rule 2: Liquidity Sweep beyond AH/AL + sharp rejection closing back inside range
 - Rule 3: EQ Level Test with TWO consecutive 5M closes holding across Daily EQ
-- Stop Loss: Fixed 30-35 points beyond EQ invalidation
-- TP1: Opposing Asia High/Low (Move to BE)
-- TP2: Daily Pivot R1 / S1
-- TP3: Daily Pivot R2 / S2 (Two-Round exit constraint: Never hold for R3/S3)
+- Adaptive Buffers: Scales EQ tolerance (5% ADR) and target fallback (25% ADR) under adaptive mode
+- Target Progression: TP1 = Asia High/Low, TP2 = Pivot R1/S1, TP3 = Pivot R2/S2
 """
 
 import pandas as pd
 from strategies.base import StrategySignal
 from core.session_config import MarketSessionManager
-from config.strategy_params import GLOBAL_PARAMS
+
+try:
+    from config.strategy_params import GLOBAL_PARAMS
+except ImportError:
+    from core.session_config import GLOBAL_PARAMS
+
 
 class GrubberKick:
     def __init__(self, stop_loss_points: float = None):
@@ -54,6 +57,17 @@ class GrubberKick:
         c_curr = data_5m.iloc[-1]
         c_prev = data_5m.iloc[-2]
 
+        # Dynamic EQ tolerance and fallback target scaling
+        adr = session_levels.get("adr")
+        if GLOBAL_PARAMS.adaptive_mode and adr is not None and adr > 0:
+            eq_tolerance = 0.05 * adr      # [PROPOSED]: 5% of daily range tolerance around EQ
+            fallback_dist = 0.25 * adr     # [PROPOSED]: 25% of daily range target expansion
+        else:
+            eq_tolerance = 15.0            # Legacy fixed point tolerance
+            fallback_dist = 80.0           # Legacy fixed point fallback target
+
+        asia_range_height = abs(ah - al)
+
         # LONG CRITERIA: Sweep of Asia Low -> EQ Retest -> 2 Closes above EQ
         swept_al = False
         for i in range(len(recent_bars) - 2):
@@ -64,14 +78,14 @@ class GrubberKick:
 
         if swept_al:
             two_closes_above_eq = (c_prev['close'] > eq) and (c_curr['close'] > eq)
-            held_support_on_eq = (c_prev['low'] >= (eq - 15.0)) and (c_curr['low'] >= (eq - 15.0))
+            held_support_on_eq = (c_prev['low'] >= (eq - eq_tolerance)) and (c_curr['low'] >= (eq - eq_tolerance))
             trigger_candle_bullish = c_curr['close'] > c_curr['open']
 
             if two_closes_above_eq and held_support_on_eq and trigger_candle_bullish:
                 sl_price = float(eq - self.stop_loss_points)
                 tp1 = float(ah)
-                tp2 = float(r1) if r1 and r1 > c_curr['close'] else float(c_curr['close'] + 80.0)
-                tp3 = float(r2) if r2 and r2 > tp2 else float(tp2 + 80.0)
+                tp2 = float(r1) if r1 and r1 > c_curr['close'] else float(c_curr['close'] + fallback_dist)
+                tp3 = float(r2) if r2 and r2 > tp2 else float(tp2 + fallback_dist)
 
                 diagnostics.update({"passed": True, "setup": "GRUBBER_LONG", "sweep_level": al, "eq": eq})
                 return StrategySignal(
@@ -84,6 +98,7 @@ class GrubberKick:
                     take_profit_1=tp1,
                     take_profit_2=tp2,
                     take_profit_3=tp3,
+                    reference_range_height=asia_range_height,
                     scale_out_fraction=0.50,
                     trail_mode="MOVE_TO_BE_80",
                     session="POST_ASIA",
@@ -102,14 +117,14 @@ class GrubberKick:
 
         if swept_ah:
             two_closes_below_eq = (c_prev['close'] < eq) and (c_curr['close'] < eq)
-            held_resistance_on_eq = (c_prev['high'] <= (eq + 15.0)) and (c_curr['high'] <= (eq + 15.0))
+            held_resistance_on_eq = (c_prev['high'] <= (eq + eq_tolerance)) and (c_curr['high'] <= (eq + eq_tolerance))
             trigger_candle_bearish = c_curr['close'] < c_curr['open']
 
             if two_closes_below_eq and held_resistance_on_eq and trigger_candle_bearish:
                 sl_price = float(eq + self.stop_loss_points)
                 tp1 = float(al)
-                tp2 = float(s1) if s1 and s1 < c_curr['close'] else float(c_curr['close'] - 80.0)
-                tp3 = float(s2) if s2 and s2 < tp2 else float(tp2 - 80.0)
+                tp2 = float(s1) if s1 and s1 < c_curr['close'] else float(c_curr['close'] - fallback_dist)
+                tp3 = float(s2) if s2 and s2 < tp2 else float(tp2 - fallback_dist)
 
                 diagnostics.update({"passed": True, "setup": "GRUBBER_SHORT", "sweep_level": ah, "eq": eq})
                 return StrategySignal(
@@ -122,6 +137,7 @@ class GrubberKick:
                     take_profit_1=tp1,
                     take_profit_2=tp2,
                     take_profit_3=tp3,
+                    reference_range_height=asia_range_height,
                     scale_out_fraction=0.50,
                     trail_mode="MOVE_TO_BE_80",
                     session="POST_ASIA",
