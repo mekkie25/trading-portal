@@ -14,6 +14,7 @@ interface BotGatewayConfig {
   currency: string;
   updatedAt: string;
   version: number;
+  strategyModes?: Record<string, string>;
   weeklyDepositBaseline?: number;
   weeklyGoalTarget?: number;
   dailyGoalTarget?: number;
@@ -205,7 +206,8 @@ function loadTradesFromDisk(): any[] {
       const content = fs.readFileSync(TRADES_DB_FILE, 'utf8').trim();
       if (content) {
         const parsed = JSON.parse(content);
-        if (Array.isArray(parsed) && parsed.length > 0) {
+        // Fix: If file exists and parsed is a valid array (even if empty []), respect it!
+        if (Array.isArray(parsed)) {
           return parsed;
         }
       }
@@ -213,6 +215,8 @@ function loadTradesFromDisk(): any[] {
   } catch (e) {
     console.error('Failed to load trades from disk:', e);
   }
+
+  // Only seed if file does not exist at all
   saveTradesToDisk(SEED_TRADES);
   return SEED_TRADES;
 }
@@ -305,7 +309,7 @@ async function startServer() {
     next();
   });
 
-  // 1. CANDLE FEED ENDPOINT (Provides chart data to LiveFeedView)
+  // 1. CANDLE FEED ENDPOINT
   app.get('/api/market/candles', (req, res) => {
     try {
       const symbol = String(req.query.symbol || 'US30').toUpperCase();
@@ -321,7 +325,7 @@ async function startServer() {
     }
   });
 
-  // 2. CLOSE POSITION ON DEMAND (Triggered by Dashboard "Close Now" button)
+  // 2. CLOSE POSITION
   app.post('/api/positions/close/:id', (req, res) => {
     try {
       const positionId = req.params.id;

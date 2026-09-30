@@ -7,6 +7,8 @@ Architecture: Master-Grade Institutional Multi-Strategy Execution Engine
 Components:   - Native Account Currency Detection (USD, ZAR, EUR, GBP)
               - Mathematically Exact Pip/Tick Dollar Value Parity Across All Pairs
               - Broker Live Position Reconciliation (ProtoOAReconcile 2124)
+              - True Frozen 15M Opening Range (London & NY Session Opens)
+              - Dynamic ORB Established Gatekeeper (No Blind Pre-ORB Trades)
               - Zero-Amnesia Memory: Syncs Active Positions Directly From Broker
               - Asset Independence: Independent Execution Across Whitelist Pairs
               - Event-Driven Trigger Locks: Only Enters On Fresh Signal Candles
@@ -43,6 +45,10 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# Priority Core Import: Registers configuration and session engine first
+import core.session_config
+from core.session_config import MarketSessionManager, GLOBAL_PARAMS
 
 try:
     import google.generativeai as genai
@@ -316,7 +322,7 @@ class CTraderClient:
             with open(strat_file, "w") as f:
                 json.dump(self.position_strategies, f)
         except Exception:
-            pass    
+            pass
 
     def _next_id(self) -> str:
         self._msg_counter += 1
@@ -356,8 +362,7 @@ class CTraderClient:
                 pid = str(p.get("positionId"))
                 sid = p.get("symbolId")
                 sym_name = self.symbol_details.get(sid, {}).get("name", "UNKNOWN")
-                
-                # Reverse alias to clean name
+
                 friendly = sym_name
                 for f_name, aliases in ConfigManager.SYMBOL_ALIASES.items():
                     if sym_name in aliases or any(a in sym_name for a in aliases):
@@ -576,7 +581,6 @@ class CTraderClient:
                 raw_bal = float(t_info.get("balance", 0))
                 self.last_known_balance = raw_bal / (10 ** self.money_digits)
                 self.last_known_equity = self.last_known_balance
-                # Auto-detect account currency (USD, ZAR, EUR, etc.)
                 self.account_currency = str(t_info.get("depositAssetId", "USD")).upper()
                 if self.account_currency in ("1", "USD"):
                     self.account_currency = "USD"
@@ -709,6 +713,10 @@ class CTraderClient:
         return mid, bid, ask
 
     async def fetch_ohlc_candles(self, symbol_name: str, period: CTraderTrendbarPeriod, count: int = 60) -> pd.DataFrame:
+        """
+        Calculates bar duration dynamically based on the exact period requested.
+        Applies a 3x lookback buffer for weekends and market closures.
+        """
         sid = self.resolve_symbol_id(symbol_name)
         if not sid or not self.is_authorized:
             return pd.DataFrame()
@@ -716,8 +724,19 @@ class CTraderClient:
         digits = self.symbol_details.get(sid, {}).get("digits", 5)
         divisor = float(10 ** digits)
 
+        period_minutes_map = {
+            CTraderTrendbarPeriod.M1: 1,
+            CTraderTrendbarPeriod.M5: 5,
+            CTraderTrendbarPeriod.M15: 15,
+            CTraderTrendbarPeriod.H1: 60,
+            CTraderTrendbarPeriod.H4: 240,
+            CTraderTrendbarPeriod.D1: 1440
+        }
+        bar_min = period_minutes_map.get(period, 5)
+
         now_ms = int(time.time() * 1000)
-        from_ms = now_ms - (count * 60 * 1000 * 10)
+        # Dynamic lookback window with 3x weekend buffer
+        from_ms = now_ms - (count * bar_min * 60 * 1000 * 3)
 
         res = await self._send_and_wait(2137, {
             "ctidTraderAccountId": self.account_id,
@@ -753,6 +772,9 @@ class CTraderClient:
 
         df = pd.DataFrame(candles)
         df.sort_values("time", inplace=True)
+        # Drop the forming live bar: Only completed candles are evaluated per spec
+        if len(df) > 1:
+            df = df.iloc[:-1]
         return df.tail(count)
 
     async def execute_market_order(
@@ -775,7 +797,6 @@ class CTraderClient:
         volume_cents = int(round(lots * contract_size * 100))
         volume_cents = max(volume_cents, 100)
 
-        # Prepend exact strategy name to broker comment
         order_comment = strategy_name[:16]
 
         order_payload = {
@@ -805,7 +826,7 @@ class CTraderClient:
         return None
 
     async def update_position_sl(self, position_id: int, new_sl: float) -> bool:
-        """AMENDS POSITION STOP LOSS USING PROTOC OA 2110 (Not 2107)."""
+        """Amends Position Stop Loss using ProtoOAAmendPositionSLTPReq 2110."""
         res = await self._send_and_wait(2110, {
             "ctidTraderAccountId": self.account_id,
             "positionId": int(position_id),
@@ -863,7 +884,7 @@ class OrderFlowAnalyzer:
         poc_price = float((bins[poc_idx] + bins[poc_idx + 1]) / 2.0)
 
         total_vol = np.sum(vol_distribution)
-        target_vol = total_vol * 0.70
+        target_vol = total_vol * 0.75  # Spec Section 2: 75% Value Area
 
         sorted_indices = np.argsort(vol_distribution)[::-1]
         cum_vol = 0.0
@@ -883,7 +904,7 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & ACCOUNT CURRENCY PARITY)
+# 7. INSTITUTIONAL RISK ENGINE
 # ==============================================================================
 
 class InstitutionalRiskEngine:
@@ -891,9 +912,9 @@ class InstitutionalRiskEngine:
         self.config_file = config_file
         self.master_execution: bool = True
         self.dry_run: bool = False
-        self.risk_per_trade_pct: float = 1.0
+        self.risk_per_trade_pct: float = GLOBAL_PARAMS.base_risk_per_trade_pct
         self.risk_to_reward: float = 2.0
-        self.max_daily_trades: int = 4
+        self.max_daily_trades: int = GLOBAL_PARAMS.max_daily_trades
         self.max_daily_loss_usd: float = 2500.0
 
         self.daily_goal_target: float = 0.0
@@ -903,7 +924,6 @@ class InstitutionalRiskEngine:
         self.consecutive_losses: int = 0
         self.open_positions: Dict[str, dict] = {}
         
-        # Track last signal candle time per pair per strategy to eliminate duplicate re-entries
         self.last_signal_event: Dict[str, str] = {}
 
         self.max_spread_to_sl_ratio: float = 0.30
@@ -941,38 +961,18 @@ class InstitutionalRiskEngine:
         self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target or 20.0))
 
     def has_active_position(self, symbol: str) -> bool:
-        """Strictly forbids re-entering the same pair while a trade is already active."""
         for pid, pos in self.open_positions.items():
             if pos.get("symbol") == symbol:
                 return True
         return False
 
     def is_red_folder_active(self) -> bool:
-        now = datetime.now(timezone.utc)
-        weekday = now.weekday()
-        day = now.day
-        hour = now.hour
-        minute = now.minute
-
-        # 1. NFP (First Friday of month, 12:25 - 12:40 UTC)
-        if weekday == 4 and day <= 7:
-            if hour == 12 and 25 <= minute <= 40:
-                return True
-
-        # 2. US CPI release window (mid-month ~10th-15th, 12:25 - 12:40 UTC)
-        if 10 <= day <= 15 and weekday in (1, 2, 3, 4):
-            if hour == 12 and 25 <= minute <= 40:
-                return True
-
-        # 3. FOMC Rate Decision Window (Wednesday 18:00 UTC / 20:00 SAST)
-        if weekday == 2 and hour == 17 and minute >= 55:
-            return True
-        if weekday == 2 and hour == 18 and minute <= 10:
-            return True
-
-        return False
+        is_active, _ = MarketSessionManager.is_blackout_active()
+        return is_active
 
     def check_sector_exposure(self, symbol: str) -> Tuple[bool, str]:
+        if not GLOBAL_PARAMS.enable_sector_limit:
+            return True, ""
         sector = self.SECTOR_MAP.get(symbol, "OTHER")
         for ticket, pos in self.open_positions.items():
             open_sym = pos.get("symbol", "")
@@ -990,7 +990,7 @@ class InstitutionalRiskEngine:
         else:
             current_progress = entry - current_price
 
-        return (current_progress / total_target_distance) >= 0.80
+        return (current_progress / total_target_distance) >= GLOBAL_PARAMS.breakeven_trigger_ratio
 
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
@@ -1055,36 +1055,28 @@ class InstitutionalRiskEngine:
         account_currency: str = "USD",
         ai_quality_factor: float = 1.0
     ) -> float:
-        """
-        TRUE DYNAMIC CURRENCY & PIP VALUE SIZER:
-        Calculates exact pip cash value in your deposit currency (USD or ZAR),
-        ensuring that every asset targets the strategy's intended monetary reward.
-        """
         equity = current_equity if current_equity > 0 else 10.0
 
-        if equity < 60.0:
-            base_risk_pct = 25.0
-        elif 60.0 <= equity < 200.0:
-            base_risk_pct = 12.5
-        elif 200.0 <= equity < 1000.0:
-            base_risk_pct = 5.0
+        if GLOBAL_PARAMS.micro_account_mode:
+            if equity < 60.0:
+                base_risk_pct = GLOBAL_PARAMS.micro_account_risk_pct
+            elif 60.0 <= equity < 200.0:
+                base_risk_pct = 12.5
+            elif 200.0 <= equity < 1000.0:
+                base_risk_pct = 5.0
+            else:
+                base_risk_pct = 1.0
         else:
-            base_risk_pct = 1.5
+            base_risk_pct = GLOBAL_PARAMS.base_risk_per_trade_pct
 
-        if self.risk_per_trade_pct > 0:
-            active_risk_pct = min(base_risk_pct, self.risk_per_trade_pct)
+        if self.consecutive_losses >= GLOBAL_PARAMS.consecutive_loss_threshold:
+            active_risk_pct = GLOBAL_PARAMS.consecutive_loss_risk_pct
         else:
             active_risk_pct = base_risk_pct
 
-        if self.consecutive_losses == 1:
-            active_risk_pct *= 0.70
-        elif self.consecutive_losses == 2:
-            active_risk_pct *= 0.50
-        elif self.consecutive_losses >= 3:
-            active_risk_pct *= 0.25
-
-        if self.is_red_folder_active():
-            active_risk_pct *= 0.50
+        # Apply Day-of-Week multiplier (Spec Sec 1)
+        _, dow_mult, _ = MarketSessionManager.get_day_of_week_policy()
+        active_risk_pct *= dow_mult
 
         final_risk_pct = active_risk_pct * ai_quality_factor
         risk_cash = equity * (final_risk_pct / 100.0)
@@ -1097,20 +1089,16 @@ class InstitutionalRiskEngine:
 
         pips_at_risk = (sl_distance / pip_size) if pip_size > 0 else 10.0
 
-        # Exact Pip Value Converted to Account Currency
-        # If quote is JPY (USDJPY), 1 pip = 1000 JPY. Convert to USD by dividing by quote rate.
         if symbol == "USDJPY":
             rate = current_price if current_price > 50 else 145.0
             pip_value_usd_per_lot = (pip_size * contract_size) / rate
         elif symbol in ("EURUSD", "GBPUSD"):
-            pip_value_usd_per_lot = pip_size * contract_size  # $10/lot
+            pip_value_usd_per_lot = pip_size * contract_size
         elif symbol == "GOLD":
-            pip_value_usd_per_lot = pip_size * contract_size  # $1 per 0.01 move per lot = $100 per $1 move
+            pip_value_usd_per_lot = pip_size * contract_size
         else:
-            # Indices (US30, NAS100, DE40)
             pip_value_usd_per_lot = pip_size * contract_size
 
-        # If user account is in ZAR, convert USD to ZAR (approx 18.0)
         if account_currency == "ZAR":
             pip_value_per_lot = pip_value_usd_per_lot * 18.0
         else:
@@ -1124,10 +1112,6 @@ class InstitutionalRiskEngine:
             calculated_lots = min_lots
 
         final_lots = round(max(min(calculated_lots, max_lots), min_lots), 2)
-        log.info(
-            f"Lot Math for {symbol}: Acc: {account_currency} | Risk: {risk_cash:.2f} | Pips: {pips_at_risk:.1f} | "
-            f"PipVal: {pip_value_per_lot:.2f} | Lots: {final_lots}"
-        )
         return final_lots
 
     def validate_pre_trade(
@@ -1148,11 +1132,17 @@ class InstitutionalRiskEngine:
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
 
-        # 1. Strictest In-Flight Check: NEVER double-enter on the same pair
+        is_blackout, blackout_reason = MarketSessionManager.is_blackout_active()
+        if is_blackout:
+            return False, f"Macro News Blackout: {blackout_reason}", {}
+
+        can_trade_day, day_reason = MarketSessionManager.get_day_of_week_policy()
+        if not can_trade_day:
+            return False, f"Day-of-Week Policy: {day_reason}", {}
+
         if self.has_active_position(symbol):
             return False, f"Re-entry Blocked: A trade is already active on {symbol}.", {}
 
-        # 2. Sector Exposure check (Index vs Forex vs Metal)
         sector_ok, sector_msg = self.check_sector_exposure(symbol)
         if not sector_ok:
             return False, sector_msg, {}
@@ -1195,7 +1185,7 @@ class InstitutionalRiskEngine:
 class AIOverseer:
     def __init__(self):
         self.api_key = ConfigManager.GEMINI_API_KEY
-        if self.api_key and GENAI_AVAILABLE:
+        if self.api_key and GENAI_AVAILABLE and GLOBAL_PARAMS.ai_overseer_enabled:
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel('gemini-1.5-flash')
             log.info("Gemini AI Intuition & Overseer Engine initialized.")
@@ -1211,8 +1201,8 @@ class AIOverseer:
         candle_stats: dict,
         history: List[dict]
     ) -> Tuple[bool, float, str]:
-        if not self.model:
-            return True, 1.0, "Rule-based pass (AI Standby)"
+        if not self.model or not GLOBAL_PARAMS.ai_overseer_enabled:
+            return True, 1.0, "Rule-based pass (AI Overseer bypassed per spec)"
 
         direction = getattr(signal, 'direction', 'BUY')
         symbol = getattr(signal, 'symbol', 'UNKNOWN')
@@ -1325,7 +1315,7 @@ class CloudExecutionEngine:
         total_lots = bp['lots']
         half_lots = round(max(total_lots / 2.0, 0.01), 2)
         sl_distance = abs(bp['entry_price'] - bp['stop_loss'])
-        tp1_price = round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 5)
+        tp1_price = getattr(signal, 'take_profit_1', None) or round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 5)
         tp2_price = getattr(signal, 'take_profit_2', None) or bp['take_profit']
 
         log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Lots: 2x {half_lots} | Strat: {strategy_name}")
@@ -1340,7 +1330,6 @@ class CloudExecutionEngine:
             pid_a = str(res_a["position_id"]) if res_a else None
             pid_b = str(res_b["position_id"]) if res_b else None
 
-            # Twin-Position Partner Smart Link
             if pid_a:
                 self.ctrader._save_position_strategy(pid_a, strategy_name)
                 self.risk.open_positions[pid_a] = {
@@ -1420,7 +1409,7 @@ class CloudExecutionEngine:
         return False
 
 # ==============================================================================
-# 10. MASTER ORCHESTRATOR WITH RECONCILIATION
+# 10. MASTER ORCHESTRATOR WITH FROZEN OPENING RANGE ENGINE
 # ==============================================================================
 
 class MatrixEngineMaster:
@@ -1430,6 +1419,9 @@ class MatrixEngineMaster:
         self.risk_mgr = InstitutionalRiskEngine()
         self.execution_engine: Optional[CloudExecutionEngine] = None
         self.volume_profiles: Dict[str, VolumeProfileNode] = {}
+        
+        # Frozen Opening Ranges (Key = (symbol, session_date_str))
+        self.frozen_opening_ranges: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     async def start(self) -> None:
         log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Edition)...")
@@ -1437,7 +1429,6 @@ class MatrixEngineMaster:
             log.warning("Connection attempt failed. Retrying in 10s...")
             await asyncio.sleep(10.0)
 
-        # RECONCILE ON STARTUP (Protects against amnesia after any restart)
         broker_positions = await self.ctrader.reconcile_open_positions()
         for bp in broker_positions:
             pid = bp["position_id"]
@@ -1560,13 +1551,62 @@ class MatrixEngineMaster:
                 log.error(f"Error in EOD Flusher: {e}")
                 await asyncio.sleep(30.0)
 
+    def _compute_frozen_opening_range(self, symbol: str, m5_df: pd.DataFrame) -> Tuple[float, float, bool]:
+        """
+        Computes and FROZES the 15M Opening Range from the exact first 3 candles
+        after session open. Once 15 minutes pass, the ORB is permanently fixed.
+        Before 15 minutes pass, orb_established is False (Spec Non-Negotiable #1).
+        """
+        now = datetime.now(timezone.utc)
+        today_str = now.strftime("%Y-%m-%d")
+        cache_key = (symbol, today_str)
+
+        # Check if already frozen for today
+        if cache_key in self.frozen_opening_ranges:
+            entry = self.frozen_opening_ranges[cache_key]
+            return entry['high'], entry['low'], True
+
+        times = MarketSessionManager.get_current_times(now)
+        in_london = MarketSessionManager.is_in_london_open(now)
+        in_ny = MarketSessionManager.is_in_ny_open(now)
+
+        if not (in_london or in_ny):
+            # Outside active open windows, use fallback of available established session
+            return float(m5_df['high'].tail(12).max()), float(m5_df['low'].tail(12).min()), True
+
+        # Identify session open boundary in UTC
+        m5_df_time = pd.to_datetime(m5_df['time'])
+        if in_london:
+            # London open is 08:00 Local London
+            t_open_local = times["LONDON"].replace(hour=8, minute=0, second=0, microsecond=0)
+            t_open_utc = t_open_local.astimezone(timezone.utc)
+        else:
+            # NY open is 09:30 Local NY
+            t_open_local = times["NEWYORK"].replace(hour=9, minute=30, second=0, microsecond=0)
+            t_open_utc = t_open_local.astimezone(timezone.utc)
+
+        # Filter the first 3 M5 candles starting at session open
+        session_candles = m5_df[m5_df_time >= t_open_utc]
+
+        if len(session_candles) < 3:
+            # First 15 minutes still developing: Spec forbids trading before OR is established!
+            return 0.0, 0.0, False
+
+        # First 3 candles have closed: Freeze Opening Range permanently
+        first_3_candles = session_candles.head(3)
+        orb_h = float(first_3_candles['high'].max())
+        orb_l = float(first_3_candles['low'].min())
+
+        self.frozen_opening_ranges[cache_key] = {'high': orb_h, 'low': orb_l}
+        log.info(f"FROZEN 15M OPENING RANGE ESTABLISHED for {symbol}: High = {orb_h:.5f}, Low = {orb_l:.5f}")
+        return orb_h, orb_l, True
+
     async def _market_scan_loop(self) -> None:
         while True:
             try:
                 start_time = time.time()
                 await self.ctrader.ensure_connection()
 
-                # Continuously reconcile active positions from broker
                 broker_positions = await self.ctrader.reconcile_open_positions()
                 broker_pids = set()
                 for bp in broker_positions:
@@ -1575,7 +1615,6 @@ class MatrixEngineMaster:
                     if pid not in self.risk_mgr.open_positions:
                         self.risk_mgr.open_positions[pid] = bp
 
-                # Remove positions that have officially closed on the broker
                 for local_pid in list(self.risk_mgr.open_positions.keys()):
                     if local_pid not in broker_pids:
                         self.risk_mgr.open_positions.pop(local_pid, None)
@@ -1589,10 +1628,10 @@ class MatrixEngineMaster:
                 for friendly_name in ConfigManager.SYMBOL_ALIASES.keys():
                     await asyncio.sleep(0.20)
 
-                    # ASSET INDEPENDENCE: If this specific pair is already open, skip it
                     if self.risk_mgr.has_active_position(friendly_name):
                         continue
 
+                    # Fetch genuine multi-timeframe candles with true lookbacks
                     m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
                     d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=15)
@@ -1632,6 +1671,9 @@ class MatrixEngineMaster:
                         asia_high = float(m5_df['high'].tail(36).max())
                         asia_low = float(m5_df['low'].tail(36).min())
 
+                    # True Frozen Opening Range
+                    orb_h, orb_l, orb_established = self._compute_frozen_opening_range(friendly_name, m5_df)
+
                     session_levels = {
                         "asia_high": asia_high,
                         "asia_low": asia_low,
@@ -1641,8 +1683,9 @@ class MatrixEngineMaster:
                         "daily_pivot": daily_pivot,
                         "pivot_r1": pivot_r1,
                         "pivot_s1": pivot_s1,
-                        "orb_high": float(m5_df['high'].tail(3).max()),
-                        "orb_low": float(m5_df['low'].tail(3).min()),
+                        "orb_high": orb_h,
+                        "orb_low": orb_l,
+                        "orb_established": orb_established,
                         "is_ranging": candle_stats["is_ranging"],
                         "range_span": candle_stats["range_span"],
                         "poc": vp.poc_price,
@@ -1650,7 +1693,6 @@ class MatrixEngineMaster:
                         "val": vp.value_area_low
                     }
 
-                    # Pass multi-timeframe feeds directly into strategy manager
                     signal = self.strategy_mgr.evaluate_all(
                         symbol=friendly_name, 
                         data_5m=m5_df, 
@@ -1660,7 +1702,6 @@ class MatrixEngineMaster:
                     )
 
                     if signal:
-                        # EVENT LOCK: Verify this specific candle hasn't already fired this strategy
                         latest_candle_time = str(m5_df.iloc[-1]['time'])
                         event_key = f"{friendly_name}_{signal.strategy}_{latest_candle_time}"
 

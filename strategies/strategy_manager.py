@@ -1,13 +1,15 @@
 """
 trading-portal/strategies/strategy_manager.py
 Orchestrates institutional quantitative strategies across the 7 whitelisted assets,
-passing multi-timeframe market feeds (M5, H4, D1) and enforcing the 3-Way Mode Switch.
+passing multi-timeframe market feeds (M5, H4, D1) and selecting the highest-confidence
+setup among all permitted strategies (eliminating first-match short-circuiting).
 """
 
 import os
 import json
 import logging
 import inspect
+from typing import List, Optional
 from strategies.base import StrategySignal
 from strategies.grubber_kick import GrubberKick
 from strategies.strategy_513_cross import Strategy513
@@ -66,12 +68,18 @@ class StrategyManager:
             return {}
 
     def evaluate_all(self, symbol: str, data_5m, data_h4, data_d1, session_levels: dict) -> StrategySignal | None:
+        """
+        Evaluates ALL strategies for the symbol. Rather than stopping at the first match,
+        it collects all valid signals and selects the one with the highest confidence score.
+        """
         if symbol not in self.ALLOWED_ASSETS:
             return None
 
         strategy_modes = self._get_strategy_modes()
+        valid_signals: List[StrategySignal] = []
 
         for strat in self.strategies:
+            strat_name = strat.__class__.__name__
             try:
                 sig = inspect.signature(strat.evaluate)
                 if len(sig.parameters) >= 5:
@@ -80,22 +88,33 @@ class StrategyManager:
                     signal = strat.evaluate(symbol, data_5m, session_levels)
 
                 if signal:
+                    # 1. Enforce strict asset boundary
                     permitted = self.STRATEGY_PERMITTED_ASSETS.get(signal.strategy, set())
                     if signal.symbol not in permitted:
                         continue
 
+                    # 2. Enforce 3-Way Mode Switch (LIVE | DRY_RUN | OFF)
                     mode = strategy_modes.get(signal.strategy, "LIVE")
                     if mode == "OFF":
                         continue
-                    
+
                     if mode == "DRY_RUN":
                         setattr(signal, "is_dry_run", True)
                     else:
                         setattr(signal, "is_dry_run", False)
 
-                    return signal
+                    valid_signals.append(signal)
+
             except Exception as e:
-                log.error(f"Error evaluating {strat.__class__.__name__} on {symbol}: {e}")
+                log.error(f"Error evaluating {strat_name} on {symbol}: {e}")
                 continue
 
-        return None
+        if not valid_signals:
+            return None
+
+        # Return the highest-confidence setup (A+ setup prioritization)
+        best_signal = max(valid_signals, key=lambda s: getattr(s, 'confidence', 0.80))
+        if len(valid_signals) > 1:
+            log.info(f"Multiple signals generated for {symbol} ({[s.strategy for s in valid_signals]}). Selected highest confidence: {best_signal.strategy} ({best_signal.confidence})")
+
+        return best_signal
