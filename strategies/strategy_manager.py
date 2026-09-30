@@ -1,11 +1,13 @@
 """
-strategies/strategy_manager.py
+trading-portal/strategies/strategy_manager.py
 Orchestrates institutional quantitative strategies across the 7 whitelisted assets,
 passing multi-timeframe market feeds (M5, H4, D1) and enforcing the 3-Way Mode Switch.
 """
+
 import os
 import json
 import logging
+import inspect
 from strategies.base import StrategySignal
 from strategies.grubber_kick import GrubberKick
 from strategies.strategy_513_cross import Strategy513
@@ -71,8 +73,6 @@ class StrategyManager:
 
         for strat in self.strategies:
             try:
-                # Check if strategy accepts multi-timeframe arguments
-                import inspect
                 sig = inspect.signature(strat.evaluate)
                 if len(sig.parameters) >= 5:
                     signal = strat.evaluate(symbol, data_5m, data_h4, data_d1, session_levels)
