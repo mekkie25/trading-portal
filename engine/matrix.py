@@ -7,6 +7,7 @@ Architecture: Master-Grade Institutional Multi-Strategy Execution Engine
 Components:   - Native Account Currency Detection (USD, ZAR, EUR, GBP)
               - Mathematically Exact Pip/Tick Dollar Value Parity Across All Pairs
               - Broker Live Position Reconciliation (ProtoOAReconcile 2124)
+              - Runtime Asset Stop-Size Boundary Enforcement (Spec Section 5)
               - True Frozen 15M Opening Range (London & NY Session Opens)
               - Dynamic ORB Established Gatekeeper (No Blind Pre-ORB Trades)
               - Zero-Amnesia Memory: Syncs Active Positions Directly From Broker
@@ -46,7 +47,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Priority Core Import: Registers configuration and session engine first
 import core.session_config
 from core.session_config import MarketSessionManager, GLOBAL_PARAMS
 
@@ -135,7 +135,7 @@ class WhatsAppNotifier:
 whatsapp = WhatsAppNotifier()
 
 # ==============================================================================
-# 3. TELEMETRY, UI I/O & TRADE JOURNAL HELPERS
+# 3. TELEMETRY & CACHING HELPERS
 # ==============================================================================
 
 def write_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str, open_positions_list: list = None) -> None:
@@ -713,10 +713,6 @@ class CTraderClient:
         return mid, bid, ask
 
     async def fetch_ohlc_candles(self, symbol_name: str, period: CTraderTrendbarPeriod, count: int = 60) -> pd.DataFrame:
-        """
-        Calculates bar duration dynamically based on the exact period requested.
-        Applies a 3x lookback buffer for weekends and market closures.
-        """
         sid = self.resolve_symbol_id(symbol_name)
         if not sid or not self.is_authorized:
             return pd.DataFrame()
@@ -735,7 +731,6 @@ class CTraderClient:
         bar_min = period_minutes_map.get(period, 5)
 
         now_ms = int(time.time() * 1000)
-        # Dynamic lookback window with 3x weekend buffer
         from_ms = now_ms - (count * bar_min * 60 * 1000 * 3)
 
         res = await self._send_and_wait(2137, {
@@ -772,7 +767,6 @@ class CTraderClient:
 
         df = pd.DataFrame(candles)
         df.sort_values("time", inplace=True)
-        # Drop the forming live bar: Only completed candles are evaluated per spec
         if len(df) > 1:
             df = df.iloc[:-1]
         return df.tail(count)
@@ -884,7 +878,7 @@ class OrderFlowAnalyzer:
         poc_price = float((bins[poc_idx] + bins[poc_idx + 1]) / 2.0)
 
         total_vol = np.sum(vol_distribution)
-        target_vol = total_vol * 0.75  # Spec Section 2: 75% Value Area
+        target_vol = total_vol * 0.75
 
         sorted_indices = np.argsort(vol_distribution)[::-1]
         cum_vol = 0.0
@@ -904,7 +898,7 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 7. INSTITUTIONAL RISK ENGINE
+# 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & STOP BOUNDARIES)
 # ==============================================================================
 
 class InstitutionalRiskEngine:
@@ -979,6 +973,20 @@ class InstitutionalRiskEngine:
             if self.SECTOR_MAP.get(open_sym) == sector:
                 return False, f"Sector limit: An open trade already exists in {sector} ({open_sym})."
         return True, ""
+
+    def validate_asset_stop_size(self, symbol: str, sl_distance: float) -> Tuple[bool, str]:
+        """Strict runtime enforcement of Spec Section 5 stop boundaries."""
+        if symbol == "NAS100":
+            if not (GLOBAL_PARAMS.nas100_stop_range[0] <= sl_distance <= GLOBAL_PARAMS.nas100_stop_range[2]):
+                return False, f"NAS100 Stop ({sl_distance:.1f} pts) outside spec [35-60 pts]"
+        elif symbol == "US30":
+            if not (GLOBAL_PARAMS.us30_stop_range[0] <= sl_distance <= GLOBAL_PARAMS.us30_stop_range[2]):
+                return False, f"US30 Stop ({sl_distance:.1f} pts) outside spec [30-50 pts]"
+        elif symbol == "GOLD":
+            pips = sl_distance * 10.0
+            if not (GLOBAL_PARAMS.gold_stop_range_pips[0] <= pips <= GLOBAL_PARAMS.gold_stop_range_pips[2]):
+                return False, f"Gold Stop ({pips:.1f} pips) outside spec [12-60 pips]"
+        return True, "Stop size valid"
 
     def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
         total_target_distance = abs(tp - entry)
@@ -1074,7 +1082,6 @@ class InstitutionalRiskEngine:
         else:
             active_risk_pct = base_risk_pct
 
-        # Apply Day-of-Week multiplier (Spec Sec 1)
         _, dow_mult, _ = MarketSessionManager.get_day_of_week_policy()
         active_risk_pct *= dow_mult
 
@@ -1153,6 +1160,11 @@ class InstitutionalRiskEngine:
         sl_distance = abs(entry_price - stop_loss)
         if sl_distance <= 0:
             return False, "Invalid Stop Loss distance", {}
+
+        # RUNTIME ASSET STOP-SIZE BOUNDARY ENFORCEMENT
+        stop_ok, stop_msg = self.validate_asset_stop_size(symbol, sl_distance)
+        if not stop_ok:
+            return False, f"Stop Range Rejection: {stop_msg}", {}
 
         final_tp = take_profit
         if final_tp is None or final_tp == 0:
@@ -1419,8 +1431,6 @@ class MatrixEngineMaster:
         self.risk_mgr = InstitutionalRiskEngine()
         self.execution_engine: Optional[CloudExecutionEngine] = None
         self.volume_profiles: Dict[str, VolumeProfileNode] = {}
-        
-        # Frozen Opening Ranges (Key = (symbol, session_date_str))
         self.frozen_opening_ranges: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     async def start(self) -> None:
@@ -1552,16 +1562,10 @@ class MatrixEngineMaster:
                 await asyncio.sleep(30.0)
 
     def _compute_frozen_opening_range(self, symbol: str, m5_df: pd.DataFrame) -> Tuple[float, float, bool]:
-        """
-        Computes and FROZES the 15M Opening Range from the exact first 3 candles
-        after session open. Once 15 minutes pass, the ORB is permanently fixed.
-        Before 15 minutes pass, orb_established is False (Spec Non-Negotiable #1).
-        """
         now = datetime.now(timezone.utc)
         today_str = now.strftime("%Y-%m-%d")
         cache_key = (symbol, today_str)
 
-        # Check if already frozen for today
         if cache_key in self.frozen_opening_ranges:
             entry = self.frozen_opening_ranges[cache_key]
             return entry['high'], entry['low'], True
@@ -1571,28 +1575,21 @@ class MatrixEngineMaster:
         in_ny = MarketSessionManager.is_in_ny_open(now)
 
         if not (in_london or in_ny):
-            # Outside active open windows, use fallback of available established session
             return float(m5_df['high'].tail(12).max()), float(m5_df['low'].tail(12).min()), True
 
-        # Identify session open boundary in UTC
         m5_df_time = pd.to_datetime(m5_df['time'])
         if in_london:
-            # London open is 08:00 Local London
             t_open_local = times["LONDON"].replace(hour=8, minute=0, second=0, microsecond=0)
             t_open_utc = t_open_local.astimezone(timezone.utc)
         else:
-            # NY open is 09:30 Local NY
             t_open_local = times["NEWYORK"].replace(hour=9, minute=30, second=0, microsecond=0)
             t_open_utc = t_open_local.astimezone(timezone.utc)
 
-        # Filter the first 3 M5 candles starting at session open
         session_candles = m5_df[m5_df_time >= t_open_utc]
 
         if len(session_candles) < 3:
-            # First 15 minutes still developing: Spec forbids trading before OR is established!
             return 0.0, 0.0, False
 
-        # First 3 candles have closed: Freeze Opening Range permanently
         first_3_candles = session_candles.head(3)
         orb_h = float(first_3_candles['high'].max())
         orb_l = float(first_3_candles['low'].min())
@@ -1631,7 +1628,6 @@ class MatrixEngineMaster:
                     if self.risk_mgr.has_active_position(friendly_name):
                         continue
 
-                    # Fetch genuine multi-timeframe candles with true lookbacks
                     m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
                     d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=15)
