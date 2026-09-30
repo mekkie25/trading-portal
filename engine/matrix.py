@@ -734,9 +734,9 @@ class CTraderClient:
         return None
 
     async def update_position_sl(self, position_id: int, new_sl: float) -> bool:
-        res = await self._send_and_wait(2107, {
+        res = await self._send_and_wait(2110, {
             "ctidTraderAccountId": self.account_id,
-            "positionId": position_id,
+            "positionId": int(position_id),
             "stopLoss": round(new_sl, 5)
         }, timeout=6.0)
         return bool(res and res.get("payloadType") == 2126)
