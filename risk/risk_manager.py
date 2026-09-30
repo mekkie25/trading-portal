@@ -30,7 +30,8 @@ RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", os.path.join(PROJECT_ROOT, "risk_
 def get_sast_session_date() -> str:
     """Calculates active session date strictly aligned with the SAST reset hour."""
     now_sast = datetime.now(timezone.utc).astimezone(TZ_SAST)
-    if now_sast.hour < GLOBAL_PARAMS.daily_reset_hour_sast:
+    reset_hour = getattr(GLOBAL_PARAMS, 'daily_reset_hour_sast', 0)
+    if now_sast.hour < reset_hour:
         now_sast -= timedelta(days=1)
     return now_sast.strftime("%Y-%m-%d")
 
@@ -40,20 +41,20 @@ class RiskManager:
         self.config_file = config_file if os.path.isabs(config_file) else os.path.join(PROJECT_ROOT, config_file)
         self.state_file = state_file
 
-        # UI & Spec Synced Controls
+        # UI & Spec Synced Controls (with bulletproof getattr fallbacks)
         self.master_execution: bool = True
         self.dry_run: bool = False
-        self.risk_per_trade_pct: float = GLOBAL_PARAMS.base_risk_per_trade_pct
+        self.risk_per_trade_pct: float = getattr(GLOBAL_PARAMS, 'base_risk_per_trade_pct', 1.0)
         self.risk_to_reward: float = 2.0
-        self.max_daily_trades: int = GLOBAL_PARAMS.max_daily_trades
-        self.max_daily_loss_pct: float = GLOBAL_PARAMS.max_daily_loss_pct
-        self.max_weekly_loss_pct: float = GLOBAL_PARAMS.max_weekly_loss_pct
-        self.max_monthly_loss_pct: float = GLOBAL_PARAMS.max_monthly_loss_pct
+        self.max_daily_trades: int = getattr(GLOBAL_PARAMS, 'max_daily_trades', 2)
+        self.max_daily_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_daily_loss_pct', 5.0)
+        self.max_weekly_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_weekly_loss_pct', 10.0)
+        self.max_monthly_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_monthly_loss_pct', 15.0)
 
         # USD Drawdown Limits default to 0.0 (Unset -> Percentage limits act as active fallback)
-        self.max_daily_loss_usd: float = 0.0
-        self.max_weekly_loss_usd: float = 0.0
-        self.max_monthly_loss_usd: float = 0.0
+        self.max_daily_loss_usd: float = getattr(GLOBAL_PARAMS, 'max_daily_loss_usd', 0.0)
+        self.max_weekly_loss_usd: float = getattr(GLOBAL_PARAMS, 'max_weekly_loss_usd', 0.0)
+        self.max_monthly_loss_usd: float = getattr(GLOBAL_PARAMS, 'max_monthly_loss_usd', 0.0)
 
         # Currency Switch Tracking
         self.last_seen_currency: Optional[str] = None
@@ -331,10 +332,11 @@ class RiskManager:
         - Multiplies streak reduction (0.5x on 3+ losses), DOW multiplier, and AI factor.
         - Floored at min_risk_multiplier_floor (25% of base risk).
         """
-        if GLOBAL_PARAMS.micro_account_mode:
+        micro_mode = getattr(GLOBAL_PARAMS, 'micro_account_mode', False)
+        if micro_mode:
             # Micro-account tiers bypass the 2.0% max_risk_per_trade_pct ceiling
             if current_equity < 60.0:
-                base_risk = GLOBAL_PARAMS.micro_account_risk_pct  # 25%
+                base_risk = getattr(GLOBAL_PARAMS, 'micro_account_risk_pct', 25.0)
             elif 60.0 <= current_equity < 200.0:
                 base_risk = 12.5
             elif 200.0 <= current_equity < 1000.0:
@@ -343,16 +345,19 @@ class RiskManager:
                 base_risk = 1.0
         else:
             base_risk = self.risk_per_trade_pct
-            if base_risk > GLOBAL_PARAMS.max_risk_per_trade_pct:
+            max_ceiling = getattr(GLOBAL_PARAMS, 'max_risk_per_trade_pct', 2.0)
+            if base_risk > max_ceiling:
                 log.warning(
-                    f"UI Risk ({base_risk}%) exceeds safety ceiling ({GLOBAL_PARAMS.max_risk_per_trade_pct}%). "
-                    f"Clamping base risk to {GLOBAL_PARAMS.max_risk_per_trade_pct}%."
+                    f"UI Risk ({base_risk}%) exceeds safety ceiling ({max_ceiling}%). "
+                    f"Clamping base risk to {max_ceiling}%."
                 )
-                base_risk = GLOBAL_PARAMS.max_risk_per_trade_pct
+                base_risk = max_ceiling
 
-        streak_mult = 0.5 if self.consecutive_losses >= GLOBAL_PARAMS.consecutive_loss_threshold else 1.0
+        loss_threshold = getattr(GLOBAL_PARAMS, 'consecutive_loss_threshold', 3)
+        streak_mult = 0.5 if self.consecutive_losses >= loss_threshold else 1.0
         raw_mult = streak_mult * dow_mult * ai_factor
-        final_mult = max(raw_mult, GLOBAL_PARAMS.min_risk_multiplier_floor)
+        mult_floor = getattr(GLOBAL_PARAMS, 'min_risk_multiplier_floor', 0.25)
+        final_mult = max(raw_mult, mult_floor)
         return base_risk * final_mult
 
     def validate_min_lot_risk(self, min_lots: float, risk_per_lot: float, risk_cash: float) -> Tuple[bool, str]:
@@ -361,7 +366,8 @@ class RiskManager:
         Protects small accounts from over-leveraging when structural stops are wide.
         """
         min_lot_cash_risk = min_lots * risk_per_lot
-        allowed_max = GLOBAL_PARAMS.min_lot_risk_tolerance * risk_cash
+        tolerance = getattr(GLOBAL_PARAMS, 'min_lot_risk_tolerance', 1.5)
+        allowed_max = tolerance * risk_cash
         if min_lot_cash_risk > allowed_max:
             msg = (
                 f"Min-Lot Risk Rejection: Minimum trade size ({min_lots:.2f} lots) "
