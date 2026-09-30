@@ -904,7 +904,11 @@ class OrderFlowAnalyzer:
 # 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & STOP BOUNDARIES)
 # ==============================================================================
 
-   class InstitutionalRiskEngine:
+   # ==============================================================================
+# 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & STOP BOUNDARIES)
+# ==============================================================================
+
+class InstitutionalRiskEngine:
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config_file = config_file
         # Instantiate persistent risk manager (reads/writes risk_state.json)
