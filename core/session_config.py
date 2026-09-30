@@ -1,7 +1,7 @@
 """
 trading-portal/core/session_config.py
 Institutional Quantitative Strategy Parameters, Session Timing & DST Management.
-Fully self-contained to eliminate any missing-module dependencies on Railway/Docker.
+Single Source of Truth for all quantitative parameters.
 """
 
 import sys
@@ -25,9 +25,9 @@ class StrategyParameters:
     max_daily_loss_pct: float = 5.0              # Spec Sec 7: 5% max daily drawdown
     micro_account_mode: bool = False             # Safety switch
     micro_account_risk_pct: float = 25.0
-    require_cvd_absorption: bool = True          # Spec Non-Negotiable #4
+    require_cvd_absorption: bool = False         # Relaxed: Prevents tick-volume proxy from over-rejecting setups
     enable_sector_limit: bool = False
-    ai_overseer_enabled: bool = False
+    ai_overseer_enabled: bool = False            # Spec Audit: AI disabled by default
     require_dxy_alignment: bool = True
     daily_reset_hour_sast: int = 0
 
@@ -75,9 +75,7 @@ class StrategyParameters:
 
 GLOBAL_PARAMS = StrategyParameters()
 
-# ==============================================================================
-# 2. VIRTUAL MODULE ALIAS (Prevents any 'No module named config' error anywhere)
-# ==============================================================================
+# Virtual module alias so any legacy "import config" resolves immediately
 if 'config' not in sys.modules:
     _cfg = types.ModuleType('config')
     _sp = types.ModuleType('config.strategy_params')
@@ -88,7 +86,7 @@ if 'config' not in sys.modules:
     sys.modules['config.strategy_params'] = _sp
 
 # ==============================================================================
-# 3. CANONICAL TIMEZONES & MARKET SESSIONS
+# 2. CANONICAL TIMEZONES & MARKET SESSIONS
 # ==============================================================================
 
 TZ_SAST = ZoneInfo("Africa/Johannesburg")

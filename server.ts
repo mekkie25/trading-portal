@@ -151,6 +151,16 @@ let activeBotConfig: BotGatewayConfig = {
   currency: 'USD',
   updatedAt: new Date().toISOString(),
   version: 1,
+  strategyModes: {
+    "EMA_9_25_CROSS": "LIVE",
+    "GRUBBER_KICK": "LIVE",
+    "STRATEGY_513": "LIVE",
+    "ORB_LIQUIDITY_SWEEP": "LIVE",
+    "AVWAP_200EMA_CONTINUATION": "LIVE",
+    "PDH_PDL_FAILED_BREAKOUT": "LIVE",
+    "ORB_CRACKER": "DRY_RUN",
+    "OES_4H_ORDER_BLOCK": "LIVE"
+  },
   weeklyDepositBaseline: 10,
   weeklyGoalTarget: 20,
   dailyGoalTarget: 5
@@ -206,7 +216,6 @@ function loadTradesFromDisk(): any[] {
       const content = fs.readFileSync(TRADES_DB_FILE, 'utf8').trim();
       if (content) {
         const parsed = JSON.parse(content);
-        // Fix: If file exists and parsed is a valid array (even if empty []), respect it!
         if (Array.isArray(parsed)) {
           return parsed;
         }
@@ -216,7 +225,6 @@ function loadTradesFromDisk(): any[] {
     console.error('Failed to load trades from disk:', e);
   }
 
-  // Only seed if file does not exist at all
   saveTradesToDisk(SEED_TRADES);
   return SEED_TRADES;
 }
@@ -325,7 +333,7 @@ async function startServer() {
     }
   });
 
-  // 2. CLOSE POSITION
+  // 2. CLOSE POSITION ON DEMAND
   app.post('/api/positions/close/:id', (req, res) => {
     try {
       const positionId = req.params.id;
