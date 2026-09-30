@@ -2,7 +2,6 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import WebSocket from 'ws';
 import { spawn } from 'child_process';
 
 interface BotGatewayConfig {
@@ -58,22 +57,26 @@ interface BrokerTelemetry {
   lastSyncTime: string;
   lastHeartbeat: string;
   openPositions: Array<{
+    id: string;
     ticket: string;
     symbol: string;
-    type: 'BUY' | 'SELL';
+    strategy: string;
+    direction: 'BUY' | 'SELL';
     lots: number;
-    openPrice: number;
+    entry: number;
     currentPrice: number;
-    pnl: number;
-    stopLoss?: number;
-    takeProfit?: number;
+    sl?: number;
+    tp?: number;
+    floatingPnL: number;
+    isRiskFree: boolean;
   }>;
 }
 
 const BOT_CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
 const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
+const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
+const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
 
-// Real verified 4-trade fallback history so the portal is never blank
 const SEED_TRADES = [
   {
     id: "deal-26686729",
@@ -174,12 +177,6 @@ if (fs.existsSync(BOT_CONFIG_FILE)) {
     if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) {
       riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
     }
-    if (saved.maxDailyDrawdownPct !== undefined) {
-      riskLimits.maxDailyDrawdownPct = saved.maxDailyDrawdownPct;
-    }
-    if (saved.autoLiquidateAllOnTrip !== undefined) {
-      riskLimits.autoLiquidateAllOnTrip = saved.autoLiquidateAllOnTrip;
-    }
   } catch (e) {
     console.error('Failed to load bot_config.json on startup:', e);
   }
@@ -216,8 +213,6 @@ function loadTradesFromDisk(): any[] {
   } catch (e) {
     console.error('Failed to load trades from disk:', e);
   }
-
-  // Pre-seed and save to disk if empty
   saveTradesToDisk(SEED_TRADES);
   return SEED_TRADES;
 }
@@ -272,7 +267,6 @@ function recomputeRiskState() {
   }
 }
 
-// Live telemetry reflects current verified cTrader figures
 let activeBrokerTelemetry: BrokerTelemetry = {
   connected: true,
   provider: 'Fusion Markets cTrader',
@@ -311,7 +305,34 @@ async function startServer() {
     next();
   });
 
-  // A. GET ALL TRADES (Always returns current trades, never empty)
+  // 1. CANDLE FEED ENDPOINT (Provides chart data to LiveFeedView)
+  app.get('/api/market/candles', (req, res) => {
+    try {
+      const symbol = String(req.query.symbol || 'US30').toUpperCase();
+      if (fs.existsSync(CANDLES_CACHE_FILE)) {
+        const cache = JSON.parse(fs.readFileSync(CANDLES_CACHE_FILE, 'utf8'));
+        if (cache && cache[symbol]) {
+          return res.status(200).json({ status: 'success', symbol, data: cache[symbol] });
+        }
+      }
+      return res.status(200).json({ status: 'success', symbol, data: [] });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // 2. CLOSE POSITION ON DEMAND (Triggered by Dashboard "Close Now" button)
+  app.post('/api/positions/close/:id', (req, res) => {
+    try {
+      const positionId = req.params.id;
+      fs.writeFileSync(CLOSE_COMMAND_FILE, JSON.stringify({ positionId, requestedAt: new Date().toISOString() }));
+      res.status(200).json({ status: 'success', message: `Close command queued for position #${positionId}` });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // 3. TRADE JOURNAL APIS
   app.get('/api/journal', async (req, res) => {
     try {
       const diskTrades = loadTradesFromDisk();
@@ -322,7 +343,6 @@ async function startServer() {
     }
   });
 
-  // B. ADD NEW TRADE
   app.post('/api/journal', (req, res) => {
     try {
       const newTrade = req.body;
@@ -337,7 +357,6 @@ async function startServer() {
     }
   });
 
-  // C. DELETE SINGLE TRADE
   app.delete('/api/journal/:id', (req, res) => {
     const tradeId = req.params.id;
     let trades = loadTradesFromDisk();
@@ -348,7 +367,6 @@ async function startServer() {
     res.json({ status: 'success', message: `Trade ${tradeId} deleted.` });
   });
 
-  // D. RESET JOURNAL
   app.post('/api/journal/reset', (req, res) => {
     saveTradesToDisk([]);
     activeBrokerTelemetry.trades = [];
@@ -356,12 +374,11 @@ async function startServer() {
     res.json({ status: 'success', message: 'Journal reset.' });
   });
 
-  // E. GET BOT CONFIGURATION
+  // 4. BOT CONFIG APIS
   app.get('/api/bot/config', (req, res) => {
     res.json({ status: 'success', data: activeBotConfig });
   });
 
-  // F. UPDATE BOT CONFIGURATION
   app.post('/api/bot/config', (req, res) => {
     try {
       const config = req.body;
@@ -374,13 +391,12 @@ async function startServer() {
     }
   });
 
-  // G. GET RISK LIMITS
+  // 5. RISK LIMITS APIS
   app.get('/api/limits', (req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
   });
 
-  // H. UPDATE RISK LIMITS
   app.post('/api/limits', (req, res) => {
     try {
       const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, breakerAction, resetBreaker } = req.body;
@@ -408,7 +424,7 @@ async function startServer() {
     }
   });
 
-  // I. TELEMETRY
+  // 6. TELEMETRY APIS
   app.get('/api/broker/telemetry', (req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: activeBrokerTelemetry });
@@ -420,7 +436,7 @@ async function startServer() {
     res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
   });
 
-  // LAUNCH PYTHON BOT
+  // 7. LAUNCH PYTHON BOT ENGINE
   function launchPythonBot() {
     console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
@@ -447,10 +463,13 @@ async function startServer() {
           if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
           if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
           if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
+          if (Array.isArray(telem.openPositions)) {
+            activeBrokerTelemetry.openPositions = telem.openPositions;
+          }
           activeBrokerTelemetry.connected = true;
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
         } catch (e) {
-          // Ignore parsing errors on partial logs
+          // Ignore parsing noise
         }
       }
       console.log(`[Python Engine] ${line}`);
