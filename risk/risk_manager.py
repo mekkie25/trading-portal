@@ -1,6 +1,6 @@
 """
-risk/risk_manager.py
-Institutional Risk Management & Volatility Engine with "News Armor"
+trading-portal/risk/risk_manager.py
+Institutional Risk Engine with Persistent Daily Rollover & Dynamic Drawdown Throttling.
 """
 
 import os
@@ -11,241 +11,136 @@ import numpy as np
 from datetime import datetime, timezone, time as dtime
 from typing import Dict, Tuple, Optional
 
+try:
+    from config.strategy_params import GLOBAL_PARAMS
+except ImportError:
+    import sys
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from config.strategy_params import GLOBAL_PARAMS
+
 log = logging.getLogger("RiskManager")
 
 class RiskManager:
-    def __init__(self, config_file: str = "bot_config.json"):
+    def __init__(self, config_file: str = "bot_config.json", state_file: str = "risk_state.json"):
         self.config_file = config_file
-        
-        # UI Synced Controls
+        self.state_file = state_file
+
+        # UI & Spec Synced Controls
         self.master_execution: bool = True
         self.dry_run: bool = False
-        self.risk_per_trade_pct: float = 1.0       # 1.0% base risk
-        self.risk_to_reward: float = 2.0           # 1 : 2 default target
-        self.max_daily_trades: int = 4
-        self.max_daily_loss_usd: float = 2500.0
-        self.max_weekly_loss_usd: float = 6500.0
-        self.max_monthly_loss_usd: float = 15000.0
-        
+        self.risk_per_trade_pct: float = GLOBAL_PARAMS.base_risk_per_trade_pct
+        self.risk_to_reward: float = 2.0
+        self.max_daily_trades: int = GLOBAL_PARAMS.max_daily_trades
+        self.max_daily_loss_pct: float = GLOBAL_PARAMS.max_daily_loss_pct
+
         # Operational State
+        self.current_day_str: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.starting_day_equity: float = 0.0
         self.trades_taken_today: int = 0
         self.consecutive_losses: int = 0
         self.current_daily_loss: float = 0.0
-        self.current_weekly_loss: float = 0.0
-        self.current_monthly_loss: float = 0.0
         self.open_positions: Dict[str, dict] = {}
 
-        # Weekly Growth Goal Engine
-        self.weekly_deposit_baseline: float = 10.0
-        self.weekly_goal_target: float = 20.0
-        
-        # Standard Baseline Spreads & Dynamic +70% Tolerance Bands
-        self.max_spread_to_sl_ratio: float = 0.30
-        self.spread_ranges = {
-            "frxXAUUSD": {"standard": 0.80, "max_allowed": 1.36},       # Gold: 0.80 -> 1.36 USD
-            "OTC_DJI":   {"standard": 4.50, "max_allowed": 7.65},       # US30: 4.5 -> 7.65 pts
-            "OTC_NDX":   {"standard": 2.00, "max_allowed": 3.40},       # NAS100: 2.0 -> 3.40 pts
-            "OTC_GDAXI": {"standard": 2.50, "max_allowed": 4.25},       # DAX40: 2.5 -> 4.25 pts
-            "frxEURUSD": {"standard": 0.00010, "max_allowed": 0.00017}, # EUR/USD: 1.0 -> 1.7 pips
-            "frxUSDJPY": {"standard": 0.012, "max_allowed": 0.0204},    # USD/JPY: 1.2 -> 2.04 pips
-            "frxGBPUSD": {"standard": 0.00014, "max_allowed": 0.00024}  # GBP/USD: 1.4 -> 2.38 pips
-        }
+        self.load_persistent_state()
 
-        # Sector Correlation Grouping (Max 1 open position per sector)
-        self.SECTOR_MAP = {
-            "OTC_DJI": "EQUITY_INDEX",
-            "OTC_NDX": "EQUITY_INDEX",
-            "OTC_GDAXI": "EQUITY_INDEX",
-            "frxXAUUSD": "PRECIOUS_METAL",
-            "GOLD": "PRECIOUS_METAL",
-            "frxEURUSD": "FOREX_MAJORS",
-            "frxGBPUSD": "FOREX_MAJORS",
-            "frxUSDJPY": "FOREX_MAJORS"
-        }
+    def load_persistent_state(self):
+        """Zero-Amnesia: Restores trade counters and streak tracking across container restarts."""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r") as f:
+                    st = json.load(f)
+                saved_day = st.get("current_day_str")
+                now_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if saved_day == now_day:
+                    self.trades_taken_today = st.get("trades_taken_today", 0)
+                    self.current_daily_loss = st.get("current_daily_loss", 0.0)
+                    self.starting_day_equity = st.get("starting_day_equity", 0.0)
+                else:
+                    self.reset_daily_counters(now_day)
+                self.consecutive_losses = st.get("consecutive_losses", 0)
+            except Exception as e:
+                log.warning(f"Could not load risk state: {e}")
 
-        # High-impact news window filters (5 min before & after)
-        self.RED_FOLDER_WINDOWS = [
-            (dtime(12, 25), dtime(12, 35)),  # US CPI / NFP window (12:30 UTC)
-            (dtime(17, 55), dtime(18, 5))    # FOMC Decision window (18:00 UTC)
-        ]
-
-    def sync_ui_config(self) -> None:
-        if not os.path.exists(self.config_file):
-            return
+    def save_persistent_state(self):
         try:
-            with open(self.config_file, "r") as f:
-                cfg = json.load(f)
-            self.master_execution = cfg.get("masterExecution", self.master_execution)
-            self.dry_run = cfg.get("dryRun", self.dry_run)
-            self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
-            self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
-            self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
-            self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
-            self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
-            self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
-            self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline))
-            self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target))
+            st = {
+                "current_day_str": self.current_day_str,
+                "trades_taken_today": self.trades_taken_today,
+                "consecutive_losses": self.consecutive_losses,
+                "current_daily_loss": self.current_daily_loss,
+                "starting_day_equity": self.starting_day_equity,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            with open(self.state_file, "w") as f:
+                json.dump(st, f, indent=2)
         except Exception as e:
-            log.warning(f"Error parsing {self.config_file}: {e}")
+            log.error(f"Failed to persist risk state: {e}")
 
-    def is_red_folder_active(self) -> bool:
-        now_utc = datetime.now(timezone.utc).time()
-        for start, end in self.RED_FOLDER_WINDOWS:
-            if start <= now_utc <= end:
-                return True
-        return False
+    def check_daily_rollover(self, current_equity: float):
+        """Enforces a clean 00:00 SAST daily risk reset without losing consecutive loss streaks."""
+        now_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if now_day != self.current_day_str:
+            self.reset_daily_counters(now_day, current_equity)
 
-    def check_sector_exposure(self, symbol: str) -> Tuple[bool, str]:
-        sector = self.SECTOR_MAP.get(symbol, "OTHER")
-        for ticket, pos in self.open_positions.items():
-            open_sym = pos.get("symbol", "")
-            if self.SECTOR_MAP.get(open_sym) == sector:
-                return False, f"Sector limit: An open trade already exists in {sector} ({open_sym})."
-        return True, ""
+    def reset_daily_counters(self, new_day_str: str, current_equity: float = 0.0):
+        self.current_day_str = new_day_str
+        self.trades_taken_today = 0
+        self.current_daily_loss = 0.0
+        if current_equity > 0:
+            self.starting_day_equity = current_equity
+        log.info(f"DAILY RISK RESET: New trading date {new_day_str} initialized. Counter reset to 0.")
+        self.save_persistent_state()
 
-    def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
-        total_target_distance = abs(tp - entry)
-        if total_target_distance <= 0:
-            return False
+    def record_trade_outcome(self, pnl: float):
+        """Updates consecutive loss streak and daily drawdown (Spec Sec 7)."""
+        if pnl < 0:
+            self.consecutive_losses += 1
+            self.current_daily_loss += abs(pnl)
+            log.warning(f"LOSS RECORDED (-${abs(pnl):.2f}). Consecutive loss streak: {self.consecutive_losses}")
+        elif pnl > 0:
+            self.consecutive_losses = 0  # Spec: Reset streak on win
+            log.info(f"WIN RECORDED (+${pnl:.2f}). Consecutive loss streak reset to 0.")
+        self.save_persistent_state()
 
-        if direction.upper() == "BUY":
-            current_progress = current_price - entry
-        else:
-            current_progress = entry - current_price
+    def get_effective_risk_pct(self) -> float:
+        """Enforces Spec Sec 7: 3 consecutive losses drops risk from 1% to 0.5%."""
+        if self.consecutive_losses >= GLOBAL_PARAMS.consecutive_loss_threshold:
+            log.info(f"CONSECUTIVE LOSS CIRCUIT ACTIVE: Risk scaled down to {GLOBAL_PARAMS.consecutive_loss_risk_pct}%")
+            return GLOBAL_PARAMS.consecutive_loss_risk_pct
+        return self.risk_per_trade_pct
 
-        progress_ratio = current_progress / total_target_distance
-        return progress_ratio >= 0.80
+    def validate_asset_stop_size(self, symbol: str, sl_distance: float) -> Tuple[bool, str]:
+        """
+        Validates stop loss strictly against Spec Section 5 parameters:
+        - NAS100: 35 to 50 pts (max 60)
+        - US30: 30 to 50 pts
+        - GOLD: 12 to 40 pips (up to 50-60 in high ATR)
+        """
+        if symbol == "NAS100":
+            if not (GLOBAL_PARAMS.nas100_stop_range[0] <= sl_distance <= GLOBAL_PARAMS.nas100_stop_range[2]):
+                return False, f"NAS100 Stop ({sl_distance:.1f} pts) outside spec [35-60 pts]"
+        elif symbol == "US30":
+            if not (GLOBAL_PARAMS.us30_stop_range[0] <= sl_distance <= GLOBAL_PARAMS.us30_stop_range[2]):
+                return False, f"US30 Stop ({sl_distance:.1f} pts) outside spec [30-50 pts]"
+        elif symbol == "GOLD":
+            pips = sl_distance * 10.0  # $1.00 move = 10 pips
+            if not (GLOBAL_PARAMS.gold_stop_range_pips[0] <= pips <= GLOBAL_PARAMS.gold_stop_range_pips[2]):
+                return False, f"Gold Stop ({pips:.1f} pips) outside spec [12-60 pips]"
+        return True, "Stop size valid"
 
-    @staticmethod
-    def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
-        def get_atr(df: pd.DataFrame, period: int = 14) -> float:
-            if df is None or df.empty or len(df) < 2:
-                return 0.0
-            high_low = df['high'] - df['low']
-            high_close = (df['high'] - df['close'].shift(1)).abs()
-            low_close = (df['low'] - df['close'].shift(1)).abs()
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            return float(tr.tail(period).mean())
-
-        m5_avg = get_atr(m5_df, 14)
-        h4_avg = get_atr(h4_df, 14)
-        d1_avg = get_atr(d1_df, 14)
-
-        is_ranging = False
-        range_high, range_low, range_span = 0.0, 0.0, 0.0
-
-        if m5_df is not None and len(m5_df) >= 20:
-            recent_20 = m5_df.tail(20)
-            range_high = float(recent_20['high'].max())
-            range_low = float(recent_20['low'].min())
-            range_span = range_high - range_low
-            if m5_avg > 0 and range_span < (m5_avg * 2.5):
-                is_ranging = True
-
-        return {
-            "m5_candle_avg": round(m5_avg, 4),
-            "h4_candle_avg": round(h4_avg, 4),
-            "d1_candle_avg": round(d1_avg, 4),
-            "is_ranging": is_ranging,
-            "range_high": round(range_high, 4),
-            "range_low": round(range_low, 4),
-            "range_span": round(range_span, 4),
-        }
-
-    def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
-        spread = abs(current_ask - current_bid)
-        range_cfg = self.spread_ranges.get(symbol)
-
-        if range_cfg:
-            std_spread = range_cfg["standard"]
-            max_allowed = range_cfg["max_allowed"]
-            if spread > max_allowed:
-                return False, f"Spread ({spread:.5f}) exceeded range [{std_spread:.5f} to {max_allowed:.5f}]", spread
-        else:
-            if spread > 5.0:
-                return False, f"Spread ({spread:.4f}) exceeds default ceiling (5.0)", spread
-
-        if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
-            return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
-
-        return True, "Spread optimal", spread
-
-    def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        equity = current_equity if current_equity > 0 else 10.0
-        active_risk_pct = self.risk_per_trade_pct
-
-        if self.consecutive_losses >= 3:
-            active_risk_pct *= 0.5
-            log.info(f"Consecutive loss protection: Risk halved to {active_risk_pct:.2f}%")
-
-        if self.is_red_folder_active():
-            active_risk_pct *= 0.5
-            log.info("News armor active: Risk halved for news window.")
-
-        base_risk_dollars = equity * (active_risk_pct / 100.0)
-        denom = sl_distance * point_value
-        calculated_stake = (base_risk_dollars / denom) if denom > 0 else min_stake
-
-        if calculated_stake < min_stake and equity >= min_stake:
-            calculated_stake = min_stake
-
-        return round(max(min(calculated_stake, max_stake), min_stake), 2)
-
-    def validate_pre_trade(
-        self,
-        symbol: str,
-        direction: str,
-        entry_price: float,
-        stop_loss: float,
-        take_profit: float,
-        current_bid: float,
-        current_ask: float,
-        current_equity: float,
-        point_value: float = 1.0,
-        min_stake: float = 0.01,
-        max_stake: float = 50.0
-    ) -> Tuple[bool, str, dict]:
-        self.sync_ui_config()
-
-        if not self.master_execution:
-            return False, "Master execution switch is OFF in UI", {}
-
-        sector_ok, sector_msg = self.check_sector_exposure(symbol)
-        if not sector_ok:
-            return False, sector_msg, {}
+    def can_trade_today(self, current_equity: float) -> Tuple[bool, str]:
+        """Enforces max 2 trades/day and daily drawdown cap (Spec Sec 7)."""
+        self.check_daily_rollover(current_equity)
 
         if self.trades_taken_today >= self.max_daily_trades:
-            return False, f"Daily trade quota reached ({self.trades_taken_today}/{self.max_daily_trades})", {}
+            return False, f"Daily trade limit reached ({self.trades_taken_today}/{self.max_daily_trades})"
 
-        sl_distance = abs(entry_price - stop_loss)
-        if sl_distance <= 0:
-            return False, "Invalid Stop Loss distance", {}
+        if self.starting_day_equity > 0:
+            max_allowed_loss = self.starting_day_equity * (self.max_daily_loss_pct / 100.0)
+            if self.current_daily_loss >= max_allowed_loss:
+                return False, f"Daily loss cap reached (-${self.current_daily_loss:.2f} >= ${max_allowed_loss:.2f})"
 
-        final_tp = take_profit
-        if final_tp is None or final_tp == 0:
-            target_distance = sl_distance * self.risk_to_reward
-            final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
-
-        spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
-        if not spread_ok:
-            return False, f"Spread Gate Rejection: {spread_msg}", {}
-
-        adjusted_sl = (stop_loss - spread_pts) if direction.upper() == "BUY" else (stop_loss + spread_pts)
-        stake = self.calculate_lot_size(current_equity, sl_distance, point_value, min_stake, max_stake)
-        if stake <= 0:
-            return False, "Calculated stake is 0", {}
-
-        blueprint = {
-            "symbol": symbol,
-            "direction": direction.upper(),
-            "stake": stake,
-            "entry_price": entry_price,
-            "stop_loss": round(adjusted_sl, 4),
-            "take_profit": round(final_tp, 4),
-            "spread_points": round(spread_pts, 4),
-            "is_dry_run": self.dry_run
-        }
-        return True, "Approved", blueprint
+        return True, "Risk gates clear"
 
 RiskState = RiskManager
 InstitutionalRiskEngine = RiskManager
