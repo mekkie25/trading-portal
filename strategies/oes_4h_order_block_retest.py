@@ -1,78 +1,114 @@
+"""
+trading-portal/strategies/oes_4h_order_block_retest.py
+Order Flow Entry Strategy (OES) / 4H Zone Retest (Spec Setup 6).
+- Timeframe Analysis: 4H/1H Institutional Order Block (OB) and Fair Value Gap (FVG)
+- Market Action: Price returns to mitigate the 4H OB zone
+- Confirmation: 5M Market Structure Shift (MSS) + Bullish/Bearish Engulfing close
+- Stop Loss: Placed strictly beyond the 4H OB extreme + technical buffer
+- Take Profit: TP1 = 1:2 R:R, TP2 = Session High/Low
+"""
+
 import pandas as pd
 from strategies.base import StrategySignal
+from core.indicators import is_bullish_engulfing, is_bearish_engulfing
 
 class OrderBlockRetest:
     def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
+        diagnostics = {"strategy": "OES_4H_ORDER_BLOCK", "passed": False, "reason": ""}
+
         if data_5m is None or len(data_5m) < 20:
+            diagnostics["reason"] = "Insufficient 5M bars"
             return None
 
-        # Require genuine 4-Hour data to identify real institutional Order Blocks
-        if data_h4 is None or len(data_h4) < 10:
+        # Requires genuine 4H data for institutional zone validation
+        if data_h4 is None or len(data_h4) < 12:
+            diagnostics["reason"] = "Requires minimum 12 bars of 4H data"
             return None
 
-        # Identify genuine 4H Order Block:
-        # A bullish OB is the last down-candle before a strong upward displacement breaking structure.
-        # A bearish OB is the last up-candle before a strong downward displacement breaking structure.
-        h4_recent = data_h4.tail(8)
-        bearish_ob_high = 0.0
-        bearish_ob_low = 0.0
-        bullish_ob_high = 0.0
-        bullish_ob_low = 0.0
+        # Scan for institutional Order Block + Fair Value Gap (FVG) in 4H data
+        h4 = data_h4.tail(10)
+        bearish_ob = None
+        bullish_ob = None
 
-        for i in range(1, len(h4_recent) - 1):
-            prev = h4_recent.iloc[i-1]
-            curr = h4_recent.iloc[i]
-            nxt = h4_recent.iloc[i+1]
-            
-            # Bearish 4H OB: Green candle followed by strong red impulse breaking prior lows
-            if curr['close'] > curr['open'] and nxt['close'] < curr['low'] and (nxt['open'] - nxt['close']) > (curr['high'] - curr['low']):
-                bearish_ob_high = float(curr['high'])
-                bearish_ob_low = float(curr['low'])
+        for i in range(2, len(h4)):
+            b1 = h4.iloc[i - 2]
+            b2 = h4.iloc[i - 1]
+            b3 = h4.iloc[i]
 
-            # Bullish 4H OB: Red candle followed by strong green impulse breaking prior highs
-            if curr['close'] < curr['open'] and nxt['close'] > curr['high'] and (nxt['close'] - nxt['open']) > (curr['high'] - curr['low']):
-                bullish_ob_high = float(curr['high'])
-                bullish_ob_low = float(curr['low'])
+            # Bullish 4H OB: Down candle followed by displacement leaving an FVG (b3['low'] > b1['high'])
+            if b2['close'] < b2['open'] and b3['close'] > b2['high']:
+                if b3['low'] > b1['high']:  # FVG presence
+                    bullish_ob = {'high': float(b2['high']), 'low': float(b2['low'])}
 
-        curr_5m = data_5m.iloc[-1]
-        prev_5m = data_5m.iloc[-2]
+            # Bearish 4H OB: Up candle followed by displacement leaving an FVG (b3['high'] < b1['low'])
+            if b2['close'] > b2['open'] and b3['close'] < b2['low']:
+                if b3['high'] < b1['low']:  # FVG presence
+                    bearish_ob = {'high': float(b2['high']), 'low': float(b2['low'])}
 
-        # Short: 5M price tests the 4H Bearish OB Zone, rejects, and closes with a bearish engulfing bar
-        if bearish_ob_high > 0 and bearish_ob_low > 0:
-            tested_zone = curr_5m['high'] >= bearish_ob_low and curr_5m['high'] <= (bearish_ob_high * 1.002)
-            rejected = curr_5m['close'] < curr_5m['open'] and curr_5m['close'] < prev_5m['low']
-            if tested_zone and rejected:
-                sl = float(max(bearish_ob_high, curr_5m['high']))
-                risk = abs(sl - curr_5m['close'])
+        curr_bar = data_5m.iloc[-1]
+        prev_bar = data_5m.iloc[-2]
+
+        buffer = 3.0 if symbol in ("US30", "NAS100") else (0.40 if symbol == "GOLD" else 0.0004)
+
+        # BULLISH OES RETEST
+        if bullish_ob:
+            in_zone = curr_bar['low'] <= bullish_ob['high'] and curr_bar['close'] >= bullish_ob['low']
+            mss_confirmed = is_bullish_engulfing(prev_bar, curr_bar)
+
+            if in_zone and mss_confirmed:
+                sl = float(bullish_ob['low'] - buffer)
+                risk = abs(curr_bar['close'] - sl)
                 if risk > 0:
-                    return StrategySignal(
-                        strategy="OES_4H_ORDER_BLOCK",
-                        symbol=symbol,
-                        direction="SELL",
-                        entry_price=float(curr_5m['close']),
-                        stop_loss=sl,
-                        take_profit=float(curr_5m['close'] - (2 * risk)),
-                        confidence=0.88,
-                        reason="Confirmed test and rejection of 4H Bearish Order Block with 5M structure shift"
-                    )
+                    tp1 = float(curr_bar['close'] + (2.0 * risk))
+                    tp2 = float(session_levels.get('pdh', curr_bar['close'] + (3.0 * risk)))
 
-        # Long: 5M price tests the 4H Bullish OB Zone, rejects, and closes with a bullish engulfing bar
-        if bullish_ob_high > 0 and bullish_ob_low > 0:
-            tested_zone = curr_5m['low'] <= bullish_ob_high and curr_5m['low'] >= (bullish_ob_low * 0.998)
-            rejected = curr_5m['close'] > curr_5m['open'] and curr_5m['close'] > prev_5m['high']
-            if tested_zone and rejected:
-                sl = float(min(bullish_ob_low, curr_5m['low']))
-                risk = abs(curr_5m['close'] - sl)
-                if risk > 0:
+                    diagnostics.update({"passed": True, "action": "BUY", "ob_zone": bullish_ob})
                     return StrategySignal(
                         strategy="OES_4H_ORDER_BLOCK",
                         symbol=symbol,
                         direction="BUY",
-                        entry_price=float(curr_5m['close']),
+                        entry_price=float(curr_bar['close']),
                         stop_loss=sl,
-                        take_profit=float(curr_5m['close'] + (2 * risk)),
-                        confidence=0.88,
-                        reason="Confirmed test and rejection of 4H Bullish Order Block with 5M structure shift"
+                        take_profit=tp1,
+                        take_profit_1=tp1,
+                        take_profit_2=tp2,
+                        scale_out_fraction=0.50,
+                        trail_mode="MOVE_TO_BE_80",
+                        session="ALL_DAY",
+                        confidence=0.90,
+                        reason="Mitigation of 4H Bullish Order Block + FVG with 5M market structure shift",
+                        diagnostics=diagnostics
                     )
 
+        # BEARISH OES RETEST
+        if bearish_ob:
+            in_zone = curr_bar['high'] >= bearish_ob['low'] and curr_bar['close'] <= bearish_ob['high']
+            mss_confirmed = is_bearish_engulfing(prev_bar, curr_bar)
+
+            if in_zone and mss_confirmed:
+                sl = float(bearish_ob['high'] + buffer)
+                risk = abs(sl - curr_bar['close'])
+                if risk > 0:
+                    tp1 = float(curr_bar['close'] - (2.0 * risk))
+                    tp2 = float(session_levels.get('pdl', curr_bar['close'] - (3.0 * risk)))
+
+                    diagnostics.update({"passed": True, "action": "SELL", "ob_zone": bearish_ob})
+                    return StrategySignal(
+                        strategy="OES_4H_ORDER_BLOCK",
+                        symbol=symbol,
+                        direction="SELL",
+                        entry_price=float(curr_bar['close']),
+                        stop_loss=sl,
+                        take_profit=tp1,
+                        take_profit_1=tp1,
+                        take_profit_2=tp2,
+                        scale_out_fraction=0.50,
+                        trail_mode="MOVE_TO_BE_80",
+                        session="ALL_DAY",
+                        confidence=0.90,
+                        reason="Mitigation of 4H Bearish Order Block + FVG with 5M market structure shift",
+                        diagnostics=diagnostics
+                    )
+
+        diagnostics["reason"] = "No active 4H OB mitigation and lower timeframe structure shift"
         return None

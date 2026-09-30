@@ -1,56 +1,105 @@
-from datetime import datetime, timezone
+"""
+trading-portal/strategies/orb_cracker_counter_sweep.py
+1M / 5M Opening Range Counter-Sweep ('Cracker' Setup - Spec Setup 5).
+- Time: NYSE Session Open strictly (09:30 - 10:30 US/Eastern / 15:30 - 16:30 SAST)
+- Trigger: Initial momentum pulse breaks 1M/5M ORB High or Low
+- Rejection: Counter-pulse rejects at 200 EMA or Session VWAP
+- Asset-Specific Stops (Spec Sec 5): NAS100 35-50 pts (max 60), US30 37-50 pts, Gold 12-40 pips
+- TP: Fixed R:R 1:1 to 1:2 (Move SL to BE at 80%)
+"""
+
 import pandas as pd
 from strategies.base import StrategySignal
+from core.session_config import MarketSessionManager
+from core.indicators import calculate_session_vwap
 
 class ORBCracker:
     def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
-        if data_5m is None or len(data_5m) < 15 or session_levels is None:
+        diagnostics = {"strategy": "ORB_CRACKER", "passed": False, "reason": ""}
+
+        if data_5m is None or len(data_5m) < 15 or not session_levels:
+            diagnostics["reason"] = "Missing data or session levels"
             return None
 
-        # STRICT TIME GATE: Only active during NYSE Open (15:30 - 16:30 SAST / 13:30 - 14:30 UTC)
-        now_utc = datetime.now(timezone.utc)
-        if not (now_utc.hour == 13 and now_utc.minute >= 30) and not (now_utc.hour == 14 and now_utc.minute <= 30):
+        # Permitted Assets: NAS100, US30, GOLD
+        if symbol not in ("NAS100", "US30", "GOLD"):
+            diagnostics["reason"] = "Asset not permitted for Cracker setup"
+            return None
+
+        curr_bar_time = data_5m.iloc[-1]['time']
+        if not MarketSessionManager.is_in_ny_cracker_window(curr_bar_time):
+            diagnostics["reason"] = "Outside NYSE Open Cracker window (15:30 - 16:30 SAST)"
             return None
 
         orb_h = session_levels.get('orb_high')
         orb_l = session_levels.get('orb_low')
         if not orb_h or not orb_l:
+            diagnostics["reason"] = "Opening range levels not established"
             return None
 
-        curr = data_5m.iloc[-1]
-        prev = data_5m.iloc[-2]
-        ema_200 = data_5m['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        curr_bar = data_5m.iloc[-1]
+        prev_bar = data_5m.iloc[-2]
 
-        # Bearish Cracker: NYSE open initial pulse sweeps ORB High & rejects 200 EMA
-        if prev['high'] > orb_h and curr['high'] >= ema_200 and curr['close'] < curr['open']:
-            sl = float(max(curr['high'], prev['high']))
-            risk = abs(sl - curr['close'])
-            if risk > 0:
+        ema_200 = data_5m['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        vwap = calculate_session_vwap(data_5m).iloc[-1]
+
+        # Asset-specific stop enforcement (Spec Sec 5)
+        if symbol == "NAS100":
+            target_sl_pts = 45.0
+        elif symbol == "US30":
+            target_sl_pts = 45.0
+        else:  # GOLD
+            target_sl_pts = 2.50  # 25 pips ($2.50)
+
+        # BEARISH CRACKER: Upward pulse broke ORB High, rejected 200 EMA/VWAP, closed red
+        if prev_bar['high'] > orb_h and (prev_bar['high'] >= ema_200 or prev_bar['high'] >= vwap):
+            if curr_bar['close'] < curr_bar['open'] and curr_bar['close'] < prev_bar['low']:
+                sl = float(curr_bar['close'] + target_sl_pts)
+                tp = float(curr_bar['close'] - (1.8 * target_sl_pts))
+                tp1 = float(curr_bar['close'] - (1.0 * target_sl_pts))
+
+                diagnostics.update({"passed": True, "action": "SELL", "pulse": "UP_PULSE_REJECTED"})
                 return StrategySignal(
                     strategy="ORB_CRACKER",
                     symbol=symbol,
                     direction="SELL",
-                    entry_price=float(curr['close']),
+                    entry_price=float(curr_bar['close']),
                     stop_loss=sl,
-                    take_profit=float(curr['close'] - (1.5 * risk)),
-                    confidence=0.86,
-                    reason="NYSE Open ORB Cracker counter-pulse rejection off 200 EMA"
+                    take_profit=tp,
+                    take_profit_1=tp1,
+                    take_profit_2=tp,
+                    scale_out_fraction=0.50,
+                    trail_mode="MOVE_TO_BE_80",
+                    session="NY_OPEN",
+                    confidence=0.87,
+                    reason="NYSE Open ORB Cracker counter-pulse rejection off 200 EMA/VWAP",
+                    diagnostics=diagnostics
                 )
 
-        # Bullish Cracker: NYSE open initial pulse sweeps ORB Low & rejects 200 EMA
-        if prev['low'] < orb_l and curr['low'] <= ema_200 and curr['close'] > curr['open']:
-            sl = float(min(curr['low'], prev['low']))
-            risk = abs(curr['close'] - sl)
-            if risk > 0:
+        # BULLISH CRACKER: Downward pulse broke ORB Low, rejected 200 EMA/VWAP, closed green
+        if prev_bar['low'] < orb_l and (prev_bar['low'] <= ema_200 or prev_bar['low'] <= vwap):
+            if curr_bar['close'] > curr_bar['open'] and curr_bar['close'] > prev_bar['high']:
+                sl = float(curr_bar['close'] - target_sl_pts)
+                tp = float(curr_bar['close'] + (1.8 * target_sl_pts))
+                tp1 = float(curr_bar['close'] + (1.0 * target_sl_pts))
+
+                diagnostics.update({"passed": True, "action": "BUY", "pulse": "DOWN_PULSE_REJECTED"})
                 return StrategySignal(
                     strategy="ORB_CRACKER",
                     symbol=symbol,
                     direction="BUY",
-                    entry_price=float(curr['close']),
+                    entry_price=float(curr_bar['close']),
                     stop_loss=sl,
-                    take_profit=float(curr['close'] + (1.5 * risk)),
-                    confidence=0.86,
-                    reason="NYSE Open ORB Cracker counter-pulse rejection off 200 EMA"
+                    take_profit=tp,
+                    take_profit_1=tp1,
+                    take_profit_2=tp,
+                    scale_out_fraction=0.50,
+                    trail_mode="MOVE_TO_BE_80",
+                    session="NY_OPEN",
+                    confidence=0.87,
+                    reason="NYSE Open ORB Cracker counter-pulse rejection off 200 EMA/VWAP",
+                    diagnostics=diagnostics
                 )
 
+        diagnostics["reason"] = "No Cracker counter-pulse rejection identified"
         return None
