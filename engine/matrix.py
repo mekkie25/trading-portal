@@ -287,6 +287,17 @@ class CTraderClient:
         self.notified_closed_deals = set()
         self.position_strategies: Dict[str, str] = {}
         self._load_position_strategies()
+        self._seed_notified_deals()
+
+    def _seed_notified_deals(self):
+        """Pre-seeds notified deals from trades_db.json so past trades are not re-processed on reboot."""
+        for t in read_trade_history():
+            tid = str(t.get("ticket", "")).replace("#", "").strip()
+            if tid:
+                self.notified_closed_deals.add(tid)
+            did = str(t.get("id", "")).replace("deal-", "").strip()
+            if did:
+                self.notified_closed_deals.add(did)
 
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_authorized: bool = False
