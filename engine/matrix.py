@@ -7,21 +7,15 @@ Architecture: Institutional Multi-Strategy Quantitative Execution Engine
 Components:   - All-Day Execution Engine for Fusion Markets (cTrader Open API)
               - Dynamic Micro-Account Scaling (Handles R100, R1,000, up to $100k+)
               - AI Intuition & Target-Pacing Sizer (Gemini AI Quality Multiplier)
-              - Daily Profit Target Runway Allocator (e.g. R500 Target on R1,000 Balance)
               - Automatic Token Sanitizer & Spotware Account ID Auto-Resolution
               - Real-Time Trade Journal Synchronization (trades_db.json)
               - Dual-Stage OAuth Handshake (App Auth 2100 + Account Auth 2102)
               - Daily 21:00 SAST End-of-Day Position Flusher (Zero Overnight Risk)
               - Instant Personal WhatsApp Alerts Engine (CallMeBot Integration)
               - Twin-Position 50/50 Partial Scaling (Bank Half at TP1, Trail TP2)
-              - Order Flow & Volume Profile Analyzer (POC, VAH, VAL, Cumulative Delta)
-              - Quantitative Math Engine (EMA, ATR, Bollinger Bands, RSI)
-              - Temporal Clock & Session Manager (Asian, London, NY)
               - Multi-Timeframe Volatility Engine (M5, H4, D1 Candle Averages)
               - Live Bid/Ask Spread Gatekeeper & News Armor Protection
               - In-Flight Position Supervisor (80% R:R Move-to-Breakeven Loop)
-              - Dual Telemetry Pipeline (Stdout IPC + bot_telemetry.json)
-Deployment:   Headless Linux / Railway / Cloud VPS / Docker Container
 ================================================================================
 """
 
@@ -44,31 +38,27 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
 
-# Silence library warning in terminal
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Ensure project root is in Python search path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Google Gemini Generative AI SDK
 try:
     import google.generativeai as genai
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
 
-# Modular Strategy Framework
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 
-CONFIG_FILE = "bot_config.json"
-TELEMETRY_FILE = "bot_telemetry.json"
-TRADES_DB_FILE = "trades_db.json"
+CONFIG_FILE = os.path.join(PROJECT_ROOT, "bot_config.json")
+TELEMETRY_FILE = os.path.join(PROJECT_ROOT, "bot_telemetry.json")
+TRADES_DB_FILE = os.path.join(PROJECT_ROOT, "trades_db.json")
 
 # ==============================================================================
-# 1. ADVANCED INSTITUTIONAL LOGGING SYSTEM
+# 1. ADVANCED LOGGING SYSTEM
 # ==============================================================================
 
 class InstitutionalFormatter(logging.Formatter):
@@ -113,7 +103,7 @@ class WhatsAppNotifier:
         if self.enabled:
             log.info(f"WhatsApp Notification Engine Online for {self.phone}")
         else:
-            log.info("WhatsApp Alerts standby (Set WHATSAPP_PHONE & WHATSAPP_API_KEY in Railway to activate).")
+            log.info("WhatsApp Alerts standby (Set WHATSAPP_PHONE & WHATSAPP_API_KEY to activate).")
 
     async def send_alert(self, message: str) -> bool:
         if not self.enabled:
@@ -184,7 +174,6 @@ def read_trade_history() -> List[dict]:
         return []
 
 def save_trade_record(trade_data: dict) -> None:
-    """Appends or updates a live trade in trades_db.json so the Trade Journal reflects it."""
     try:
         trades = read_trade_history()
         existing_idx = next((i for i, t in enumerate(trades) if t.get("ticket") == trade_data.get("ticket")), None)
@@ -224,7 +213,6 @@ class ConfigManager:
     CLIENT_ID: str = os.getenv("CTRADER_CLIENT_ID", "").strip()
     CLIENT_SECRET: str = os.getenv("CTRADER_CLIENT_SECRET", "").strip()
 
-    # Automatically clean any accidental "AT:" prefix, "Bearer", or spaces from token
     _raw_token: str = os.getenv("CTRADER_ACCESS_TOKEN", "").strip()
     _cleaned_token: str = _raw_token.replace("AT:", "").replace("Bearer", "").strip()
     ACCESS_TOKEN: str = "".join(_cleaned_token.split())
@@ -258,7 +246,7 @@ class ConfigManager:
     }
 
 # ==============================================================================
-# 5. NATIVE CTRADER OPEN API CLIENT (WITH SPOTWARE ACCOUNT AUTO-RESOLVER)
+# 5. NATIVE CTRADER OPEN API CLIENT
 # ==============================================================================
 
 class CTraderClient:
@@ -287,17 +275,19 @@ class CTraderClient:
         self._lock = asyncio.Lock()
 
     def _load_position_strategies(self):
-     try:
-         if os.path.exists("position_strategies.json"):
-             with open("position_strategies.json", "r") as f:
-                 self.position_strategies = json.load(f)
-     except Exception:
-         self.position_strategies = {}
+        strat_file = os.path.join(PROJECT_ROOT, "engine", "position_strategies.json")
+        try:
+            if os.path.exists(strat_file):
+                with open(strat_file, "r") as f:
+                    self.position_strategies = json.load(f)
+        except Exception:
+            self.position_strategies = {}
 
     def _save_position_strategy(self, position_id: str, strategy: str):
         self.position_strategies[str(position_id)] = strategy
+        strat_file = os.path.join(PROJECT_ROOT, "engine", "position_strategies.json")
         try:
-            with open("position_strategies.json", "w") as f:
+            with open(strat_file, "w") as f:
                 json.dump(self.position_strategies, f)
         except Exception:
             pass    
@@ -312,127 +302,123 @@ class CTraderClient:
         return getattr(self.ws, "open", False) or getattr(getattr(self.ws, "state", None), "name", "") == "OPEN"
 
     async def sync_deals_from_ctrader(self) -> List[dict]:
-     """Automatically queries cTrader for all closed deals and syncs trades_db.json."""
-     if not self.is_authorized:
-         return []
-     try:
-         now_ms = int(time.time() * 1000)
-         from_ms = now_ms - (30 * 86400 * 1000)
-         deal_res = await self._send_and_wait(2133, {
-             "ctidTraderAccountId": self.account_id,
-             "fromTimestamp": from_ms,
-             "toTimestamp": now_ms,
-             "maxRows": 100
-         }, timeout=6.0)
+        if not self.is_authorized:
+            return []
+        try:
+            now_ms = int(time.time() * 1000)
+            from_ms = now_ms - (30 * 86400 * 1000)
+            deal_res = await self._send_and_wait(2133, {
+                "ctidTraderAccountId": self.account_id,
+                "fromTimestamp": from_ms,
+                "toTimestamp": now_ms,
+                "maxRows": 100
+            }, timeout=6.0)
 
-         if not deal_res or "deal" not in deal_res.get("payload", {}):
-             return []
+            if not deal_res or "deal" not in deal_res.get("payload", {}):
+                return []
 
-         deals = deal_res["payload"]["deal"]
-         synced_trades = []
+            deals = deal_res["payload"]["deal"]
+            synced_trades = []
 
-         for d in deals:
-             pos_det = d.get("closePositionDetail")
-             if pos_det:
-                 deal_id_str = str(d.get('dealId'))
-                 pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0) + pos_det.get("swap", 0)
-                 real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
-                 t_ms = d.get("executionTimestamp", 0)
-                 t_time = datetime.fromtimestamp(t_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if t_ms else ""
+            for d in deals:
+                pos_det = d.get("closePositionDetail")
+                if pos_det:
+                    deal_id_str = str(d.get('dealId'))
+                    pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0) + pos_det.get("swap", 0)
+                    real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
+                    t_ms = d.get("executionTimestamp", 0)
+                    t_time = datetime.fromtimestamp(t_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if t_ms else ""
 
-                 sid = d.get("symbolId")
-                 sym_info = self.symbol_details.get(sid, {})
-                 sym_name = sym_info.get("name", "FOREX")
+                    sid = d.get("symbolId")
+                    sym_info = self.symbol_details.get(sid, {})
+                    sym_name = sym_info.get("name", "FOREX")
 
-                 # Identify strategy: Check in-memory map, order comment, or tag as manual
-                 pos_id_str = str(d.get("positionId", ""))
-                 strategy = self.position_strategies.get(pos_id_str)
-                 if not strategy:
-                     comment = d.get("comment", "")
-                     if comment and comment not in ("NexusMatrix", ""):
-                         strategy = comment
-                     else:
-                         strategy = "MANUAL_TRADE"
+                    pos_id_str = str(d.get("positionId", ""))
+                    strategy = self.position_strategies.get(pos_id_str)
+                    if not strategy:
+                        comment = d.get("comment", "")
+                        if comment and comment not in ("NexusMatrix", ""):
+                            strategy = comment
+                        else:
+                            strategy = "MANUAL_TRADE"
 
-                 lots = round(d.get("filledVolume", 0) / 10000000.0, 2)
-                 open_p = pos_det.get("entryPrice", 0)
-                 close_p = d.get("executionPrice", 0)
+                    lots = round(d.get("filledVolume", 0) / 10000000.0, 2)
+                    open_p = pos_det.get("entryPrice", 0)
+                    close_p = d.get("executionPrice", 0)
 
-                 record = {
-                     "id": f"deal-{deal_id_str}",
-                     "ticket": f"#{deal_id_str}",
-                     "asset": sym_name,
-                     "strategy": strategy,
-                     "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
-                     "lots": lots if lots > 0 else 0.02,
-                     "openPrice": open_p,
-                     "closePrice": close_p,
-                     "pnl": real_pnl,
-                     "openTime": t_time,
-                     "closeTime": t_time,
-                     "status": "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "BREAKEVEN"),
-                     "source": "Fusion cTrader"
-                 }
-                 save_trade_record(record)
-                 synced_trades.append(record)
+                    record = {
+                        "id": f"deal-{deal_id_str}",
+                        "ticket": f"#{deal_id_str}",
+                        "asset": sym_name,
+                        "strategy": strategy,
+                        "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
+                        "lots": lots if lots > 0 else 0.02,
+                        "openPrice": open_p,
+                        "closePrice": close_p,
+                        "pnl": real_pnl,
+                        "openTime": t_time,
+                        "closeTime": t_time,
+                        "status": "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "BREAKEVEN"),
+                        "source": "Fusion cTrader"
+                    }
+                    save_trade_record(record)
+                    synced_trades.append(record)
 
-                 # WHATSAPP NOTIFICATION FOR CLOSED TRADES
-                 if deal_id_str not in self.notified_closed_deals:
-                     self.notified_closed_deals.add(deal_id_str)
-                     curr_balance = await self.get_balance()
-                     if real_pnl > 0:
-                         alert = (
-                             f"🎯 *[TAKE PROFIT REACHED / TRADE WON]*\n"
-                             f"• Asset: {sym_name}\n"
-                             f"• Strategy: {strategy}\n"
-                             f"• Profit Banked: +${real_pnl:.2f}\n"
-                             f"• Account Balance: ${curr_balance:.2f}\n"
-                             f"• Status: 100% Target Hit."
-                         )
-                     elif real_pnl < 0:
-                         alert = (
-                             f"🔴 *[STOP LOSS EXITED / TRADE CLOSED]*\n"
-                             f"• Asset: {sym_name}\n"
-                             f"• Strategy: {strategy}\n"
-                             f"• Realized Loss: -${abs(real_pnl):.2f}\n"
-                             f"• Account Balance: ${curr_balance:.2f}\n"
-                             f"• Stop Loss respected. Capital preserved."
-                         )
-                     else:
-                         alert = (
-                             f"⚪ *[EXIT AT BREAK-EVEN]*\n"
-                             f"• Asset: {sym_name}\n"
-                             f"• Strategy: {strategy}\n"
-                             f"• Result: $0.00 (Risk-Free Exit)"
-                         )
-                     await whatsapp.send_alert(alert)
+                    # WhatsApp Alert on Closed Trade
+                    if deal_id_str not in self.notified_closed_deals:
+                        self.notified_closed_deals.add(deal_id_str)
+                        curr_balance, _ = await self.get_balance_and_equity()
+                        if real_pnl > 0:
+                            alert = (
+                                f"🎯 *[TAKE PROFIT REACHED / TRADE WON]*\n"
+                                f"• Asset: {sym_name}\n"
+                                f"• Strategy: {strategy}\n"
+                                f"• Profit Banked: +${real_pnl:.2f}\n"
+                                f"• Account Balance: ${curr_balance:.2f}\n"
+                                f"• Target Hit."
+                            )
+                        elif real_pnl < 0:
+                            alert = (
+                                f"🔴 *[STOP LOSS EXITED / TRADE CLOSED]*\n"
+                                f"• Asset: {sym_name}\n"
+                                f"• Strategy: {strategy}\n"
+                                f"• Realized Loss: -${abs(real_pnl):.2f}\n"
+                                f"• Account Balance: ${curr_balance:.2f}\n"
+                                f"• Capital preserved."
+                            )
+                        else:
+                            alert = (
+                                f"⚪ *[EXIT AT BREAK-EVEN]*\n"
+                                f"• Asset: {sym_name}\n"
+                                f"• Strategy: {strategy}\n"
+                                f"• Result: $0.00 (Risk-Free Exit)"
+                            )
+                        await whatsapp.send_alert(alert)
 
-         return synced_trades
-     except Exception as e:
-         log.warning(f"Error syncing deals from cTrader: {e}")
-         return []
-    
+            return synced_trades
+        except Exception as e:
+            log.warning(f"Error syncing deals from cTrader: {e}")
+            return []
+
     def fetch_real_account_id_from_http(self) -> Optional[int]:
-        """Queries Spotware API directly to map login number (e.g. 41425) to ctidTraderAccountId."""
         try:
             url = f"https://api.spotware.com/connect/tradingaccounts?access_token={self.access_token}"
             req = urllib.request.Request(url, headers={"User-Agent": "NexusMatrix/1.0"})
             with urllib.request.urlopen(req, timeout=7) as resp:
                 data = json.loads(resp.read().decode())
                 accounts = data.get("data", [])
-                log.info(f"Spotware Accounts API returned {len(accounts)} account(s) for your token.")
+                log.info(f"Spotware Accounts API returned {len(accounts)} account(s).")
                 for acc in accounts:
                     a_id = acc.get("accountId")
                     a_num = acc.get("accountNumber")
-                    log.info(f"-> Account: Login #{a_num} | ctidTraderAccountId: #{a_id} | Live: {acc.get('live')}")
                     if self.account_id in (a_id, a_num):
-                        log.info(f"MATCH FOUND! Auto-binding account #{a_id} (Login #{a_num})")
+                        log.info(f"Match found: Auto-binding account #{a_id} (Login #{a_num})")
                         return a_id
                 if accounts:
                     is_live = (ConfigManager.ENV == "live")
                     matching = [a for a in accounts if a.get("live", False) == is_live]
                     chosen = matching[0] if matching else accounts[0]
-                    log.info(f"Auto-selected account: Login #{chosen.get('accountNumber')} -> ctidTraderAccountId #{chosen.get('accountId')}")
+                    log.info(f"Auto-selected account #{chosen.get('accountId')}")
                     return chosen.get("accountId")
         except Exception as e:
             log.warning(f"Spotware HTTP account query: {e}")
@@ -440,10 +426,9 @@ class CTraderClient:
 
     async def connect(self) -> bool:
         if not self.client_id or not self.client_secret or not self.access_token:
-            log.critical("Missing cTrader credentials in Railway environment variables.")
+            log.critical("Missing cTrader credentials in environment variables.")
             return False
 
-        # Attempt to auto-resolve account ID
         resolved_id = await asyncio.to_thread(self.fetch_real_account_id_from_http)
         if resolved_id:
             self.account_id = resolved_id
@@ -453,7 +438,6 @@ class CTraderClient:
             self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
             asyncio.create_task(self._listen_loop())
 
-            # 1. Application Auth (ProtoOAApplicationAuthReq: 2100)
             app_auth_res = await self._send_and_wait(2100, {
                 "clientId": self.client_id,
                 "clientSecret": self.client_secret
@@ -462,7 +446,6 @@ class CTraderClient:
                 log.critical(f"cTrader App Auth failed: {app_auth_res}")
                 return False
 
-            # 2. Account Auth (ProtoOAAccountAuthReq: 2102)
             acc_auth_res = await self._send_and_wait(2102, {
                 "ctidTraderAccountId": self.account_id,
                 "accessToken": self.access_token
@@ -474,7 +457,6 @@ class CTraderClient:
 
             self.is_authorized = True
 
-            # 3. Pull Live Balance & Digits (ProtoOATraderReq: 2121)
             trader_res = await self._send_and_wait(2121, {
                 "ctidTraderAccountId": self.account_id
             })
@@ -484,49 +466,11 @@ class CTraderClient:
                 raw_bal = float(t_info.get("balance", 0))
                 self.last_known_balance = raw_bal / (10 ** self.money_digits)
                 self.last_known_equity = self.last_known_balance
-                log.info(f"--- CTRADER / FUSION ONLINE --- Balance: {self.last_known_balance:,.2f}")
+                log.info(f"--- CTRADER / FUSION ONLINE --- Balance: ${self.last_known_balance:,.2f}")
 
-            # 4. Discover Broker Symbols & Map IDs (ProtoOASymbolsListReq: 2114)
             await self._discover_symbols()
+            await self.sync_deals_from_ctrader()
             return True
-
-            # 5. Automatically Sync Real cTrader Closed Deals History (ProtoOADealListReq: 2133)
-            now_ms = int(time.time() * 1000)
-            from_ms = now_ms - (30 * 86400 * 1000) # Past 30 days
-            deal_res = await self._send_and_wait(2133, {
-                "ctidTraderAccountId": self.account_id,
-                "fromTimestamp": from_ms,
-                "toTimestamp": now_ms,
-                "maxRows": 100
-            }, timeout=8.0)
-
-            if deal_res and "deal" in deal_res.get("payload", {}):
-                deals = deal_res["payload"]["deal"]
-                log.info(f"Retrieved {len(deals)} historical deal(s) from cTrader account.")
-                for d in deals:
-                    pos_det = d.get("closePositionDetail")
-                    if pos_det: # It's a closed deal
-                        pnl_cents = pos_det.get("grossProfit", 0) + pos_det.get("commission", 0)
-                        real_pnl = round(pnl_cents / (10 ** self.money_digits), 2)
-                        t_time = datetime.fromtimestamp(d.get("executionTimestamp", 0) / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                        sym_info = self.symbol_details.get(d.get("symbolId"), {})
-                        sym_name = sym_info.get("name", "FOREX")
-                        
-                        save_trade_record({
-                            "id": f"deal-{d.get('dealId')}",
-                            "ticket": f"#{d.get('dealId')}",
-                            "asset": sym_name,
-                            "strategy": "cTrader Deal",
-                            "type": "BUY" if d.get("tradeSide") == 1 else "SELL",
-                            "lots": round(d.get("filledVolume", 0) / 10000000.0, 2),
-                            "openPrice": pos_det.get("entryPrice", 0),
-                            "closePrice": d.get("executionPrice", 0),
-                            "pnl": real_pnl,
-                            "openTime": t_time,
-                            "closeTime": t_time,
-                            "status": "WIN" if real_pnl > 0 else "LOSS",
-                            "source": "cTrader Deal"
-                        })
 
         except Exception as e:
             log.error(f"Failed to connect to cTrader Gateway: {e}")
@@ -550,7 +494,7 @@ class CTraderClient:
             self.symbol_details[sid] = {"name": sname, "digits": digits}
 
         target_ids = []
-        for friendly, aliases in ConfigManager.SYMBOL_ALIASES.items():
+        for friendly in ConfigManager.SYMBOL_ALIASES.keys():
             resolved_id = self.resolve_symbol_id(friendly)
             if resolved_id:
                 target_ids.append(resolved_id)
@@ -624,7 +568,7 @@ class CTraderClient:
                     self._pending_requests[client_id].set_result(msg)
 
         except Exception as e:
-            log.warning(f"cTrader WebSocket listener closed: {e}")
+            log.warning(f"cTrader listener closed: {e}")
             self.is_authorized = False
 
     async def get_balance_and_equity(self) -> Tuple[float, float]:
@@ -653,6 +597,9 @@ class CTraderClient:
         if not sid or not self.is_authorized:
             return pd.DataFrame()
 
+        digits = self.symbol_details.get(sid, {}).get("digits", 5)
+        divisor = float(10 ** digits)
+
         now_ms = int(time.time() * 1000)
         from_ms = now_ms - (count * 60 * 1000 * 10)
 
@@ -673,10 +620,10 @@ class CTraderClient:
 
         candles = []
         for b in bars:
-            low = float(b.get("low", 0)) / 100000.0
-            open_p = (float(b.get("low", 0)) + float(b.get("deltaOpen", 0))) / 100000.0
-            close_p = (float(b.get("low", 0)) + float(b.get("deltaClose", 0))) / 100000.0
-            high_p = (float(b.get("low", 0)) + float(b.get("deltaHigh", 0))) / 100000.0
+            low = float(b.get("low", 0)) / divisor
+            open_p = (float(b.get("low", 0)) + float(b.get("deltaOpen", 0))) / divisor
+            close_p = (float(b.get("low", 0)) + float(b.get("deltaClose", 0))) / divisor
+            high_p = (float(b.get("low", 0)) + float(b.get("deltaHigh", 0))) / divisor
             t_sec = b.get("utcTimestampInMinutes", 0) * 60
 
             candles.append({
@@ -693,20 +640,25 @@ class CTraderClient:
         return df.tail(count)
 
     async def execute_market_order(
-    self,
-    symbol_name: str,
-    direction: str,
-    lots: float,
-    stop_loss: float,
-    take_profit: float,
-    strategy_name: str = "QUANT_STRATEGY"
-) -> Optional[dict]:
+        self,
+        symbol_name: str,
+        direction: str,
+        lots: float,
+        stop_loss: float,
+        take_profit: float,
+        strategy_name: str = "QUANT_STRATEGY"
+    ) -> Optional[dict]:
         sid = self.resolve_symbol_id(symbol_name)
         if not sid or not self.is_authorized:
             return None
 
         trade_side = 1 if direction.upper() == "BUY" else 2
-        volume_cents = int(round(lots * 10000000))
+        cfg = ConfigManager.ASSETS.get(symbol_name)
+        contract_size = cfg.contract_size if cfg else 100000.0
+        
+        # cTrader volume in cents (1/100th of an asset unit)
+        volume_cents = int(round(lots * contract_size * 100))
+        volume_cents = max(volume_cents, 100)
 
         order_payload = {
             "ctidTraderAccountId": self.account_id,
@@ -751,32 +703,7 @@ class CTraderClient:
         return bool(res and res.get("payloadType") == 2126)
 
 # ==============================================================================
-# 6. QUANT MATH & VOLATILITY ANALYZER
-# ==============================================================================
-
-class MathEngine:
-    @staticmethod
-    def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        high = df['high']
-        low = df['low']
-        close = df['close'].shift(1)
-        tr = pd.concat([high - low, (high - close).abs(), (low - close).abs()], axis=1).max(axis=1)
-        return tr.rolling(window=period).mean()
-
-    @staticmethod
-    def calculate_ema(series: pd.Series, period: int) -> pd.Series:
-        return series.ewm(span=period, adjust=False).mean()
-
-    @staticmethod
-    def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / (loss + 1e-10)
-        return 100 - (100 / (1 + rs))
-
-# ==============================================================================
-# 7. ORDER FLOW & VOLUME PROFILE ANALYZER
+# 6. ORDER FLOW & VOLUME PROFILE ANALYZER
 # ==============================================================================
 
 @dataclass
@@ -837,7 +764,7 @@ class OrderFlowAnalyzer:
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
 # ==============================================================================
-# 8. INSTITUTIONAL RISK ENGINE & DYNAMIC LOT SIZER
+# 7. INSTITUTIONAL RISK ENGINE & DYNAMIC LOT SIZER
 # ==============================================================================
 
 class InstitutionalRiskEngine:
@@ -851,6 +778,8 @@ class InstitutionalRiskEngine:
         self.max_daily_loss_usd: float = 2500.0
 
         self.daily_goal_target: float = 0.0
+        self.weekly_deposit_baseline: float = 10.0
+        self.weekly_goal_target: float = 20.0
         self.trades_taken_today: int = 0
         self.consecutive_losses: int = 0
         self.open_positions: Dict[str, dict] = {}
@@ -891,6 +820,8 @@ class InstitutionalRiskEngine:
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
         self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
         self.daily_goal_target = float(cfg.get("dailyGoalTarget", self.daily_goal_target))
+        self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline or 10.0))
+        self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target or 20.0))
 
     def is_red_folder_active(self) -> bool:
         now_utc = datetime.now(timezone.utc).time()
@@ -963,7 +894,7 @@ class InstitutionalRiskEngine:
             std_spread = range_cfg["standard"]
             max_allowed = range_cfg["max_allowed"]
             if spread > max_allowed:
-                return False, f"Spread ({spread:.5f}) exceeds tolerance ceiling ({max_allowed:.5f})", spread
+                return False, f"Spread ({spread:.5f}) exceeds ceiling ({max_allowed:.5f})", spread
         else:
             if spread > 5.0:
                 return False, f"Spread ({spread:.4f}) exceeds default ceiling (5.0)", spread
@@ -981,60 +912,34 @@ class InstitutionalRiskEngine:
         ai_quality_factor: float = 1.0
     ) -> float:
         equity = current_equity if current_equity > 0 else 10.0
-        baseline = self.weekly_deposit_baseline if self.weekly_deposit_baseline > 0 else 10.0
 
-        # =====================================================================
-        # 1. 4-TIER AUTOMATIC CAPITAL PROGRESSION
-        # =====================================================================
         if equity < 60.0:
-            # TIER 1: Micro-Flip Stage ($10 to $60)
-            stage_name = "TIER 1 (MICRO-FLIP)"
-            base_risk_pct = 25.0  # Aggressive sizing to escape the 0.01 floor
+            base_risk_pct = 25.0
         elif 60.0 <= equity < 200.0:
-            # TIER 2: Acceleration Stage ($60 to $200)
-            stage_name = "TIER 2 (ACCELERATION)"
-            base_risk_pct = 12.5  # Stepping down risk as capital expands
+            base_risk_pct = 12.5
         elif 200.0 <= equity < 1000.0:
-            # TIER 3: Compounding Stage ($200 to $1,000)
-            stage_name = "TIER 3 (COMPOUNDING)"
-            base_risk_pct = 5.0   # $10 - $25 risk per trade
+            base_risk_pct = 5.0
         else:
-            # TIER 4: Institutional Wealth Preservation Stage ($1,000+)
-            stage_name = "TIER 4 (WEALTH PRESERVATION)"
-            base_risk_pct = 1.5   # 1.5% of $1,000 is $15 (equals entire Tier 1 deposit!)
+            base_risk_pct = 1.5
 
-        # Allow user's UI portal slider to act as an override ceiling if desired
         if self.risk_per_trade_pct > 0:
             active_risk_pct = min(base_risk_pct, self.risk_per_trade_pct)
         else:
             active_risk_pct = base_risk_pct
 
-        # =====================================================================
-        # 2. THE PARACHUTE: DYNAMIC DRAWDOWN & STREAK THROTTLE
-        # =====================================================================
-        # If we take losses and drop below baseline deposit, step risk down
         if self.consecutive_losses == 1:
-            active_risk_pct *= 0.70  # Trim 30% after first loss
-            log.info(f"DEFENSE THROTTLE 1: Single loss detected. Risk lowered to {active_risk_pct:.1f}%")
+            active_risk_pct *= 0.70
         elif self.consecutive_losses == 2:
-            active_risk_pct *= 0.50  # Halve risk after second loss
-            log.info(f"DEFENSE THROTTLE 2: Two consecutive losses. Risk halved to {active_risk_pct:.1f}%")
+            active_risk_pct *= 0.50
         elif self.consecutive_losses >= 3:
-            active_risk_pct *= 0.25  # Cut risk to absolute survival minimum
-            log.info(f"DEFENSE THROTTLE 3: Drawdown circuit active. Capital protection engaged at {active_risk_pct:.1f}%")
+            active_risk_pct *= 0.25
 
-        # News Armor Throttle
         if self.is_red_folder_active():
             active_risk_pct *= 0.50
-            log.info("NEWS ARMOR: Halving risk during high-impact news window.")
 
-        # =====================================================================
-        # 3. AI INTUITION MODULATOR
-        # =====================================================================
         final_risk_pct = active_risk_pct * ai_quality_factor
         risk_cash = equity * (final_risk_pct / 100.0)
 
-        # Pip value math
         cfg = ConfigManager.ASSETS.get(symbol)
         pip_size = cfg.pip_size if cfg else 0.0001
         contract_size = cfg.contract_size if cfg else 100000.0
@@ -1049,17 +954,10 @@ class InstitutionalRiskEngine:
         else:
             calculated_lots = min_lots
 
-        # Micro-Account floor protection
         if calculated_lots < min_lots and equity >= 5.0:
             calculated_lots = min_lots
 
         final_lots = round(max(min(calculated_lots, max_lots), min_lots), 2)
-
-        log.info(
-            f"Stage: {stage_name} | Equity: ${equity:.2f} | Base Risk: {base_risk_pct}% | "
-            f"Loss Streak: {self.consecutive_losses} | AI Factor: {ai_quality_factor}x | "
-            f"Final Risk: {final_risk_pct:.1f}% (${risk_cash:.2f}) | Lots: {final_lots}"
-        )
         return final_lots
 
     def validate_pre_trade(
@@ -1115,7 +1013,7 @@ class InstitutionalRiskEngine:
         return True, "Approved", blueprint
 
 # ==============================================================================
-# 9. GEMINI AI OVERSEER & INTUITION QUALITY GRADER
+# 8. GEMINI AI OVERSEER
 # ==============================================================================
 
 class AIOverseer:
@@ -1153,16 +1051,15 @@ class AIOverseer:
         hist_win_rate = (len(wins) / len(relevant_trades) * 100) if relevant_trades else 50.0
 
         prompt = (
-            f"You are the Lead Quantitative Risk Manager & Trade Intuition Engine for an automated fund.\n"
+            f"You are the Lead Quantitative Risk Manager for an automated fund.\n"
             f"EVALUATE THIS TRADE SETUP:\n"
             f"- Instrument: {symbol} | Direction: {direction} | Strategy: {strategy_name}\n"
             f"- Entry: {entry} | SL: {sl} | TP: {tp} | Reason: {reason}\n"
             f"- Account Balance: {balance:,.2f} | Daily Profit Goal: {daily_target:,.2f} | Trades Left Today: {trades_left}\n"
             f"- Market Regime: {'RANGING' if candle_stats.get('is_ranging') else 'TRENDING'} | M5 ATR: {candle_stats.get('m5_candle_avg')}\n"
-            f"- Historical Edge on this Pair: {hist_win_rate:.1f}% win rate across {len(relevant_trades)} closed trades\n\n"
-            f"Provide an intuitive decision in EXACT JSON format:\n"
-            f'{{"verdict": "APPROVED" or "REJECTED", "quality_multiplier": 0.5 to 1.5, "reasoning": "brief summary"}}\n'
-            f"Note: If it is an A+ confluence setup, grant 1.2 to 1.5 multiplier. If marginal, grant 0.6 to 0.8. If dangerous, REJECT."
+            f"- Historical Edge on Pair: {hist_win_rate:.1f}% win rate across {len(relevant_trades)} trades\n\n"
+            f"Provide decision in EXACT JSON format:\n"
+            f'{{"verdict": "APPROVED" or "REJECTED", "quality_multiplier": 0.5 to 1.5, "reasoning": "brief summary"}}'
         )
 
         try:
@@ -1183,7 +1080,7 @@ class AIOverseer:
         return True, 1.0, "Approved by Quantitative Edge"
 
 # ==============================================================================
-# 10. CLOUD EXECUTION ENGINE (TWIN 50/50 PARTIAL SCALING + JOURNAL RECORDING)
+# 9. EXECUTION ENGINE (TWIN 50/50 ORDERS)
 # ==============================================================================
 
 class CloudExecutionEngine:
@@ -1242,10 +1139,9 @@ class CloudExecutionEngine:
                 f"• Lots: {bp['lots']}\n"
                 f"• Entry: {bp['entry_price']}\n"
                 f"• SL: {bp['stop_loss']}\n"
-                f"• TP: {bp['take_profit']}\n"
-                f"• AI Intuition: {ai_notes}"
+                f"• TP: {bp['take_profit']}"
             )
-            log.info(f"[SIMULATOR] Approved: {bp['direction']} {bp['symbol']} | Lots: {bp['lots']} | Strategy: {strategy_name}")
+            log.info(f"[SIMULATOR] Approved: {bp['direction']} {bp['symbol']} | Lots: {bp['lots']}")
             await whatsapp.send_alert(msg)
             return True
 
@@ -1253,9 +1149,9 @@ class CloudExecutionEngine:
         half_lots = round(max(total_lots / 2.0, 0.01), 2)
         sl_distance = abs(bp['entry_price'] - bp['stop_loss'])
         tp1_price = round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 5)
-        tp2_price = bp['take_profit']
+        tp2_price = getattr(signal, 'take_profit_2', None) or bp['take_profit']
 
-        log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total: {total_lots} Lots | Contract A TP1: {tp1_price} | Contract B TP2: {tp2_price}")
+        log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Total: {total_lots} Lots | A(TP1): {tp1_price} | B(TP2): {tp2_price}")
 
         res_a = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp1_price, strategy_name)
         res_b = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp2_price, strategy_name)
@@ -1278,7 +1174,6 @@ class CloudExecutionEngine:
                         "lots": res["lots"],
                         "is_be_moved": False
                     }
-                    # Save open trade to Trade Journal Database
                     save_trade_record({
                         "id": f"pos-{pid}",
                         "ticket": f"#{pid}",
@@ -1296,16 +1191,14 @@ class CloudExecutionEngine:
                     })
 
             whatsapp_msg = (
-                f"🟢 *[FUSION MARKETS CTRADER ORDER FILLED]*\n"
+                f"🟢 *[FUSION CTRADER ORDER FILLED]*\n"
                 f"• Asset: {bp['symbol']}\n"
                 f"• Strategy: {strategy_name}\n"
                 f"• Direction: {bp['direction']}\n"
                 f"• Twin Lots: 2x {half_lots} ({total_lots} Total)\n"
                 f"• Entry: {bp['entry_price']}\n"
-                f"• Stop Loss: {bp['stop_loss']}\n"
-                f"• TP1 (Bank 50%): {tp1_price}\n"
-                f"• TP2 (Runner): {tp2_price}\n"
-                f"• AI Intuition: {ai_notes}\n"
+                f"• SL: {bp['stop_loss']}\n"
+                f"• TP1: {tp1_price} | TP2: {tp2_price}\n"
                 f"• 80% R:R Break-Even Active."
             )
             await whatsapp.send_alert(whatsapp_msg)
@@ -1314,7 +1207,7 @@ class CloudExecutionEngine:
         return False
 
 # ==============================================================================
-# 11. MASTER SYSTEM ORCHESTRATOR & CONCURRENT EVENT LOOPS
+# 10. MASTER SYSTEM ORCHESTRATOR
 # ==============================================================================
 
 class MatrixEngineMaster:
@@ -1326,14 +1219,14 @@ class MatrixEngineMaster:
         self.volume_profiles: Dict[str, VolumeProfileNode] = {}
 
     async def start(self) -> None:
-        log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Open API Edition)...")
+        log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Edition)...")
         if not await self.ctrader.connect():
-            log.critical("Failed to connect to cTrader Open API. Please check your Railway environment variables.")
+            log.critical("Failed to connect to cTrader Open API. Please check your credentials.")
             return
 
         balance, equity = await self.ctrader.get_balance_and_equity()
         self.execution_engine = CloudExecutionEngine(self.ctrader, self.risk_mgr)
-        log.info(f"SYSTEM READY. Initial Account Balance: {balance:,.2f}")
+        log.info(f"SYSTEM READY. Initial Account Balance: ${balance:,.2f}")
 
         await asyncio.gather(
             self._market_scan_loop(),
@@ -1351,64 +1244,18 @@ class MatrixEngineMaster:
                     sl = pos["stop_loss"]
                     tp = pos["take_profit"]
                     be_moved = pos.get("is_be_moved", False)
-                    lots = pos.get("lots", 0.01)
 
                     quote, _, _ = await self.ctrader.get_live_quote(sym)
                     if quote <= 0:
                         continue
 
-                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-                    # 1. Stop Loss Hit
-                    sl_hit = (direction == "BUY" and quote <= sl) or (direction == "SELL" and quote >= sl)
-                    if sl_hit:
-                        pnl_calc = (quote - entry) if direction == "BUY" else (entry - quote)
-                        status_str = "BREAKEVEN" if be_moved else "LOSS"
-                        
-                        save_trade_record({
-                            "ticket": f"#{pid}",
-                            "closePrice": quote,
-                            "closeTime": now_str,
-                            "status": status_str,
-                            "pnl": round(pnl_calc * lots * 100, 2)
-                        })
-
-                        if be_moved:
-                            sl_msg = f"⚪ *[EXIT AT BREAK-EVEN]*\n• Asset: {sym}\n• Closed at Entry: {quote}\n• P&L: 0.00 (Risk-Free Exit)"
-                        else:
-                            sl_msg = f"🔴 *[STOP LOSS HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit: {quote}\n• Capital protected."
-                        
-                        log.info(f"Position #{pid} exited at SL/BE on {sym}")
-                        await whatsapp.send_alert(sl_msg)
-                        self.risk_mgr.open_positions.pop(pid, None)
-                        continue
-
-                    # 2. Take Profit Hit
-                    tp_hit = (direction == "BUY" and quote >= tp) or (direction == "SELL" and quote <= tp)
-                    if tp_hit:
-                        pnl_calc = (quote - entry) if direction == "BUY" else (entry - quote)
-                        
-                        save_trade_record({
-                            "ticket": f"#{pid}",
-                            "closePrice": quote,
-                            "closeTime": now_str,
-                            "status": "WIN",
-                            "pnl": round(pnl_calc * lots * 100, 2)
-                        })
-
-                        tp_msg = f"🎯 *[TAKE PROFIT HIT]*\n• Asset: {sym}\n• Direction: {direction}\n• Exit Price: {quote}\n• Profit banked."
-                        log.info(f"Position #{pid} exited at TP on {sym}")
-                        await whatsapp.send_alert(tp_msg)
-                        self.risk_mgr.open_positions.pop(pid, None)
-                        continue
-
-                    # 3. Move Stop Loss to Break-Even at 80% Progress
+                    # Move SL to Break-Even at 80% towards TP
                     if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
-                        log.info(f"80% R:R PROGRESS HIT ON {sym} (Position #{pid})! Moving SL to Break-Even.")
+                        log.info(f"80% R:R PROGRESS HIT ON {sym} (Pos #{pid})! Moving SL to Break-Even.")
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
                         if success:
                             pos["is_be_moved"] = True
-                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 80% of TP!\n• Stop Loss moved to Entry ({entry}).\n• Trade is now 100% Risk-Free."
+                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 80% of TP!\n• SL moved to Entry ({entry}).\n• Trade is now Risk-Free."
                             await whatsapp.send_alert(alert)
 
                 await asyncio.sleep(3.0)
@@ -1424,11 +1271,11 @@ class MatrixEngineMaster:
                 minute = now_sast.minute
 
                 if hour == 21 and minute == 0 and len(self.risk_mgr.open_positions) > 0:
-                    log.warning(f"🌆 21:00 SAST LOCKDOWN: Closing {len(self.risk_mgr.open_positions)} open positions to cash.")
+                    log.warning(f"21:00 SAST LOCKDOWN: Closing {len(self.risk_mgr.open_positions)} open positions to cash.")
                     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
                     for pid, pos in list(self.risk_mgr.open_positions.items()):
-                        await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100000))
+                        await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100))
                         save_trade_record({
                             "ticket": f"#{pid}",
                             "closePrice": pos.get("entry_price"),
@@ -1453,7 +1300,6 @@ class MatrixEngineMaster:
         while True:
             try:
                 start_time = time.time()
-                # Sync all newly closed cTrader deals into trades_db.json
                 await self.ctrader.sync_deals_from_ctrader()
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
@@ -1461,9 +1307,9 @@ class MatrixEngineMaster:
                 last_signal: Optional[Any] = None
 
                 for friendly_name in ConfigManager.SYMBOL_ALIASES.keys():
-                    await asyncio.sleep(0.20)
+                    await asyncio.sleep(0.25)
 
-                    m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=60)
+                    m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
                     d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=15)
 
@@ -1471,23 +1317,44 @@ class MatrixEngineMaster:
                         continue
 
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
-
                     vp = OrderFlowAnalyzer.compute_volume_profile(m5_df, num_bins=30)
                     self.volume_profiles[friendly_name] = vp
 
-                    recent_high = float(m5_df['high'].tail(24).max())
-                    recent_low = float(m5_df['low'].tail(24).min())
-                    latest_close = float(m5_df.iloc[-1]['close'])
+                    # Real daily levels from D1 candle
+                    if len(d1_df) >= 2:
+                        prev_d1 = d1_df.iloc[-2]
+                        pdh = float(prev_d1['high'])
+                        pdl = float(prev_d1['low'])
+                        pdc = float(prev_d1['close'])
+                    else:
+                        pdh = float(m5_df['high'].max())
+                        pdl = float(m5_df['low'].min())
+                        pdc = float(m5_df.iloc[-1]['close'])
+
+                    daily_pivot = (pdh + pdl + pdc) / 3.0
+                    pivot_r1 = (2.0 * daily_pivot) - pdl
+                    pivot_s1 = (2.0 * daily_pivot) - pdh
+                    daily_eq = (pdh + pdl) / 2.0
+
+                    # True Asian Range (01:00 to 06:00 SAST / 23:00 to 04:00 UTC)
+                    m5_df['utc_time'] = pd.to_datetime(m5_df['time'])
+                    asia_candles = m5_df[(m5_df['utc_time'].dt.hour >= 23) | (m5_df['utc_time'].dt.hour < 4)]
+                    if not asia_candles.empty:
+                        asia_high = float(asia_candles['high'].max())
+                        asia_low = float(asia_candles['low'].min())
+                    else:
+                        asia_high = float(m5_df['high'].tail(36).max())
+                        asia_low = float(m5_df['low'].tail(36).min())
 
                     session_levels = {
-                        "asia_high": recent_high,
-                        "asia_low": recent_low,
-                        "daily_eq": (recent_high + recent_low) / 2.0,
-                        "pdh": recent_high,
-                        "pdl": recent_low,
-                        "daily_pivot": (recent_high + recent_low + latest_close) / 3.0,
-                        "pivot_r1": (2.0 * ((recent_high + recent_low + latest_close) / 3.0)) - recent_low,
-                        "pivot_s1": (2.0 * ((recent_high + recent_low + latest_close) / 3.0)) - recent_high,
+                        "asia_high": asia_high,
+                        "asia_low": asia_low,
+                        "daily_eq": daily_eq,
+                        "pdh": pdh,
+                        "pdl": pdl,
+                        "daily_pivot": daily_pivot,
+                        "pivot_r1": pivot_r1,
+                        "pivot_s1": pivot_s1,
                         "orb_high": float(m5_df['high'].tail(3).max()),
                         "orb_low": float(m5_df['low'].tail(3).min()),
                         "is_ranging": candle_stats["is_ranging"],
@@ -1509,7 +1376,6 @@ class MatrixEngineMaster:
                     active_setup_str = active_setup_str.value
                 verdict_str = getattr(last_signal, 'reason', getattr(last_signal, 'reasoning', '')) if last_signal else "Scanning all day on Fusion Markets cTrader."
 
-                # Compute actual live stats from closed trade history
                 history = read_trade_history()
                 closed_history = [t for t in history if t.get('status') in ('WIN', 'LOSS', 'BREAKEVEN')]
                 total_closed = len(closed_history)
@@ -1543,7 +1409,7 @@ class MatrixEngineMaster:
                 await asyncio.sleep(5)
 
 # ==============================================================================
-# 12. CLOUD ENTRY POINT
+# 11. ENTRY POINT
 # ==============================================================================
 
 def start_bot() -> None:
@@ -1551,7 +1417,7 @@ def start_bot() -> None:
     try:
         asyncio.run(master.start())
     except KeyboardInterrupt:
-        log.info("Shutdown signal received. Stopping Nexus Matrix Engine.")
+        log.info("Shutdown signal received. Stopping Nexus Matrix.")
 
 if __name__ == "__main__":
     start_bot()

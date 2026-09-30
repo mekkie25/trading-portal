@@ -36,8 +36,9 @@ class RiskManager:
         self.open_positions: Dict[str, dict] = {}
 
         # Weekly Growth Goal Engine
-        self.weekly_deposit_baseline: float = 0.0
-        self.weekly_goal_target: float = 0.0
+        self.weekly_deposit_baseline: float = 10.0
+        self.weekly_goal_target: float = 20.0
+        
         # Standard Baseline Spreads & Dynamic +70% Tolerance Bands
         self.max_spread_to_sl_ratio: float = 0.30
         self.spread_ranges = {
@@ -62,11 +63,10 @@ class RiskManager:
             "frxUSDJPY": "FOREX_MAJORS"
         }
 
-        # Targeted Red-Folder Windows (Only high-impact NFP/CPI releases: 5 min before & after)
-        # Note: We do NOT block trading; we apply "News Armor" (cut size by 50% & require tight spread)
+        # High-impact news window filters (5 min before & after)
         self.RED_FOLDER_WINDOWS = [
-            (dtime(12, 25), dtime(12, 35)),  # US CPI / NFP release window (12:30 UTC)
-            (dtime(17, 55), dtime(18, 05))   # FOMC Rate Decision announcement (18:00 UTC)
+            (dtime(12, 25), dtime(12, 35)),  # US CPI / NFP window (12:30 UTC)
+            (dtime(17, 55), dtime(18, 5))    # FOMC Decision window (18:00 UTC)
         ]
 
     def sync_ui_config(self) -> None:
@@ -83,13 +83,12 @@ class RiskManager:
             self.max_daily_loss_usd = float(cfg.get("maxDailyLoss", cfg.get("maxDailyLossUsd", self.max_daily_loss_usd)))
             self.max_weekly_loss_usd = float(cfg.get("maxWeeklyLoss", cfg.get("maxWeeklyLossUsd", self.max_weekly_loss_usd)))
             self.max_monthly_loss_usd = float(cfg.get("maxMonthlyLoss", cfg.get("maxMonthlyLossUsd", self.max_monthly_loss_usd)))
-            # Read Weekly Growth Goal targets from UI
             self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline))
             self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target))
+        except Exception as e:
             log.warning(f"Error parsing {self.config_file}: {e}")
 
     def is_red_folder_active(self) -> bool:
-        """Checks if current time is inside a high-impact red folder release window."""
         now_utc = datetime.now(timezone.utc).time()
         for start, end in self.RED_FOLDER_WINDOWS:
             if start <= now_utc <= end:
@@ -152,16 +151,16 @@ class RiskManager:
             "range_low": round(range_low, 4),
             "range_span": round(range_span, 4),
         }
-def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
-        """Evaluates live spread against the standard baseline + 70% dynamic range."""
+
+    def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, sl_distance: float) -> Tuple[bool, str, float]:
         spread = abs(current_ask - current_bid)
         range_cfg = self.spread_ranges.get(symbol)
 
         if range_cfg:
             std_spread = range_cfg["standard"]
-            max_allowed = range_cfg["max_allowed"]  # Standard + 70%
+            max_allowed = range_cfg["max_allowed"]
             if spread > max_allowed:
-                return False, f"Spread ({spread:.5f}) exceeded +70% range [{std_spread:.5f} to {max_allowed:.5f}]", spread
+                return False, f"Spread ({spread:.5f}) exceeded range [{std_spread:.5f} to {max_allowed:.5f}]", spread
         else:
             if spread > 5.0:
                 return False, f"Spread ({spread:.4f}) exceeds default ceiling (5.0)", spread
@@ -169,99 +168,26 @@ def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, s
         if sl_distance > 0 and (spread / sl_distance) > self.max_spread_to_sl_ratio:
             return False, f"Spread is {(spread/sl_distance)*100:.1f}% of SL distance (Max: {self.max_spread_to_sl_ratio*100:.0f}%)", spread
 
-        return True, "Spread optimal (within +70% range)", spread
+        return True, "Spread optimal", spread
 
     def calculate_lot_size(self, current_equity: float, sl_distance: float, point_value: float, min_stake: float, max_stake: float) -> float:
-        """
-        Adapts dynamically to ANY account size:
-        - Micro-Account Mode (R100 / $5-$10): Uses broker min stake to build small deposits.
-        - Goal Shield: When weekly target is 90%+ reached, cuts risk in half to protect gains.
-        """
-        equity = current_equity if current_equity > 0 else 10051.99
+        equity = current_equity if current_equity > 0 else 10.0
         active_risk_pct = self.risk_per_trade_pct
 
-        # 1. Weekly Goal Shield (Lock in profits when goal is almost reached)
-        if self.weekly_goal_target > 0 and self.weekly_deposit_baseline > 0:
-            target_gain = self.weekly_goal_target - self.weekly_deposit_baseline
-            current_gain = equity - self.weekly_deposit_baseline
-            if target_gain > 0 and (current_gain / target_gain) >= 0.90:
-                active_risk_pct = active_risk_pct * 0.5
-                log.info(f"CAPITAL SHIELD ENGAGED: 90%+ of Weekly Goal achieved! Risk halved to {active_risk_pct:.2f}% to lock in gains.")
-
-        # 2. Consecutive Loss Protection
         if self.consecutive_losses >= 3:
-            active_risk_pct = active_risk_pct * 0.5
-            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
+            active_risk_pct *= 0.5
+            log.info(f"Consecutive loss protection: Risk halved to {active_risk_pct:.2f}%")
 
-        # 3. News Armor
         if self.is_red_folder_active():
-            active_risk_pct = active_risk_pct * 0.5
-
-        # 4. Weekly & Daily Buffer Budgeting
-        if self.max_weekly_loss_usd > 0:
-            weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
-            remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
-            if weekly_used_ratio >= 0.75:
-                active_risk_pct = min(active_risk_pct, 0.25)
-            elif weekly_used_ratio >= 0.50:
-                active_risk_pct = min(active_risk_pct, 0.50)
-            max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
-        else:
-            max_weekly_allowed_dollars = float('inf')
+            active_risk_pct *= 0.5
+            log.info("News armor active: Risk halved for news window.")
 
         base_risk_dollars = equity * (active_risk_pct / 100.0)
-        final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars)
-
-        # 5. Micro-Account Scaling
-        # If account is small (R100 / $5 - $10) and standard % yields less than min_stake:
         denom = sl_distance * point_value
-        calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
+        calculated_stake = (base_risk_dollars / denom) if denom > 0 else min_stake
 
-        # Micro-Account Growth Rule:
-        # If balance is small but greater than min_stake, allow min_stake so the account can grow!
         if calculated_stake < min_stake and equity >= min_stake:
-            log.info(f"MICRO-ACCOUNT GROWTH MODE: Balance is small ({equity:.2f}). Floor stake set to broker minimum ({min_stake}).")
             calculated_stake = min_stake
-
-        return round(max(min(calculated_stake, max_stake), min_stake), 2)
-
-        # Consecutive loss protection
-        if self.consecutive_losses >= 3:
-            active_risk_pct = active_risk_pct * 0.5
-            log.info(f"CONSECUTIVE LOSS CIRCUIT: Risk halved to {active_risk_pct:.2f}%")
-
-        # News Armor: If trading during a red-folder event, halve risk to protect against slippage
-        if self.is_red_folder_active():
-            active_risk_pct = active_risk_pct * 0.5
-            log.info(f"NEWS ARMOR ENGAGED: Red folder window active. Risk halved to {active_risk_pct:.2f}% to absorb volatility.")
-
-        # Weekly Buffer Budgeting
-        if self.max_weekly_loss_usd > 0:
-            weekly_used_ratio = self.current_weekly_loss / self.max_weekly_loss_usd
-            remaining_weekly_buffer = max(0.0, self.max_weekly_loss_usd - self.current_weekly_loss)
-
-            if weekly_used_ratio >= 0.90:
-                active_risk_pct = min(active_risk_pct, 0.10)
-            elif weekly_used_ratio >= 0.75:
-                active_risk_pct = min(active_risk_pct, 0.25)
-            elif weekly_used_ratio >= 0.50:
-                active_risk_pct = min(active_risk_pct, 0.50)
-
-            max_weekly_allowed_dollars = remaining_weekly_buffer / 4.0 if remaining_weekly_buffer > 0 else 0.0
-        else:
-            max_weekly_allowed_dollars = float('inf')
-
-        # Daily Buffer Budgeting
-        if self.max_daily_loss_usd > 0:
-            remaining_daily_buffer = max(0.0, self.max_daily_loss_usd - self.current_daily_loss)
-            max_daily_allowed_dollars = remaining_daily_buffer / 2.0 if remaining_daily_buffer > 0 else 0.0
-        else:
-            max_daily_allowed_dollars = float('inf')
-
-        base_risk_dollars = equity * (active_risk_pct / 100.0)
-        final_risk_dollars = min(base_risk_dollars, max_weekly_allowed_dollars, max_daily_allowed_dollars)
-        denom = sl_distance * point_value
-        calculated_stake = (final_risk_dollars / denom) if denom > 0 else min_stake
 
         return round(max(min(calculated_stake, max_stake), min_stake), 2)
 
@@ -275,27 +201,19 @@ def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, s
         current_bid: float,
         current_ask: float,
         current_equity: float,
-        point_value: float,
-        min_stake: float,
-        max_stake: float
+        point_value: float = 1.0,
+        min_stake: float = 0.01,
+        max_stake: float = 50.0
     ) -> Tuple[bool, str, dict]:
         self.sync_ui_config()
 
         if not self.master_execution:
             return False, "Master execution switch is OFF in UI", {}
 
-        # Sector Correlation Limit Gate
         sector_ok, sector_msg = self.check_sector_exposure(symbol)
         if not sector_ok:
             return False, sector_msg, {}
 
-        # Ceilings
-        if self.current_daily_loss >= self.max_daily_loss_usd:
-            return False, f"Daily loss ceiling breached (-${self.current_daily_loss:.2f})", {}
-        if self.current_weekly_loss >= self.max_weekly_loss_usd:
-            return False, f"Weekly loss ceiling breached (-${self.current_weekly_loss:.2f})", {}
-        if self.current_monthly_loss >= self.max_monthly_loss_usd:
-            return False, f"Monthly loss ceiling breached (-${self.current_monthly_loss:.2f})", {}
         if self.trades_taken_today >= self.max_daily_trades:
             return False, f"Daily trade quota reached ({self.trades_taken_today}/{self.max_daily_trades})", {}
 
@@ -308,7 +226,6 @@ def evaluate_spread(self, symbol: str, current_bid: float, current_ask: float, s
             target_distance = sl_distance * self.risk_to_reward
             final_tp = (entry_price + target_distance) if direction.upper() == "BUY" else (entry_price - target_distance)
 
-        # Spread Gate (Primary shield during news volatility)
         spread_ok, spread_msg, spread_pts = self.evaluate_spread(symbol, current_bid, current_ask, sl_distance)
         if not spread_ok:
             return False, f"Spread Gate Rejection: {spread_msg}", {}
