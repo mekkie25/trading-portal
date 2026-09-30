@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { motion } from 'motion/react';
 import {
   Chart as ChartJS,
@@ -40,6 +40,21 @@ ChartJS.register(
   Filler
 );
 
+interface OpenPositionItem {
+  id: string;
+  ticket: string;
+  symbol: string;
+  strategy: string;
+  direction: 'BUY' | 'SELL';
+  lots: number;
+  entry: number;
+  currentPrice: number;
+  sl?: number;
+  tp?: number;
+  floatingPnL: number;
+  isRiskFree: boolean;
+}
+
 interface DashboardViewProps {
   metrics: TopMetrics;
   botSettings: BotSettings;
@@ -75,10 +90,43 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 }) => {
   const [formSettings, setFormSettings] = useState<BotSettings>(botSettings);
   const [saveToast, setSaveToast] = useState<string | null>(null);
+  const [openPositions, setOpenPositions] = useState<OpenPositionItem[]>([]);
+  const [closingId, setClosingId] = useState<string | null>(null);
 
   React.useEffect(() => {
     setFormSettings(botSettings);
   }, [botSettings]);
+
+  useEffect(() => {
+    const pollPositions = async () => {
+      try {
+        const res = await fetch('/api/broker/telemetry');
+        if (res.ok) {
+          const json = await res.json();
+          if (json.data && Array.isArray(json.data.openPositions)) {
+            setOpenPositions(json.data.openPositions);
+          }
+        }
+      } catch {}
+    };
+    pollPositions();
+    const interval = setInterval(pollPositions, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleClosePosition = async (posId: string) => {
+    setClosingId(posId);
+    try {
+      await fetch(`/api/positions/close/${posId}`, { method: 'POST' });
+      setSaveToast(`Close order dispatched for Position #${posId}!`);
+      setOpenPositions(prev => prev.filter(p => p.id !== posId));
+    } catch {
+      setSaveToast(`Failed to close Position #${posId}`);
+    } finally {
+      setTimeout(() => setSaveToast(null), 3500);
+      setClosingId(null);
+    }
+  };
 
   const handleStrategyModeChange = (stratId: string, mode: StrategyExecutionMode) => {
     const updatedModes = {
@@ -111,7 +159,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const isDark = themeMode === 'dark';
 
-  // Strategy performance leaderboard mapped directly from real trade records
   const strategyStats = useMemo(() => {
     const statsMap: Record<string, { trades: number; wins: number; losses: number; pnl: number }> = {};
     STRATEGY_METADATA.forEach(s => {
@@ -130,12 +177,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return statsMap;
   }, [trades]);
 
-  // DAILY-GROUPED CUMULATIVE EQUITY TRAJECTORY:
-  // X-Axis = Day/Date. Green Dot = Profitable Day, Red Dot = Negative Day.
   const chartData = useMemo(() => {
     const startingBal = metrics.totalInjections > 0 ? metrics.totalInjections : 10.0;
-    
-    // 1. Group closed trades by Date (YYYY-MM-DD)
     const dailyMap = new Map<string, { dateLabel: string; netPnL: number; count: number }>();
 
     const sortedTrades = [...trades].filter(t => t.status !== 'OPEN').sort((a, b) => {
@@ -144,9 +187,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
     sortedTrades.forEach(tr => {
       const dateRaw = tr.closeTime || tr.openTime || new Date().toISOString();
-      const dateKey = dateRaw.slice(0, 10); // "YYYY-MM-DD"
-      
-      // Format friendly date like "29 Sep"
+      const dateKey = dateRaw.slice(0, 10);
       const dateObj = new Date(dateKey);
       const friendlyDate = isNaN(dateObj.getTime())
         ? dateKey
@@ -183,15 +224,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         equityPoints.push(cleanEq);
         dayStats.push({ pnl: day.netPnL, count: day.count });
 
-        // GREEN DOT if day was profitable, RED DOT if day was negative
         if (day.netPnL > 0) {
-          pointColors.push('#10b981'); // Green = Winning Day
+          pointColors.push('#10b981');
           pointRadii.push(7);
         } else if (day.netPnL < 0) {
-          pointColors.push('#ef4444'); // Red = Losing Day
+          pointColors.push('#ef4444');
           pointRadii.push(7);
         } else {
-          pointColors.push('#94a3b8'); // Gray = Breakeven
+          pointColors.push('#94a3b8');
           pointRadii.push(5);
         }
       });
@@ -253,14 +293,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       y: { grid: { color: isDark ? '#141a26' : '#e2e8f0' }, ticks: { color: isDark ? '#64748b' : '#000000', callback: (v) => `$${Number(v).toFixed(2)}` } },
     },
   };
-
-  const startBaseline = formSettings.weeklyDepositBaseline || (metrics.totalInjections > 0 ? metrics.totalInjections : 10);
-  const goalTarget = formSettings.weeklyGoalTarget || (startBaseline * 2);
-  const currentEq = metrics.currentEquity > 0 ? metrics.currentEquity : startBaseline;
-  const targetDiff = goalTarget - startBaseline;
-  const currentDiff = currentEq - startBaseline;
-  const goalPct = targetDiff > 0 ? Math.min(100, Math.max(0, Math.round((currentDiff / targetDiff) * 100))) : 0;
-  const remainingToGoal = Math.max(0, goalTarget - currentEq);
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
@@ -380,6 +412,105 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </motion.div>
 
+      {/* ACTIVE TRADES IN-FLIGHT (LIVE OPEN POSITIONS CARD) */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6 space-y-4"
+      >
+        <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-[#1a2030]">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+              <Activity className="w-4 h-4 animate-pulse" />
+            </div>
+            <div>
+              <h2 className="text-base font-bold text-black dark:text-white tracking-tight flex items-center gap-2">
+                Active In-Flight Positions (cTrader)
+                <span className="text-xs font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 font-bold border border-emerald-500/20">
+                  {openPositions.length} OPEN
+                </span>
+              </h2>
+              <p className="text-xs text-black dark:text-slate-400">
+                Live floating positions currently managed by the 80% R:R break-even supervisor.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {openPositions.length === 0 ? (
+          <div className="py-6 text-center text-xs text-slate-500 font-mono">
+            No positions currently open. Engine is scanning all pairs.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead>
+                <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                  <th className="py-2.5 px-3">Ticket / Pair</th>
+                  <th className="py-2.5 px-3">Strategy</th>
+                  <th className="py-2.5 px-3">Direction</th>
+                  <th className="py-2.5 px-3">Lots</th>
+                  <th className="py-2.5 px-3">Entry $\rightarrow$ Current</th>
+                  <th className="py-2.5 px-3">Stop Loss</th>
+                  <th className="py-2.5 px-3">Take Profit</th>
+                  <th className="py-2.5 px-3 text-right">Floating P&L</th>
+                  <th className="py-2.5 px-3 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                {openPositions.map((pos) => {
+                  const isBuy = pos.direction === 'BUY';
+                  const isProfit = pos.floatingPnL >= 0;
+                  return (
+                    <tr key={pos.id} className="hover:bg-slate-50 dark:hover:bg-[#121520] transition-colors">
+                      <td className="py-3 px-3">
+                        <div className="font-bold text-black dark:text-white">{pos.symbol}</div>
+                        <div className="text-[10px] text-slate-500">{pos.ticket}</div>
+                      </td>
+                      <td className="py-3 px-3">
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
+                          {pos.strategy}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          isBuy ? 'bg-emerald-500/10 text-emerald-600 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-600 border border-rose-500/20'
+                        }`}>
+                          {pos.direction}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3 font-bold text-black dark:text-white">{pos.lots}</td>
+                      <td className="py-3 px-3">
+                        <span>{pos.entry}</span> $\rightarrow$ <strong className="text-black dark:text-white">{pos.currentPrice}</strong>
+                      </td>
+                      <td className="py-3 px-3">
+                        <span className={pos.isRiskFree ? 'text-emerald-500 font-bold' : 'text-rose-500'}>
+                          {pos.sl || '--'} {pos.isRiskFree && '🛡️ (BE)'}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3 text-emerald-600 dark:text-emerald-400 font-bold">{pos.tp || '--'}</td>
+                      <td className={`py-3 px-3 text-right font-bold text-sm ${isProfit ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        {isProfit ? '+' : ''}${pos.floatingPnL.toFixed(2)}
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        <button
+                          type="button"
+                          disabled={closingId === pos.id}
+                          onClick={() => handleClosePosition(pos.id)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold text-[10px] transition-all cursor-pointer shadow-xs disabled:opacity-50"
+                        >
+                          {closingId === pos.id ? 'Closing...' : 'Close Now'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </motion.div>
+
       {/* STRATEGY CONTROL CENTER & PERFORMANCE LEADERBOARD */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
@@ -490,7 +621,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-1 lg:grid-cols-12 gap-6"
       >
-        {/* Cumulative Equity Curve by Day with Green/Red Dots */}
         <div className="lg:col-span-8 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div>
@@ -537,7 +667,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* Bot Controls with 0.1% to 100% Risk Slider + Direct Type Input */}
         <div className="lg:col-span-4 flex flex-col rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-6">
           <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-[#1a2030] shrink-0">
             <div className="flex items-center gap-2.5">
@@ -580,7 +709,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </label>
               </div>
 
-              {/* RISK PER TRADE SLIDER (UP TO 100%) */}
               <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-bold flex items-center gap-1.5">
@@ -616,7 +744,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
               </div>
 
-              {/* Target R:R */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
@@ -635,7 +762,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 />
               </div>
 
-              {/* Max Daily Trades */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
