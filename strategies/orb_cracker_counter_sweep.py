@@ -2,7 +2,7 @@
 trading-portal/strategies/orb_cracker_counter_sweep.py
 1M / 5M Opening Range Counter-Sweep ('Cracker' Setup - Spec Setup 5).
 - Time: NYSE Session Open strictly (09:30 - 10:30 US/Eastern / 15:30 - 16:30 SAST)
-- Trigger: Initial momentum pulse breaks 1M/5M ORB High or Low
+- Trigger: Initial momentum pulse breaks dedicated 5M Cracker ORB High or Low
 - Rejection: Counter-pulse rejects at 200 EMA or Session VWAP
 - Asset-Specific Stops (Spec Sec 5): NAS100 35-50 pts (max 60), US30 37-50 pts, Gold 12-40 pips
 - TP: Fixed R:R 1:1 to 1:2 (Move SL to BE at 80%)
@@ -31,10 +31,15 @@ class ORBCracker:
             diagnostics["reason"] = "Outside NYSE Open Cracker window (15:30 - 16:30 SAST)"
             return None
 
-        orb_h = session_levels.get('cracker_orb_high', session_levels.get('orb_high'))
-        orb_l = session_levels.get('cracker_orb_low', session_levels.get('orb_low'))
-        if not orb_h or not orb_l:
-            diagnostics["reason"] = "Cracker opening range levels not established"
+        # Dedicated 5M Cracker ORB verification (strictly no fallback to 15M ORB)
+        if not session_levels.get('cracker_orb_established', False):
+            diagnostics["reason"] = "Cracker 5M Opening Range not yet established"
+            return None
+
+        orb_h = session_levels.get('cracker_orb_high')
+        orb_l = session_levels.get('cracker_orb_low')
+        if orb_h is None or orb_l is None or orb_h == 0.0 or orb_l == 0.0:
+            diagnostics["reason"] = "Cracker 5M Opening Range not yet established"
             return None
 
         curr_bar = data_5m.iloc[-1]

@@ -1,99 +1,147 @@
 """
-trading-portal/strategies/pdh_pdl_failed_breakout.py
-Previous Daily High / Low (PDH/PDL) Failed Breakout Liquidity Trap (Spec Setup 3).
-- Breakout beyond PDH or PDL within a configured liquidity buffer
-- 15M or 5M close back inside the previous day's range
-- CVD seller/buyer injection confirming institutional trap
-- SL at failed breakout peak; TP at Previous Day POC or opposite Value Area extreme
+trading-portal/strategies/oes_4h_order_block_retest.py
+Order Flow Entry Strategy (OES) / 4H & 1H Zone Retest (Spec Setup 6).
+- Timeframe Analysis: 4H & 1H Institutional Order Blocks (OB) and Fair Value Gaps (FVG)
+- Confluence: 4H + 1H overlapping order block confluence yields higher confidence (0.95)
+- Confirmation: 5M Market Structure Shift (MSS) + Bullish/Bearish Engulfing close
+- Stop Loss: Placed strictly beyond the OB extreme + technical buffer
+- Take Profit: TP1 = 1:2 R:R, TP2 = Session High/Low
 """
 
 import pandas as pd
 from strategies.base import StrategySignal
-from core.indicators import calculate_cvd_absorption_proxy
-from config.strategy_params import GLOBAL_PARAMS
+from core.indicators import is_bullish_engulfing, is_bearish_engulfing
 
-class LiquidityTrap:
-    def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
-        diagnostics = {"strategy": "PDH_PDL_FAILED_BREAKOUT", "passed": False, "reason": ""}
+def find_order_blocks(df: pd.DataFrame):
+    bullish_ob = None
+    bearish_ob = None
+    if df is None or len(df) < 3:
+        return bullish_ob, bearish_ob
 
-        if data_5m is None or len(data_5m) < 15 or not session_levels:
-            diagnostics["reason"] = "Insufficient data or session levels"
+    sub = df.tail(12)
+    for i in range(2, len(sub)):
+        b1 = sub.iloc[i - 2]
+        b2 = sub.iloc[i - 1]
+        b3 = sub.iloc[i]
+
+        # Bullish OB: Down candle followed by displacement leaving an FVG (b3['low'] > b1['high'])
+        if b2['close'] < b2['open'] and b3['close'] > b2['high']:
+            if b3['low'] > b1['high']:
+                bullish_ob = {'high': float(b2['high']), 'low': float(b2['low'])}
+
+        # Bearish OB: Up candle followed by displacement leaving an FVG (b3['high'] < b1['low'])
+        if b2['close'] > b2['open'] and b3['close'] < b2['low']:
+            if b3['high'] < b1['low']:
+                bearish_ob = {'high': float(b2['high']), 'low': float(b2['low'])}
+
+    return bullish_ob, bearish_ob
+
+class OrderBlockRetest:
+    def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None, data_h1: pd.DataFrame = None) -> StrategySignal | None:
+        diagnostics = {"strategy": "OES_4H_ORDER_BLOCK", "passed": False, "reason": ""}
+
+        if data_5m is None or len(data_5m) < 20:
+            diagnostics["reason"] = "Insufficient 5M bars"
             return None
 
-        pdh = session_levels.get('pdh')
-        pdl = session_levels.get('pdl')
-        poc = session_levels.get('poc')
-        val = session_levels.get('val')
-        vah = session_levels.get('vah')
-
-        if not pdh or not pdl:
-            diagnostics["reason"] = "Missing PDH or PDL"
+        # Minimum timeframe validation
+        if (data_h4 is None or len(data_h4) < 10) and (data_h1 is None or len(data_h1) < 12):
+            diagnostics["reason"] = "Requires minimum 10 bars of 4H or 12 bars of 1H data"
             return None
+
+        h4_bull, h4_bear = find_order_blocks(data_h4)
+        h1_bull, h1_bear = find_order_blocks(data_h1)
+
+        # Determine bullish OB with 4H+1H confluence check
+        bullish_ob = h4_bull or h1_bull
+        bull_confluence = False
+        if h4_bull and h1_bull:
+            if max(h4_bull['low'], h1_bull['low']) <= min(h4_bull['high'], h1_bull['high']):
+                bull_confluence = True
+                bullish_ob = {
+                    'high': min(h4_bull['high'], h1_bull['high']),
+                    'low': max(h4_bull['low'], h1_bull['low'])
+                }
+
+        # Determine bearish OB with 4H+1H confluence check
+        bearish_ob = h4_bear or h1_bear
+        bear_confluence = False
+        if h4_bear and h1_bear:
+            if max(h4_bear['low'], h1_bear['low']) <= min(h4_bear['high'], h1_bear['high']):
+                bear_confluence = True
+                bearish_ob = {
+                    'high': min(h4_bear['high'], h1_bear['high']),
+                    'low': max(h4_bear['low'], h1_bear['low'])
+                }
 
         curr_bar = data_5m.iloc[-1]
         prev_bar = data_5m.iloc[-2]
 
-        buffer = GLOBAL_PARAMS.pdh_pdl_liquidity_buffer_pts
-        if symbol == "GOLD":
-            buffer = 1.50
-        elif symbol in ("EURUSD", "GBPUSD"):
-            buffer = 0.0015
+        buffer = 3.0 if symbol in ("US30", "NAS100") else (0.40 if symbol == "GOLD" else 0.0004)
 
-        # SHORT: Trap above Previous Daily High
-        broke_above_pdh = prev_bar['high'] > pdh and (prev_bar['high'] - pdh) <= buffer
-        closed_back_under = curr_bar['close'] < pdh and curr_bar['close'] < curr_bar['open']
+        # BULLISH OES RETEST
+        if bullish_ob:
+            in_zone = curr_bar['low'] <= bullish_ob['high'] and curr_bar['close'] >= bullish_ob['low']
+            mss_confirmed = is_bullish_engulfing(prev_bar, curr_bar)
 
-        if broke_above_pdh and closed_back_under:
-            sl = float(max(prev_bar['high'], curr_bar['high']) + (buffer * 0.2))
-            risk = abs(sl - curr_bar['close'])
-            tp1 = float(poc) if poc and poc < curr_bar['close'] else float(curr_bar['close'] - risk)
-            tp2 = float(val) if val and val < tp1 else float(curr_bar['close'] - (2 * risk))
+            if in_zone and mss_confirmed:
+                sl = float(bullish_ob['low'] - buffer)
+                risk = abs(curr_bar['close'] - sl)
+                if risk > 0:
+                    tp1 = float(curr_bar['close'] + (2.0 * risk))
+                    tp2 = float(session_levels.get('pdh', curr_bar['close'] + (3.0 * risk)))
+                    confidence = 0.95 if bull_confluence else 0.90
+                    reason = "Mitigation of 4H + 1H Confluent Order Block + FVG with 5M MSS" if bull_confluence else "Mitigation of Institutional Order Block + FVG with 5M MSS"
 
-            diagnostics.update({"passed": True, "action": "SELL", "trap": "PDH_TRAP"})
-            return StrategySignal(
-                strategy="PDH_PDL_FAILED_BREAKOUT",
-                symbol=symbol,
-                direction="SELL",
-                entry_price=float(curr_bar['close']),
-                stop_loss=sl,
-                take_profit=tp2,
-                take_profit_1=tp1,
-                take_profit_2=tp2,
-                scale_out_fraction=0.50,
-                trail_mode="MOVE_TO_BE_80",
-                session="LONDON_OR_NY",
-                confidence=0.88,
-                reason=f"Failed breakout trap above PDH ({pdh:.2f}) with close back inside daily range",
-                diagnostics=diagnostics
-            )
+                    diagnostics.update({"passed": True, "action": "BUY", "ob_zone": bullish_ob, "confluence": bull_confluence})
+                    return StrategySignal(
+                        strategy="OES_4H_ORDER_BLOCK",
+                        symbol=symbol,
+                        direction="BUY",
+                        entry_price=float(curr_bar['close']),
+                        stop_loss=sl,
+                        take_profit=tp1,
+                        take_profit_1=tp1,
+                        take_profit_2=tp2,
+                        scale_out_fraction=0.50,
+                        trail_mode="SUPERTREND",
+                        session="ALL_DAY",
+                        confidence=confidence,
+                        reason=reason,
+                        diagnostics=diagnostics
+                    )
 
-        # LONG: Trap below Previous Daily Low
-        broke_below_pdl = prev_bar['low'] < pdl and (pdl - prev_bar['low']) <= buffer
-        closed_back_over = curr_bar['close'] > pdl and curr_bar['close'] > curr_bar['open']
+        # BEARISH OES RETEST
+        if bearish_ob:
+            in_zone = curr_bar['high'] >= bearish_ob['low'] and curr_bar['close'] <= bearish_ob['high']
+            mss_confirmed = is_bearish_engulfing(prev_bar, curr_bar)
 
-        if broke_below_pdl and closed_back_over:
-            sl = float(min(prev_bar['low'], curr_bar['low']) - (buffer * 0.2))
-            risk = abs(curr_bar['close'] - sl)
-            tp1 = float(poc) if poc and poc > curr_bar['close'] else float(curr_bar['close'] + risk)
-            tp2 = float(vah) if vah and vah > tp1 else float(curr_bar['close'] + (2 * risk))
+            if in_zone and mss_confirmed:
+                sl = float(bearish_ob['high'] + buffer)
+                risk = abs(sl - curr_bar['close'])
+                if risk > 0:
+                    tp1 = float(curr_bar['close'] - (2.0 * risk))
+                    tp2 = float(session_levels.get('pdl', curr_bar['close'] - (3.0 * risk)))
+                    confidence = 0.95 if bear_confluence else 0.90
+                    reason = "Mitigation of 4H + 1H Confluent Order Block + FVG with 5M MSS" if bear_confluence else "Mitigation of Institutional Order Block + FVG with 5M MSS"
 
-            diagnostics.update({"passed": True, "action": "BUY", "trap": "PDL_TRAP"})
-            return StrategySignal(
-                strategy="PDH_PDL_FAILED_BREAKOUT",
-                symbol=symbol,
-                direction="BUY",
-                entry_price=float(curr_bar['close']),
-                stop_loss=sl,
-                take_profit=tp2,
-                take_profit_1=tp1,
-                take_profit_2=tp2,
-                scale_out_fraction=0.50,
-                trail_mode="MOVE_TO_BE_80",
-                session="LONDON_OR_NY",
-                confidence=0.88,
-                reason=f"Failed breakout trap below PDL ({pdl:.2f}) with close back inside daily range",
-                diagnostics=diagnostics
-            )
+                    diagnostics.update({"passed": True, "action": "SELL", "ob_zone": bearish_ob, "confluence": bear_confluence})
+                    return StrategySignal(
+                        strategy="OES_4H_ORDER_BLOCK",
+                        symbol=symbol,
+                        direction="SELL",
+                        entry_price=float(curr_bar['close']),
+                        stop_loss=sl,
+                        take_profit=tp1,
+                        take_profit_1=tp1,
+                        take_profit_2=tp2,
+                        scale_out_fraction=0.50,
+                        trail_mode="SUPERTREND",
+                        session="ALL_DAY",
+                        confidence=confidence,
+                        reason=reason,
+                        diagnostics=diagnostics
+                    )
 
-        diagnostics["reason"] = "No PDH/PDL failed breakout condition"
+        diagnostics["reason"] = "No active institutional OB mitigation and lower timeframe structure shift"
         return None

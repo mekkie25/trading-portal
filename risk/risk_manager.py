@@ -45,21 +45,30 @@ class RiskManager:
 
     def load_persistent_state(self):
         """Zero-Amnesia: Restores trade counters and streak tracking across container restarts."""
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, "r") as f:
-                    st = json.load(f)
-                saved_day = st.get("current_day_str")
-                now_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                if saved_day == now_day:
-                    self.trades_taken_today = st.get("trades_taken_today", 0)
-                    self.current_daily_loss = st.get("current_daily_loss", 0.0)
-                    self.starting_day_equity = st.get("starting_day_equity", 0.0)
-                else:
-                    self.reset_daily_counters(now_day)
-                self.consecutive_losses = st.get("consecutive_losses", 0)
-            except Exception as e:
-                log.warning(f"Could not load risk state: {e}")
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r") as f:
+                st = json.load(f)
+            saved_day = st.get("current_day_str")
+            now_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            # Always restore streak tracking FIRST (never reset on day rollover)
+            self.consecutive_losses = st.get("consecutive_losses", 0)
+
+            if saved_day == now_day:
+                self.current_day_str = saved_day
+                self.trades_taken_today = st.get("trades_taken_today", 0)
+                self.current_daily_loss = st.get("current_daily_loss", 0.0)
+                self.starting_day_equity = st.get("starting_day_equity", 0.0)
+            else:
+                self.current_day_str = now_day
+                self.trades_taken_today = 0
+                self.current_daily_loss = 0.0
+                log.info(f"DAILY ROLLOVER: New trading date {now_day} initialized.")
+                self.save_persistent_state()
+        except Exception as e:
+            log.warning(f"Could not load risk state: {e}")
 
     def save_persistent_state(self):
         try:

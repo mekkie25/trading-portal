@@ -1,7 +1,7 @@
 """
 trading-portal/strategies/strategy_manager.py
 Orchestrates institutional quantitative strategies across the 7 whitelisted assets,
-passing multi-timeframe market feeds (M5, H4, D1) and selecting the highest-confidence
+passing multi-timeframe market feeds (M5, H1, H4, D1) and selecting the highest-confidence
 setup among all permitted strategies (eliminating first-match short-circuiting).
 """
 
@@ -67,7 +67,7 @@ class StrategyManager:
         except Exception:
             return {}
 
-    def evaluate_all(self, symbol: str, data_5m, data_h4, data_d1, session_levels: dict) -> StrategySignal | None:
+    def evaluate_all(self, symbol: str, data_5m, data_h4, data_d1, session_levels: dict, data_h1=None) -> StrategySignal | None:
         """
         Evaluates ALL strategies for the symbol. Rather than stopping at the first match,
         it collects all valid signals and selects the one with the highest confidence score.
@@ -82,10 +82,14 @@ class StrategyManager:
             strat_name = strat.__class__.__name__
             try:
                 sig = inspect.signature(strat.evaluate)
-                if len(sig.parameters) >= 5:
-                    signal = strat.evaluate(symbol, data_5m, data_h4, data_d1, session_levels)
-                else:
-                    signal = strat.evaluate(symbol, data_5m, session_levels)
+                params = sig.parameters
+                kwargs = {}
+                if 'data_h4' in params: kwargs['data_h4'] = data_h4
+                if 'data_d1' in params: kwargs['data_d1'] = data_d1
+                if 'session_levels' in params: kwargs['session_levels'] = session_levels
+                if 'data_h1' in params: kwargs['data_h1'] = data_h1
+
+                signal = strat.evaluate(symbol, data_5m, **kwargs)
 
                 if signal:
                     # 1. Enforce strict asset boundary

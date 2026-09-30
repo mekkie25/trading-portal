@@ -15,7 +15,7 @@ Components:   - Native Account Currency Detection (USD, ZAR, EUR, GBP)
               - Event-Driven Trigger Locks: Only Enters On Fresh Signal Candles
               - Authentic Strategy Name Preservation in cTrader Comments
               - Twin-Position 50/50 Smart Link (TP1 Moves Runner to BE via 2110)
-              - Multi-Timeframe Volatility Analytics (M5, H4, D1)
+              - Multi-Timeframe Volatility Analytics (M5, H1, H4, D1)
               - 21:00 SAST EOD Position Flusher (Zero Overnight Risk)
               - High-Impact Macro News Armor & Spread Defense
               - Personal WhatsApp Alerts Engine (CallMeBot)
@@ -40,7 +40,6 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
-from risk.risk_manager import RiskManager
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -50,6 +49,7 @@ if PROJECT_ROOT not in sys.path:
 
 import core.session_config
 from core.session_config import MarketSessionManager, GLOBAL_PARAMS
+from core.indicators import calculate_supertrend
 
 try:
     import google.generativeai as genai
@@ -371,7 +371,6 @@ class CTraderClient:
                         friendly = f_name
                         break
 
-                digits = self.symbol_details.get(sid, {}).get("digits", 5)
                 entry = float(p.get("price", 0))
                 sl = float(p.get("stopLoss", 0)) if p.get("stopLoss") else 0.0
                 tp = float(p.get("takeProfit", 0)) if p.get("takeProfit") else 0.0
@@ -904,10 +903,6 @@ class OrderFlowAnalyzer:
 # 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & STOP BOUNDARIES)
 # ==============================================================================
 
-   # ==============================================================================
-# 7. INSTITUTIONAL RISK ENGINE (EXACT PIP VALUE & STOP BOUNDARIES)
-# ==============================================================================
-
 class InstitutionalRiskEngine:
     def __init__(self, config_file: str = CONFIG_FILE):
         self.config_file = config_file
@@ -919,6 +914,7 @@ class InstitutionalRiskEngine:
         
         self.master_execution: bool = True
         self.dry_run: bool = False
+        self.risk_per_trade_pct: float = GLOBAL_PARAMS.base_risk_per_trade_pct
         self.risk_to_reward: float = 2.0
         self.daily_goal_target: float = 0.0
         self.weekly_deposit_baseline: float = 10.0
@@ -965,15 +961,21 @@ class InstitutionalRiskEngine:
     def max_daily_trades(self) -> int:
         return self.persistent_risk.max_daily_trades
 
+    @max_daily_trades.setter
+    def max_daily_trades(self, val: int):
+        self.persistent_risk.max_daily_trades = val
+        self.persistent_risk.save_persistent_state()
+
     def sync_ui_config(self) -> None:
         cfg = read_ui_config()
         if not cfg:
             return
         self.master_execution = cfg.get("masterExecution", self.master_execution)
         self.dry_run = cfg.get("dryRun", self.dry_run)
-        self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
+        self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", getattr(self, 'risk_per_trade_pct', GLOBAL_PARAMS.base_risk_per_trade_pct)))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
-        self.max_daily_trades = int(cfg.get("maxDailyTrades", self.max_daily_trades))
+        if "maxDailyTrades" in cfg:
+            self.max_daily_trades = int(cfg["maxDailyTrades"])
         self.daily_goal_target = float(cfg.get("dailyGoalTarget", self.daily_goal_target))
         self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline or 10.0))
         self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target or 20.0))
@@ -1297,6 +1299,7 @@ class CloudExecutionEngine:
         entry = getattr(signal, 'entry_price')
         sl = getattr(signal, 'stop_loss', None) or getattr(signal, 'sl', 0.0)
         tp = getattr(signal, 'take_profit', None) or getattr(signal, 'tp1', None)
+        trail_mode = getattr(signal, 'trail_mode', 'MOVE_TO_BE_80')
 
         strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
         if isinstance(strategy_name, Enum):
@@ -1379,7 +1382,8 @@ class CloudExecutionEngine:
                     "lots": res_a["lots"],
                     "is_be_moved": False,
                     "role": "CONTRACT_A_TP1",
-                    "twin_partner_id": pid_b
+                    "twin_partner_id": pid_b,
+                    "trail_mode": trail_mode
                 }
                 save_trade_record({
                     "id": f"pos-{pid_a}",
@@ -1410,7 +1414,8 @@ class CloudExecutionEngine:
                     "lots": res_b["lots"],
                     "is_be_moved": False,
                     "role": "CONTRACT_B_RUNNER",
-                    "twin_partner_id": pid_a
+                    "twin_partner_id": pid_a,
+                    "trail_mode": trail_mode
                 }
                 save_trade_record({
                     "id": f"pos-{pid_b}",
@@ -1515,10 +1520,25 @@ class MatrixEngineMaster:
                     be_moved = pos.get("is_be_moved", False)
                     role = pos.get("role", "")
                     twin_id = pos.get("twin_partner_id")
+                    trail_mode = pos.get("trail_mode", "MOVE_TO_BE_80")
 
                     quote, bid, ask = await self.ctrader.get_live_quote(sym)
                     if quote <= 0:
                         continue
+
+                    # Dynamic SuperTrend Trailing Stop (Spec Sec 2 & 8)
+                    if trail_mode == "SUPERTREND":
+                        m5_candles = await self.ctrader.fetch_ohlc_candles(sym, CTraderTrendbarPeriod.M5, count=25)
+                        if not m5_candles.empty and len(m5_candles) >= 12:
+                            st_df = calculate_supertrend(m5_candles, period=10, factor=1.6)
+                            curr_dir = int(st_df['supertrend_direction'].iloc[-1])
+                            if (direction == "BUY" and curr_dir == -1) or (direction == "SELL" and curr_dir == 1):
+                                log.info(f"SUPERTREND TRAIL FLIP on {sym} (Pos #{pid})! Closing position.")
+                                await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100))
+                                self.risk_mgr.open_positions.pop(pid, None)
+                                alert = f"🛑 *[SUPERTREND TRAIL EXIT]*\n• {direction} {sym} closed as SuperTrend flipped against trend.\n• Risk management executed."
+                                await whatsapp.send_alert(alert)
+                                continue
 
                     # TWIN-ORDER SMART LINK (Contract A hit TP1 -> Auto-move Contract B to BE via 2110)
                     if role == "CONTRACT_A_TP1":
@@ -1664,6 +1684,7 @@ class MatrixEngineMaster:
                         continue
 
                     m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
+                    h1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H1, count=30)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
                     d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=15)
 
@@ -1702,7 +1723,13 @@ class MatrixEngineMaster:
                         asia_high = float(m5_df['high'].tail(36).max())
                         asia_low = float(m5_df['low'].tail(36).min())
 
-                    # True Frozen Opening Range
+                    # Start-of-Week AVWAP anchor index
+                    avwap_anchor_idx = 0
+                    if not m5_df.empty:
+                        mon_candles = m5_df[m5_df['utc_time'].dt.weekday == 0]
+                        if not mon_candles.empty:
+                            avwap_anchor_idx = int(m5_df.index.get_loc(mon_candles.index[0]))
+
                     # True Frozen Opening Range
                     orb_h, orb_l, orb_established, cracker_h, cracker_l, cracker_established = self._compute_frozen_opening_range(friendly_name, m5_df)
 
@@ -1721,6 +1748,7 @@ class MatrixEngineMaster:
                         "cracker_orb_high": cracker_h,
                         "cracker_orb_low": cracker_l,
                         "cracker_orb_established": cracker_established,
+                        "avwap_anchor_index": avwap_anchor_idx,
                         "is_ranging": candle_stats["is_ranging"],
                         "range_span": candle_stats["range_span"],
                         "poc": vp.poc_price,
@@ -1733,7 +1761,8 @@ class MatrixEngineMaster:
                         data_5m=m5_df, 
                         data_h4=h4_df, 
                         data_d1=d1_df, 
-                        session_levels=session_levels
+                        session_levels=session_levels,
+                        data_h1=h1_df
                     )
 
                     if signal:
