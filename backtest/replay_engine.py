@@ -54,8 +54,12 @@ def run_simulation(symbol: str = "US30", adaptive_mode: bool = True, balance: fl
 
     for i in range(start_idx, total_bars):
         m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
+        # Convert 'time' column to real datetime objects so strategies see the same
+        # data type as the live bot (engine/matrix.py). Without this, MarketSessionManager
+        # crashes with "'str' object has no attribute 'tzinfo'".
+        m5_slice['time'] = pd.to_datetime(m5_slice['time'], utc=True)
         curr_bar = m5_slice.iloc[-1]
-        curr_time = pd.to_datetime(curr_bar['time'], utc=True).to_pydatetime()
+        curr_time = curr_bar['time'].to_pydatetime()
 
         # 1. Update in-flight trades against current bar
         sim.process_candle(symbol, curr_bar, m5_slice)
