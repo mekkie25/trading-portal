@@ -1,7 +1,8 @@
 """
 backtest/downloader.py
 Automated historical candle downloader using your existing cTrader connection.
-Pulls chunked M5, H1, H4, and D1 data in UTC without exceeding Spotware 5000-bar limits.
+Pulls rolling 365 days of 5-Minute (M5) candles in safe 10-day chunks, then automatically
+synthesizes H1, H4, and D1 history from M5 so no extra broker API calls are needed.
 """
 
 import sys
@@ -12,14 +13,15 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 
 # Ensure parent directory is in path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from engine.matrix import ConfigManager, CTraderClient, CTraderTrendbarPeriod
 
 # Target whitelist assets
 WHITELIST_SYMBOLS = ["GOLD", "US30", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"]
 
-# Output directory
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -36,17 +38,17 @@ async def fetch_chunked_bars(
     """
     sid = client.resolve_symbol_id(symbol_name)
     if not sid:
-        print(f"[-] Could not resolve broker symbol ID for {symbol_name}")
+        print(f"[-] Could not resolve broker symbol ID for {symbol_name}", flush=True)
         return pd.DataFrame()
 
     digits = client.symbol_details.get(sid, {}).get("digits", 5)
     divisor = float(10 ** digits)
 
     all_candles = []
-    chunk_days = 10 if period_enum == CTraderTrendbarPeriod.M5 else 60
+    chunk_days = 10
     current_start = start_dt
 
-    print(f"    Fetching {period_enum.name} from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}...")
+    print(f"    Fetching {period_enum.name} from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}...", flush=True)
 
     while current_start < end_dt:
         current_end = min(current_start + timedelta(days=chunk_days), end_dt)
@@ -92,44 +94,78 @@ async def fetch_chunked_bars(
     df.reset_index(drop=True, inplace=True)
     return df
 
-async def run_downloader(days_back: int = 90):
-    client = CTraderClient()
-    print("=" * 65)
-    print("1. CONNECTING TO BROKER VIA CTRADER OPEN API")
-    print("=" * 65)
-
-    if not await client.connect():
-        print("[!] Connection failed. Check CTRADER credentials in your .env file.")
+def build_higher_timeframes_from_m5(m5_df: pd.DataFrame, symbol: str) -> None:
+    """
+    Synthesizes H1, H4, and D1 CSVs directly from M5 candles.
+    Eliminates unnecessary broker API requests and guarantees 100% price consistency.
+    """
+    if m5_df.empty:
         return
 
+    df = m5_df.copy()
+    df['dt'] = pd.to_datetime(df['time'], utc=True)
+    df.set_index('dt', inplace=True)
+
+    agg_rules = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+
+    # 1. H1 Bars
+    h1 = df.resample('1h').agg(agg_rules).dropna().reset_index()
+    h1['time'] = h1['dt'].dt.strftime("%Y-%m-%d %H:%M:%S")
+    h1[['time', 'open', 'high', 'low', 'close', 'volume']].to_csv(
+        os.path.join(DATA_DIR, f"{symbol}_H1.csv"), index=False
+    )
+
+    # 2. H4 Bars
+    h4 = df.resample('4h').agg(agg_rules).dropna().reset_index()
+    h4['time'] = h4['dt'].dt.strftime("%Y-%m-%d %H:%M:%S")
+    h4[['time', 'open', 'high', 'low', 'close', 'volume']].to_csv(
+        os.path.join(DATA_DIR, f"{symbol}_H4.csv"), index=False
+    )
+
+    # 3. D1 Bars (21:00 UTC open alignment)
+    d1 = df.resample('24h', offset='21h').agg(agg_rules).dropna().reset_index()
+    d1['time'] = d1['dt'].dt.strftime("%Y-%m-%d %H:%M:%S")
+    d1[['time', 'open', 'high', 'low', 'close', 'volume']].to_csv(
+        os.path.join(DATA_DIR, f"{symbol}_D1.csv"), index=False
+    )
+    print(f"    [+] Automatically synthesized H1, H4, and D1 for {symbol} from M5 data.", flush=True)
+
+async def run_downloader(days_back: int = 365):
+    client = CTraderClient()
+    print("=" * 65, flush=True)
+    print("1. CONNECTING TO BROKER VIA CTRADER OPEN API", flush=True)
+    print("=" * 65, flush=True)
+
+    if not await client.connect():
+        print("[!] Connection failed. Check CTRADER credentials in your .env file.", flush=True)
+        return
+
+    # Dynamic rolling 365-day window from current time
     now_utc = datetime.now(timezone.utc)
-    # 90 days of backtest + 150 days of D1 warmup history
     test_start = now_utc - timedelta(days=days_back)
-    warmup_start = now_utc - timedelta(days=days_back + 180)
 
-    periods_to_fetch = [
-        (CTraderTrendbarPeriod.M5, test_start),
-        (CTraderTrendbarPeriod.H1, test_start),
-        (CTraderTrendbarPeriod.H4, test_start),
-        (CTraderTrendbarPeriod.D1, warmup_start)  # Needs 150+ closed bars for volatility engine
-    ]
-
-    print("\n" + "=" * 65)
-    print(f"2. DOWNLOADING {days_back} DAYS OF DATA + 180 DAYS D1 WARMUP")
-    print("=" * 65)
+    print("\n" + "=" * 65, flush=True)
+    print(f"2. DOWNLOADING ROLLING {days_back} DAYS OF 5-MINUTE CANDLES", flush=True)
+    print("=" * 65, flush=True)
 
     for symbol in WHITELIST_SYMBOLS:
-        print(f"\n[*] Processing Asset: {symbol}")
-        for period_enum, start_time in periods_to_fetch:
-            df = await fetch_chunked_bars(client, symbol, period_enum, start_time, now_utc)
-            if not df.empty:
-                filename = os.path.join(DATA_DIR, f"{symbol}_{period_enum.name}.csv")
-                df.to_csv(filename, index=False)
-                print(f"    [+] Saved {len(df):,} bars to {filename}")
-            else:
-                print(f"    [-] No data returned for {symbol} {period_enum.name}")
+        print(f"\n[*] Processing Asset: {symbol}", flush=True)
+        m5_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, test_start, now_utc)
+        if not m5_df.empty:
+            m5_filename = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+            m5_df.to_csv(m5_filename, index=False)
+            print(f"    [+] Saved {len(m5_df):,} M5 bars to {m5_filename}", flush=True)
+            build_higher_timeframes_from_m5(m5_df, symbol)
+        else:
+            print(f"    [-] No data returned for {symbol} M5", flush=True)
 
-    print("\n[✓] Historical download complete.")
+    print("\n[✓] Historical download and timeframe synthesis complete.", flush=True)
     if client.ws:
         try:
             await client.ws.close()
@@ -137,4 +173,4 @@ async def run_downloader(days_back: int = 90):
             pass
 
 if __name__ == "__main__":
-    asyncio.run(run_downloader(days_back=90))
+    asyncio.run(run_downloader(days_back=365))

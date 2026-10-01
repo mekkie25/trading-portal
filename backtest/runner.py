@@ -2,7 +2,7 @@
 backtest/runner.py
 Automated End-to-End Backtest Runner.
 Called by the Web UI to run historical tests:
-- Automatically downloads missing broker candles from cTrader.
+- Automatically downloads missing broker M5 candles for a rolling 365-day window.
 - Replays every closed M5 bar through StrategyManager (Zero Look-Ahead).
 - Simulates twin 50/50 legs, break-even triggers, and 21:00 SAST EOD close.
 - Exports structured JSON reports directly into backtest/output/.
@@ -30,58 +30,51 @@ from core.session_config import GLOBAL_PARAMS
 from backtest.bar_aggregator import ZeroLookAheadAggregator
 from backtest.simulator import TradeSimulator
 from backtest.report import calculate_kpis
-from backtest.downloader import fetch_chunked_bars, CTraderTrendbarPeriod, CTraderClient
+from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int = 60) -> bool:
-    required_periods = [
-        (CTraderTrendbarPeriod.M5, days_back),
-        (CTraderTrendbarPeriod.H1, days_back),
-        (CTraderTrendbarPeriod.H4, days_back),
-        (CTraderTrendbarPeriod.D1, days_back + 180)
-    ]
-    
-    now_utc = datetime.now(timezone.utc)
-    all_exist = True
+async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int = 365) -> bool:
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
 
-    for p_enum, _ in required_periods:
-        f_path = os.path.join(DATA_DIR, f"{symbol}_{p_enum.name}.csv")
-        if not os.path.exists(f_path) or os.path.getsize(f_path) < 100:
-            all_exist = False
-            break
-
-    if all_exist:
+    # If M5 already exists and is complete, synthesize any missing higher timeframes
+    if os.path.exists(m5_path) and os.path.getsize(m5_path) > 5000:
+        if not all(os.path.exists(p) for p in [h1_path, h4_path, d1_path]):
+            m5_df = pd.read_csv(m5_path)
+            build_higher_timeframes_from_m5(m5_df, symbol)
         return True
 
-    print(f"[*] Historical data missing for {symbol}. Connecting to cTrader to download past {days_back} days...")
+    now_utc = datetime.now(timezone.utc)
+    start_dt = now_utc - timedelta(days=days_back)
+
+    print(f"[*] Downloading rolling {days_back} days of M5 candles for {symbol}...", flush=True)
     if not client.is_authorized:
         connected = await client.connect()
         if not connected:
-            print("[!] Could not connect to cTrader. Please check CTRADER credentials in your environment.")
+            print("ERROR: Could not connect to cTrader. Please check CTRADER credentials in your environment.", flush=True)
             return False
 
-    for p_enum, span_days in required_periods:
-        start_dt = now_utc - timedelta(days=span_days)
-        df = await fetch_chunked_bars(client, symbol, p_enum, start_dt, now_utc)
-        if not df.empty:
-            f_path = os.path.join(DATA_DIR, f"{symbol}_{p_enum.name}.csv")
-            df.to_csv(f_path, index=False)
-            print(f"    [+] Saved {len(df):,} bars to {f_path}")
-        else:
-            print(f"    [-] Failed downloading {symbol} {p_enum.name}")
-            return False
+    m5_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, start_dt, now_utc)
+    if not m5_df.empty:
+        m5_df.to_csv(m5_path, index=False)
+        print(f"    [+] Saved {len(m5_df):,} M5 bars to {m5_path}", flush=True)
+        build_higher_timeframes_from_m5(m5_df, symbol)
+        return True
+    else:
+        print(f"ERROR: Failed downloading M5 candles for {symbol}", flush=True)
+        return False
 
-    return True
-
-def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, balance: float = 1000.0, risk_pct: float = 1.0):
+def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, balance: float = 1000.0, risk_pct: float = 1.0) -> bool:
     mode_str = "adaptive" if adaptive_mode else "legacy"
-    print(f"\n=======================================================")
-    print(f"STARTING AUTOMATED BACKTEST: {symbol} ({mode_str.upper()})")
-    print(f"=======================================================")
+    print(f"\n=======================================================", flush=True)
+    print(f"STARTING AUTOMATED BACKTEST: {symbol} ({mode_str.upper()})", flush=True)
+    print(f"=======================================================", flush=True)
 
     GLOBAL_PARAMS.adaptive_mode = adaptive_mode
 
@@ -91,7 +84,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
     d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
 
     if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
-        print(f"[!] Incomplete data files for {symbol} in {DATA_DIR}.")
+        print(f"ERROR: Incomplete data files for {symbol} in {DATA_DIR}.", flush=True)
         return False
 
     m5_df = pd.read_csv(m5_path)
@@ -107,13 +100,10 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
     total_bars = len(m5_df)
     start_idx = 120
 
-    print(f"[*] Simulating across {total_bars - start_idx:,} M5 candles (Zero Look-Ahead)...")
+    print(f"[*] Simulating across {total_bars - start_idx:,} M5 candles (Zero Look-Ahead)...", flush=True)
 
     for i in range(start_idx, total_bars):
         m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
-        # Convert 'time' column to real datetime objects so strategies see the same
-        # data type as the live bot (engine/matrix.py). Without this, MarketSessionManager
-        # crashes with "'str' object has no attribute 'tzinfo'".
         m5_slice['time'] = pd.to_datetime(m5_slice['time'], utc=True)
         curr_bar = m5_slice.iloc[-1]
         curr_time = curr_bar['time'].to_pydatetime()
@@ -236,20 +226,21 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
     with open(out_file, "w") as f:
         json.dump(report_payload, f, indent=2)
 
-    print(f"[✓] Backtest report written to {out_file}")
+    print(f"[✓] Backtest report written to {out_file}", flush=True)
     return True
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
-    parser.add_argument("--days", type=int, default=60)
+    parser.add_argument("--days", type=int, default=365)
     parser.add_argument("--adaptive", action="store_true", default=True)
     args = parser.parse_args()
 
     client = CTraderClient()
     ok = await ensure_symbol_data(client, args.symbol, days_back=args.days)
+    success = False
     if ok:
-        run_backtest_for_symbol(symbol=args.symbol, adaptive_mode=args.adaptive)
+        success = run_backtest_for_symbol(symbol=args.symbol, adaptive_mode=args.adaptive)
 
     if client.ws:
         try:
@@ -258,10 +249,9 @@ async def main():
             pass
 
     if not ok or not success:
-        sys.exit(1)    
+        sys.exit(1)
 
 def print_startup_diagnostics() -> None:
-    import sys
     print("=" * 60, flush=True)
     print("BACKTEST STARTUP DIAGNOSTICS", flush=True)
     print("=" * 60, flush=True)
@@ -279,14 +269,13 @@ def print_startup_diagnostics() -> None:
         print(f"{key}: {status}", flush=True)
     print("=" * 60, flush=True)
 
-
 if __name__ == "__main__":
     try:
         from dotenv import load_dotenv
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         load_dotenv(os.path.join(project_root, '.env'))
     except ImportError:
-        print("WARNING: python-dotenv not installed. On Railway this is fine.", flush=True)
+        pass
 
     print_startup_diagnostics()
     asyncio.run(main())
