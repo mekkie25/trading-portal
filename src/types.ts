@@ -17,7 +17,7 @@ export interface SiteBrandingConfig {
 }
 
 export interface BrokerConfig {
-  provider: 'MetaTrader 5' | 'Deriv' | 'cTrader' | 'Custom Gateway';
+  provider: 'MetaTrader 5' | 'Deriv' | 'cTrader' | 'Fusion Markets cTrader' | 'Custom Gateway' | string;
   accountNumber: string;
   server: string;
   apiToken: string;

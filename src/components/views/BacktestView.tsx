@@ -7,7 +7,9 @@ import {
   ColorType, 
   LineStyle, 
   UTCTimestamp 
+  // @ts-ignore
 } from 'lightweight-charts';
+
 import { 
   History, 
   Calendar, 
@@ -604,4 +606,4 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       )}
     </div>
   );
-};s
+};
