@@ -576,7 +576,7 @@ class CTraderClient:
             if resolved_id:
                 self.account_id = resolved_id
 
-            if self.ws and not self.ws.closed:
+            if self.ws:
                 try:
                     await self.ws.close()
                 except Exception:

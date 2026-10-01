@@ -130,8 +130,11 @@ async def run_downloader(days_back: int = 90):
                 print(f"    [-] No data returned for {symbol} {period_enum.name}")
 
     print("\n[✓] Historical download complete.")
-    if client.ws and not client.ws.closed:
-        await client.ws.close()
+    if client.ws:
+        try:
+            await client.ws.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(run_downloader(days_back=90))

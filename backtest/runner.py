@@ -92,7 +92,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
 
     if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
         print(f"[!] Incomplete data files for {symbol} in {DATA_DIR}.")
-        return
+        return False
 
     m5_df = pd.read_csv(m5_path)
     h1_df = pd.read_csv(h1_path)
@@ -237,6 +237,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
         json.dump(report_payload, f, indent=2)
 
     print(f"[✓] Backtest report written to {out_file}")
+    return True
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -250,8 +251,14 @@ async def main():
     if ok:
         run_backtest_for_symbol(symbol=args.symbol, adaptive_mode=args.adaptive)
 
-    if client.ws and not client.ws.closed:
-        await client.ws.close()
+    if client.ws:
+        try:
+            await client.ws.close()
+        except Exception:
+            pass
+
+    if not ok or not success:
+        sys.exit(1)    
 
 def print_startup_diagnostics() -> None:
     import sys
