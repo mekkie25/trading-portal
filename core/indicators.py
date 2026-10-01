@@ -15,11 +15,11 @@ import numpy as np
 from typing import Dict, Tuple, Any
 
 try:
-    from config.strategy_params import GLOBAL_PARAMS
+    from core.session_config import GLOBAL_PARAMS
 except ImportError:
     import sys, os
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from config.strategy_params import GLOBAL_PARAMS
+    from core.session_config import GLOBAL_PARAMS
 
 # ==============================================================================
 # 1. EXPONENTIAL MOVING AVERAGES (EMA)

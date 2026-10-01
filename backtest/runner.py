@@ -21,6 +21,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import core.session_config
 from strategies.strategy_manager import StrategyManager
 from core.session_levels import build_session_levels
 from core.indicators import get_session_volume_profile

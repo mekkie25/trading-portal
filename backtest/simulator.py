@@ -3,7 +3,7 @@ backtest/simulator.py
 Replicates the exact live order and position management of engine/matrix.py:
 - Twin 50/50 Leg A (TP1) & Leg B (TP2)
 - Micro-lot 0.01 split logic
-- Smart-Link (Leg A hits TP1 -> Leg B SL moves to BE)
+- Smart-Link (Leg A hits TP1 -> Leg B SL moves to BE on next candle)
 - 80% R:R Break-Even trigger
 - SuperTrend 5M trailing exit
 - 21:00 SAST EOD close
@@ -17,11 +17,23 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from engine.matrix import ConfigManager
 from core.session_config import TZ_SAST, GLOBAL_PARAMS
 from core.indicators import calculate_supertrend
+
+# Whitelist asset specifications
+ASSETS = {
+    "GOLD": {"pip_size": 0.01, "contract_size": 100.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
+    "US30": {"pip_size": 1.0, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 2.50},
+    "NAS100": {"pip_size": 0.1, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 1.50},
+    "GERMAN30": {"pip_size": 0.1, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 1.80},
+    "EURUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00010},
+    "USDJPY": {"pip_size": 0.01, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
+    "GBPUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
+}
 
 class TradeSimulator:
     def __init__(self, starting_balance: float = 1000.0, risk_pct: float = 1.0, account_currency: str = "USD"):
@@ -45,33 +57,27 @@ class TradeSimulator:
         if sl_dist <= 0:
             return False
 
-        # Spread & Asset Config
-        cfg = ConfigManager.ASSETS.get(symbol)
-        contract_size = cfg.contract_size if cfg else 100000.0
-        pip_size = cfg.pip_size if cfg else 0.0001
-        spread_pts = 2.50 if symbol == "US30" else (0.30 if symbol == "GOLD" else 0.00010)
+        cfg = ASSETS.get(symbol, {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.0001})
+        contract_size = cfg["contract_size"]
+        pip_size = cfg["pip_size"]
+        spread_pts = cfg["spread"]
 
-        # Apply spread to entry
         actual_entry = (entry_price + (spread_pts / 2.0)) if direction == "BUY" else (entry_price - (spread_pts / 2.0))
 
-        # Position Sizing
         risk_cash = self.equity * (self.risk_pct / 100.0)
         pips_at_risk = sl_dist / pip_size
         pip_value_per_lot = pip_size * contract_size
         risk_per_lot = pips_at_risk * pip_value_per_lot
         raw_lots = risk_cash / (risk_per_lot + 1e-9)
 
-        lot_step = cfg.lot_step if cfg else 0.01
-        min_lots = cfg.min_lots if cfg else 0.01
+        lot_step = cfg["lot_step"]
+        min_lots = cfg["min_lots"]
         stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
         total_lots = round(max(stepped_lots, min_lots), 2)
 
-        # Mirror Live Matrix Logic (L765):
         half_lots = round(max(total_lots / 2.0, 0.01), 2)
-
         pos_group_id = f"{symbol}_{int(current_time.timestamp())}"
 
-        # Leg A: Target TP1 (50% size)
         leg_a = {
             "group_id": pos_group_id,
             "leg": "A",
@@ -95,7 +101,6 @@ class TradeSimulator:
             "mae_price": actual_entry
         }
 
-        # Leg B: Target TP2 (Runner, 50% size)
         leg_b = {
             "group_id": pos_group_id,
             "leg": "B",
@@ -150,12 +155,18 @@ class TradeSimulator:
                 pos["mfe_price"] = min(pos["mfe_price"], c_low)
                 pos["mae_price"] = max(pos["mae_price"], c_high)
 
-            # 1. Conservative Collision Check (SL hit first if both touched in same candle)
+            # Apply armed Break-Even from previous candle
+            if pos.get("arm_be_next_candle") and not pos["is_be_moved"]:
+                pos["stop_loss"] = entry
+                pos["is_be_moved"] = True
+                sl = entry
+                pos.pop("arm_be_next_candle", None)
+
+            # 1. Conservative Collision Check
             sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
             tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
 
             if sl_hit and tp_hit:
-                # Conservative rule: Assume SL hit first
                 self._close_position(pos, sl, curr_time, "SL_CONSERVATIVE_COLLISION")
                 continue
 
@@ -165,18 +176,11 @@ class TradeSimulator:
 
             if tp_hit:
                 self._close_position(pos, tp, curr_time, f"TP_{pos['leg']}")
-                # Smart-Link: If Leg A hit TP1, arm Break-Even for Leg B on NEXT candle
                 if pos["leg"] == "A":
                     for partner in self.open_positions:
                         if partner["group_id"] == pos["group_id"] and partner["leg"] == "B":
                             partner["arm_be_next_candle"] = True
                 continue
-
-            # Apply armed Break-Even from previous candle
-            if pos.get("arm_be_next_candle") and not pos["is_be_moved"]:
-                pos["stop_loss"] = entry
-                pos["is_be_moved"] = True
-                pos.pop("arm_be_next_candle", None)
 
             # 2. Dynamic 80% R:R Break-Even Rule
             if not pos["is_be_moved"]:
@@ -214,7 +218,6 @@ class TradeSimulator:
         r_multiple = round(price_diff / sl_dist, 2) if sl_dist > 0 else 0.0
         money_pnl = round(price_diff * lots * contract_size, 2)
 
-        # MFE / MAE in R
         mfe_dist = abs(pos["mfe_price"] - entry)
         mae_dist = abs(pos["mae_price"] - entry)
         mfe_r = round(mfe_dist / sl_dist, 2) if sl_dist > 0 else 0.0
