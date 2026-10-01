@@ -7,6 +7,7 @@ import { AdvancedLimitsView } from './components/views/AdvancedLimitsView';
 import { EconomicCalendarView } from './components/views/EconomicCalendarView';
 import { LiveFeedView } from './components/views/LiveFeedView';
 import { SettingsView } from './components/views/SettingsView';
+import { BacktestView } from './components/views/BacktestView';
 import { BrokerVsCodeBridgeModal } from './components/BrokerVsCodeBridgeModal';
 
 import { 
@@ -331,6 +332,13 @@ export default function App() {
             />
           )}
 
+          {currentTab === 'backtest' && (
+            <BacktestView
+              themeMode={themeMode}
+              brokerCurrency={brokerConfig.currency || 'USD'}
+            />
+          )}
+
           {currentTab === 'settings' && (
             <SettingsView
               themeMode={themeMode}
@@ -350,6 +358,8 @@ export default function App() {
           )}
         </main>
       </div>
+
+      
 
       <BrokerVsCodeBridgeModal
         isOpen={isBridgeOpen}

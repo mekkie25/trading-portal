@@ -8,6 +8,7 @@ import {
   Settings as SettingsIcon,
   Bot,
   X
+  History
 } from 'lucide-react';
 import { TabId, ThemeMode } from '../types';
 
@@ -33,6 +34,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'limits', label: 'Advanced Limits', icon: ShieldAlert, subtext: 'Circuit breakers & drawdowns' },
     { id: 'calendar', label: 'Economic Calendar', icon: CalendarDays, badge: 'MACRO', subtext: 'Grid macro & mentor insights' },
     { id: 'live_feed', label: 'Live Feed & Charts', icon: LineChart, badge: 'R_10', subtext: 'TradingView & technical feed' },
+    { id: 'backtest', label: 'Backtest & Replay', icon: History, badge: 'AUDIT', subtext: 'Historical M5 replay & reports' },
     { id: 'settings', label: 'Settings & Broker API', icon: SettingsIcon, subtext: 'Dark/light & cTrader config' },
   ];
 

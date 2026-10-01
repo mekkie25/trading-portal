@@ -33,6 +33,7 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional, Any, Union, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from core.session_levels import build_session_levels
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -1853,33 +1854,17 @@ class MatrixEngineMaster:
                     # True Frozen Opening Range
                     orb_h, orb_l, orb_established, cracker_h, cracker_l, cracker_established = self._compute_frozen_opening_range(friendly_name, m5_df)
 
-                    session_levels = {
-                        "asia_high": asia_high,
-                        "asia_low": asia_low,
-                        "daily_eq": daily_eq,
-                        "pdh": pdh,
-                        "pdl": pdl,
-                        "daily_pivot": daily_pivot,
-                        "pivot_r1": pivot_r1,
-                        "pivot_s1": pivot_s1,
-                        "pivot_r2": pivot_r2,
-                        "pivot_s2": pivot_s2,
-                        "orb_high": orb_h,
-                        "orb_low": orb_l,
-                        "orb_established": orb_established,
-                        "cracker_orb_high": cracker_h,
-                        "cracker_orb_low": cracker_l,
-                        "cracker_orb_established": cracker_established,
-                        "weekly_open": weekly_open,
-                        "d1_open": float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open']),
-                        "adr": adr_val,
-                        "avwap_anchor_index": avwap_anchor_idx,
-                        "is_ranging": candle_stats["is_ranging"],
-                        "range_span": candle_stats["range_span"],
-                        "poc": vp.poc_price,
-                        "vah": vp.value_area_high,
-                        "val": vp.value_area_low
-                    }
+                    session_levels = build_session_levels(
+                        symbol=friendly_name,
+                        m5_df=m5_df,
+                        d1_df=d1_df,
+                        vp_node=vp,
+                        frozen_orbs=self.frozen_opening_ranges,
+                        as_of=None,
+                        adr_val=adr_val
+                    )
+                    session_levels["is_ranging"] = candle_stats["is_ranging"]
+                    session_levels["range_span"] = candle_stats["range_span"]
 
                     # 6. Evaluate Strategy Modules
                     signal = self.strategy_mgr.evaluate_all(

@@ -4,7 +4,8 @@ export type TabId =
   | 'limits'
   | 'calendar'
   | 'live_feed'
-  | 'settings';
+  | 'settings'
+  | 'backtest';
 
 export type ThemeMode = 'dark' | 'light';
 export type StrategyExecutionMode = 'LIVE' | 'DRY_RUN' | 'OFF';
@@ -150,4 +151,58 @@ export interface MarketAsset {
   category: 'Synthetic / Volatility' | 'Forex' | 'Commodities' | 'Indices' | 'Crypto';
   price: number;
   change24h: number;
+}
+
+// ============================================================================
+// BACKTEST REPORT TYPES
+// ============================================================================
+
+export interface BacktestKPIs {
+  count: number;
+  win_rate: number;
+  avg_r: number;
+  expectancy: number;
+  profit_factor: number;
+  max_dd_money: number;
+  avg_duration: number;
+  best_r: number;
+  worst_r: number;
+  net_pnl: number;
+  is_inconclusive: boolean;
+}
+
+export interface BacktestDayLevels {
+  asia_high?: number;
+  asia_low?: number;
+  daily_eq?: number;
+  daily_pivot?: number;
+  pdh?: number;
+  pdl?: number;
+  orb_high?: number;
+  orb_low?: number;
+}
+
+export interface BacktestCandle {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+export interface BacktestDayData {
+  candles: BacktestCandle[];
+  trades: any[];
+  levels: BacktestDayLevels;
+}
+
+export interface BacktestReportPayload {
+  symbol: string;
+  mode: string;
+  global_kpis: BacktestKPIs;
+  strategy_kpis: Record<string, BacktestKPIs>;
+  dow_kpis: Record<string, BacktestKPIs>;
+  trading_dates: string[];
+  day_data: Record<string, BacktestDayData>;
+  all_trades: any[];
 }

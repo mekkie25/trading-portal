@@ -45,17 +45,18 @@ class VolatilityEngine:
         d1_df: pd.DataFrame,
         m5_df: pd.DataFrame,
         current_quote: float,
-        symbol: str
+        symbol: str,
+        as_of: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """
         Computes rolling smoothed ADR, true W1/MN1 resampled ranges, and 90-day ADR percentile.
         Requires >= 120 completed D1 bars.
         """
-        now_utc = datetime.now(timezone.utc)
+        now_utc = as_of if as_of is not None else datetime.now(timezone.utc)
         now_epoch = now_utc.timestamp()
 
-        # 1. 60-second TTL Per-Symbol Cache Guard (returns a shallow copy)
-        if symbol in self._vol_cache:
+        # 1. 60-second TTL Per-Symbol Cache Guard (only active in live mode)
+        if as_of is None and symbol in self._vol_cache:
             cached_ts, cached_data = self._vol_cache[symbol]
             if (now_epoch - cached_ts) < 60.0:
                 return dict(cached_data)

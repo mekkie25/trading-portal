@@ -82,6 +82,9 @@ const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
 const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
 const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
 const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
+const BACKTEST_OUTPUT_DIR = path.join(process.cwd(), 'backtest', 'output');
+
+
 
 const SEED_TRADES = [
   {
@@ -314,6 +317,37 @@ async function startServer() {
       const positionId = req.params.id;
       fs.writeFileSync(CLOSE_COMMAND_FILE, JSON.stringify({ positionId, requestedAt: new Date().toISOString() }));
       res.status(200).json({ status: 'success', message: `Close command queued for position #${positionId}` });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // READ-ONLY BACKTEST REPORT APIS
+  app.get('/api/backtest/reports', (_req, res) => {
+    try {
+      if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) {
+        return res.status(200).json({ status: 'success', reports: [] });
+      }
+      const files = fs.readdirSync(BACKTEST_OUTPUT_DIR)
+        .filter(f => f.endsWith('.json') && !f.startsWith('.'));
+      res.status(200).json({ status: 'success', reports: files });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.get('/api/backtest/report/:filename', (req, res) => {
+    try {
+      const safeFilename = path.basename(req.params.filename);
+      if (!safeFilename.endsWith('.json')) {
+        return res.status(400).json({ status: 'error', message: 'Invalid file format' });
+      }
+      const targetPath = path.resolve(BACKTEST_OUTPUT_DIR, safeFilename);
+      if (!targetPath.startsWith(path.resolve(BACKTEST_OUTPUT_DIR)) || !fs.existsSync(targetPath)) {
+        return res.status(404).json({ status: 'error', message: 'Report not found' });
+      }
+      const data = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+      res.status(200).json({ status: 'success', data });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
