@@ -5,6 +5,7 @@ Called by the Web UI to run historical tests:
 - Automatically downloads missing broker M5 candles for a rolling 365-day window.
 - Replays every closed M5 bar through StrategyManager (Zero Look-Ahead).
 - Simulates twin 50/50 legs, break-even triggers, and 21:00 SAST EOD close.
+- Generates plain-English Actionable Improvement Tips (advisor.py).
 - Exports structured JSON reports directly into backtest/output/.
 """
 
@@ -31,6 +32,7 @@ from backtest.bar_aggregator import ZeroLookAheadAggregator
 from backtest.simulator import TradeSimulator
 from backtest.report import calculate_kpis
 from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
+from backtest.advisor import generate_improvement_tips
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -43,7 +45,6 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int 
     h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
     d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
 
-    # If M5 already exists and is complete, synthesize any missing higher timeframes
     if os.path.exists(m5_path) and os.path.getsize(m5_path) > 5000:
         if not all(os.path.exists(p) for p in [h1_path, h4_path, d1_path]):
             m5_df = pd.read_csv(m5_path)
@@ -210,6 +211,9 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
             }
         }
 
+    # Generate Actionable Plain-English Improvement Tips
+    improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
+
     report_payload = {
         "symbol": symbol,
         "mode": mode_str,
@@ -219,14 +223,15 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
         "dow_kpis": dow_kpis,
         "trading_dates": trading_dates,
         "day_data": day_charts_data,
-        "all_trades": all_trades
+        "all_trades": all_trades,
+        "improvement_tips": improvement_tips
     }
 
     out_file = os.path.join(OUTPUT_DIR, f"{symbol}_{mode_str}_report.json")
     with open(out_file, "w") as f:
         json.dump(report_payload, f, indent=2)
 
-    print(f"[✓] Backtest report written to {out_file}", flush=True)
+    print(f"[✓] Backtest report with {len(improvement_tips)} Actionable Tips written to {out_file}", flush=True)
     return True
 
 async def main():
