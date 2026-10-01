@@ -3,30 +3,26 @@ import { motion } from 'motion/react';
 import { 
   createChart, 
   IChartApi, 
-  ISeriesApi, 
   ColorType, 
   LineStyle, 
   UTCTimestamp 
 // @ts-ignore
 } from 'lightweight-charts';
 import { 
-  History, 
   Calendar, 
   TrendingUp, 
-  TrendingDown, 
-  Target, 
-  Layers, 
-  Clock, 
-  ShieldAlert,
-  ArrowUpRight,
-  ArrowDownRight,
-  RefreshCw,
-  FileText,
-  Zap,
-  Play,
-  CheckCircle2
+  RefreshCw, 
+  FileText, 
+  Play, 
+  CheckCircle2, 
+  AlertTriangle, 
+  Lightbulb, 
+  Trash2, 
+  RotateCcw,
+  Sparkles,
+  Layers
 } from 'lucide-react';
-import { ThemeMode, BacktestReportPayload, BacktestKPIs } from '../../types';
+import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
 
 interface BacktestViewProps {
@@ -43,8 +39,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger'>('summary');
+  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
   // Runner & Live Progress State
@@ -52,9 +47,22 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
+  // Table & Tip Filters
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
+  const [tipFilter, setTipFilter] = useState<string>('ALL');
+
+  // Dismissed tips persistent storage
+  const [dismissedTipIds, setDismissedTipIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('dismissed_improvement_tips');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
 
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
@@ -83,7 +91,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
-      setIsLoading(true);
       try {
         const res = await fetch(`/api/backtest/report/${encodeURIComponent(selectedFile)}`);
         if (res.ok) {
@@ -97,8 +104,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         }
       } catch (err) {
         console.warn('Could not load report payload:', err);
-      } finally {
-        setIsLoading(false);
       }
     };
     loadReport();
@@ -118,9 +123,17 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           }
           if (!json.isRunning) {
             setIsRunning(false);
-            setSuccessBanner(`Backtest completed successfully! Updated report loaded.`);
+            if (json.exitCode === 0 && !json.lastError) {
+              setSuccessBanner(`Backtest completed successfully! Updated report loaded.`);
+              setErrorBanner(null);
+            } else {
+              setErrorBanner(json.lastError || 'Backtest exited with an error. Check server logs.');
+              setSuccessBanner(null);
+            }
             await fetchReportList();
-            setTimeout(() => setSuccessBanner(null), 4000);
+            setTimeout(() => {
+              setSuccessBanner(null);
+            }, 5000);
           }
         }
       } catch (err) {
@@ -131,32 +144,49 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList]);
 
-  // 4. Trigger Backtest Function
-  const handleRunBacktest = async () => {
+  // 4. Trigger Backtest Function (Single or ALL)
+  const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
-    setProgressText(`Connecting to broker & preparing historical data for ${testSymbol}...`);
+    setErrorBanner(null);
     setSuccessBanner(null);
+    setProgressText(`Connecting to broker & preparing rolling 365-day M5 data for ${targetSym}...`);
 
     try {
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: testSymbol, days: 60, adaptive: true }),
+        body: JSON.stringify({ symbol: targetSym, days: 365, adaptive: true }),
       });
 
       if (!res.ok) {
         const errJson = await res.json();
-        alert(errJson.message || 'Failed to initiate backtest');
+        setErrorBanner(errJson.message || 'Failed to initiate backtest');
         setIsRunning(false);
       }
-    } catch (err) {
-      alert('Network error connecting to backtest engine.');
+    } catch {
+      setErrorBanner('Network error connecting to backtest engine.');
       setIsRunning(false);
     }
   };
 
-  // 5. Render Lightweight-Chart for the selected day
+  // 5. Dismiss Tip handler
+  const handleDismissTip = (tipId: string) => {
+    const updated = [...dismissedTipIds, tipId];
+    setDismissedTipIds(updated);
+    try {
+      localStorage.setItem('dismissed_improvement_tips', JSON.stringify(updated));
+    } catch {}
+  };
+
+  const handleResetDismissedTips = () => {
+    setDismissedTipIds([]);
+    try {
+      localStorage.removeItem('dismissed_improvement_tips');
+    } catch {}
+  };
+
+  // 6. Render Lightweight-Chart for the selected day
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -208,7 +238,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }));
     candleSeries.setData(formattedCandles);
 
-    // Plot horizontal session levels
     const lvls = dayData.levels || {};
     if (lvls.asia_high) {
       candleSeries.createPriceLine({
@@ -261,7 +290,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       });
     }
 
-    // Trade markers (Arrows)
     if (dayData.trades && dayData.trades.length > 0) {
       const markers: any[] = [];
       dayData.trades.forEach((t) => {
@@ -312,6 +340,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     return matchStrat && matchOutcome;
   });
 
+  const rawTips: ImprovementTip[] = reportData?.improvement_tips || [];
+  const activeTips = rawTips.filter((tip) => {
+    const isDismissed = dismissedTipIds.includes(tip.id);
+    const matchFilter = tipFilter === 'ALL' || tip.strategy === tipFilter || tip.category === tipFilter;
+    return !isDismissed && matchFilter;
+  });
+
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
       {/* Header with Test Controls */}
@@ -324,11 +359,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
             Backtest & Replay Suite
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
-              Zero Look-Ahead
+              Rolling 365 Days
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Replay historical broker candles across all 8 strategies without risking real capital.
+            Replays 5-minute broker candles across all 8 strategies with actionable improvement advice.
           </p>
         </div>
 
@@ -348,20 +383,35 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
             <button
               type="button"
-              onClick={handleRunBacktest}
+              onClick={() => handleRunBacktest(testSymbol)}
               disabled={isRunning}
-              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
                 isRunning 
                   ? 'bg-blue-600/50 text-white cursor-not-allowed' 
                   : 'bg-emerald-600 hover:bg-emerald-500 text-white'
               }`}
             >
               {isRunning ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              <span>{isRunning ? 'Running...' : `Run Backtest (Past 2 Mo)`}</span>
+              <span>{isRunning ? 'Running...' : `Run ${testSymbol} (1 Yr)`}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleRunBacktest('ALL')}
+              disabled={isRunning}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
+                isRunning 
+                  ? 'bg-blue-600/50 text-white cursor-not-allowed' 
+                  : 'bg-blue-600 hover:bg-blue-500 text-white'
+              }`}
+              title="Sequentially runs rolling 365-day backtest across all 7 whitelist pairs"
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Run All 7 Pairs</span>
             </button>
           </div>
 
-          <div className="h-6 w-px bg-slate-300 dark:bg-[#1a2030] hidden sm:block" />
+          <div className="h-6 w-px bg-slate-300 dark:border-[#1a2030] hidden sm:block" />
 
           {/* Report Viewer Dropdown */}
           <div className="flex items-center gap-2">
@@ -400,6 +450,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
+      {/* Error Banner */}
+      {errorBanner && (
+        <div className="p-4 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-700 dark:text-rose-400 text-xs font-semibold flex items-center justify-between animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>{errorBanner}</span>
+          </div>
+          <button onClick={() => setErrorBanner(null)} className="text-slate-400 hover:text-black dark:hover:text-white cursor-pointer">
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Completion Toast */}
       {successBanner && (
         <div className="p-3.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-700 dark:text-emerald-400 text-xs font-semibold flex items-center gap-2 animate-in fade-in">
@@ -408,8 +471,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* 3 Navigation Sub-Tabs */}
-      <div className="flex gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
+      {/* 4 Navigation Sub-Tabs */}
+      <div className="flex flex-wrap gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
         <button
           onClick={() => setActiveSubTab('summary')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
@@ -421,6 +484,24 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           <TrendingUp className="w-3.5 h-3.5" />
           <span>Summary Dashboard</span>
         </button>
+
+        <button
+          onClick={() => setActiveSubTab('tips')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 relative ${
+            activeSubTab === 'tips'
+              ? 'bg-blue-600 text-white shadow-xs'
+              : 'text-slate-500 hover:text-black dark:hover:text-white'
+          }`}
+        >
+          <Lightbulb className="w-3.5 h-3.5 text-amber-400" />
+          <span>Actionable Improvement Tips</span>
+          {activeTips.length > 0 && (
+            <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold bg-amber-500 text-black">
+              {activeTips.length}
+            </span>
+          )}
+        </button>
+
         <button
           onClick={() => setActiveSubTab('chart')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
@@ -432,6 +513,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           <Calendar className="w-3.5 h-3.5" />
           <span>Day Chart Inspector</span>
         </button>
+
         <button
           onClick={() => setActiveSubTab('ledger')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
@@ -448,7 +530,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       {/* SUB-TAB 1: SUMMARY DASHBOARD */}
       {activeSubTab === 'summary' && (
         <div className="space-y-6">
-          {/* Top KPI Cards */}
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] uppercase font-bold text-slate-500">Filled Legs</div>
@@ -503,7 +584,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
-          {/* Strategy Breakdown Table */}
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
             <h3 className="text-sm font-bold text-black dark:text-white mb-3">Performance by Strategy</h3>
             <div className="overflow-x-auto">
@@ -554,7 +634,118 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* SUB-TAB 2: DAY CHART INSPECTOR */}
+      {/* SUB-TAB 2: ACTIONABLE IMPROVEMENT TIPS */}
+      {activeSubTab === 'tips' && (
+        <div className="space-y-4">
+          <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-3">
+              <label className="font-bold text-slate-500">Filter Strategy:</label>
+              <select
+                value={tipFilter}
+                onChange={(e) => setTipFilter(e.target.value)}
+                className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white cursor-pointer"
+              >
+                <option value="ALL">All Tips</option>
+                {Array.from(new Set(rawTips.map((t) => t.strategy))).map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {dismissedTipIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleResetDismissedTips}
+                  className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-slate-600 dark:text-slate-300 hover:text-black dark:hover:text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Restore Dismissed Tips ({dismissedTipIds.length})</span>
+                </button>
+              )}
+              <span className="font-mono text-slate-500 text-xs">
+                Showing {activeTips.length} active insights
+              </span>
+            </div>
+          </div>
+
+          {activeTips.length === 0 ? (
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center space-y-3">
+              <Sparkles className="w-8 h-8 text-amber-400 mx-auto" />
+              <div className="text-sm font-bold text-black dark:text-white">All Improvement Tips Reviewed!</div>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">
+                No active recommendations pending. Run another test on a different pair or click "Restore Dismissed Tips" above.
+              </p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {activeTips.map((tip) => {
+                const isHigh = tip.severity === 'HIGH';
+                const isMed = tip.severity === 'MEDIUM';
+
+                return (
+                  <div
+                    key={tip.id}
+                    className={`p-5 rounded-2xl border bg-white dark:bg-[#0f1118] shadow-xs flex flex-col justify-between space-y-4 ${
+                      isHigh
+                        ? 'border-rose-500/30 dark:border-rose-500/30'
+                        : isMed
+                        ? 'border-amber-500/30 dark:border-amber-500/30'
+                        : 'border-blue-500/30 dark:border-blue-500/30'
+                    }`}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-[#1a2030]">
+                        <div className="flex items-center gap-2">
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
+                            isHigh
+                              ? 'bg-rose-500/15 text-rose-600 border border-rose-500/30'
+                              : isMed
+                              ? 'bg-amber-500/15 text-amber-600 border border-amber-500/30'
+                              : 'bg-blue-500/15 text-blue-600 border border-blue-500/30'
+                          }`}>
+                            {tip.severity} PRIORITY
+                          </span>
+                          <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-100 dark:bg-[#08090d] text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-[#1a2030]">
+                            {tip.strategy}
+                          </span>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleDismissTip(tip.id)}
+                          className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-500/10 transition-colors cursor-pointer"
+                          title="Dismiss this tip"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      <h4 className="text-sm font-bold text-black dark:text-white mt-3">
+                        {tip.title}
+                      </h4>
+                      <p className="text-xs text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
+                        {tip.description}
+                      </p>
+                    </div>
+
+                    <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] text-xs">
+                      <div className="font-bold text-blue-600 dark:text-blue-400 text-[11px] mb-1 flex items-center gap-1.5">
+                        <Lightbulb className="w-3.5 h-3.5" /> Recommended Tweak:
+                      </div>
+                      <div className="text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed">
+                        {tip.action}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* SUB-TAB 3: DAY CHART INSPECTOR */}
       {activeSubTab === 'chart' && (
         <div className="space-y-4">
           <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -585,7 +776,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             className="w-full h-[480px] rounded-2xl bg-white dark:bg-[#07090e] border border-slate-300 dark:border-[#1a2030] overflow-hidden"
           />
 
-          {/* Trades table for that selected day */}
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
             <h4 className="text-xs font-bold text-black dark:text-white uppercase mb-3">
               Trades for {selectedDay} ({reportData?.day_data?.[selectedDay]?.trades?.length || 0} legs)
@@ -632,7 +822,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* SUB-TAB 3: FULL TRADE LEDGER */}
+      {/* SUB-TAB 4: FULL TRADE LEDGER */}
       {activeSubTab === 'ledger' && (
         <div className="space-y-4">
           <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -678,9 +868,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                     <th className="py-3 px-3">Entry</th>
                     <th className="py-3 px-3">SL</th>
                     <th className="py-3 px-3">TP</th>
-                    <th className="py-3 px-3">Exit</th>
-                    <th className="py-3 px-3">Reason</th>
-                    <th className="py-3 px-3 text-center">R</th>
+                    <th className="py-3 px-3">MFE (R/Pips)</th>
+                    <th className="py-3 px-3">MAE (R/Pips)</th>
+                    <th className="py-3 px-3">Classification</th>
                     <th className="py-3 px-3 text-right">Net P&L</th>
                     <th className="py-3 px-3 text-center">Result</th>
                   </tr>
@@ -698,10 +888,22 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                       <td className="py-2.5 px-3">{t.entry_price}</td>
                       <td className="py-2.5 px-3 text-rose-500">{t.sl}</td>
                       <td className="py-2.5 px-3 text-emerald-500">{t.tp}</td>
-                      <td className="py-2.5 px-3">{t.exit_price}</td>
-                      <td className="py-2.5 px-3 text-slate-400">{t.exit_reason}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {t.r_multiple}R
+                      <td className="py-2.5 px-3 text-emerald-500 font-semibold">
+                        +{t.mfe_r ?? 0}R ({t.mfe_pips ?? 0}p)
+                      </td>
+                      <td className="py-2.5 px-3 text-rose-500 font-semibold">
+                        -{t.mae_r ?? 0}R ({t.mae_pips ?? 0}p)
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${
+                          t.failure_reason === 'NOISE_STOPOUT_RECOVERED'
+                            ? 'bg-amber-500/15 text-amber-500 border border-amber-500/30'
+                            : t.failure_reason === 'NEAR_TP_REVERSAL'
+                            ? 'bg-purple-500/15 text-purple-500 border border-purple-500/30'
+                            : 'bg-slate-100 dark:bg-[#0d1017] text-slate-400'
+                        }`}>
+                          {t.failure_reason || t.exit_reason}
+                        </span>
                       </td>
                       <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
                         ${t.money_pnl}

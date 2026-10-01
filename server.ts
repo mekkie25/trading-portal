@@ -84,9 +84,11 @@ const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
 const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
 const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
 const BACKTEST_OUTPUT_DIR = path.join(process.cwd(), 'backtest', 'output');
+
 let backtestRunning = false;
 let backtestProgress = '';
-
+let backtestLastError: string | null = null;
+let backtestExitCode: number | null = null;
 
 const SEED_TRADES = [
   {
@@ -243,7 +245,6 @@ function loadTradesFromDisk(): any[] {
 }
 
 function recomputeRiskState() {
-  // Display-only relay: Reads authoritative breaker state written exclusively by Python engine
   try {
     if (fs.existsSync(RISK_STATE_FILE)) {
       const st = JSON.parse(fs.readFileSync(RISK_STATE_FILE, 'utf8'));
@@ -254,9 +255,7 @@ function recomputeRiskState() {
       riskState.activeTripScope = st.active_trip_scope || 'NONE';
       riskState.lastTriggerReason = st.last_trigger_reason;
     }
-  } catch (e) {
-    // Retain cached state on file lock
-  }
+  } catch (e) {}
 }
 
 let activeBrokerTelemetry: BrokerTelemetry = {
@@ -324,7 +323,7 @@ async function startServer() {
     }
   });
 
-  // READ-ONLY BACKTEST REPORT APIS
+  // 3. READ-ONLY BACKTEST REPORT APIS
   app.get('/api/backtest/reports', (_req, res) => {
     try {
       if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) {
@@ -356,7 +355,13 @@ async function startServer() {
   });
 
   app.get('/api/backtest/status', (_req, res) => {
-    res.status(200).json({ status: 'success', isRunning: backtestRunning, progress: backtestProgress });
+    res.status(200).json({ 
+      status: 'success', 
+      isRunning: backtestRunning, 
+      progress: backtestProgress,
+      lastError: backtestLastError,
+      exitCode: backtestExitCode 
+    });
   });
 
   app.post('/api/backtest/run', (req, res) => {
@@ -364,44 +369,92 @@ async function startServer() {
       return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
     }
 
-    const symbol = String(req.body?.symbol || 'US30').toUpperCase();
-    const days = parseInt(req.body?.days || '60', 10);
+    const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
+    const days = parseInt(req.body?.days || '365', 10);
     const adaptive = req.body?.adaptive !== false;
 
     backtestRunning = true;
-    backtestProgress = `Starting simulation for ${symbol}...`;
+    backtestProgress = `Starting simulation...`;
+    backtestLastError = null;
+    backtestExitCode = null;
+
+    const symbolsQueue = requestedSymbol === 'ALL'
+      ? ['US30', 'GOLD', 'NAS100', 'GERMAN30', 'EURUSD', 'GBPUSD', 'USDJPY']
+      : [requestedSymbol];
 
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const runnerArgs = ['backtest/runner.py', '--symbol', symbol, '--days', String(days)];
-    if (adaptive) runnerArgs.push('--adaptive');
 
-    const runnerProc = spawn(pythonCmd, runnerArgs, {
-      env: { ...process.env, PYTHONPATH: process.cwd() }
-    });
+    async function runQueue() {
+      for (let i = 0; i < symbolsQueue.length; i++) {
+        const sym = symbolsQueue[i];
+        backtestProgress = `[${i + 1}/${symbolsQueue.length}] Simulating ${sym} (Past 365 Days)...`;
+        console.log(`[Backtest Runner Queue]: Starting ${sym}...`);
 
-    runnerProc.stdout.on('data', (data) => {
-      const text = data.toString().trim();
-      if (text) {
-        const lines = text.split('\n');
-        backtestProgress = lines[lines.length - 1];
-        console.log(`[Backtest Runner]: ${lines[lines.length - 1]}`);
+        const runnerArgs = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
+        if (adaptive) runnerArgs.push('--adaptive');
+
+        await new Promise<void>((resolve) => {
+          const proc = spawn(pythonCmd, runnerArgs, {
+            env: { ...process.env, PYTHONPATH: process.cwd() }
+          });
+
+          proc.stdout.on('data', (data) => {
+            const text = data.toString().trim();
+            if (text) {
+              const lines = text.split('\n');
+              const lastLine = lines[lines.length - 1];
+              backtestProgress = `[${i + 1}/${symbolsQueue.length}] ${sym}: ${lastLine}`;
+              console.log(`[Backtest Runner]: ${lastLine}`);
+              if (lastLine.startsWith('ERROR:')) {
+                backtestLastError = lastLine;
+              }
+            }
+          });
+
+          proc.stderr.on('data', (data) => {
+            const errText = data.toString().trim();
+            console.error(`[Backtest Error]: ${errText}`);
+            if (!backtestLastError && errText.includes('Traceback')) {
+              backtestLastError = `ERROR in ${sym}: Python execution crashed.`;
+            }
+          });
+
+          proc.on('exit', (code) => {
+            backtestExitCode = code;
+            if (code !== 0 && !backtestLastError) {
+              backtestLastError = `ERROR: ${sym} simulation exited with code ${code}`;
+            }
+            resolve();
+          });
+        });
+
+        if (backtestExitCode !== 0) {
+          console.warn(`[Backtest Runner Queue]: Aborting remaining queue due to error on ${sym}`);
+          break;
+        }
       }
-    });
 
-    runnerProc.stderr.on('data', (data) => {
-      console.error(`[Backtest Error]: ${data.toString().trim()}`);
-    });
-
-    runnerProc.on('exit', (code) => {
       backtestRunning = false;
-      backtestProgress = code === 0 ? 'Completed successfully' : `Exited with code ${code}`;
+      if (backtestExitCode === 0) {
+        backtestProgress = requestedSymbol === 'ALL'
+          ? 'Completed all 7 pairs successfully!'
+          : `Completed ${requestedSymbol} successfully!`;
+      } else {
+        backtestProgress = `Failed with error: ${backtestLastError || 'Non-zero exit'}`;
+      }
       console.log(`[Backtest Finished]: ${backtestProgress}`);
+    }
+
+    runQueue().catch((err) => {
+      backtestRunning = false;
+      backtestLastError = err?.message || 'Unexpected runner queue error';
+      console.error('[Backtest Queue Error]:', err);
     });
 
-    res.status(200).json({ status: 'success', message: `Backtest initiated for ${symbol}` });
+    res.status(200).json({ status: 'success', message: `Backtest initiated for ${requestedSymbol}` });
   });
 
-  // 3. TRADE JOURNAL APIS
+  // 4. TRADE JOURNAL APIS
   app.get('/api/journal', async (req, res) => {
     try {
       const diskTrades = loadTradesFromDisk();
@@ -443,7 +496,7 @@ async function startServer() {
     res.json({ status: 'success', message: 'Journal reset.' });
   });
 
-  // 4. BOT CONFIG APIS
+  // 5. BOT CONFIG APIS
   app.get('/api/bot/config', (req, res) => {
     res.json({ status: 'success', data: activeBotConfig });
   });
@@ -473,7 +526,7 @@ async function startServer() {
     }
   });
 
-  // 5. RISK LIMITS APIS
+  // 6. RISK LIMITS APIS
   app.get('/api/limits', (req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
@@ -493,7 +546,7 @@ async function startServer() {
       const confirmedPayload = { 
         ...existingConfig, 
         ...riskLimits, 
-        limitsConfirmedAt: new Date().toISOString() // Clears CURRENCY breaker in Python engine
+        limitsConfirmedAt: new Date().toISOString()
       };
 
       if (resetBreaker) {
@@ -510,7 +563,7 @@ async function startServer() {
     }
   });
 
-  // 6. TELEMETRY APIS
+  // 7. TELEMETRY APIS
   app.get('/api/broker/telemetry', (req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: activeBrokerTelemetry });
@@ -522,7 +575,7 @@ async function startServer() {
     res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
   });
 
-  // 7. LAUNCH PYTHON BOT ENGINE
+  // 8. LAUNCH PYTHON BOT ENGINE
   function launchPythonBot() {
     console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
@@ -555,9 +608,7 @@ async function startServer() {
           }
           activeBrokerTelemetry.connected = true;
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-        } catch (e) {
-          // Ignore parsing noise
-        }
+        } catch (e) {}
       }
       console.log(`[Python Engine] ${line}`);
     });

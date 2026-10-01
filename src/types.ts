@@ -54,9 +54,9 @@ export interface TopMetrics {
 export interface BotSettings {
   masterExecution: boolean;
   riskPerTradePct: number;
-  minRr?: number;                          // Minimum acceptable target R:R (replaces R:R slider)
-  adaptiveMode?: boolean;                  // On = Volatility Engine, Off = Legacy Fixed
-  stopOnDailyGoalReached?: boolean;        // Optional toggle: auto-halt on daily target
+  minRr?: number;
+  adaptiveMode?: boolean;
+  stopOnDailyGoalReached?: boolean;
   maxDailyTrades: number;
   trailingStopActive: boolean;
   autoBreakevenPips: number;
@@ -64,7 +64,6 @@ export interface BotSettings {
   lastAppliedTimestamp?: string;
   strategyModes: Record<string, StrategyExecutionMode>;
   
-  // Profit Goals
   dailyGoalTarget?: number;
   weeklyGoalTarget?: number;
   monthlyGoalTarget?: number;
@@ -153,10 +152,6 @@ export interface MarketAsset {
   change24h: number;
 }
 
-// ============================================================================
-// BACKTEST REPORT TYPES
-// ============================================================================
-
 export interface BacktestKPIs {
   count: number;
   win_rate: number;
@@ -196,6 +191,16 @@ export interface BacktestDayData {
   levels: BacktestDayLevels;
 }
 
+export interface ImprovementTip {
+  id: string;
+  strategy: string;
+  category: string;
+  severity: 'HIGH' | 'MEDIUM' | 'INFO';
+  title: string;
+  description: string;
+  action: string;
+}
+
 export interface BacktestReportPayload {
   symbol: string;
   mode: string;
@@ -205,4 +210,5 @@ export interface BacktestReportPayload {
   trading_dates: string[];
   day_data: Record<string, BacktestDayData>;
   all_trades: any[];
+  improvement_tips?: ImprovementTip[];
 }
