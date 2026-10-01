@@ -249,5 +249,33 @@ async def main():
     if client.ws and not client.ws.closed:
         await client.ws.close()
 
+def print_startup_diagnostics() -> None:
+    import sys
+    print("=" * 60, flush=True)
+    print("BACKTEST STARTUP DIAGNOSTICS", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Python version: {sys.version.split()[0]}", flush=True)
+
+    env_checks = [
+        "CTRADER_CLIENT_ID",
+        "CTRADER_CLIENT_SECRET",
+        "CTRADER_ACCESS_TOKEN",
+        "CTRADER_ACCOUNT_ID",
+    ]
+    for key in env_checks:
+        value = os.environ.get(key, "").strip()
+        status = "SET" if value else "MISSING"
+        print(f"{key}: {status}", flush=True)
+    print("=" * 60, flush=True)
+
+
 if __name__ == "__main__":
+    try:
+        from dotenv import load_dotenv
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        load_dotenv(os.path.join(project_root, '.env'))
+    except ImportError:
+        print("WARNING: python-dotenv not installed. On Railway this is fine.", flush=True)
+
+    print_startup_diagnostics()
     asyncio.run(main())
