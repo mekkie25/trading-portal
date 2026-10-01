@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion } from 'motion/react';
 import { 
   createChart, 
@@ -7,9 +7,8 @@ import {
   ColorType, 
   LineStyle, 
   UTCTimestamp 
-  // @ts-ignore
+// @ts-ignore
 } from 'lightweight-charts';
-
 import { 
   History, 
   Calendar, 
@@ -22,7 +21,10 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   RefreshCw,
-  FileText
+  FileText,
+  Zap,
+  Play,
+  CheckCircle2
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -31,6 +33,8 @@ interface BacktestViewProps {
   themeMode?: ThemeMode;
   brokerCurrency?: string;
 }
+
+const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
 
 export const BacktestView: React.FC<BacktestViewProps> = ({
   themeMode = 'dark',
@@ -43,6 +47,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
+  // Runner & Live Progress State
+  const [testSymbol, setTestSymbol] = useState<string>('US30');
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [progressText, setProgressText] = useState<string>('');
+  const [successBanner, setSuccessBanner] = useState<string | null>(null);
+
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
 
@@ -50,23 +60,24 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const chartApiRef = useRef<IChartApi | null>(null);
 
   // 1. Fetch available report files
-  useEffect(() => {
-    const fetchReportList = async () => {
-      try {
-        const res = await fetch('/api/backtest/reports');
-        if (res.ok) {
-          const json = await res.json();
-          if (json.reports && json.reports.length > 0) {
-            setReportFiles(json.reports);
-            setSelectedFile(json.reports[0]);
-          }
+  const fetchReportList = useCallback(async () => {
+    try {
+      const res = await fetch('/api/backtest/reports');
+      if (res.ok) {
+        const json = await res.json();
+        if (json.reports && json.reports.length > 0) {
+          setReportFiles(json.reports);
+          setSelectedFile((prev) => (json.reports.includes(prev) ? prev : json.reports[0]));
         }
-      } catch (err) {
-        console.warn('Could not fetch backtest report list:', err);
       }
-    };
-    fetchReportList();
+    } catch (err) {
+      console.warn('Could not fetch backtest report list:', err);
+    }
   }, []);
+
+  useEffect(() => {
+    fetchReportList();
+  }, [fetchReportList]);
 
   // 2. Fetch selected report JSON payload
   useEffect(() => {
@@ -93,7 +104,59 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     loadReport();
   }, [selectedFile]);
 
-  // 3. Render Lightweight-Chart for the selected day
+  // 3. Live Polling for Background Backtest Runner
+  useEffect(() => {
+    if (!isRunning) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/backtest/status');
+        if (res.ok) {
+          const json = await res.json();
+          if (json.progress) {
+            setProgressText(json.progress);
+          }
+          if (!json.isRunning) {
+            setIsRunning(false);
+            setSuccessBanner(`Backtest completed successfully! Updated report loaded.`);
+            await fetchReportList();
+            setTimeout(() => setSuccessBanner(null), 4000);
+          }
+        }
+      } catch (err) {
+        console.warn('Status poll error:', err);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [isRunning, fetchReportList]);
+
+  // 4. Trigger Backtest Function
+  const handleRunBacktest = async () => {
+    if (isRunning) return;
+    setIsRunning(true);
+    setProgressText(`Connecting to broker & preparing historical data for ${testSymbol}...`);
+    setSuccessBanner(null);
+
+    try {
+      const res = await fetch('/api/backtest/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: testSymbol, days: 60, adaptive: true }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json();
+        alert(errJson.message || 'Failed to initiate backtest');
+        setIsRunning(false);
+      }
+    } catch (err) {
+      alert('Network error connecting to backtest engine.');
+      setIsRunning(false);
+    }
+  };
+
+  // 5. Render Lightweight-Chart for the selected day
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -251,11 +314,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
-      {/* Header with File Selector */}
+      {/* Header with Test Controls */}
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
-        className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-300 dark:border-[#1a2030]"
+        className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-300 dark:border-[#1a2030]"
       >
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
@@ -265,29 +328,85 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Audited historical execution data strictly served from static outputs. Live bot state is unaffected.
+            Replay historical broker candles across all 8 strategies without risking real capital.
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
-          <label className="text-xs font-bold text-slate-500">Report:</label>
-          <select
-            value={selectedFile}
-            onChange={(e) => setSelectedFile(e.target.value)}
-            className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
-          >
-            {reportFiles.length === 0 ? (
-              <option value="">No reports found in backtest/output/</option>
-            ) : (
-              reportFiles.map((f) => (
-                <option key={f} value={f}>{f}</option>
-              ))
-            )}
-          </select>
+        {/* Action Controls */}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1 rounded-xl border border-slate-300 dark:border-[#1a2030]">
+            <select
+              value={testSymbol}
+              onChange={(e) => setTestSymbol(e.target.value)}
+              disabled={isRunning}
+              className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
+            >
+              {WHITELIST_ASSETS.map((sym) => (
+                <option key={sym} value={sym}>{sym}</option>
+              ))}
+            </select>
 
-          {isLoading && <RefreshCw className="w-4 h-4 text-blue-500 animate-spin" />}
+            <button
+              type="button"
+              onClick={handleRunBacktest}
+              disabled={isRunning}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
+                isRunning 
+                  ? 'bg-blue-600/50 text-white cursor-not-allowed' 
+                  : 'bg-emerald-600 hover:bg-emerald-500 text-white'
+              }`}
+            >
+              {isRunning ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+              <span>{isRunning ? 'Running...' : `Run Backtest (Past 2 Mo)`}</span>
+            </button>
+          </div>
+
+          <div className="h-6 w-px bg-slate-300 dark:bg-[#1a2030] hidden sm:block" />
+
+          {/* Report Viewer Dropdown */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold text-slate-500">Report:</span>
+            <select
+              value={selectedFile}
+              onChange={(e) => setSelectedFile(e.target.value)}
+              disabled={isRunning}
+              className="px-3 py-2 rounded-xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
+            >
+              {reportFiles.length === 0 ? (
+                <option value="">No reports found (Click Run above)</option>
+              ) : (
+                reportFiles.map((f) => (
+                  <option key={f} value={f}>{f}</option>
+                ))
+              )}
+            </select>
+          </div>
         </div>
       </motion.div>
+
+      {/* Live Running Progress Banner */}
+      {isRunning && (
+        <div className="p-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-between text-xs animate-in fade-in">
+          <div className="flex items-center gap-3">
+            <RefreshCw className="w-4 h-4 text-blue-500 animate-spin" />
+            <div>
+              <div className="font-bold text-blue-600 dark:text-blue-400">Simulation in Progress</div>
+              <div className="text-slate-500 font-mono text-[11px] mt-0.5">{progressText || 'Stepping through historical candles...'}</div>
+            </div>
+          </div>
+          <span className="text-[10px] font-mono font-bold text-blue-500 bg-blue-500/15 px-2 py-0.5 rounded border border-blue-500/30">
+            AUTO-SYNC ACTIVE
+          </span>
+        </div>
+      )}
+
+      {/* Completion Toast */}
+      {successBanner && (
+        <div className="p-3.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-700 dark:text-emerald-400 text-xs font-semibold flex items-center gap-2 animate-in fade-in">
+          <CheckCircle2 className="w-4 h-4 shrink-0" />
+          <span>{successBanner}</span>
+        </div>
+      )}
 
       {/* 3 Navigation Sub-Tabs */}
       <div className="flex gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">

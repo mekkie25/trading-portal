@@ -83,7 +83,8 @@ const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
 const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
 const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
 const BACKTEST_OUTPUT_DIR = path.join(process.cwd(), 'backtest', 'output');
-
+let backtestRunning = false;
+let backtestProgress = '';
 
 
 const SEED_TRADES = [
@@ -351,6 +352,52 @@ async function startServer() {
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
+  });
+
+  app.get('/api/backtest/status', (_req, res) => {
+    res.status(200).json({ status: 'success', isRunning: backtestRunning, progress: backtestProgress });
+  });
+
+  app.post('/api/backtest/run', (req, res) => {
+    if (backtestRunning) {
+      return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
+    }
+
+    const symbol = String(req.body?.symbol || 'US30').toUpperCase();
+    const days = parseInt(req.body?.days || '60', 10);
+    const adaptive = req.body?.adaptive !== false;
+
+    backtestRunning = true;
+    backtestProgress = `Starting simulation for ${symbol}...`;
+
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const runnerArgs = ['backtest/runner.py', '--symbol', symbol, '--days', String(days)];
+    if (adaptive) runnerArgs.push('--adaptive');
+
+    const runnerProc = spawn(pythonCmd, runnerArgs, {
+      env: { ...process.env, PYTHONPATH: process.cwd() }
+    });
+
+    runnerProc.stdout.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) {
+        const lines = text.split('\n');
+        backtestProgress = lines[lines.length - 1];
+        console.log(`[Backtest Runner]: ${lines[lines.length - 1]}`);
+      }
+    });
+
+    runnerProc.stderr.on('data', (data) => {
+      console.error(`[Backtest Error]: ${data.toString().trim()}`);
+    });
+
+    runnerProc.on('exit', (code) => {
+      backtestRunning = false;
+      backtestProgress = code === 0 ? 'Completed successfully' : `Exited with code ${code}`;
+      console.log(`[Backtest Finished]: ${backtestProgress}`);
+    });
+
+    res.status(200).json({ status: 'success', message: `Backtest initiated for ${symbol}` });
   });
 
   // 3. TRADE JOURNAL APIS
