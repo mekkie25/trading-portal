@@ -2,8 +2,9 @@
 backtest/runner.py
 Automated End-to-End Backtest Runner.
 Called by the Web UI to run historical tests:
-- Automatically downloads missing broker M5 candles for a rolling 365-day window.
+- Automatically downloads missing broker M5 candles for a rolling window.
 - Replays every closed M5 bar through StrategyManager (Zero Look-Ahead).
+- Optimized for speed: parses dates once, caches volatility metrics.
 - Simulates twin 50/50 legs, break-even triggers, and 21:00 SAST EOD close.
 - Generates plain-English Actionable Improvement Tips (advisor.py).
 - Exports structured JSON reports directly into backtest/output/.
@@ -39,7 +40,7 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int = 365) -> bool:
+async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int = 60) -> bool:
     m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
     h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
     h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
@@ -93,6 +94,9 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
     h4_df = pd.read_csv(h4_path)
     d1_df = pd.read_csv(d1_path)
 
+    # Pre-parse timestamps once before the loop (massive speedup)
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+
     aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
     sm = StrategyManager()
     sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct)
@@ -103,30 +107,40 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
 
     print(f"[*] Simulating across {total_bars - start_idx:,} M5 candles (Zero Look-Ahead)...", flush=True)
 
+    last_vol_hour = -1
+    vol_metrics = {"valid": False}
+    adr_val = None
+    regime = "NORMAL"
+
+    step_interval = max(1, (total_bars - start_idx) // 10)
+
     for i in range(start_idx, total_bars):
         m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
-        m5_slice['time'] = pd.to_datetime(m5_slice['time'], utc=True)
         curr_bar = m5_slice.iloc[-1]
         curr_time = curr_bar['time'].to_pydatetime()
+
+        if (i - start_idx) % step_interval == 0:
+            pct = int(((i - start_idx) / (total_bars - start_idx)) * 100)
+            print(f"[*] Progress: {pct}% ({i - start_idx:,}/{total_bars - start_idx:,} candles)", flush=True)
 
         sim.process_candle(symbol, curr_bar, m5_slice)
 
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
 
-        adr_val = None
-        regime = "NORMAL"
-        vol_metrics = {"valid": False}
+        # Cache volatility computation hourly (avoids resampling 75,000 times)
         if adaptive_mode:
-            vol_metrics = volatility_engine.compute_symbol_volatility(
-                d1_df=d1_view,
-                m5_df=m5_slice,
-                current_quote=float(curr_bar['close']),
-                symbol=symbol,
-                as_of=curr_time
-            )
-            if vol_metrics.get("valid", False):
-                adr_val = vol_metrics.get("adr")
-                regime = vol_metrics.get("regime", "NORMAL")
+            if curr_time.hour != last_vol_hour or not vol_metrics.get("valid", False):
+                vol_metrics = volatility_engine.compute_symbol_volatility(
+                    d1_df=d1_view,
+                    m5_df=m5_slice,
+                    current_quote=float(curr_bar['close']),
+                    symbol=symbol,
+                    as_of=curr_time
+                )
+                if vol_metrics.get("valid", False):
+                    adr_val = vol_metrics.get("adr")
+                    regime = vol_metrics.get("regime", "NORMAL")
+                last_vol_hour = curr_time.hour
 
         vp = get_session_volume_profile(m5_slice)
         session_levels = build_session_levels(
@@ -211,7 +225,6 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
             }
         }
 
-    # Generate Actionable Plain-English Improvement Tips
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
     report_payload = {
@@ -237,7 +250,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
-    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--days", type=int, default=60)
     parser.add_argument("--adaptive", action="store_true", default=True)
     args = parser.parse_args()
 

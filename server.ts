@@ -3,7 +3,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 
 interface BotGatewayConfig {
   masterExecution: boolean;
@@ -89,6 +89,7 @@ let backtestRunning = false;
 let backtestProgress = '';
 let backtestLastError: string | null = null;
 let backtestExitCode: number | null = null;
+let activeBacktestProcess: ChildProcess | null = null;
 
 const SEED_TRADES = [
   {
@@ -364,13 +365,27 @@ async function startServer() {
     });
   });
 
+  // EMERGENCY STOP / CANCEL BACKTEST ENDPOINT
+  app.post('/api/backtest/stop', (_req, res) => {
+    if (activeBacktestProcess) {
+      try {
+        activeBacktestProcess.kill();
+      } catch {}
+      activeBacktestProcess = null;
+    }
+    backtestRunning = false;
+    backtestProgress = 'Backtest canceled by user.';
+    backtestLastError = null;
+    res.status(200).json({ status: 'success', message: 'Backtest stopped.' });
+  });
+
   app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) {
       return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
     }
 
     const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
-    const days = parseInt(req.body?.days || '365', 10);
+    const days = parseInt(req.body?.days || '60', 10);
     const adaptive = req.body?.adaptive !== false;
 
     backtestRunning = true;
@@ -386,8 +401,9 @@ async function startServer() {
 
     async function runQueue() {
       for (let i = 0; i < symbolsQueue.length; i++) {
+        if (!backtestRunning) break;
         const sym = symbolsQueue[i];
-        backtestProgress = `[${i + 1}/${symbolsQueue.length}] Simulating ${sym} (Past 365 Days)...`;
+        backtestProgress = `[${i + 1}/${symbolsQueue.length}] Simulating ${sym} (${days} Days)...`;
         console.log(`[Backtest Runner Queue]: Starting ${sym}...`);
 
         const runnerArgs = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
@@ -397,6 +413,7 @@ async function startServer() {
           const proc = spawn(pythonCmd, runnerArgs, {
             env: { ...process.env, PYTHONPATH: process.cwd() }
           });
+          activeBacktestProcess = proc;
 
           proc.stdout.on('data', (data) => {
             const text = data.toString().trim();
@@ -421,9 +438,16 @@ async function startServer() {
 
           proc.on('exit', (code) => {
             backtestExitCode = code;
+            activeBacktestProcess = null;
             if (code !== 0 && !backtestLastError) {
               backtestLastError = `ERROR: ${sym} simulation exited with code ${code}`;
             }
+            resolve();
+          });
+
+          proc.on('error', (err) => {
+            activeBacktestProcess = null;
+            backtestLastError = `ERROR: Failed to spawn Python process: ${err.message}`;
             resolve();
           });
         });
@@ -440,7 +464,7 @@ async function startServer() {
           ? 'Completed all 7 pairs successfully!'
           : `Completed ${requestedSymbol} successfully!`;
       } else {
-        backtestProgress = `Failed with error: ${backtestLastError || 'Non-zero exit'}`;
+        backtestProgress = `Failed: ${backtestLastError || 'Non-zero exit'}`;
       }
       console.log(`[Backtest Finished]: ${backtestProgress}`);
     }
@@ -455,12 +479,12 @@ async function startServer() {
   });
 
   // 4. TRADE JOURNAL APIS
-  app.get('/api/journal', async (req, res) => {
+  app.get('/api/journal', async (_req, res) => {
     try {
       const diskTrades = loadTradesFromDisk();
       activeBrokerTelemetry.trades = diskTrades;
       res.status(200).json(diskTrades);
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Failed to fetch journal entries" });
     }
   });
@@ -474,7 +498,7 @@ async function startServer() {
       activeBrokerTelemetry.trades = trades;
       recomputeRiskState();
       res.status(200).json({ status: "success", trade: newTrade });
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Failed to save journal entry" });
     }
   });
@@ -489,7 +513,7 @@ async function startServer() {
     res.json({ status: 'success', message: `Trade ${tradeId} deleted.` });
   });
 
-  app.post('/api/journal/reset', (req, res) => {
+  app.post('/api/journal/reset', (_req, res) => {
     saveTradesToDisk([]);
     activeBrokerTelemetry.trades = [];
     recomputeRiskState();
@@ -497,7 +521,7 @@ async function startServer() {
   });
 
   // 5. BOT CONFIG APIS
-  app.get('/api/bot/config', (req, res) => {
+  app.get('/api/bot/config', (_req, res) => {
     res.json({ status: 'success', data: activeBotConfig });
   });
 
@@ -527,7 +551,7 @@ async function startServer() {
   });
 
   // 6. RISK LIMITS APIS
-  app.get('/api/limits', (req, res) => {
+  app.get('/api/limits', (_req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
   });
@@ -564,7 +588,7 @@ async function startServer() {
   });
 
   // 7. TELEMETRY APIS
-  app.get('/api/broker/telemetry', (req, res) => {
+  app.get('/api/broker/telemetry', (_req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: activeBrokerTelemetry });
   });
@@ -608,7 +632,7 @@ async function startServer() {
           }
           activeBrokerTelemetry.connected = true;
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-        } catch (e) {}
+        } catch {}
       }
       console.log(`[Python Engine] ${line}`);
     });
@@ -630,7 +654,7 @@ async function startServer() {
 
   if (isProduction) {
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {

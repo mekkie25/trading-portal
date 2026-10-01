@@ -20,7 +20,8 @@ import {
   Trash2, 
   RotateCcw,
   Sparkles,
-  Layers
+  Layers,
+  Square
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -44,6 +45,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
   // Runner & Live Progress State
   const [testSymbol, setTestSymbol] = useState<string>('US30');
+  const [testDays, setTestDays] = useState<number>(60);
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
@@ -67,7 +69,24 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
 
-  // 1. Fetch available report files
+  // 1. Initial status poll on mount (syncs running state even if page refreshed)
+  useEffect(() => {
+    const checkInitialStatus = async () => {
+      try {
+        const res = await fetch('/api/backtest/status');
+        if (res.ok) {
+          const json = await res.json();
+          if (json.isRunning) {
+            setIsRunning(true);
+            setProgressText(json.progress || 'Simulation in progress...');
+          }
+        }
+      } catch {}
+    };
+    checkInitialStatus();
+  }, []);
+
+  // 2. Fetch available report files
   const fetchReportList = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/reports');
@@ -87,7 +106,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchReportList();
   }, [fetchReportList]);
 
-  // 2. Fetch selected report JSON payload
+  // 3. Fetch selected report JSON payload
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
@@ -109,7 +128,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     loadReport();
   }, [selectedFile]);
 
-  // 3. Live Polling for Background Backtest Runner
+  // 4. Live Polling for Background Backtest Runner
   useEffect(() => {
     if (!isRunning) return;
 
@@ -127,13 +146,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               setSuccessBanner(`Backtest completed successfully! Updated report loaded.`);
               setErrorBanner(null);
             } else {
-              setErrorBanner(json.lastError || 'Backtest exited with an error. Check server logs.');
+              setErrorBanner(json.lastError || 'Backtest failed or stopped.');
               setSuccessBanner(null);
             }
             await fetchReportList();
-            setTimeout(() => {
-              setSuccessBanner(null);
-            }, 5000);
+            setTimeout(() => setSuccessBanner(null), 5000);
           }
         }
       } catch (err) {
@@ -144,19 +161,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList]);
 
-  // 4. Trigger Backtest Function (Single or ALL)
+  // 5. Trigger Backtest Function
   const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
     setErrorBanner(null);
     setSuccessBanner(null);
-    setProgressText(`Connecting to broker & preparing rolling 365-day M5 data for ${targetSym}...`);
+    setProgressText(`Connecting to broker & preparing historical data for ${targetSym}...`);
 
     try {
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: targetSym, days: 365, adaptive: true }),
+        body: JSON.stringify({ symbol: targetSym, days: testDays, adaptive: true }),
       });
 
       if (!res.ok) {
@@ -170,7 +187,18 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }
   };
 
-  // 5. Dismiss Tip handler
+  // 6. Stop / Cancel Running Backtest
+  const handleStopBacktest = async () => {
+    try {
+      await fetch('/api/backtest/stop', { method: 'POST' });
+      setIsRunning(false);
+      setProgressText('Backtest cancelled.');
+    } catch {
+      setErrorBanner('Failed to stop backtest process.');
+    }
+  };
+
+  // 7. Dismiss Tip handler
   const handleDismissTip = (tipId: string) => {
     const updated = [...dismissedTipIds, tipId];
     setDismissedTipIds(updated);
@@ -186,7 +214,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
-  // 6. Render Lightweight-Chart for the selected day
+  // 8. Render Lightweight-Chart for the selected day
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -359,7 +387,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
             Backtest & Replay Suite
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
-              Rolling 365 Days
+              Zero Look-Ahead
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
@@ -381,34 +409,50 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               ))}
             </select>
 
-            <button
-              type="button"
-              onClick={() => handleRunBacktest(testSymbol)}
+            <select
+              value={testDays}
+              onChange={(e) => setTestDays(parseInt(e.target.value, 10))}
               disabled={isRunning}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
-                isRunning 
-                  ? 'bg-blue-600/50 text-white cursor-not-allowed' 
-                  : 'bg-emerald-600 hover:bg-emerald-500 text-white'
-              }`}
+              className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
             >
-              {isRunning ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              <span>{isRunning ? 'Running...' : `Run ${testSymbol} (1 Yr)`}</span>
-            </button>
+              <option value={30}>30 Days (~15s)</option>
+              <option value={60}>60 Days (~30s)</option>
+              <option value={90}>90 Days (~45s)</option>
+              <option value={180}>180 Days (~1.5m)</option>
+              <option value={365}>365 Days (1 Yr)</option>
+            </select>
 
-            <button
-              type="button"
-              onClick={() => handleRunBacktest('ALL')}
-              disabled={isRunning}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer ${
-                isRunning 
-                  ? 'bg-blue-600/50 text-white cursor-not-allowed' 
-                  : 'bg-blue-600 hover:bg-blue-500 text-white'
-              }`}
-              title="Sequentially runs rolling 365-day backtest across all 7 whitelist pairs"
-            >
-              <Layers className="w-3.5 h-3.5" />
-              <span>Run All 7 Pairs</span>
-            </button>
+            {!isRunning ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleRunBacktest(testSymbol)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>Run {testSymbol}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleRunBacktest('ALL')}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white"
+                  title="Sequentially runs backtest across all 7 whitelist pairs"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>Run All 7</span>
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={handleStopBacktest}
+                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white"
+              >
+                <Square className="w-3.5 h-3.5" />
+                <span>Stop Backtest</span>
+              </button>
+            )}
           </div>
 
           <div className="h-6 w-px bg-slate-300 dark:border-[#1a2030] hidden sm:block" />
@@ -438,15 +482,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       {isRunning && (
         <div className="p-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-between text-xs animate-in fade-in">
           <div className="flex items-center gap-3">
-            <RefreshCw className="w-4 h-4 text-blue-500 animate-spin" />
+            <RefreshCw className="w-4 h-4 text-blue-500 animate-spin shrink-0" />
             <div>
               <div className="font-bold text-blue-600 dark:text-blue-400">Simulation in Progress</div>
               <div className="text-slate-500 font-mono text-[11px] mt-0.5">{progressText || 'Stepping through historical candles...'}</div>
             </div>
           </div>
-          <span className="text-[10px] font-mono font-bold text-blue-500 bg-blue-500/15 px-2 py-0.5 rounded border border-blue-500/30">
-            AUTO-SYNC ACTIVE
-          </span>
+          <button
+            type="button"
+            onClick={handleStopBacktest}
+            className="px-3 py-1.5 rounded-lg text-[11px] font-bold font-mono bg-rose-600 hover:bg-rose-500 text-white transition-colors cursor-pointer"
+          >
+            Cancel Run
+          </button>
         </div>
       )}
 
@@ -674,7 +722,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <Sparkles className="w-8 h-8 text-amber-400 mx-auto" />
               <div className="text-sm font-bold text-black dark:text-white">All Improvement Tips Reviewed!</div>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
-                No active recommendations pending. Run another test on a different pair or click "Restore Dismissed Tips" above.
+                No active recommendations pending. Run a backtest or click "Restore Dismissed Tips" above.
               </p>
             </div>
           ) : (
