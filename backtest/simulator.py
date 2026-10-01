@@ -8,6 +8,8 @@ Replicates the exact live order and position management of engine/matrix.py:
 - SuperTrend 5M trailing exit
 - 21:00 SAST EOD close
 - Conservative collision rule (SL hit first if same candle touches both SL and TP)
+- Detailed Trade Metrics: MFE/MAE in R & pips, Profit-First detection,
+  and strict 2-hour post-SL recovery tracking with adverse limits.
 """
 
 import sys
@@ -44,6 +46,7 @@ class TradeSimulator:
         self.account_currency = account_currency
         self.open_positions: List[Dict[str, Any]] = []
         self.completed_trades: List[Dict[str, Any]] = []
+        self.pending_sl_evaluations: List[Dict[str, Any]] = []
 
     def open_trade(self, signal: Any, current_time: datetime, adr_val: Optional[float], regime: str, ref_levels: dict) -> bool:
         symbol = signal.symbol
@@ -78,19 +81,18 @@ class TradeSimulator:
         half_lots = round(max(total_lots / 2.0, 0.01), 2)
         pos_group_id = f"{symbol}_{int(current_time.timestamp())}"
 
-        leg_a = {
+        base_leg = {
             "group_id": pos_group_id,
-            "leg": "A",
             "symbol": symbol,
             "strategy": signal.strategy,
             "direction": direction,
             "lots": half_lots,
             "entry_price": actual_entry,
             "stop_loss": sl,
-            "take_profit": tp1,
             "initial_sl_dist": sl_dist,
             "open_time": current_time,
             "contract_size": contract_size,
+            "pip_size": pip_size,
             "spread_paid": spread_pts,
             "adr_val": adr_val,
             "regime": regime,
@@ -98,31 +100,14 @@ class TradeSimulator:
             "trail_mode": getattr(signal, "trail_mode", "MOVE_TO_BE_80"),
             "is_be_moved": False,
             "mfe_price": actual_entry,
-            "mae_price": actual_entry
+            "mae_price": actual_entry,
+            "profit_seen": False,
+            "loss_seen": False,
+            "profit_first": False
         }
 
-        leg_b = {
-            "group_id": pos_group_id,
-            "leg": "B",
-            "symbol": symbol,
-            "strategy": signal.strategy,
-            "direction": direction,
-            "lots": half_lots,
-            "entry_price": actual_entry,
-            "stop_loss": sl,
-            "take_profit": tp2,
-            "initial_sl_dist": sl_dist,
-            "open_time": current_time,
-            "contract_size": contract_size,
-            "spread_paid": spread_pts,
-            "adr_val": adr_val,
-            "regime": regime,
-            "ref_levels": ref_levels,
-            "trail_mode": getattr(signal, "trail_mode", "MOVE_TO_BE_80"),
-            "is_be_moved": False,
-            "mfe_price": actual_entry,
-            "mae_price": actual_entry
-        }
+        leg_a = {**base_leg, "leg": "A", "take_profit": tp1}
+        leg_b = {**base_leg, "leg": "B", "take_profit": tp2}
 
         self.open_positions.extend([leg_a, leg_b])
         return True
@@ -134,6 +119,7 @@ class TradeSimulator:
         curr_time = pd.to_datetime(candle['time'], utc=True).to_pydatetime()
         sast_time = curr_time.astimezone(TZ_SAST)
 
+        # 1. Update in-flight open positions
         remaining_positions = []
 
         for pos in self.open_positions:
@@ -147,13 +133,25 @@ class TradeSimulator:
             direction = pos["direction"]
             sl_dist = pos["initial_sl_dist"]
 
-            # Update MFE & MAE
+            # Update MFE, MAE, and Profit-First flags
             if direction == "BUY":
                 pos["mfe_price"] = max(pos["mfe_price"], c_high)
                 pos["mae_price"] = min(pos["mae_price"], c_low)
+                if c_high > entry and not pos["loss_seen"]:
+                    pos["profit_first"] = True
+                if c_high > entry:
+                    pos["profit_seen"] = True
+                if c_low < entry:
+                    pos["loss_seen"] = True
             else:
                 pos["mfe_price"] = min(pos["mfe_price"], c_low)
                 pos["mae_price"] = max(pos["mae_price"], c_high)
+                if c_low < entry and not pos["loss_seen"]:
+                    pos["profit_first"] = True
+                if c_low < entry:
+                    pos["profit_seen"] = True
+                if c_high > entry:
+                    pos["loss_seen"] = True
 
             # Apply armed Break-Even from previous candle
             if pos.get("arm_be_next_candle") and not pos["is_be_moved"]:
@@ -162,7 +160,7 @@ class TradeSimulator:
                 sl = entry
                 pos.pop("arm_be_next_candle", None)
 
-            # 1. Conservative Collision Check
+            # Collision Check (Conservative: SL hit first)
             sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
             tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
 
@@ -182,7 +180,7 @@ class TradeSimulator:
                             partner["arm_be_next_candle"] = True
                 continue
 
-            # 2. Dynamic 80% R:R Break-Even Rule
+            # Dynamic 80% R:R Break-Even Rule
             if not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
@@ -190,7 +188,7 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            # 3. SuperTrend 5M Trailing Stop Exit
+            # SuperTrend 5M Trailing Stop Exit
             if pos["trail_mode"] == "SUPERTREND" and len(m5_slice) >= 15:
                 st = calculate_supertrend(m5_slice, period=10, factor=1.6)
                 curr_dir = int(st['supertrend_direction'].iloc[-1])
@@ -198,7 +196,7 @@ class TradeSimulator:
                     self._close_position(pos, c_close, curr_time, "SUPERTREND_TRAIL")
                     continue
 
-            # 4. EOD 21:00 SAST Lockdown Close
+            # EOD 21:00 SAST Lockdown Close
             if sast_time.hour == 21 and sast_time.minute == 0:
                 self._close_position(pos, c_close, curr_time, "EOD_LOCKDOWN")
                 continue
@@ -207,24 +205,77 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
+        # 2. Strict Post-SL Recovery Monitor (Max 2 hours, max 0.5x SL adverse breach)
+        active_pending = []
+        for pending in self.pending_sl_evaluations:
+            if pending["symbol"] != symbol:
+                active_pending.append(pending)
+                continue
+
+            direction = pending["direction"]
+            target_tp = pending["target_tp"]
+            max_adverse = pending["max_adverse_allowed"]
+
+            # Check if market blew past adverse tolerance
+            if not pending["adverse_blown"]:
+                if direction == "BUY" and c_low <= max_adverse:
+                    pending["adverse_blown"] = True
+                elif direction == "SELL" and c_high >= max_adverse:
+                    pending["adverse_blown"] = True
+
+            # If adverse move was modest, check if it reached original TP within 2 hours
+            if not pending["adverse_blown"]:
+                reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
+                if reached_tp:
+                    pending["record"]["failure_reason"] = "NOISE_STOPOUT_RECOVERED"
+                    pending["record"]["recovered_to_tp"] = True
+                    pending["bars_remaining"] = 0
+
+            pending["bars_remaining"] -= 1
+
+            if pending["bars_remaining"] > 0 and not (sast_time.hour == 21 and sast_time.minute == 0):
+                active_pending.append(pending)
+
+        self.pending_sl_evaluations = active_pending
+
     def _close_position(self, pos: Dict[str, Any], exit_price: float, exit_time: datetime, reason: str):
         direction = pos["direction"]
         entry = pos["entry_price"]
         sl_dist = pos["initial_sl_dist"]
         lots = pos["lots"]
         contract_size = pos["contract_size"]
+        pip_size = pos.get("pip_size", 0.01)
 
         price_diff = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
         r_multiple = round(price_diff / sl_dist, 2) if sl_dist > 0 else 0.0
         money_pnl = round(price_diff * lots * contract_size, 2)
 
-        mfe_dist = abs(pos["mfe_price"] - entry)
-        mae_dist = abs(pos["mae_price"] - entry)
+        # MFE and MAE calculations
+        if direction == "BUY":
+            mfe_dist = max(0.0, pos["mfe_price"] - entry)
+            mae_dist = max(0.0, entry - pos["mae_price"])
+        else:
+            mfe_dist = max(0.0, entry - pos["mfe_price"])
+            mae_dist = max(0.0, pos["mae_price"] - entry)
+
         mfe_r = round(mfe_dist / sl_dist, 2) if sl_dist > 0 else 0.0
         mae_r = round(mae_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+        mfe_pips = round(mfe_dist / pip_size, 1) if pip_size > 0 else 0.0
+        mae_pips = round(mae_dist / pip_size, 1) if pip_size > 0 else 0.0
 
         result = "WIN" if money_pnl > 0.50 else ("LOSS" if money_pnl < -0.50 else "BREAKEVEN")
         duration_min = int((exit_time - pos["open_time"]).total_seconds() / 60)
+
+        # Initial failure categorization
+        target_dist = abs(pos["take_profit"] - entry)
+        if result == "WIN":
+            failure_reason = "NONE_WIN"
+        elif target_dist > 0 and (mfe_dist / target_dist) >= 0.75:
+            failure_reason = "NEAR_TP_REVERSAL"
+        elif mfe_r < 0.25:
+            failure_reason = "STRAIGHT_DRAWDOWN"
+        else:
+            failure_reason = "CLEAN_LOSS"
 
         record = {
             "date": pos["open_time"].strftime("%Y-%m-%d"),
@@ -247,10 +298,29 @@ class TradeSimulator:
             "money_pnl": money_pnl,
             "mfe_r": mfe_r,
             "mae_r": mae_r,
+            "mfe_pips": mfe_pips,
+            "mae_pips": mae_pips,
+            "profit_first": pos["profit_first"],
+            "failure_reason": failure_reason,
+            "recovered_to_tp": False,
             "spread_paid": pos["spread_paid"],
             "adr": pos["adr_val"],
             "regime": pos["regime"]
         }
+
+        # If trade stopped out, register for strict 24-candle post-SL tracking
+        if result == "LOSS" and "SL" in reason:
+            max_adverse = (pos["stop_loss"] - (0.50 * sl_dist)) if direction == "BUY" else (pos["stop_loss"] + (0.50 * sl_dist))
+            self.pending_sl_evaluations.append({
+                "record": record,
+                "symbol": pos["symbol"],
+                "direction": direction,
+                "target_tp": pos["take_profit"],
+                "max_adverse_allowed": max_adverse,
+                "adverse_blown": False,
+                "bars_remaining": 24,
+                "pip_size": pip_size
+            })
 
         self.balance += money_pnl
         self.equity = self.balance
