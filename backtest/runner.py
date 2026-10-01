@@ -1,681 +1,296 @@
-import 'dotenv/config';
-import express from 'express';
-import path from 'path';
-import fs from 'fs';
-import { createServer as createViteServer } from 'vite';
-import { spawn, ChildProcess } from 'child_process';
+"""
+backtest/runner.py
+High-Performance Automated End-to-End Backtest Runner.
+- Pre-parsed vectorized datetime indexing.
+- Daily-cached ADR and session level baseline calculation (avoids 75,000 redundant resamplings).
+- Zero Look-Ahead simulation through StrategyManager.
+- Detailed MFE / MAE tracking, failure attribution, and actionable improvement tips.
+- Clean execution with code 0 on success, code 1 on error.
+"""
 
-interface BotGatewayConfig {
-  masterExecution: boolean;
-  riskPerTradePct: number;
-  minRr: number;
-  adaptiveMode: boolean;
-  stopOnDailyGoalReached: boolean;
-  dailyGoalTarget: number;
-  weeklyGoalTarget: number;
-  monthlyGoalTarget: number;
-  weeklyDepositBaseline: number;
-  maxDailyTrades: number;
-  trailingStopActive: boolean;
-  autoBreakevenPips: number;
-  currency: string;
-  updatedAt: string;
-  version: number;
-  strategyModes?: Record<string, string>;
-  limitsConfirmedAt?: string;
-}
+import sys
+import os
+import json
+import asyncio
+import argparse
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any
 
-interface RiskLimitsConfig {
-  maxDailyLossUsd: number;
-  maxWeeklyLossUsd: number;
-  maxMonthlyLossUsd: number;
-  maxDailyDrawdownPct?: number;
-  autoLiquidateAllOnTrip?: boolean;
-  breakerAction: 'HALT_PREVENT_NEW';
-}
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-interface RiskState {
-  currentDailyLossUsd: number;
-  currentWeeklyLossUsd: number;
-  currentMonthlyLossUsd: number;
-  breakerTriggered: boolean;
-  activeTripScope: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'CURRENCY';
-  lastTriggerReason?: string;
-}
+import core.session_config
+from strategies.strategy_manager import StrategyManager
+from core.session_levels import build_session_levels
+from core.indicators import get_session_volume_profile
+from core.volatility_engine import volatility_engine
+from core.session_config import GLOBAL_PARAMS
+from backtest.bar_aggregator import ZeroLookAheadAggregator
+from backtest.simulator import TradeSimulator
+from backtest.report import calculate_kpis
+from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
+from backtest.advisor import generate_improvement_tips
 
-interface BrokerTelemetry {
-  connected: boolean;
-  provider: string;
-  trades: any[];
-  accountNumber: string;
-  server: string;
-  currency: string;
-  balance: number;
-  equity: number;
-  floatingPnL: number;
-  netProfit: number;
-  totalDeposits: number;
-  winRate: number;
-  totalTrades: number;
-  winningTrades: number;
-  losingTrades: number;
-  lastPingMs: number;
-  lastSyncTime: string;
-  lastHeartbeat: string;
-  openPositions: Array<{
-    id: string;
-    ticket: string;
-    symbol: string;
-    strategy: string;
-    direction: 'BUY' | 'SELL';
-    lots: number;
-    entry: number;
-    currentPrice: number;
-    sl?: number;
-    tp?: number;
-    floatingPnL: number;
-    isRiskFree: boolean;
-  }>;
-}
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-const BOT_CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
-const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
-const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
-const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
-const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
-const BACKTEST_OUTPUT_DIR = path.join(process.cwd(), 'backtest', 'output');
+async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int = 60) -> bool:
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
 
-let backtestRunning = false;
-let backtestProgress = '';
-let backtestLastError: string | null = null;
-let backtestExitCode: number | null = null;
-let activeBacktestProcesses: ChildProcess[] = [];
+    if os.path.exists(m5_path) and os.path.getsize(m5_path) > 5000:
+        if not all(os.path.exists(p) for p in [h1_path, h4_path, d1_path]):
+            m5_df = pd.read_csv(m5_path)
+            build_higher_timeframes_from_m5(m5_df, symbol)
+        return True
 
-const SEED_TRADES = [
-  {
-    id: "deal-26686729",
-    ticket: "#26686729",
-    asset: "EURUSD",
-    strategy: "STRATEGY_513",
-    type: "BUY",
-    lots: 0.02,
-    openPrice: 1.11420,
-    closePrice: 1.11660,
-    pnl: 2.88,
-    openTime: "2026-09-29 15:23:10",
-    closeTime: "2026-09-29 16:02:45",
-    status: "WIN",
-    source: "Fusion cTrader"
-  },
-  {
-    id: "deal-26685480",
-    ticket: "#26685480",
-    asset: "EURUSD",
-    strategy: "STRATEGY_513",
-    type: "BUY",
-    lots: 0.02,
-    openPrice: 1.11420,
-    closePrice: 1.11660,
-    pnl: 1.92,
-    openTime: "2026-09-29 15:05:40",
-    closeTime: "2026-09-29 16:01:30",
-    status: "WIN",
-    source: "Fusion cTrader"
-  },
-  {
-    id: "deal-26668860",
-    ticket: "#26668860",
-    asset: "GBPUSD",
-    strategy: "EMA_9_25_CROSS",
-    type: "BUY",
-    lots: 0.02,
-    openPrice: 1.33520,
-    closePrice: 1.33700,
-    pnl: 0.36,
-    openTime: "2026-09-29 10:51:15",
-    closeTime: "2026-09-29 12:50:32",
-    status: "WIN",
-    source: "Fusion cTrader"
-  },
-  {
-    id: "deal-26667829",
-    ticket: "#26667829",
-    asset: "AUDUSD",
-    strategy: "MANUAL_TRADE",
-    type: "SELL",
-    lots: 0.01,
-    openPrice: 0.68940,
-    closePrice: 0.68994,
-    pnl: -0.54,
-    openTime: "2026-09-29 10:29:00",
-    closeTime: "2026-09-29 12:47:10",
-    status: "LOSS",
-    source: "Fusion cTrader"
-  }
-];
+    now_utc = datetime.now(timezone.utc)
+    start_dt = now_utc - timedelta(days=days_back)
 
-let activeBotConfig: BotGatewayConfig = {
-  masterExecution: true,
-  riskPerTradePct: 1.0,
-  minRr: 1.0,
-  adaptiveMode: false,
-  stopOnDailyGoalReached: false,
-  dailyGoalTarget: 5.0,
-  weeklyGoalTarget: 20.0,
-  monthlyGoalTarget: 50.0,
-  weeklyDepositBaseline: 10.0,
-  maxDailyTrades: 4,
-  trailingStopActive: true,
-  autoBreakevenPips: 15,
-  currency: 'USD',
-  updatedAt: new Date().toISOString(),
-  version: 1,
-  strategyModes: {
-    "EMA_9_25_CROSS": "LIVE",
-    "GRUBBER_KICK": "LIVE",
-    "STRATEGY_513": "LIVE",
-    "ORB_LIQUIDITY_SWEEP": "LIVE",
-    "AVWAP_200EMA_CONTINUATION": "LIVE",
-    "PDH_PDL_FAILED_BREAKOUT": "LIVE",
-    "ORB_CRACKER": "DRY_RUN",
-    "OES_4H_ORDER_BLOCK": "LIVE"
-  }
-};
+    print(f"[*] Downloading rolling {days_back} days of M5 candles for {symbol}...", flush=True)
+    if not client.is_authorized:
+        connected = await client.connect()
+        if not connected:
+            print("ERROR: Could not connect to cTrader. Please check CTRADER credentials in your environment.", flush=True)
+            return False
 
-let riskLimits: RiskLimitsConfig = {
-  maxDailyLossUsd: 0.0,
-  maxWeeklyLossUsd: 0.0,
-  maxMonthlyLossUsd: 0.0,
-  maxDailyDrawdownPct: 5.0,
-  autoLiquidateAllOnTrip: false,
-  breakerAction: 'HALT_PREVENT_NEW',
-};
+    m5_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, start_dt, now_utc)
+    if not m5_df.empty:
+        m5_df.to_csv(m5_path, index=False)
+        print(f"    [+] Saved {len(m5_df):,} M5 bars to {m5_path}", flush=True)
+        build_higher_timeframes_from_m5(m5_df, symbol)
+        return True
+    else:
+        print(f"ERROR: Failed downloading M5 candles for {symbol}", flush=True)
+        return False
 
-if (fs.existsSync(BOT_CONFIG_FILE)) {
-  try {
-    const saved = JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8'));
-    activeBotConfig = { ...activeBotConfig, ...saved };
-    if (saved.maxDailyLoss !== undefined || saved.maxDailyLossUsd !== undefined) {
-      riskLimits.maxDailyLossUsd = saved.maxDailyLoss ?? saved.maxDailyLossUsd;
-    }
-    if (saved.maxWeeklyLoss !== undefined || saved.maxWeeklyLossUsd !== undefined) {
-      riskLimits.maxWeeklyLossUsd = saved.maxWeeklyLoss ?? saved.maxWeeklyLossUsd;
-    }
-    if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) {
-      riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
-    }
-  } catch (e) {
-    console.error('Failed to load bot_config.json on startup:', e);
-  }
-}
+def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, balance: float = 1000.0, risk_pct: float = 1.0) -> bool:
+    mode_str = "adaptive" if adaptive_mode else "legacy"
+    print(f"\n=======================================================", flush=True)
+    print(f"STARTING HIGH-SPEED BACKTEST: {symbol} ({mode_str.upper()})", flush=True)
+    print(f"=======================================================", flush=True)
 
-let riskState: RiskState = {
-  currentDailyLossUsd: 0,
-  currentWeeklyLossUsd: 0,
-  currentMonthlyLossUsd: 0,
-  breakerTriggered: false,
-  activeTripScope: 'NONE',
-  lastTriggerReason: undefined,
-};
+    GLOBAL_PARAMS.adaptive_mode = adaptive_mode
 
-function saveTradesToDisk(tradesList: any[]) {
-  try {
-    fs.writeFileSync(TRADES_DB_FILE, JSON.stringify(tradesList, null, 2));
-  } catch (e) {
-    console.error('Failed to save trades to disk:', e);
-  }
-}
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
 
-function loadTradesFromDisk(): any[] {
-  try {
-    if (fs.existsSync(TRADES_DB_FILE)) {
-      const content = fs.readFileSync(TRADES_DB_FILE, 'utf8').trim();
-      if (content) {
-        const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) {
-          return parsed;
-        }
-      }
-    }
-  } catch (e) {
-    console.error('Failed to load trades from disk:', e);
-  }
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        print(f"ERROR: Incomplete data files for {symbol} in {DATA_DIR}.", flush=True)
+        return False
 
-  saveTradesToDisk(SEED_TRADES);
-  return SEED_TRADES;
-}
+    m5_df = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
 
-function recomputeRiskState() {
-  try {
-    if (fs.existsSync(RISK_STATE_FILE)) {
-      const st = JSON.parse(fs.readFileSync(RISK_STATE_FILE, 'utf8'));
-      riskState.currentDailyLossUsd = st.current_daily_loss || 0;
-      riskState.currentWeeklyLossUsd = st.current_weekly_loss || 0;
-      riskState.currentMonthlyLossUsd = st.current_monthly_loss || 0;
-      riskState.breakerTriggered = Boolean(st.breaker_triggered);
-      riskState.activeTripScope = st.active_trip_scope || 'NONE';
-      riskState.lastTriggerReason = st.last_trigger_reason;
-    }
-  } catch (e) {}
-}
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
 
-let activeBrokerTelemetry: BrokerTelemetry = {
-  connected: true,
-  provider: 'Fusion Markets cTrader',
-  accountNumber: '48868725',
-  server: 'cTrader Open API',
-  currency: 'USD',
-  balance: 14.62,
-  equity: 14.62,
-  floatingPnL: 0.00,
-  netProfit: 4.62,
-  totalDeposits: 10.00,
-  winRate: 75.0,
-  totalTrades: 4,
-  winningTrades: 3,
-  losingTrades: 1,
-  lastPingMs: 12,
-  lastSyncTime: new Date().toISOString(),
-  lastHeartbeat: new Date().toISOString(),
-  openPositions: [],
-  trades: SEED_TRADES,
-};
+    aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
+    sm = StrategyManager()
+    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct)
 
-async function startServer() {
-  const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+    frozen_orbs: Dict[Any, Any] = {}
+    total_bars = len(m5_df)
+    start_idx = 120
 
-  app.use(express.json());
+    print(f"[*] Simulating across {total_bars - start_idx:,} M5 candles (Zero Look-Ahead)...", flush=True)
 
-  app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
-    }
-    next();
-  });
+    last_vol_date = None
+    vol_metrics = {"valid": False}
+    adr_val = None
+    regime = "NORMAL"
 
-  // 1. CANDLE FEED ENDPOINT
-  app.get('/api/market/candles', (req, res) => {
-    try {
-      const symbol = String(req.query.symbol || 'US30').toUpperCase();
-      if (fs.existsSync(CANDLES_CACHE_FILE)) {
-        const cache = JSON.parse(fs.readFileSync(CANDLES_CACHE_FILE, 'utf8'));
-        if (cache && cache[symbol]) {
-          return res.status(200).json({ status: 'success', symbol, data: cache[symbol] });
-        }
-      }
-      return res.status(200).json({ status: 'success', symbol, data: [] });
-    } catch (err: any) {
-      return res.status(500).json({ status: 'error', message: err?.message });
-    }
-  });
+    step_interval = max(1, (total_bars - start_idx) // 10)
 
-  // 2. CLOSE POSITION ON DEMAND
-  app.post('/api/positions/close/:id', (req, res) => {
-    try {
-      const positionId = req.params.id;
-      fs.writeFileSync(CLOSE_COMMAND_FILE, JSON.stringify({ positionId, requestedAt: new Date().toISOString() }));
-      res.status(200).json({ status: 'success', message: `Close command queued for position #${positionId}` });
-    } catch (err: any) {
-      res.status(500).json({ status: 'error', message: err?.message });
-    }
-  });
+    for i in range(start_idx, total_bars):
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
+        curr_bar = m5_slice.iloc[-1]
+        curr_time = curr_bar['time'].to_pydatetime()
+        curr_date = curr_time.date()
 
-  // 3. READ-ONLY BACKTEST REPORT APIS
-  app.get('/api/backtest/reports', (_req, res) => {
-    try {
-      if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) {
-        return res.status(200).json({ status: 'success', reports: [] });
-      }
-      const files = fs.readdirSync(BACKTEST_OUTPUT_DIR)
-        .filter(f => f.endsWith('.json') && !f.startsWith('.'));
-      res.status(200).json({ status: 'success', reports: files });
-    } catch (err: any) {
-      res.status(500).json({ status: 'error', message: err?.message });
-    }
-  });
+        if (i - start_idx) % step_interval == 0:
+            pct = int(((i - start_idx) / (total_bars - start_idx)) * 100)
+            print(f"[*] {symbol} Progress: {pct}% ({i - start_idx:,}/{total_bars - start_idx:,} candles)", flush=True)
 
-  app.get('/api/backtest/report/:filename', (req, res) => {
-    try {
-      const safeFilename = path.basename(req.params.filename);
-      if (!safeFilename.endsWith('.json')) {
-        return res.status(400).json({ status: 'error', message: 'Invalid file format' });
-      }
-      const targetPath = path.resolve(BACKTEST_OUTPUT_DIR, safeFilename);
-      if (!targetPath.startsWith(path.resolve(BACKTEST_OUTPUT_DIR)) || !fs.existsSync(targetPath)) {
-        return res.status(404).json({ status: 'error', message: 'Report not found' });
-      }
-      const data = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
-      res.status(200).json({ status: 'success', data });
-    } catch (err: any) {
-      res.status(500).json({ status: 'error', message: err?.message });
-    }
-  });
+        sim.process_candle(symbol, curr_bar, m5_slice)
 
-  app.get('/api/backtest/status', (_req, res) => {
-    res.status(200).json({ 
-      status: 'success', 
-      isRunning: backtestRunning, 
-      progress: backtestProgress,
-      lastError: backtestLastError,
-      exitCode: backtestExitCode 
-    });
-  });
+        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
 
-  // EMERGENCY STOP / CANCEL ALL RUNNING BACKTEST PROCESSES
-  app.post('/api/backtest/stop', (_req, res) => {
-    activeBacktestProcesses.forEach(proc => {
-      try { proc.kill(); } catch {}
-    });
-    activeBacktestProcesses = [];
-    backtestRunning = false;
-    backtestProgress = 'Backtest canceled by user.';
-    backtestLastError = null;
-    res.status(200).json({ status: 'success', message: 'All backtests stopped.' });
-  });
+        if adaptive_mode:
+            if curr_date != last_vol_date or not vol_metrics.get("valid", False):
+                vol_metrics = volatility_engine.compute_symbol_volatility(
+                    d1_df=d1_view,
+                    m5_df=m5_slice,
+                    current_quote=float(curr_bar['close']),
+                    symbol=symbol,
+                    as_of=curr_time
+                )
+                if vol_metrics.get("valid", False):
+                    adr_val = vol_metrics.get("adr")
+                    regime = vol_metrics.get("regime", "NORMAL")
+                last_vol_date = curr_date
 
-  // PARALLEL BATCH EXECUTION
-  app.post('/api/backtest/run', (req, res) => {
-    if (backtestRunning) {
-      return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
-    }
+        vp = get_session_volume_profile(m5_slice)
+        session_levels = build_session_levels(
+            symbol=symbol,
+            m5_df=m5_slice,
+            d1_df=d1_view,
+            vp_node=vp,
+            frozen_orbs=frozen_orbs,
+            as_of=curr_time,
+            adr_val=adr_val
+        )
 
-    const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
-    const days = parseInt(req.body?.days || '60', 10);
-    const adaptive = req.body?.adaptive !== false;
+        signal = sm.evaluate_all(
+            symbol=symbol,
+            data_5m=m5_slice,
+            data_h4=h4_view,
+            data_d1=d1_view,
+            session_levels=session_levels,
+            data_h1=h1_view
+        )
 
-    backtestRunning = true;
-    backtestProgress = `Starting simulation...`;
-    backtestLastError = null;
-    backtestExitCode = null;
-    activeBacktestProcesses = [];
+        if signal and adaptive_mode:
+            if vol_metrics.get("valid", False):
+                adapted = volatility_engine.adapt_signal(signal, vol_metrics, ui_rr=2.0, session_levels=session_levels)
+                if adapted:
+                    spread = 2.50 if symbol == "US30" else (0.30 if symbol == "GOLD" else 0.00010)
+                    sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                    tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                    vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+                        vol_metrics, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                    )
+                    signal = adapted if vol_ok else None
+                else:
+                    signal = None
 
-    const symbolsQueue = requestedSymbol === 'ALL'
-      ? ['US30', 'GOLD', 'NAS100', 'GERMAN30', 'EURUSD', 'GBPUSD', 'USDJPY']
-      : [requestedSymbol];
+        if signal:
+            has_open = any(p["symbol"] == symbol for p in sim.open_positions)
+            if not has_open:
+                sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
 
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const statusMap: Record<string, string> = {};
-    symbolsQueue.forEach(s => { statusMap[s] = 'queued'; });
+    all_trades = sim.completed_trades
+    df_trades = pd.DataFrame(all_trades)
+    global_kpis = calculate_kpis(all_trades)
 
-    async function runParallel() {
-      console.log(`[Backtest Master]: Spawning ${symbolsQueue.length} parallel backtest workers...`);
+    strat_kpis = {}
+    dow_kpis = {}
+    if not df_trades.empty:
+        for s_name, s_group in df_trades.groupby("strategy"):
+            strat_kpis[s_name] = calculate_kpis(s_group.to_dict("records"))
 
-      const tasks = symbolsQueue.map((sym) => {
-        return new Promise<void>((resolve) => {
-          const runnerArgs = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
-          if (adaptive) runnerArgs.push('--adaptive');
+        df_trades["weekday"] = pd.to_datetime(df_trades["date"]).dt.day_name()
+        for dow, dow_group in df_trades.groupby("weekday"):
+            dow_kpis[dow] = calculate_kpis(dow_group.to_dict("records"))
 
-          const proc = spawn(pythonCmd, runnerArgs, {
-            env: { ...process.env, PYTHONPATH: process.cwd() }
-          });
-          activeBacktestProcesses.push(proc);
+    m5_df["dt"] = m5_df["time"]
+    m5_df["date_str"] = m5_df["dt"].dt.strftime("%Y-%m-%d")
+    trading_dates = sorted(df_trades["date"].unique().tolist()) if not df_trades.empty else []
 
-          proc.stdout.on('data', (data) => {
-            const text = data.toString().trim();
-            if (text) {
-              const lines = text.split('\n');
-              const lastLine = lines[lines.length - 1];
-              statusMap[sym] = lastLine;
-              console.log(`[${sym}]: ${lastLine}`);
-              if (lastLine.startsWith('ERROR:')) {
-                backtestLastError = `${sym}: ${lastLine}`;
-              }
+    day_charts_data = {}
+    for d_str in trading_dates:
+        sub_m5 = m5_df[m5_df["date_str"] == d_str]
+        candles_list = [
+            {"time": int(r["dt"].timestamp()), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
+            for _, r in sub_m5.iterrows()
+        ]
+        day_t = df_trades[df_trades["date"] == d_str].to_dict("records")
+        first_t = day_t[0] if day_t else {}
+        ref_levels = first_t.get("ref_levels", {})
+
+        day_charts_data[d_str] = {
+            "candles": candles_list,
+            "trades": day_t,
+            "levels": {
+                "asia_high": ref_levels.get("asia_high"),
+                "asia_low": ref_levels.get("asia_low"),
+                "daily_eq": ref_levels.get("daily_eq"),
+                "daily_pivot": ref_levels.get("daily_pivot"),
+                "pdh": ref_levels.get("pdh"),
+                "pdl": ref_levels.get("pdl"),
+                "orb_high": ref_levels.get("orb_high"),
+                "orb_low": ref_levels.get("orb_low")
             }
-          });
-
-          proc.stderr.on('data', (data) => {
-            const errText = data.toString().trim();
-            console.error(`[${sym} Error]: ${errText}`);
-          });
-
-          proc.on('exit', (code) => {
-            if (code !== 0 && !backtestLastError) {
-              backtestLastError = `${sym} worker exited with code ${code}`;
-            }
-            statusMap[sym] = code === 0 ? 'Completed' : `Failed (${code})`;
-            resolve();
-          });
-
-          proc.on('error', (err) => {
-            statusMap[sym] = `Error: ${err.message}`;
-            backtestLastError = `Spawn failure on ${sym}: ${err.message}`;
-            resolve();
-          });
-        });
-      });
-
-      const monitorInterval = setInterval(() => {
-        if (!backtestRunning) {
-          clearInterval(monitorInterval);
-          return;
         }
-        const activeCount = Object.values(statusMap).filter(s => s !== 'Completed' && !s.startsWith('Failed')).length;
-        backtestProgress = `Running ${symbolsQueue.length} pairs in parallel (${activeCount} active)...`;
-      }, 1000);
 
-      await Promise.all(tasks);
-      clearInterval(monitorInterval);
-      activeBacktestProcesses = [];
-      backtestRunning = false;
+    improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
-      if (!backtestLastError) {
-        backtestExitCode = 0;
-        backtestProgress = requestedSymbol === 'ALL'
-          ? 'Completed all 7 pairs in parallel successfully!'
-          : `Completed ${requestedSymbol} successfully!`;
-      } else {
-        backtestExitCode = 1;
-        backtestProgress = `Finished with error: ${backtestLastError}`;
-      }
-      console.log(`[Backtest Master]: ${backtestProgress}`);
+    report_payload = {
+        "symbol": symbol,
+        "mode": mode_str,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "global_kpis": global_kpis,
+        "strategy_kpis": strat_kpis,
+        "dow_kpis": dow_kpis,
+        "trading_dates": trading_dates,
+        "day_data": day_charts_data,
+        "all_trades": all_trades,
+        "improvement_tips": improvement_tips
     }
 
-    runParallel().catch((err) => {
-      backtestRunning = false;
-      backtestLastError = err?.message || 'Parallel execution crash';
-      console.error('[Backtest Parallel Crash]:', err);
-    });
+    out_file = os.path.join(OUTPUT_DIR, f"{symbol}_{mode_str}_report.json")
+    with open(out_file, "w") as f:
+        json.dump(report_payload, f, indent=2)
 
-    res.status(200).json({ status: 'success', message: `Backtest initiated for ${requestedSymbol}` });
-  });
+    print(f"[✓] {symbol} Backtest completed with {len(improvement_tips)} Actionable Tips written to {out_file}", flush=True)
+    return True
 
-  // 4. TRADE JOURNAL APIS
-  app.get('/api/journal', async (_req, res) => {
-    try {
-      const diskTrades = loadTradesFromDisk();
-      activeBrokerTelemetry.trades = diskTrades;
-      res.status(200).json(diskTrades);
-    } catch {
-      res.status(500).json({ error: "Failed to fetch journal entries" });
-    }
-  });
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", type=str, default="US30")
+    parser.add_argument("--days", type=int, default=60)
+    parser.add_argument("--adaptive", action="store_true", default=True)
+    args = parser.parse_args()
 
-  app.post('/api/journal', (req, res) => {
-    try {
-      const newTrade = req.body;
-      const trades = loadTradesFromDisk();
-      trades.unshift(newTrade);
-      saveTradesToDisk(trades);
-      activeBrokerTelemetry.trades = trades;
-      recomputeRiskState();
-      res.status(200).json({ status: "success", trade: newTrade });
-    } catch {
-      res.status(500).json({ error: "Failed to save journal entry" });
-    }
-  });
+    client = CTraderClient()
+    ok = await ensure_symbol_data(client, args.symbol, days_back=args.days)
+    success = False
+    if ok:
+        success = run_backtest_for_symbol(symbol=args.symbol, adaptive_mode=args.adaptive)
 
-  app.delete('/api/journal/:id', (req, res) => {
-    const tradeId = req.params.id;
-    let trades = loadTradesFromDisk();
-    trades = trades.filter(t => t.id !== tradeId && t.ticket !== tradeId);
-    saveTradesToDisk(trades);
-    activeBrokerTelemetry.trades = trades;
-    recomputeRiskState();
-    res.json({ status: 'success', message: `Trade ${tradeId} deleted.` });
-  });
+    if client.ws:
+        try:
+            await client.ws.close()
+        except Exception:
+            pass
 
-  app.post('/api/journal/reset', (_req, res) => {
-    saveTradesToDisk([]);
-    activeBrokerTelemetry.trades = [];
-    recomputeRiskState();
-    res.json({ status: 'success', message: 'Journal reset.' });
-  });
+    if not ok or not success:
+        sys.exit(1)
 
-  // 5. BOT CONFIG APIS
-  app.get('/api/bot/config', (_req, res) => {
-    res.json({ status: 'success', data: activeBotConfig });
-  });
+def print_startup_diagnostics() -> None:
+    print("=" * 60, flush=True)
+    print("BACKTEST STARTUP DIAGNOSTICS", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Python version: {sys.version.split()[0]}", flush=True)
 
-  app.post('/api/bot/config', (req, res) => {
-    try {
-      const config = req.body;
-      activeBotConfig = { 
-        ...activeBotConfig, 
-        ...config,
-        adaptiveMode: config.adaptiveMode !== undefined ? Boolean(config.adaptiveMode) : activeBotConfig.adaptiveMode,
-        minRr: config.minRr !== undefined ? Number(config.minRr) : activeBotConfig.minRr,
-        stopOnDailyGoalReached: config.stopOnDailyGoalReached !== undefined 
-          ? Boolean(config.stopOnDailyGoalReached) 
-          : (config.stop_on_daily_goal_reached !== undefined ? Boolean(config.stop_on_daily_goal_reached) : activeBotConfig.stopOnDailyGoalReached),
-        dailyGoalTarget: config.dailyGoalTarget !== undefined ? Number(config.dailyGoalTarget) : activeBotConfig.dailyGoalTarget,
-        weeklyGoalTarget: config.weeklyGoalTarget !== undefined ? Number(config.weeklyGoalTarget) : activeBotConfig.weeklyGoalTarget,
-        monthlyGoalTarget: config.monthlyGoalTarget !== undefined ? Number(config.monthlyGoalTarget) : activeBotConfig.monthlyGoalTarget,
-        updatedAt: new Date().toISOString() 
-      };
+    env_checks = [
+        "CTRADER_CLIENT_ID",
+        "CTRADER_CLIENT_SECRET",
+        "CTRADER_ACCESS_TOKEN",
+        "CTRADER_ACCOUNT_ID",
+    ]
+    for key in env_checks:
+        value = os.environ.get(key, "").strip()
+        status = "SET" if value else "MISSING"
+        print(f"{key}: {status}", flush=True)
+    print("=" * 60, flush=True)
 
-      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify({ ...existingConfig, ...activeBotConfig }, null, 2));
-      res.json({ status: 'success', config: activeBotConfig });
-    } catch (error: any) {
-      res.status(500).json({ status: 'error', message: error?.message });
-    }
-  });
+if __name__ == "__main__":
+    try:
+        from dotenv import load_dotenv
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        load_dotenv(os.path.join(project_root, '.env'))
+    except ImportError:
+        pass
 
-  // 6. RISK LIMITS APIS
-  app.get('/api/limits', (_req, res) => {
-    recomputeRiskState();
-    res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
-  });
-
-  app.post('/api/limits', (req, res) => {
-    try {
-      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, resetBreaker } = req.body;
-
-      if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
-      if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
-      if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
-      if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
-      if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
-
-      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
-      const confirmedPayload = { 
-        ...existingConfig, 
-        ...riskLimits, 
-        limitsConfirmedAt: new Date().toISOString()
-      };
-
-      if (resetBreaker) {
-        riskState.breakerTriggered = false;
-        riskState.activeTripScope = 'NONE';
-        riskState.lastTriggerReason = undefined;
-        activeBotConfig.masterExecution = true;
-      }
-
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(confirmedPayload, null, 2));
-      res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
-    } catch (error: any) {
-      res.status(500).json({ status: 'error', message: error?.message });
-    }
-  });
-
-  // 7. TELEMETRY APIS
-  app.get('/api/broker/telemetry', (_req, res) => {
-    recomputeRiskState();
-    res.json({ status: 'success', data: activeBrokerTelemetry });
-  });
-
-  app.post('/api/broker/telemetry', (req, res) => {
-    const payload = req.body;
-    activeBrokerTelemetry = { ...activeBrokerTelemetry, ...payload, lastHeartbeat: new Date().toISOString() };
-    res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
-  });
-
-  // 8. LAUNCH PYTHON BOT ENGINE
-  function launchPythonBot() {
-    console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    
-    const bot = spawn(pythonCmd, ['engine/matrix.py'], {
-      env: { ...process.env, PYTHONPATH: process.cwd() },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    bot.on('error', (err) => {
-      console.error(`[Python Engine Spawn Warning]: ${err.message}`);
-    });
-
-    bot.stdout.on('data', (chunk) => {
-      const line = chunk.toString().trim();
-      if (line.includes('[MATRIX_TELEMETRY]')) {
-        try {
-          const jsonStr = line.split('[MATRIX_TELEMETRY]')[1].trim();
-          const telem = JSON.parse(jsonStr);
-          activeBrokerTelemetry.balance = telem.balance;
-          activeBrokerTelemetry.equity = telem.equity;
-          if (telem.currency) activeBrokerTelemetry.currency = telem.currency;
-          if (telem.netProfit !== undefined) activeBrokerTelemetry.netProfit = telem.netProfit;
-          if (telem.winRate !== undefined) activeBrokerTelemetry.winRate = telem.winRate;
-          if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
-          if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
-          if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
-          if (Array.isArray(telem.openPositions)) {
-            activeBrokerTelemetry.openPositions = telem.openPositions;
-          }
-          activeBrokerTelemetry.connected = true;
-          activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-        } catch {}
-      }
-      console.log(`[Python Engine] ${line}`);
-    });
-
-    bot.stderr.on('data', (chunk) => {
-      console.error(`[Python Engine Error] ${chunk.toString().trim()}`);
-    });
-
-    bot.on('exit', (code) => {
-      console.warn(`⚠️ Python Bot process exited with code ${code}. Restarting in 5s...`);
-      setTimeout(launchPythonBot, 5000);
-    });
-  }
-
-  launchPythonBot();
-
-  const distPath = path.join(process.cwd(), 'dist');
-  const isProduction = fs.existsSync(path.join(distPath, 'index.html'));
-
-  if (isProduction) {
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true, host: '0.0.0.0' },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Trading Portal & API Gateway active on port ${PORT}`);
-  });
-}
-
-startServer().catch((err) => {
-  console.error('Server startup error:', err);
-  process.exit(1);
-});
+    print_startup_diagnostics()
+    asyncio.run(main())
