@@ -7,7 +7,7 @@ import {
   LineChart, 
   Settings as SettingsIcon,
   Bot,
-  X
+  X,
   History
 } from 'lucide-react';
 import { TabId, ThemeMode } from '../types';
