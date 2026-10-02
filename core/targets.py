@@ -3,10 +3,8 @@ trading-portal/core/targets.py
 Pure function for fixed risk-to-reward target calculation and structural room checking.
 """
 
-from typing import Optional, Any
 
-
-def compute_fixed_target(signal: Any, target_rr: float, use_final_target: bool = False) -> Optional[float]:
+def compute_fixed_target(signal, target_rr, use_final_target=False):
     """
     Computes a fixed R:R take-profit price and verifies there is enough room:
     - stop_distance = abs(entry_price - stop_loss)
