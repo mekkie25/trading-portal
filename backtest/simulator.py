@@ -1,13 +1,14 @@
 """
 backtest/simulator.py
-Replicates the exact live order and position management of engine/matrix.py:
-- Twin 50/50 Leg A (TP1) & Leg B (TP2)
-- Micro-lot 0.01 split logic
-- Smart-Link (Leg A hits TP1 -> Leg B SL moves to BE on next candle)
-- 80% R:R Break-Even trigger
+Replicates the exact single-order live position management of engine/matrix.py:
+- Single market order with full lot size
+- Fixed R:R target via compute_fixed_target
+- 80% R:R Break-Even trigger gated by GLOBAL_PARAMS.use_breakeven
 - SuperTrend 5M trailing exit
 - 21:00 SAST EOD close
 - Conservative collision rule (SL hit first if same candle touches both SL and TP)
+- Half spread charged on entry AND half spread charged on exit
+- Classification by R: WIN if r_multiple > 0.1, LOSS if r_multiple < -0.1, else BREAKEVEN
 - Detailed Trade Metrics: MFE/MAE in R & pips, Profit-First detection,
   and strict 2-hour post-SL recovery tracking with adverse limits.
 """
@@ -25,6 +26,7 @@ if PROJECT_ROOT not in sys.path:
 
 from core.session_config import TZ_SAST, GLOBAL_PARAMS
 from core.indicators import calculate_supertrend
+from core.targets import compute_fixed_target
 
 # Whitelist asset specifications
 ASSETS = {
@@ -47,17 +49,20 @@ class TradeSimulator:
         self.open_positions: List[Dict[str, Any]] = []
         self.completed_trades: List[Dict[str, Any]] = []
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
+        self._trade_counter: int = 0
 
     def open_trade(self, signal: Any, current_time: datetime, adr_val: Optional[float], regime: str, ref_levels: dict) -> bool:
         symbol = signal.symbol
         direction = signal.direction.upper()
         entry_price = float(signal.entry_price)
         sl = float(signal.stop_loss)
-        tp1 = float(signal.take_profit_1) if signal.take_profit_1 else float(signal.take_profit)
-        tp2 = float(signal.take_profit_2) if signal.take_profit_2 else float(signal.take_profit)
         sl_dist = abs(entry_price - sl)
 
         if sl_dist <= 0:
+            return False
+
+        fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr)
+        if fixed_tp is None:
             return False
 
         cfg = ASSETS.get(symbol, {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.0001})
@@ -78,22 +83,23 @@ class TradeSimulator:
         stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
         total_lots = round(max(stepped_lots, min_lots), 2)
 
-        half_lots = round(max(total_lots / 2.0, 0.01), 2)
-        pos_group_id = f"{symbol}_{int(current_time.timestamp())}"
+        self._trade_counter += 1
+        trade_id = f"{symbol}_{int(current_time.timestamp())}_{self._trade_counter}"
 
-        base_leg = {
-            "group_id": pos_group_id,
+        position = {
+            "trade_id": trade_id,
             "symbol": symbol,
             "strategy": signal.strategy,
             "direction": direction,
-            "lots": half_lots,
+            "lots": total_lots,
             "entry_price": actual_entry,
             "stop_loss": sl,
+            "take_profit": fixed_tp,
             "initial_sl_dist": sl_dist,
             "open_time": current_time,
             "contract_size": contract_size,
             "pip_size": pip_size,
-            "spread_paid": spread_pts,
+            "spread_pts": spread_pts,
             "adr_val": adr_val,
             "regime": regime,
             "ref_levels": ref_levels,
@@ -106,10 +112,7 @@ class TradeSimulator:
             "profit_first": False
         }
 
-        leg_a = {**base_leg, "leg": "A", "take_profit": tp1}
-        leg_b = {**base_leg, "leg": "B", "take_profit": tp2}
-
-        self.open_positions.extend([leg_a, leg_b])
+        self.open_positions.append(position)
         return True
 
     def process_candle(self, symbol: str, candle: pd.Series, m5_slice: pd.DataFrame):
@@ -119,7 +122,6 @@ class TradeSimulator:
         curr_time = pd.to_datetime(candle['time'], utc=True).to_pydatetime()
         sast_time = curr_time.astimezone(TZ_SAST)
 
-        # 1. Update in-flight open positions
         remaining_positions = []
 
         for pos in self.open_positions:
@@ -153,13 +155,6 @@ class TradeSimulator:
                 if c_high > entry:
                     pos["loss_seen"] = True
 
-            # Apply armed Break-Even from previous candle
-            if pos.get("arm_be_next_candle") and not pos["is_be_moved"]:
-                pos["stop_loss"] = entry
-                pos["is_be_moved"] = True
-                sl = entry
-                pos.pop("arm_be_next_candle", None)
-
             # Collision Check (Conservative: SL hit first)
             sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
             tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
@@ -173,15 +168,11 @@ class TradeSimulator:
                 continue
 
             if tp_hit:
-                self._close_position(pos, tp, curr_time, f"TP_{pos['leg']}")
-                if pos["leg"] == "A":
-                    for partner in self.open_positions:
-                        if partner["group_id"] == pos["group_id"] and partner["leg"] == "B":
-                            partner["arm_be_next_candle"] = True
+                self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            # Dynamic 80% R:R Break-Even Rule
-            if not pos["is_be_moved"]:
+            # Dynamic 80% R:R Break-Even Rule (gated by GLOBAL_PARAMS.use_breakeven)
+            if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
                 if target_dist > 0 and (progress / target_dist) >= 0.80 and progress >= (0.50 * sl_dist):
@@ -205,7 +196,7 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
-        # 2. Strict Post-SL Recovery Monitor (Max 2 hours, max 0.5x SL adverse breach)
+        # Strict Post-SL Recovery Monitor (Max 2 hours, max 0.5x SL adverse breach)
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
@@ -245,8 +236,12 @@ class TradeSimulator:
         lots = pos["lots"]
         contract_size = pos["contract_size"]
         pip_size = pos.get("pip_size", 0.01)
+        spread_pts = pos.get("spread_pts", 0.0)
 
-        price_diff = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
+        # Half spread charged on exit (deducted from price difference)
+        actual_exit = (exit_price - (spread_pts / 2.0)) if direction == "BUY" else (exit_price + (spread_pts / 2.0))
+
+        price_diff = (actual_exit - entry) if direction == "BUY" else (entry - actual_exit)
         r_multiple = round(price_diff / sl_dist, 2) if sl_dist > 0 else 0.0
         money_pnl = round(price_diff * lots * contract_size, 2)
 
@@ -263,7 +258,14 @@ class TradeSimulator:
         mfe_pips = round(mfe_dist / pip_size, 1) if pip_size > 0 else 0.0
         mae_pips = round(mae_dist / pip_size, 1) if pip_size > 0 else 0.0
 
-        result = "WIN" if money_pnl > 0.50 else ("LOSS" if money_pnl < -0.50 else "BREAKEVEN")
+        # Classify result strictly by R: WIN if r_multiple > 0.1, LOSS if r_multiple < -0.1, else BREAKEVEN
+        if r_multiple > 0.1:
+            result = "WIN"
+        elif r_multiple < -0.1:
+            result = "LOSS"
+        else:
+            result = "BREAKEVEN"
+
         duration_min = int((exit_time - pos["open_time"]).total_seconds() / 60)
 
         # Initial failure categorization
@@ -278,15 +280,15 @@ class TradeSimulator:
             failure_reason = "CLEAN_LOSS"
 
         record = {
+            "trade_id": pos["trade_id"],
             "date": pos["open_time"].strftime("%Y-%m-%d"),
             "symbol": pos["symbol"],
             "strategy": pos["strategy"],
-            "leg": pos["leg"],
             "direction": direction,
             "signal_time_utc": pos["open_time"].strftime("%Y-%m-%d %H:%M:%S"),
             "signal_time_sast": pos["open_time"].astimezone(TZ_SAST).strftime("%Y-%m-%d %H:%M:%S"),
             "entry_price": round(entry, 5),
-            "exit_price": round(exit_price, 5),
+            "exit_price": round(actual_exit, 5),
             "sl": round(pos["stop_loss"], 5),
             "tp": round(pos["take_profit"], 5),
             "lots": lots,
@@ -303,7 +305,7 @@ class TradeSimulator:
             "profit_first": pos["profit_first"],
             "failure_reason": failure_reason,
             "recovered_to_tp": False,
-            "spread_paid": pos["spread_paid"],
+            "spread_paid": spread_pts,
             "adr": pos["adr_val"],
             "regime": pos["regime"]
         }

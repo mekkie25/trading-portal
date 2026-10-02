@@ -73,7 +73,7 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int 
 def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, balance: float = 1000.0, risk_pct: float = 1.0) -> bool:
     mode_str = "adaptive" if adaptive_mode else "legacy"
     print(f"\n=======================================================", flush=True)
-    print(f"STARTING HIGH-SPEED BACKTEST: {symbol} ({mode_str.upper()})", flush=True)
+    print(f"STARTING HIGH-SPEED BACKTEST: {symbol} ({mode_str.upper()}) | Target R:R: {GLOBAL_PARAMS.target_rr} | BE: {GLOBAL_PARAMS.use_breakeven}", flush=True)
     print(f"=======================================================", flush=True)
 
     GLOBAL_PARAMS.adaptive_mode = adaptive_mode
@@ -161,7 +161,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
 
         if signal and adaptive_mode:
             if vol_metrics.get("valid", False):
-                adapted = volatility_engine.adapt_signal(signal, vol_metrics, ui_rr=2.0, session_levels=session_levels)
+                adapted = volatility_engine.adapt_signal(signal, vol_metrics, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
                 if adapted:
                     spread = 2.50 if symbol == "US30" else (0.30 if symbol == "GOLD" else 0.00010)
                     sl_dist = abs(adapted.entry_price - adapted.stop_loss)
@@ -249,7 +249,12 @@ async def main():
     parser.add_argument("--symbol", type=str, default="US30")
     parser.add_argument("--days", type=int, default=60)
     parser.add_argument("--adaptive", action="store_true", default=True)
+    parser.add_argument("--rr", type=float, default=1.0, help="Fixed target R:R multiplier (default: 1.0)")
+    parser.add_argument("--breakeven", type=str, default="off", choices=["on", "off"], help="Break-even on/off (default: off)")
     args = parser.parse_args()
+
+    GLOBAL_PARAMS.target_rr = args.rr
+    GLOBAL_PARAMS.use_breakeven = (args.breakeven.lower() == "on")
 
     client = CTraderClient()
     ok = await ensure_symbol_data(client, args.symbol, days_back=args.days)

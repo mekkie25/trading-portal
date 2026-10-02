@@ -190,7 +190,7 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
     <div id="tab-summary">
       <div class="grid-kpi">
         <div class="kpi-card">
-          <div class="kpi-label">Total Filled Legs</div>
+          <div class="kpi-label">Total Trades</div>
           <div class="kpi-value kpi-blue">{global_kpis['count']}</div>
           <div style="margin-top: 6px;">{"<span class='badge-inconclusive'>INCONCLUSIVE (<30 trades)</span>" if global_kpis['is_inconclusive'] else "<span class='badge-valid'>SAMPLE VALID</span>"}</div>
         </div>
@@ -295,9 +295,9 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
       <table>
         <thead>
           <tr>
+            <th>Trade ID</th>
             <th>Date</th>
             <th>Strategy</th>
-            <th>Leg</th>
             <th>Dir</th>
             <th>Lots</th>
             <th>Entry</th>
@@ -312,9 +312,9 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
         </thead>
         <tbody>
           {"".join([f'''<tr>
+            <td>{t.get('trade_id', t.get('ticket', ''))}</td>
             <td>{t['date']}</td>
             <td><strong>{t['strategy']}</strong></td>
-            <td>{t['leg']}</td>
             <td style="color:{'#10b981' if t['direction']=='BUY' else '#ef4444'}">{t['direction']}</td>
             <td>{t['lots']}</td>
             <td>{t['entry_price']}</td>
@@ -389,19 +389,19 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
           position: t.direction === 'BUY' ? 'belowBar' : 'aboveBar',
           color: t.direction === 'BUY' ? '#10b981' : '#ef4444',
           shape: t.direction === 'BUY' ? 'arrowUp' : 'arrowDown',
-          text: `${{t.direction}} Leg ${{t.leg}} (${{t.strategy}})`
+          text: `${{t.direction}} (${{t.strategy}})`
         }});
       }});
       markers.sort((a,b) => a.time - b.time);
       candleSeries.setMarkers(markers);
 
       // Render Day Trades Table
-      let tableHtml = `<h4 style="font-size: 13px; color: #fff; margin-bottom: 8px;">Trades for ${{day}} (${{data.trades.length}} legs)</h4>`;
-      tableHtml += `<table><thead><tr><th>Strategy</th><th>Leg</th><th>Dir</th><th>Lots</th><th>Entry</th><th>Exit</th><th>R</th><th>P&L</th><th>Reason</th></tr></thead><tbody>`;
+      let tableHtml = `<h4 style="font-size: 13px; color: #fff; margin-bottom: 8px;">Trades for ${{day}} (${{data.trades.length}} trades)</h4>`;
+      tableHtml += `<table><thead><tr><th>Trade ID</th><th>Strategy</th><th>Dir</th><th>Lots</th><th>Entry</th><th>Exit</th><th>R</th><th>P&L</th><th>Reason</th></tr></thead><tbody>`;
       data.trades.forEach(t => {{
         tableHtml += `<tr>
+          <td>${{t.trade_id || t.ticket || ''}}</td>
           <td><strong>${{t.strategy}}</strong></td>
-          <td>${{t.leg}}</td>
           <td style="color:${{t.direction === 'BUY' ? '#10b981' : '#ef4444'}}">${{t.direction}}</td>
           <td>${{t.lots}}</td>
           <td>${{t.entry_price}}</td>

@@ -46,6 +46,7 @@ from core.session_config import MarketSessionManager, GLOBAL_PARAMS, TZ_SAST
 from core.indicators import calculate_supertrend
 from core.fx import get_fx_rate_to_account, FX_CONVERSION_ALIASES
 from core.volatility_engine import volatility_engine
+from core.targets import compute_fixed_target
 
 try:
     import google.generativeai as genai
@@ -1362,6 +1363,12 @@ class CloudExecutionEngine:
         if isinstance(strategy_name, Enum):
             strategy_name = strategy_name.value
 
+        fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr)
+        if fixed_tp is None:
+            log.info(f"ORDER BLOCKED: no room for target on {symbol} with strategy {strategy_name}.")
+            return False
+        tp = fixed_tp
+
         quote, bid, ask = await self.ctrader.get_live_quote(symbol)
 
         def quote_lookup(pair: str) -> Optional[Tuple[float, float, float]]:
@@ -1425,105 +1432,60 @@ class CloudExecutionEngine:
             return True
 
         total_lots = bp['lots']
-        half_lots = round(max(total_lots / 2.0, 0.01), 2)
-        sl_distance = abs(bp['entry_price'] - bp['stop_loss'])
-        tp1_price = getattr(signal, 'take_profit_1', None) or round(bp['entry_price'] + sl_distance if bp['direction'] == 'BUY' else bp['entry_price'] - sl_distance, 5)
-        tp2_price = getattr(signal, 'take_profit_2', None) or bp['take_profit']
 
-        log.info(f"DISPATCHING TWIN 50/50 ORDERS | {bp['direction']} {bp['symbol']} | Lots: 2x {half_lots} | Strat: {strategy_name}")
+        log.info(f"DISPATCHING ORDER | {bp['direction']} {bp['symbol']} | Lots: {total_lots} | Strat: {strategy_name}")
 
-        res_a = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp1_price, strategy_name)
-        res_b = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], half_lots, bp['stop_loss'], tp2_price, strategy_name)
+        res = await self.ctrader.execute_market_order(bp['symbol'], bp['direction'], total_lots, bp['stop_loss'], bp['take_profit'], strategy_name)
 
-        if res_a or res_b:
+        if res:
             self.risk.trades_taken_today += 1
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            pid_a = str(res_a["position_id"]) if res_a else None
-            pid_b = str(res_b["position_id"]) if res_b else None
+            pid = str(res["position_id"])
             contract_size = ConfigManager.ASSETS[bp['symbol']].contract_size if bp['symbol'] in ConfigManager.ASSETS else 100000.0
 
-            if pid_a:
-                self.ctrader._save_position_strategy(pid_a, strategy_name)
-                self.risk.open_positions[pid_a] = {
-                    "symbol": bp['symbol'],
-                    "strategy": strategy_name,
-                    "direction": bp['direction'],
-                    "entry_price": bp['entry_price'],
-                    "stop_loss": bp['stop_loss'],
-                    "take_profit": tp1_price,
-                    "volume_cents": res_a["volume"],
-                    "lots": res_a["lots"],
-                    "contract_size": contract_size,
-                    "is_be_moved": False,
-                    "role": "CONTRACT_A_TP1",
-                    "twin_partner_id": pid_b,
-                    "trail_mode": trail_mode
-                }
-                save_trade_record({
-                    "id": f"pos-{pid_a}",
-                    "ticket": f"#{pid_a}",
-                    "asset": bp['symbol'],
-                    "strategy": strategy_name,
-                    "type": bp['direction'],
-                    "lots": res_a["lots"],
-                    "openPrice": bp['entry_price'],
-                    "closePrice": bp['entry_price'],
-                    "pnl": 0.0,
-                    "openTime": now_iso,
-                    "closeTime": "OPEN",
-                    "status": "OPEN",
-                    "source": "Fusion cTrader"
-                })
-
-            if pid_b:
-                self.ctrader._save_position_strategy(pid_b, strategy_name)
-                self.risk.open_positions[pid_b] = {
-                    "symbol": bp['symbol'],
-                    "strategy": strategy_name,
-                    "direction": bp['direction'],
-                    "entry_price": bp['entry_price'],
-                    "stop_loss": bp['stop_loss'],
-                    "take_profit": tp2_price,
-                    "volume_cents": res_b["volume"],
-                    "lots": res_b["lots"],
-                    "contract_size": contract_size,
-                    "is_be_moved": False,
-                    "role": "CONTRACT_B_RUNNER",
-                    "twin_partner_id": pid_a,
-                    "trail_mode": trail_mode
-                }
-                save_trade_record({
-                    "id": f"pos-{pid_b}",
-                    "ticket": f"#{pid_b}",
-                    "asset": bp['symbol'],
-                    "strategy": strategy_name,
-                    "type": bp['direction'],
-                    "lots": res_b["lots"],
-                    "openPrice": bp['entry_price'],
-                    "closePrice": bp['entry_price'],
-                    "pnl": 0.0,
-                    "openTime": now_iso,
-                    "closeTime": "OPEN",
-                    "status": "OPEN",
-                    "source": "Fusion cTrader"
-                })
+            self.ctrader._save_position_strategy(pid, strategy_name)
+            self.risk.open_positions[pid] = {
+                "symbol": bp['symbol'],
+                "strategy": strategy_name,
+                "direction": bp['direction'],
+                "entry_price": bp['entry_price'],
+                "stop_loss": bp['stop_loss'],
+                "take_profit": bp['take_profit'],
+                "volume_cents": res["volume"],
+                "lots": res["lots"],
+                "contract_size": contract_size,
+                "is_be_moved": False,
+                "trail_mode": trail_mode
+            }
+            save_trade_record({
+                "id": f"pos-{pid}",
+                "ticket": f"#{pid}",
+                "asset": bp['symbol'],
+                "strategy": strategy_name,
+                "type": bp['direction'],
+                "lots": res["lots"],
+                "openPrice": bp['entry_price'],
+                "closePrice": bp['entry_price'],
+                "pnl": 0.0,
+                "openTime": now_iso,
+                "closeTime": "OPEN",
+                "status": "OPEN",
+                "source": "Fusion cTrader"
+            })
 
             whatsapp_msg = (
                 f"🟢 *[FUSION CTRADER ORDER FILLED]*\n"
                 f"• Asset: {bp['symbol']}\n"
                 f"• Strategy: {strategy_name}\n"
                 f"• Direction: {bp['direction']}\n"
-                f"• Twin Lots: 2x {half_lots} ({total_lots} Total)\n"
+                f"• Lots: {total_lots}\n"
                 f"• Entry: {bp['entry_price']}\n"
                 f"• SL: {bp['stop_loss']}\n"
-                f"• TP1: {tp1_price} | TP2: {tp2_price}\n"
-                f"• Smart-Link Active: TP1 hit auto-moves Runner to BE."
+                f"• TP: {bp['take_profit']}"
             )
             await whatsapp.send_alert(whatsapp_msg)
             return True
-
-        return False
 
 # ==============================================================================
 # 10. MASTER ORCHESTRATOR WITH FROZEN OPENING RANGE ENGINE
@@ -1616,24 +1578,14 @@ class MatrixEngineMaster:
                                 await whatsapp.send_alert(alert)
                                 continue
 
-                    # TWIN-ORDER SMART LINK (Contract A hit TP1 -> Auto-move Contract B to BE via 2110)
-                    if role == "CONTRACT_A_TP1":
-                        tp_hit = (direction == "BUY" and bid >= tp) or (direction == "SELL" and ask <= tp)
-                        if tp_hit and twin_id and twin_id in self.risk_mgr.open_positions:
-                            twin_pos = self.risk_mgr.open_positions[twin_id]
-                            if not twin_pos.get("is_be_moved", False):
-                                log.info(f"TWIN-LINK: Contract A hit TP1 on {sym}! Auto-moving Contract B (#{twin_id}) to Break-Even.")
-                                success = await self.ctrader.update_position_sl(int(twin_id), new_sl=twin_pos["entry_price"])
-                                if success:
-                                    twin_pos["is_be_moved"] = True
-                                    alert = (
-                                        f"🎯 *[TWIN CONTRACT A BANKED + RUNNER TO BE]*\n"
-                                        f"• Asset: {sym}\n"
-                                        f"• Contract A hit TP1 ({tp})!\n"
-                                        f"• Contract B Stop Loss moved to Entry ({twin_pos['entry_price']}).\n"
-                                        f"• Remaining runner is now 100% Risk-Free!"
-                                    )
-                                    await whatsapp.send_alert(alert)
+                    # Dynamic Breakeven Trigger (Spec Q2: 80% to target AND at least 0.5x SL distance)
+                    if GLOBAL_PARAMS.use_breakeven and not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
+                        log.info(f"DYNAMIC BREAKEVEN HIT ON {sym} (Pos #{pid})! Moving SL to Break-Even.")
+                        success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
+                        if success:
+                            pos["is_be_moved"] = True
+                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} progressed >=80% of TP (and >=0.5x SL)!\n• SL moved to Entry ({entry}).\n• Trade is now Risk-Free."
+                            await whatsapp.send_alert(alert)
 
                     # Dynamic Breakeven Trigger (Spec Q2: 80% to target AND at least 0.5x SL distance)
                     if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):

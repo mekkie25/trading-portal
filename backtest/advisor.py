@@ -6,7 +6,7 @@ Analyzes simulated historical trades across:
 - Noise stop-outs (post-SL recovery within 2 hours without adverse blowout)
 - Time-of-day / session performance in SAST time
 - Day-of-week win-rate and profit factor variations
-- Asset/strategy edge viability over rolling 365 days
+- Asset/strategy edge viability over actual days in the dataset
 Outputs structured, plain-English advisory tips for the UI.
 """
 
@@ -32,6 +32,9 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
     df["hour_sast"] = pd.to_datetime(df["signal_time_sast"]).dt.hour
     df["weekday"] = pd.to_datetime(df["date"]).dt.day_name()
 
+    dates = pd.to_datetime(df["date"])
+    total_days = max(1, (dates.max() - dates.min()).days)
+
     # =========================================================================
     # 1. TARGET REALISM & NEAR-TP REVERSAL ANALYSIS (MFE)
     # =========================================================================
@@ -53,7 +56,7 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
                         f"Out of {len(losses)} losing trades, {near_tp_count} ({near_tp_pct:.0f}%) reached at least 75% of your target distance "
                         f"before turning around into a stop-out. On average, losing trades peaked at +{avg_loss_mfe:.2f}R in open profit."
                     ),
-                    "action": f"Consider lowering TP1 or TP2 by 15-20% for {strat}, or taking a 50% partial close at +1.2R to lock in gains early."
+                    "action": f"Consider lowering target R:R for {strat} or locking in gains earlier."
                 })
 
     # =========================================================================
@@ -77,7 +80,7 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
                         f"{recovered_count} trades hit their stop loss, dipped less than 0.5x stop distance further (average adverse excursion: {avg_mae_pips:.1f} pips), "
                         f"and then rallied straight into your original target within 24 candles."
                     ),
-                    "action": "Your stop loss is sitting directly inside broker/retail liquidity pockets. Consider adding a 0.03 x ADR buffer to your stop."
+                    "action": "Your entries are facing immediate liquidity sweep noise before reversing toward target. Review your entry trigger timing."
                 })
 
     # =========================================================================
@@ -144,7 +147,7 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
                 })
 
     # =========================================================================
-    # 5. OVERALL PAIR / STRATEGY VIABILITY (1-YEAR SAMPLING)
+    # 5. OVERALL PAIR / STRATEGY VIABILITY
     # =========================================================================
     for strat, s_df in df.groupby("strategy"):
         cnt = len(s_df)
@@ -162,9 +165,9 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
                     "strategy": strat,
                     "category": "PAIR_VIABILITY",
                     "severity": "HIGH",
-                    "title": f"Poor 1-Year Edge: {strat} on {symbol} (PF: {pf:.2f})",
+                    "title": f"Poor Edge: {strat} on {symbol} (PF: {pf:.2f})",
                     "description": (
-                        f"Over 365 days ({cnt} trades), {strat} on {symbol} produced a Profit Factor of only {pf:.2f} "
+                        f"Over {total_days} days ({cnt} trades), {strat} on {symbol} produced a Profit Factor of only {pf:.2f} "
                         f"and net losses of -${abs(net):.2f}."
                     ),
                     "action": f"Switch {strat} to 'OFF' for {symbol} in the Dashboard Strategy Control switch."
