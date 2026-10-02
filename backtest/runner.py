@@ -1,12 +1,11 @@
 """
 backtest/runner.py
-High-Performance Automated End-to-End Backtest Runner.
-- Incremental data store with STORE_TARGET_DAYS=365 and STORE_MAX_DAYS=400.
-- Offline fallback: uses existing stored data if broker is unavailable.
-- Intraday volatility refresh on every bar; throttles failed metrics retries to once per SAST hour.
-- SAST-aligned day grouping for charts and reports.
-- Comprehensive skipped signals breakdown (by reason, strategy, SAST hour).
-- Centralized paths via backtest.paths.
+High-Performance Automated End-to-End Backtest Matrix Runner.
+- Auto-runs all 8 parameter combinations per symbol:
+  (adaptive vs legacy) x (breakeven on vs off) x (supertrend on vs off).
+- Writes per-combination reports: {SYMBOL}_{mode}_be{on|off}_trail{on|off}_report.json
+- Writes consolidated comparison matrix: {SYMBOL}_summary.json
+- Tracks diagnostic funnel: signals evaluated, vol blocks, structural room blocks, fills.
 """
 
 import sys
@@ -17,7 +16,7 @@ import argparse
 import tempfile
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
@@ -38,6 +37,17 @@ from backtest.paths import DATA_DIR, OUTPUT_DIR
 
 STORE_TARGET_DAYS = 365
 STORE_MAX_DAYS = 400
+
+COMBINATIONS = [
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Adaptive · BE off · Trail off"},
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "on",  "use_trail": True,  "label": "Adaptive · BE off · Trail on"},
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "on",  "use_be": True,  "trail": "off", "use_trail": False, "label": "Adaptive · BE on · Trail off"},
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Adaptive · BE on · Trail on"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Legacy · BE off · Trail off"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "off", "use_be": False, "trail": "on",  "use_trail": True,  "label": "Legacy · BE off · Trail on"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "off", "use_trail": False, "label": "Legacy · BE on · Trail off"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Legacy · BE on · Trail on"},
+]
 
 def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
     dirname = os.path.dirname(target_path)
@@ -153,17 +163,20 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
 def run_backtest_for_symbol(
     symbol: str = "US30",
     adaptive_mode: bool = True,
+    use_be: bool = False,
+    use_trail: bool = False,
+    be_label: str = "off",
+    trail_label: str = "off",
     balance: float = 1000.0,
     risk_pct: float = 1.0,
     days_count: int = 60,
     eurusd_df: Optional[pd.DataFrame] = None
-) -> bool:
+) -> Optional[Dict[str, Any]]:
     mode_str = "adaptive" if adaptive_mode else "legacy"
-    print(f"\n=======================================================", flush=True)
-    print(f"STARTING BACKTEST: {symbol} ({mode_str.upper()}) | Window: {days_count} Days | R:R: {GLOBAL_PARAMS.target_rr} | BE: {GLOBAL_PARAMS.use_breakeven} | Trail: {GLOBAL_PARAMS.use_supertrend_trail}", flush=True)
-    print(f"=======================================================", flush=True)
 
     GLOBAL_PARAMS.adaptive_mode = adaptive_mode
+    GLOBAL_PARAMS.use_breakeven = use_be
+    GLOBAL_PARAMS.use_supertrend_trail = use_trail
 
     m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
     h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
@@ -172,7 +185,7 @@ def run_backtest_for_symbol(
 
     if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
         print(f"ERROR: Incomplete data files for {symbol} in {DATA_DIR}.", flush=True)
-        return False
+        return None
 
     m5_df = pd.read_csv(m5_path)
     h1_df = pd.read_csv(h1_path)
@@ -184,16 +197,13 @@ def run_backtest_for_symbol(
 
     if total_bars < 130:
         print(f"ERROR: Insufficient data bars for {symbol} ({total_bars} bars).", flush=True)
-        return False
+        return None
 
     last_bar_time = m5_df['time'].iloc[-1]
     window_cutoff = last_bar_time - timedelta(days=days_count)
 
     matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
-    if matching_indices:
-        sim_start_idx = max(120, matching_indices[0])
-    else:
-        sim_start_idx = max(120, total_bars - 1)
+    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
 
     window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
     window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -205,7 +215,6 @@ def run_backtest_for_symbol(
 
     frozen_orbs: Dict[Any, Any] = {}
     simulated_bars_count = total_bars - sim_start_idx
-    print(f"[*] Simulating {simulated_bars_count:,} M5 candles | Window: {window_start_str} to {window_end_str} (History: {history_days_before_window} days)...", flush=True)
 
     last_vol_date = None
     last_vol_retry_hour = None
@@ -214,9 +223,17 @@ def run_backtest_for_symbol(
     regime = "NORMAL"
 
     valid_vol_bars = 0
-    funnel = {"raw_signals": 0, "adapt_none": 0, "vol_filter_blocked": 0, "vol_invalid_passthrough": 0, "reached_open_trade": 0, "blocked_has_open": 0}
-    vol_block_reasons = {}
-    step_interval = max(1, simulated_bars_count // 10)
+
+    # Diagnostic Funnel Tracking
+    funnel = {
+        "raw_signals_fired": 0,
+        "adapted_signals_passed": 0,
+        "vol_filters_blocked": 0,
+        "sim_trades_attempted": 0,
+        "sim_trades_filled": 0
+    }
+    vol_block_reasons: Dict[str, int] = {}
+    strategy_errors: Dict[str, int] = {}
 
     for i in range(sim_start_idx, total_bars):
         m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
@@ -226,16 +243,10 @@ def run_backtest_for_symbol(
         sast_dt = curr_time.astimezone(TZ_SAST)
         sast_hour_key = (sast_dt.date(), sast_dt.hour)
 
-        rel_idx = i - sim_start_idx
-        if rel_idx % step_interval == 0:
-            pct = int((rel_idx / max(1, simulated_bars_count)) * 100)
-            print(f"[*] {symbol} Progress: {pct}% ({rel_idx:,}/{simulated_bars_count:,} candles)", flush=True)
-
         sim.process_candle(symbol, curr_bar, m5_slice)
 
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
 
-        # Full volatility computation when UTC date changes OR when retrying invalid metrics at most once per SAST hour
         need_full_recalc = (curr_date != last_vol_date)
         if not vol_metrics.get("valid", False) and sast_hour_key != last_vol_retry_hour:
             need_full_recalc = True
@@ -254,7 +265,6 @@ def run_backtest_for_symbol(
             last_vol_date = curr_date
             last_vol_retry_hour = sast_hour_key
 
-        # Refresh intraday range on every bar
         if vol_metrics.get("valid", False):
             active_vol = volatility_engine.refresh_intraday(
                 vol_metrics=vol_metrics,
@@ -286,37 +296,46 @@ def run_backtest_for_symbol(
             session_levels=session_levels,
             data_h1=h1_view
         )
-        if signal:
-            funnel["raw_signals"] += 1
 
-        if signal and adaptive_mode:
-            if active_vol.get("valid", False):
-                adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
-                if adapted:
-                    spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
-                    sl_dist = abs(adapted.entry_price - adapted.stop_loss)
-                    tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
-                    vol_ok, vol_reason = volatility_engine.evaluate_volatility_filters(
-                        active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
-                    )
-                    if not vol_ok:
-                        funnel["vol_filter_blocked"] += 1
-                        reason_key = str(vol_reason).split("(")[0].split(":")[0].strip()[:40]
-                        vol_block_reasons[reason_key] = vol_block_reasons.get(reason_key, 0) + 1
-                    signal = adapted if vol_ok else None
+        if signal:
+            funnel["raw_signals_fired"] += 1
+
+            if adaptive_mode:
+                if active_vol.get("valid", False):
+                    adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+                    if adapted:
+                        funnel["adapted_signals_passed"] += 1
+                        spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+                        sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                        tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                        vol_ok, vol_msg = volatility_engine.evaluate_volatility_filters(
+                            active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                        )
+                        if vol_ok:
+                            signal = adapted
+                        else:
+                            funnel["vol_filters_blocked"] += 1
+                            reason_clean = vol_msg.split(":")[0].strip() if ":" in vol_msg else vol_msg[:30]
+                            vol_block_reasons[reason_clean] = vol_block_reasons.get(reason_clean, 0) + 1
+                            signal = None
+                    else:
+                        funnel["vol_filters_blocked"] += 1
+                        vol_block_reasons["ADR Stop Clamping / Min RR"] = vol_block_reasons.get("ADR Stop Clamping / Min RR", 0) + 1
+                        signal = None
                 else:
-                    funnel["adapt_none"] += 1
+                    funnel["vol_filters_blocked"] += 1
+                    vol_block_reasons["Invalid Volatility Metrics"] = vol_block_reasons.get("Invalid Volatility Metrics", 0) + 1
                     signal = None
             else:
-                funnel["vol_invalid_passthrough"] += 1
+                funnel["adapted_signals_passed"] += 1
 
         if signal:
+            funnel["sim_trades_attempted"] += 1
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
-                funnel["reached_open_trade"] += 1
-                sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
-            else:
-                funnel["blocked_has_open"] += 1
+                opened = sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
+                if opened:
+                    funnel["sim_trades_filled"] += 1
 
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
@@ -325,7 +344,6 @@ def run_backtest_for_symbol(
     report_warnings = []
     if adaptive_mode and adaptive_pct < 90.0:
         warn_msg = f"WARNING: ADAPTIVE only active on {adaptive_pct:.1f}% of bars (needs 120 D1 bars of history before the window)"
-        print(warn_msg, flush=True)
         report_warnings.append(warn_msg)
 
     all_trades = sim.completed_trades
@@ -333,10 +351,7 @@ def run_backtest_for_symbol(
     global_kpis = calculate_kpis(all_trades)
 
     if not df_trades.empty:
-        if "date_sast" in df_trades.columns:
-            df_trades["display_date"] = df_trades["date_sast"].fillna(df_trades["date"])
-        else:
-            df_trades["display_date"] = df_trades["date"]
+        df_trades["display_date"] = df_trades["date_sast"].fillna(df_trades["date"]) if "date_sast" in df_trades.columns else df_trades["date"]
     else:
         df_trades["display_date"] = []
 
@@ -387,7 +402,9 @@ def run_backtest_for_symbol(
         f"use_breakeven: {GLOBAL_PARAMS.use_breakeven}, "
         f"use_supertrend_trail: {GLOBAL_PARAMS.use_supertrend_trail}, days: {days_count}, "
         f"adaptive_effective_pct: {adaptive_pct}%, "
-        f"funnel: {funnel}, vol_block_reasons: {vol_block_reasons}, strategy_errors: {sm.error_count}"
+        f"funnel: {json.dumps(funnel)}, "
+        f"vol_block_reasons: {json.dumps(vol_block_reasons)}, "
+        f"strategy_errors: {json.dumps(strategy_errors)}"
     )
 
     full_skip_summary = sim.skip_summary()
@@ -395,12 +412,17 @@ def run_backtest_for_symbol(
     report_payload = {
         "symbol": symbol,
         "mode": mode_str,
+        "be": be_label,
+        "trail": trail_label,
         "window_start": window_start_str,
         "window_end": window_end_str,
         "history_days_before_window": history_days_before_window,
         "adaptive_effective_pct": adaptive_pct,
         "run_settings": run_settings_text,
         "warnings": report_warnings,
+        "funnel": funnel,
+        "vol_block_reasons": vol_block_reasons,
+        "strategy_errors": strategy_errors,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "global_kpis": global_kpis,
         "strategy_kpis": strat_kpis,
@@ -413,36 +435,92 @@ def run_backtest_for_symbol(
         "improvement_tips": improvement_tips
     }
 
-    out_file = os.path.join(OUTPUT_DIR, f"{symbol}_{mode_str}_report.json")
+    report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
+    out_file = os.path.join(OUTPUT_DIR, report_filename)
     with open(out_file, "w") as f:
         json.dump(report_payload, f, indent=2)
 
-    print(f"[✓] {symbol} Backtest completed ({adaptive_pct}% adaptive coverage) -> {out_file}", flush=True)
-    return True
+    return {
+        "report_file": report_filename,
+        "payload": report_payload,
+        "kpis": global_kpis,
+        "funnel": funnel,
+        "adaptive_pct": adaptive_pct
+    }
+
+async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
+    orig_adaptive = GLOBAL_PARAMS.adaptive_mode
+    orig_be = GLOBAL_PARAMS.use_breakeven
+    orig_trail = GLOBAL_PARAMS.use_supertrend_trail
+
+    matrix_rows = []
+
+    try:
+        for idx, combo in enumerate(COMBINATIONS):
+            progress_line = f"[*] {symbol} {idx + 1}/8 {combo['mode']} BE-{combo['be']} trail-{combo['trail']}"
+            print(progress_line, flush=True)
+
+            res = run_backtest_for_symbol(
+                symbol=symbol,
+                adaptive_mode=combo["adaptive_mode"],
+                use_be=combo["use_be"],
+                use_trail=combo["use_trail"],
+                be_label=combo["be"],
+                trail_label=combo["trail"],
+                days_count=days_count,
+                eurusd_df=eurusd_df
+            )
+
+            if res:
+                k = res["kpis"]
+                matrix_rows.append({
+                    "label": combo["label"],
+                    "mode": combo["mode"],
+                    "be": combo["be"],
+                    "trail": combo["trail"],
+                    "report_file": res["report_file"],
+                    "total_trades": k["count"],
+                    "win_rate": k["win_rate"],
+                    "expectancy": k["expectancy"],
+                    "profit_factor": k["profit_factor"],
+                    "max_drawdown": k["max_dd_money"],
+                    "net_pnl": k["net_pnl"],
+                    "adaptive_effective_pct": res["adaptive_pct"],
+                    "funnel": res["funnel"]
+                })
+
+        summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
+        with open(summary_file, "w") as f:
+            json.dump({
+                "symbol": symbol,
+                "days": days_count,
+                "target_rr": GLOBAL_PARAMS.target_rr,
+                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "combinations": matrix_rows
+            }, f, indent=2)
+
+        print(f"[✓] {symbol} Matrix Complete: 8/8 combinations saved to {summary_file}", flush=True)
+        return len(matrix_rows) > 0
+
+    finally:
+        GLOBAL_PARAMS.adaptive_mode = orig_adaptive
+        GLOBAL_PARAMS.use_breakeven = orig_be
+        GLOBAL_PARAMS.use_supertrend_trail = orig_trail
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
     parser.add_argument("--days", type=int, default=60)
-    parser.add_argument("--mode", type=str, default=None, choices=["adaptive", "legacy"], help="Execution mode")
-    parser.add_argument("--adaptive", action="store_true", default=True, help="Legacy flag passed by server.ts")
-    parser.add_argument("--rr", type=float, default=1.0, help="Fixed target R:R multiplier (default: 1.0)")
-    parser.add_argument("--breakeven", type=str, default="off", choices=["on", "off"], help="Break-even on/off (default: off)")
-    parser.add_argument("--supertrend", type=str, default="on", choices=["on", "off"], help="SuperTrend trail on/off (default: on)")
+    parser.add_argument("--rr", type=float, default=1.0, help="Target R:R multiplier")
+    parser.add_argument("--mode", type=str, default=None)
+    parser.add_argument("--adaptive", action="store_true", default=True)
+    parser.add_argument("--breakeven", type=str, default="off")
+    parser.add_argument("--supertrend", type=str, default="on")
     args = parser.parse_args()
 
-    if args.mode is not None:
-        adaptive_selected = (args.mode.lower() == "adaptive")
-    else:
-        adaptive_selected = bool(args.adaptive)
-
-    GLOBAL_PARAMS.adaptive_mode = adaptive_selected
     GLOBAL_PARAMS.target_rr = args.rr
-    GLOBAL_PARAMS.use_breakeven = (args.breakeven.lower() == "on")
-    GLOBAL_PARAMS.use_supertrend_trail = (args.supertrend.lower() == "on")
 
     client = CTraderClient()
-
     ok = await ensure_symbol_data(client, args.symbol)
 
     eurusd_df: Optional[pd.DataFrame] = None
@@ -451,31 +529,16 @@ async def main():
         eurusd_m5_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
         if not eurusd_ok or not os.path.exists(eurusd_m5_path):
             print("ERROR: GERMAN30 needs EURUSD history", flush=True)
-            if client.ws:
-                try:
-                    await client.ws.close()
-                except Exception:
-                    pass
             sys.exit(1)
         try:
             eurusd_df = pd.read_csv(eurusd_m5_path)
         except Exception:
             print("ERROR: GERMAN30 needs EURUSD history", flush=True)
-            if client.ws:
-                try:
-                    await client.ws.close()
-                except Exception:
-                    pass
             sys.exit(1)
 
     success = False
     if ok:
-        success = run_backtest_for_symbol(
-            symbol=args.symbol,
-            adaptive_mode=adaptive_selected,
-            days_count=args.days,
-            eurusd_df=eurusd_df
-        )
+        success = await run_symbol_matrix(client, args.symbol, args.days, eurusd_df=eurusd_df)
 
     if client.ws:
         try:

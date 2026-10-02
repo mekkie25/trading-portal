@@ -302,7 +302,6 @@ async function startServer() {
     next();
   });
 
-  // 1. CANDLE FEED ENDPOINT
   app.get('/api/market/candles', (req, res) => {
     try {
       const symbol = String(req.query.symbol || 'US30').toUpperCase();
@@ -318,7 +317,6 @@ async function startServer() {
     }
   });
 
-  // 2. CLOSE POSITION ON DEMAND
   app.post('/api/positions/close/:id', (req, res) => {
     try {
       const positionId = req.params.id;
@@ -329,7 +327,7 @@ async function startServer() {
     }
   });
 
-  // 3. READ-ONLY BACKTEST REPORT APIS
+  // BACKTEST REPORT AND SUMMARY APIS
   app.get('/api/backtest/reports', (_req, res) => {
     try {
       if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) {
@@ -340,6 +338,20 @@ async function startServer() {
       res.status(200).json({ status: 'success', reports: files });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.get('/api/backtest/summary/:symbol', (req, res) => {
+    try {
+      const sym = req.params.symbol.toUpperCase();
+      const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
+      if (fs.existsSync(summaryFile)) {
+        const data = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
+        return res.status(200).json({ status: 'success', data });
+      }
+      return res.status(404).json({ status: 'error', message: 'Summary not found' });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
     }
   });
 
@@ -371,7 +383,6 @@ async function startServer() {
     });
   });
 
-  // EMERGENCY STOP / CANCEL BACKTEST ENDPOINT
   app.post('/api/backtest/stop', (_req, res) => {
     if (activeBacktestProcess) {
       try {
@@ -392,14 +403,11 @@ async function startServer() {
 
     const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
     const days = parseInt(req.body?.days || '60', 10);
-    const mode = String(req.body?.mode || 'adaptive').toLowerCase();
     const rr = parseFloat(req.body?.rr || 1.0);
-    const breakeven = String(req.body?.breakeven || 'off').toLowerCase();
-    const supertrend = String(req.body?.supertrend || 'on').toLowerCase();
 
     backtestResults = [];
     backtestRunning = true;
-    backtestProgress = `Starting simulation...`;
+    backtestProgress = `Starting 8-combination parameter matrix...`;
     backtestLastError = null;
     backtestExitCode = null;
 
@@ -413,18 +421,15 @@ async function startServer() {
       for (let i = 0; i < symbolsQueue.length; i++) {
         if (!backtestRunning) break;
         const sym = symbolsQueue[i];
-        backtestProgress = `[${i + 1}/${symbolsQueue.length}] Simulating ${sym} (${days} Days)...`;
-        console.log(`[Backtest Runner Queue]: Starting ${sym}...`);
+        backtestProgress = `[${i + 1}/${symbolsQueue.length}] Testing 8 combinations on ${sym} (${days} Days)...`;
+        console.log(`[Backtest Matrix Queue]: Starting ${sym}...`);
 
         let symbolLastError = '';
         const runnerArgs = [
           'backtest/runner.py',
           '--symbol', sym,
           '--days', String(days),
-          '--mode', mode,
-          '--rr', String(rr),
-          '--breakeven', breakeven,
-          '--supertrend', supertrend
+          '--rr', String(rr)
         ];
 
         await new Promise<void>((resolve) => {
@@ -462,7 +467,7 @@ async function startServer() {
           proc.on('exit', (code) => {
             activeBacktestProcess = null;
             if (code === 0) {
-              backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed' });
+              backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 8/8 matrix' });
             } else {
               backtestResults.push({ symbol: sym, status: 'FAILED', message: symbolLastError || `Exited with code ${code}` });
             }
@@ -482,7 +487,7 @@ async function startServer() {
       backtestRunning = false;
       const anyFailed = backtestResults.some(r => r.status === 'FAILED');
       backtestExitCode = anyFailed ? 1 : 0;
-      backtestProgress = `Batch run finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} passed.`;
+      backtestProgress = `Matrix batch finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} passed.`;
       console.log(`[Backtest Finished]: ${backtestProgress}`);
     }
 
@@ -492,10 +497,9 @@ async function startServer() {
       console.error('[Backtest Queue Error]:', err);
     });
 
-    res.status(200).json({ status: 'success', message: `Backtest initiated for ${requestedSymbol}` });
+    res.status(200).json({ status: 'success', message: `Backtest matrix initiated for ${requestedSymbol}` });
   });
 
-  // 4. TRADE JOURNAL APIS
   app.get('/api/journal', async (_req, res) => {
     try {
       const diskTrades = loadTradesFromDisk();
@@ -537,7 +541,6 @@ async function startServer() {
     res.json({ status: 'success', message: 'Journal reset.' });
   });
 
-  // 5. BOT CONFIG APIS
   app.get('/api/bot/config', (_req, res) => {
     res.json({ status: 'success', data: activeBotConfig });
   });
@@ -567,7 +570,6 @@ async function startServer() {
     }
   });
 
-  // 6. RISK LIMITS APIS
   app.get('/api/limits', (_req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
@@ -604,7 +606,6 @@ async function startServer() {
     }
   });
 
-  // 7. TELEMETRY APIS
   app.get('/api/broker/telemetry', (_req, res) => {
     recomputeRiskState();
     res.json({ status: 'success', data: activeBrokerTelemetry });
@@ -616,7 +617,6 @@ async function startServer() {
     res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
   });
 
-  // 8. LAUNCH PYTHON BOT ENGINE
   function launchPythonBot() {
     console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';

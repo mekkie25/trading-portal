@@ -24,7 +24,7 @@ import {
   Square,
   Copy,
   Check,
-  X
+  Table
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -32,6 +32,36 @@ import { formatCurrency } from '../../utils/currency';
 interface BacktestViewProps {
   themeMode?: ThemeMode;
   brokerCurrency?: string;
+}
+
+interface SummaryCombination {
+  label: string;
+  mode: string;
+  be: string;
+  trail: string;
+  report_file: string;
+  total_trades: number;
+  win_rate: number;
+  expectancy: number;
+  profit_factor: number;
+  max_drawdown: number;
+  net_pnl: number;
+  adaptive_effective_pct: number;
+  funnel?: {
+    raw_signals_fired: number;
+    adapted_signals_passed: number;
+    vol_filters_blocked: number;
+    sim_trades_attempted: number;
+    sim_trades_filled: number;
+  };
+}
+
+interface SymbolSummaryPayload {
+  symbol: string;
+  days: number;
+  target_rr: number;
+  generated_at: string;
+  combinations: SummaryCombination[];
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
@@ -57,117 +87,21 @@ function formatPriceBySymbol(price: any, symbol?: string): string {
   return num.toFixed(2);
 }
 
-function buildReportMarkdown(r: BacktestReportPayload): string {
-  const sections: string[] = [];
-
-  sections.push(
-    `# BACKTEST REPORT FOR AI REVIEW\n` +
-    `You are reviewing results from a rules-based trading bot backtest. Be honest and skeptical. ` +
-    `Treat any group with fewer than 30 trades as inconclusive. Spreads are estimated. ` +
-    `Do not recommend changes based on tiny samples. Rank suggestions by confidence, ` +
-    `say what extra data would confirm each one, and give changes as small testable steps.`
-  );
-
-  const settingsList: string[] = [];
-  if (r.symbol) settingsList.push(`- Symbol: ${r.symbol}`);
-  if (r.mode) settingsList.push(`- Mode: ${r.mode}`);
-  if ((r as any).generated_at) settingsList.push(`- Generated At: ${(r as any).generated_at}`);
-  if ((r as any).run_settings) settingsList.push(`- Run Settings: ${(r as any).run_settings}`);
-  if (settingsList.length > 0) {
-    sections.push(`## Settings\n${settingsList.join('\n')}`);
+function prettifyReportName(filename: string): string {
+  if (filename.includes('_summary.json')) {
+    const sym = filename.replace('_summary.json', '');
+    return `${sym} · 8-Combination Summary Matrix`;
   }
-
-  if (r.global_kpis) {
-    const g = r.global_kpis;
-    sections.push(
-      `## Overall Stats\n` +
-      `- Trades: ${g.count ?? 0}\n` +
-      `- Win Rate: ${formatNum(g.win_rate)}%\n` +
-      `- Expectancy: ${formatNum(g.expectancy)}R\n` +
-      `- Avg R: ${formatNum(g.avg_r)}R\n` +
-      `- Profit Factor: ${formatNum(g.profit_factor)}\n` +
-      `- Max Drawdown: $${formatNum(g.max_dd_money)}\n` +
-      `- Net Realized P&L: $${formatNum(g.net_pnl)}\n` +
-      `- Sample Status: ${g.is_inconclusive ? 'INCONCLUSIVE (<30 trades)' : 'VALID'}`
-    );
+  const clean = filename.replace('_report.json', '');
+  const parts = clean.split('_');
+  if (parts.length >= 4) {
+    const sym = parts[0];
+    const mode = parts[1].charAt(0).toUpperCase() + parts[1].slice(1);
+    const be = parts[2].replace('be', 'BE ');
+    const trail = parts[3].replace('trail', 'Trail ');
+    return `${sym} · ${mode} · ${be} · ${trail}`;
   }
-
-  if (r.strategy_kpis && Object.keys(r.strategy_kpis).length > 0) {
-    const rows = Object.entries(r.strategy_kpis).map(([strat, k]) => {
-      const inconcl = k.is_inconclusive ? 'Yes' : 'No';
-      return `| ${strat} | ${k.count ?? 0} | ${formatNum(k.win_rate)}% | ${formatNum(k.expectancy)}R | ${formatNum(k.profit_factor)} | $${formatNum(k.net_pnl)} | ${inconcl} |`;
-    });
-    sections.push(
-      `## Strategy Performance\n` +
-      `| Strategy | Trades | Win Rate | Expectancy | Profit Factor | Net P&L | Inconclusive |\n` +
-      `| --- | --- | --- | --- | --- | --- | --- |\n` +
-      rows.join('\n')
-    );
-  }
-
-  if (r.dow_kpis && Object.keys(r.dow_kpis).length > 0) {
-    const rows = Object.entries(r.dow_kpis).map(([dow, k]) => {
-      const inconcl = k.is_inconclusive ? 'Yes' : 'No';
-      return `| ${dow} | ${k.count ?? 0} | ${formatNum(k.win_rate)}% | ${formatNum(k.expectancy)}R | ${formatNum(k.profit_factor)} | $${formatNum(k.net_pnl)} | ${inconcl} |`;
-    });
-    sections.push(
-      `## Day of Week Performance\n` +
-      `| Day | Trades | Win Rate | Expectancy | Profit Factor | Net P&L | Inconclusive |\n` +
-      `| --- | --- | --- | --- | --- | --- | --- |\n` +
-      rows.join('\n')
-    );
-  }
-
-  if (r.improvement_tips && r.improvement_tips.length > 0) {
-    const tipBlocks = r.improvement_tips.map((t, idx) => {
-      return (
-        `### Tip ${idx + 1}: ${t.title || 'Recommendation'}\n` +
-        `- Severity: ${t.severity || 'N/A'}\n` +
-        `- Strategy: ${t.strategy || 'ALL'}\n` +
-        `- Description: ${t.description || ''}\n` +
-        `- Action: ${t.action || ''}`
-      );
-    });
-    sections.push(`## Improvement Tips\n${tipBlocks.join('\n\n')}`);
-  }
-
-  const skipped = (r as any).skipped_summary;
-  if (skipped && typeof skipped === 'object' && Object.keys(skipped).length > 0) {
-    const lines = Object.entries(skipped).map(([reason, count]) => `- ${reason}: ${count}`);
-    sections.push(`## Skipped Signals Summary\n${lines.join('\n')}`);
-  }
-
-  if (r.all_trades && Array.isArray(r.all_trades) && r.all_trades.length > 0) {
-    const totalCount = r.all_trades.length;
-    const recent = r.all_trades.slice(-150);
-    const omitted = totalCount - recent.length;
-
-    const csvHeader = 'trade_id,date,strategy,direction,signal_time_sast,entry_price,sl,tp,exit_reason,r_multiple,money_pnl,mfe_r,mae_r,result';
-    const csvRows = recent.map((t: any) => {
-      const tid = t.trade_id || t.ticket || '';
-      const date = t.date_sast || t.date || '';
-      const strat = t.strategy || '';
-      const dir = t.direction || '';
-      const sast = t.signal_time_sast || '';
-      const entry = formatNum(t.entry_price);
-      const sl = formatPriceBySymbol(t.sl, t.symbol);
-      const tp = formatPriceBySymbol(t.tp, t.symbol);
-      const reason = t.exit_reason || '';
-      const rMult = formatNum(t.r_multiple);
-      const pnl = formatNum(t.money_pnl);
-      const mfe = formatNum(t.mfe_r);
-      const mae = formatNum(t.mae_r);
-      const res = t.result || '';
-      return `${tid},${date},${strat},${dir},${sast},${entry},${sl},${tp},${reason},${rMult},${pnl},${mfe},${mae},${res}`;
-    });
-
-    const note = omitted > 0 ? `*(Showing 150 most recent trades. ${omitted} older trades omitted.)*\n\n` : '';
-    sections.push(`## Trades\n${note}\`\`\`csv\n${csvHeader}\n${csvRows.join('\n')}\n\`\`\``);
-  }
-
-  sections.push(`QUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
-
-  return sections.join('\n\n');
+  return filename;
 }
 
 export const BacktestView: React.FC<BacktestViewProps> = ({
@@ -177,18 +111,16 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
+  const [summaryData, setSummaryData] = useState<SymbolSummaryPayload | null>(null);
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
   // Runner Controls
   const [testSymbol, setTestSymbol] = useState<string>('US30');
   const [testDays, setTestDays] = useState<number>(60);
-  const [testMode, setTestMode] = useState<'adaptive' | 'legacy'>('adaptive');
   const [testRr, setTestRr] = useState<number>(1.0);
-  const [testBreakeven, setTestBreakeven] = useState<'off' | 'on'>('off');
-  const [testSupertrend, setTestSupertrend] = useState<'on' | 'off'>('on');
 
-  // Execution & Results State
+  // Execution & Status
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
   const [runResults, setRunResults] = useState<Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string }>>([]);
@@ -197,7 +129,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
   const [fallbackCopyText, setFallbackCopyText] = useState<string>('');
 
-  // Filters
+  // Table Filters
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
   const [tipFilter, setTipFilter] = useState<string>('ALL');
@@ -214,6 +146,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
 
+  // 1. Initial status poll
   useEffect(() => {
     const checkInitialStatus = async () => {
       try {
@@ -233,6 +166,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     checkInitialStatus();
   }, []);
 
+  // 2. Fetch list of reports
   const fetchReportList = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/reports');
@@ -252,6 +186,28 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchReportList();
   }, [fetchReportList]);
 
+  // 3. Load summary payload for current pair
+  const fetchSummaryData = useCallback(async (sym: string) => {
+    try {
+      const res = await fetch(`/api/backtest/summary/${sym}`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.data) {
+          setSummaryData(json.data);
+        }
+      } else {
+        setSummaryData(null);
+      }
+    } catch {
+      setSummaryData(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSummaryData(testSymbol);
+  }, [testSymbol, fetchSummaryData]);
+
+  // 4. Fetch selected individual report JSON
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
@@ -273,6 +229,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     loadReport();
   }, [selectedFile]);
 
+  // 5. Polling while running
   useEffect(() => {
     if (!isRunning) return;
 
@@ -290,6 +247,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           if (!json.isRunning) {
             setIsRunning(false);
             await fetchReportList();
+            await fetchSummaryData(testSymbol);
           }
         }
       } catch (err) {
@@ -298,13 +256,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [isRunning, fetchReportList]);
+  }, [isRunning, fetchReportList, fetchSummaryData, testSymbol]);
 
+  // 6. Trigger Run
   const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
     setRunResults([]);
-    setProgressText(`Preparing simulation for ${targetSym}...`);
+    setProgressText(`Preparing 8-combination matrix for ${targetSym}...`);
 
     try {
       const res = await fetch('/api/backtest/run', {
@@ -313,10 +272,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         body: JSON.stringify({ 
           symbol: targetSym, 
           days: testDays, 
-          mode: testMode,
-          rr: testRr,
-          breakeven: testBreakeven,
-          supertrend: testSupertrend
+          rr: testRr
         }),
       });
 
@@ -339,20 +295,67 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
+  // 7. Copy for AI Builder
   const handleCopyForAI = async () => {
-    if (!reportData) return;
-    const text = buildReportMarkdown(reportData);
+    const lines: string[] = [];
+
+    lines.push(`# BACKTEST REPORT FOR AI REVIEW`);
+    lines.push(`Pair: ${testSymbol} | Days: ${testDays} | Target R:R: ${testRr}`);
+    lines.push(`Generated: ${new Date().toUTCString()}`);
+    lines.push(``);
+    lines.push(`## All 8 Parameter Combinations Matrix`);
+
+    if (summaryData && summaryData.combinations && summaryData.combinations.length > 0) {
+      lines.push(`| Combination | Trades | Win Rate | Exp (R) | PF | Max DD | Net P&L | Adp Cov | Signals Fired | Vol Blocked | Filled |`);
+      lines.push(`| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`);
+      summaryData.combinations.forEach((c) => {
+        const f = c.funnel || { raw_signals_fired: 0, vol_filters_blocked: 0, sim_trades_filled: 0 };
+        lines.push(
+          `| ${c.label} | ${c.total_trades} | ${formatNum(c.win_rate)}% | ${formatNum(c.expectancy)}R | ${formatNum(c.profit_factor)} | $${formatNum(c.max_drawdown)} | $${formatNum(c.net_pnl)} | ${formatNum(c.adaptive_effective_pct)}% | ${f.raw_signals_fired} | ${f.vol_filters_blocked} | ${f.sim_trades_filled} |`
+        );
+      });
+    } else {
+      lines.push(`*(No summary combinations loaded yet)*`);
+    }
+
+    lines.push(``);
+    lines.push(`## Active Selected Report Details (${selectedFile || 'None'})`);
+
+    if (reportData) {
+      const g = reportData.global_kpis;
+      lines.push(`- Total Trades: ${g?.count ?? 0}`);
+      lines.push(`- Win Rate: ${formatNum(g?.win_rate)}%`);
+      lines.push(`- Net P&L: $${formatNum(g?.net_pnl)}`);
+      lines.push(`- Run Settings: ${(reportData as any).run_settings || 'N/A'}`);
+      
+      const reportWarnings = (reportData as any).warnings || [];
+      lines.push(`- Warnings: ${reportWarnings.length > 0 ? reportWarnings.join(' | ') : 'None'}`);
+
+      const skipped = (reportData as any).skipped_summary || {};
+      lines.push(`- Skipped Reasons: ${JSON.stringify(skipped)}`);
+
+      const funnelData = (reportData as any).funnel || {};
+      lines.push(`- Funnel Metrics: ${JSON.stringify(funnelData)}`);
+    } else {
+      lines.push(`*(No individual report selected)*`);
+    }
+
+    lines.push(``);
+    lines.push(`QUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
+
+    const fullText = lines.join('\n');
+
     try {
       if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(fullText);
         setCopyStatus('copied');
         setFallbackCopyText('');
         setTimeout(() => setCopyStatus('idle'), 2000);
       } else {
-        setFallbackCopyText(text);
+        setFallbackCopyText(fullText);
       }
     } catch {
-      setFallbackCopyText(text);
+      setFallbackCopyText(fullText);
     }
   };
 
@@ -371,6 +374,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
+  // 8. Candlestick Chart Rendering
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -497,10 +501,18 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   });
 
   const skippedDetail = (reportData as any)?.skipped_detail || {};
+  const funnel = (reportData as any)?.funnel;
+  const warnings = (reportData as any)?.warnings || [];
+
+  const bestComboIdx = summaryData?.combinations?.reduce((bestIdx, curr, currIdx, arr) => {
+    if (curr.total_trades < 30) return bestIdx;
+    if (bestIdx === -1) return currIdx;
+    return curr.profit_factor > arr[bestIdx].profit_factor ? currIdx : bestIdx;
+  }, -1) ?? -1;
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
-      {/* Header */}
+      {/* Top Header */}
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
@@ -510,7 +522,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
             Backtest & Replay Suite
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 font-medium font-mono">
-              Zero Look-Ahead
+              Zero Look-Ahead Matrix
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
@@ -544,17 +556,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <option value={365}>365 Days</option>
             </select>
 
-            <select
-              value={testMode}
-              onChange={(e) => setTestMode(e.target.value as any)}
-              disabled={isRunning}
-              className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
-              title="Execution Mode"
-            >
-              <option value="adaptive">Adaptive</option>
-              <option value="legacy">Legacy</option>
-            </select>
-
             <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
               <span className="text-[10px] font-bold text-slate-500">R:R</span>
               <input
@@ -568,28 +569,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none"
               />
             </div>
-
-            <select
-              value={testBreakeven}
-              onChange={(e) => setTestBreakeven(e.target.value as any)}
-              disabled={isRunning}
-              className="px-2 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
-              title="Break-even Move at 80% R:R"
-            >
-              <option value="off">BE: Off</option>
-              <option value="on">BE: On</option>
-            </select>
-
-            <select
-              value={testSupertrend}
-              onChange={(e) => setTestSupertrend(e.target.value as any)}
-              disabled={isRunning}
-              className="px-2 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
-              title="SuperTrend 5M Trailing Stop"
-            >
-              <option value="on">Trail: On</option>
-              <option value="off">Trail: Off</option>
-            </select>
 
             {!isRunning ? (
               <>
@@ -606,7 +585,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   type="button"
                   onClick={() => handleRunBacktest('ALL')}
                   className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white"
-                  title="Sequentially runs backtest across all whitelist pairs"
+                  title="Runs 8-combination matrix across all whitelist pairs"
                 >
                   <Layers className="w-3.5 h-3.5" />
                   <span>Run All</span>
@@ -626,70 +605,45 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
           <div className="h-6 w-px bg-slate-300 dark:border-[#1a2030] hidden sm:block" />
 
-          {/* Report Viewer Dropdown & Copy for AI */}
+          {/* Report Viewer & Copy for AI */}
           <div className="flex items-center gap-2">
             <span className="text-xs font-bold text-slate-500">Report:</span>
             <select
               value={selectedFile}
               onChange={(e) => setSelectedFile(e.target.value)}
               disabled={isRunning}
-              className="px-3 py-2 rounded-xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
+              className="px-3 py-2 rounded-xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer max-w-xs truncate"
             >
               {reportFiles.length === 0 ? (
                 <option value="">No reports found</option>
               ) : (
                 reportFiles.map((f) => (
-                  <option key={f} value={f}>{f}</option>
+                  <option key={f} value={f}>{prettifyReportName(f)}</option>
                 ))
               )}
             </select>
 
-            {reportData && (
-              <button
-                type="button"
-                onClick={handleCopyForAI}
-                className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
-                title="Copy markdown report for AI review"
-              >
-                {copyStatus === 'copied' ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-500" />
-                    <span className="text-emerald-500 font-bold">Copied!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5 text-blue-500" />
-                    <span>Copy for AI</span>
-                  </>
-                )}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={handleCopyForAI}
+              className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors shrink-0"
+              title="Copy markdown summary of all combinations and funnel for AI review"
+            >
+              {copyStatus === 'copied' ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-500" />
+                  <span className="text-emerald-500 font-bold">Copied!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5 text-blue-500" />
+                  <span>Copy for AI</span>
+                </>
+              )}
+            </button>
           </div>
         </div>
       </motion.div>
-
-      {/* Adaptive Coverage & Warnings Bar */}
-      {reportData && (
-        <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs">
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-slate-500">Adaptive Coverage:</span>
-            <span className="font-mono font-bold text-blue-600 dark:text-blue-400">
-              {(reportData as any).adaptive_effective_pct !== undefined ? `${(reportData as any).adaptive_effective_pct}%` : '100%'}
-            </span>
-            {(reportData as any).run_settings && (
-              <span className="text-[11px] text-slate-500 font-mono hidden md:inline">
-                ({(reportData as any).run_settings})
-              </span>
-            )}
-          </div>
-          {(reportData as any).warnings && (reportData as any).warnings.length > 0 && (
-            <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 font-semibold text-[11px]">
-              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-              <span>{(reportData as any).warnings.join(' | ')}</span>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Per-Symbol Results Box */}
       {runResults.length > 0 && (
@@ -722,7 +676,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       {fallbackCopyText && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-amber-500/40 shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between text-xs font-bold text-amber-600 dark:text-amber-400">
-            <span>Clipboard write was blocked. Select all and copy the text below:</span>
+            <span>Clipboard write blocked. Select all and copy below:</span>
             <button
               type="button"
               onClick={() => setFallbackCopyText('')}
@@ -761,14 +715,129 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
+      {/* RESULTS BY COMBINATION MATRIX TABLE */}
+      {summaryData && summaryData.combinations && summaryData.combinations.length > 0 && (
+        <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Table className="w-4 h-4 text-blue-500" />
+              <h3 className="text-sm font-bold text-black dark:text-white">
+                Results by Combination ({summaryData.symbol} · {summaryData.days} Days · R:R {summaryData.target_rr})
+              </h3>
+            </div>
+            <span className="text-[11px] text-slate-500 font-mono">
+              Click any row to view its detailed report
+            </span>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead>
+                <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                  <th className="py-2.5 px-3">Combination</th>
+                  <th className="py-2.5 px-3 text-center">Trades</th>
+                  <th className="py-2.5 px-3 text-center">Win Rate</th>
+                  <th className="py-2.5 px-3 text-center">Exp (R)</th>
+                  <th className="py-2.5 px-3 text-center">PF</th>
+                  <th className="py-2.5 px-3 text-right">Max DD</th>
+                  <th className="py-2.5 px-3 text-right">Net P&L</th>
+                  <th className="py-2.5 px-3 text-center">Adp Cov</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                {summaryData.combinations.map((c, idx) => {
+                  const isBest = idx === bestComboIdx;
+                  const isSelected = selectedFile === c.report_file;
+
+                  return (
+                    <tr
+                      key={idx}
+                      onClick={() => setSelectedFile(c.report_file)}
+                      className={`cursor-pointer transition-colors ${
+                        isSelected 
+                          ? 'bg-blue-500/15 dark:bg-blue-500/20' 
+                          : isBest 
+                          ? 'bg-amber-500/10 dark:bg-amber-500/15 hover:bg-amber-500/20' 
+                          : 'hover:bg-slate-50 dark:hover:bg-[#121520]'
+                      }`}
+                    >
+                      <td className="py-3 px-3 font-bold text-black dark:text-white flex items-center gap-2">
+                        {isBest && <span className="text-amber-500" title="Best PF with ≥ 30 trades">★</span>}
+                        <span>{c.label}</span>
+                      </td>
+                      <td className="py-3 px-3 text-center font-bold">{c.total_trades}</td>
+                      <td className={`py-3 px-3 text-center font-bold ${c.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        {c.win_rate}%
+                      </td>
+                      <td className="py-3 px-3 text-center">{c.expectancy}R</td>
+                      <td className="py-3 px-3 text-center">{c.profit_factor}</td>
+                      <td className="py-3 px-3 text-right text-rose-500">-${c.max_drawdown}</td>
+                      <td className={`py-3 px-3 text-right font-bold ${c.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        ${c.net_pnl}
+                      </td>
+                      <td className="py-3 px-3 text-center text-blue-500">{c.adaptive_effective_pct}%</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* DIAGNOSTIC FUNNEL & WARNINGS STRIP */}
+      {reportData && (
+        <div className="p-4 rounded-2xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] space-y-2 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-slate-500">Active Report:</span>
+              <span className="font-mono font-bold text-black dark:text-white">{prettifyReportName(selectedFile)}</span>
+              <span className="font-mono text-blue-600 dark:text-blue-400">
+                (Adaptive Coverage: {(reportData as any).adaptive_effective_pct ?? 100}%)
+              </span>
+            </div>
+            {warnings.length > 0 && (
+              <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 font-semibold text-[11px]">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>{warnings.join(' | ')}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Signal Generation Funnel */}
+          {funnel && (
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-2 border-t border-slate-200 dark:border-[#1a2030] text-center font-mono">
+              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="text-[10px] text-slate-400 uppercase">Signals Fired</div>
+                <div className="text-sm font-bold text-black dark:text-white mt-0.5">{funnel.raw_signals_fired}</div>
+              </div>
+              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="text-[10px] text-slate-400 uppercase">Passed Clamping</div>
+                <div className="text-sm font-bold text-blue-500 mt-0.5">{funnel.adapted_signals_passed}</div>
+              </div>
+              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="text-[10px] text-slate-400 uppercase">Vol / Room Blocked</div>
+                <div className="text-sm font-bold text-rose-500 mt-0.5">{funnel.vol_filters_blocked}</div>
+              </div>
+              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="text-[10px] text-slate-400 uppercase">Attempted Fills</div>
+                <div className="text-sm font-bold text-amber-500 mt-0.5">{funnel.sim_trades_attempted}</div>
+              </div>
+              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                <div className="text-[10px] text-slate-400 uppercase">Filled Trades</div>
+                <div className="text-sm font-bold text-emerald-500 mt-0.5">{funnel.sim_trades_filled}</div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Navigation Sub-Tabs */}
       <div className="flex flex-wrap gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
         <button
           onClick={() => setActiveSubTab('summary')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
-            activeSubTab === 'summary'
-              ? 'bg-blue-600 text-white shadow-xs'
-              : 'text-slate-500 hover:text-black dark:hover:text-white'
+            activeSubTab === 'summary' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
           }`}
         >
           <TrendingUp className="w-3.5 h-3.5" />
@@ -778,9 +847,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         <button
           onClick={() => setActiveSubTab('tips')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 relative ${
-            activeSubTab === 'tips'
-              ? 'bg-blue-600 text-white shadow-xs'
-              : 'text-slate-500 hover:text-black dark:hover:text-white'
+            activeSubTab === 'tips' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
           }`}
         >
           <Lightbulb className="w-3.5 h-3.5 text-amber-400" />
@@ -795,9 +862,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         <button
           onClick={() => setActiveSubTab('chart')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
-            activeSubTab === 'chart'
-              ? 'bg-blue-600 text-white shadow-xs'
-              : 'text-slate-500 hover:text-black dark:hover:text-white'
+            activeSubTab === 'chart' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
           }`}
         >
           <Calendar className="w-3.5 h-3.5" />
@@ -807,9 +872,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         <button
           onClick={() => setActiveSubTab('ledger')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
-            activeSubTab === 'ledger'
-              ? 'bg-blue-600 text-white shadow-xs'
-              : 'text-slate-500 hover:text-black dark:hover:text-white'
+            activeSubTab === 'ledger' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
           }`}
         >
           <FileText className="w-3.5 h-3.5" />
@@ -970,12 +1033,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
-          {/* Skipped Signals Summary */}
+          {/* Skipped Detail */}
           {skippedDetail && (skippedDetail.by_reason || Object.keys(skippedDetail).length > 0) && (
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-4">
               <h3 className="text-sm font-bold text-black dark:text-white">Skipped Signals Summary</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
-                {/* By Reason */}
                 <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
                   <div className="text-[10px] font-bold text-slate-500 uppercase">By Skip Reason</div>
                   <div className="space-y-1">
@@ -988,7 +1050,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   </div>
                 </div>
 
-                {/* By Strategy */}
                 <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
                   <div className="text-[10px] font-bold text-slate-500 uppercase">By Strategy</div>
                   <div className="space-y-1">
@@ -1001,7 +1062,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   </div>
                 </div>
 
-                {/* By SAST Hour */}
                 <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
                   <div className="text-[10px] font-bold text-slate-500 uppercase">By Hour (SAST)</div>
                   <div className="space-y-1 max-h-36 overflow-y-auto">
@@ -1061,7 +1121,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 No tip rules triggered (sample too small or no pattern above thresholds)
               </div>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
-                No active recommendations pending. Run simulation across more session opportunities to detect high-probability tweaks.
+                No active recommendations pending.
               </p>
             </div>
           ) : (
