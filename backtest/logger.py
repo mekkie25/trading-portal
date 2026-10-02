@@ -7,8 +7,7 @@ import os
 import json
 import pandas as pd
 from typing import List, Dict, Any
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+from backtest.paths import DATA_DIR
 
 class AuditLogger:
     def __init__(self, run_label: str = "simulation"):

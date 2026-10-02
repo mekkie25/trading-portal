@@ -40,6 +40,63 @@ class VolatilityEngine:
         """Exposes dynamic rejection telemetry for logging and UI telemetry."""
         return dict(self.rejection_stats)
 
+    def refresh_intraday(
+        self,
+        vol_metrics: Dict[str, Any],
+        m5_df: pd.DataFrame,
+        current_quote: float,
+        d1_view: pd.DataFrame,
+        as_of: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """
+        Refreshes today_high, today_low, range_consumed, drc_pct, and d1_open on every bar
+        without re-running long-range ADR/AWR/AMR. Never uses bars past as_of.
+        """
+        if not vol_metrics or not vol_metrics.get("valid", False):
+            return vol_metrics
+
+        now_utc = as_of if as_of is not None else datetime.now(timezone.utc)
+
+        df_d1 = d1_view.copy()
+        if not isinstance(df_d1.index, pd.DatetimeIndex):
+            df_d1['parsed_time'] = pd.to_datetime(df_d1['time'], utc=True)
+            df_d1 = df_d1.set_index('parsed_time').sort_index()
+
+        active_day_candles = df_d1[df_d1.index + pd.Timedelta(hours=24) > now_utc]
+        if not active_day_candles.empty:
+            current_d1_open_time = active_day_candles.index[-1]
+            active_d1_open = float(active_day_candles['open'].iloc[-1])
+        else:
+            current_d1_open_time = now_utc - timedelta(hours=24)
+            active_d1_open = current_quote
+
+        if not m5_df.empty:
+            m5_times = pd.to_datetime(m5_df['time'], utc=True)
+            today_m5 = m5_df[(m5_times >= current_d1_open_time) & (m5_times <= now_utc)]
+        else:
+            today_m5 = pd.DataFrame()
+
+        if not today_m5.empty:
+            today_high = float(today_m5['high'].max())
+            today_low = float(today_m5['low'].min())
+        else:
+            today_high = current_quote
+            today_low = current_quote
+
+        today_high = max(today_high, current_quote)
+        today_low = min(today_low, current_quote)
+        range_consumed = max(0.0, today_high - today_low)
+        current_adr = vol_metrics.get("adr", 0.0)
+        drc_pct = (range_consumed / (current_adr + 1e-9)) * 100.0
+
+        updated = dict(vol_metrics)
+        updated["today_high"] = today_high
+        updated["today_low"] = today_low
+        updated["range_consumed"] = range_consumed
+        updated["drc_pct"] = drc_pct
+        updated["d1_open"] = active_d1_open
+        return updated
+
     def compute_symbol_volatility(
         self,
         d1_df: pd.DataFrame,
@@ -132,7 +189,7 @@ class VolatilityEngine:
 
         if not m5_df.empty:
             m5_times = pd.to_datetime(m5_df['time'], utc=True)
-            today_m5 = m5_df[m5_times >= current_d1_open_time]
+            today_m5 = m5_df[(m5_times >= current_d1_open_time) & (m5_times <= now_utc)]
         else:
             today_m5 = pd.DataFrame()
 
@@ -206,9 +263,7 @@ class VolatilityEngine:
                     f"Remaining room ({remaining_adr_room:.2f}) [{vol_metrics['drc_pct']:.1f}% consumed]"
                 )
         else:
-            # Reversal branch: Room back inside range
             room_back = (current_price - today_low) if direction.upper() == "SELL" else (today_high - current_price)
-            # [PROPOSED]: 0.25 * ADR buffer for sweep-reversal pullback allowance
             if target_distance > (room_back + (0.25 * adr)):
                 self.rejection_stats["room"] += 1
                 return False, (
@@ -229,7 +284,6 @@ class VolatilityEngine:
         if not vol_metrics.get("valid", False):
             return None
 
-        # 1. Weekly Open derivation with logged fallback
         weekly_open = session_levels.get("weekly_open")
         if weekly_open is None or weekly_open == 0.0:
             fallback_open = vol_metrics.get("d1_open", signal.entry_price)
@@ -242,13 +296,11 @@ class VolatilityEngine:
         entry = signal.entry_price
         direction = signal.direction.upper()
 
-        # Read directly from GLOBAL_PARAMS
         raw_k_min, _, raw_k_max = GLOBAL_PARAMS.adr_sl_ratios.get(signal.symbol, (0.10, 0.20, 0.25))
         k_min = raw_k_min * k_scale
         k_max = raw_k_max * k_scale
         structural_sl_dist = abs(entry - signal.stop_loss)
 
-        # 2. Reject if structural SL > k_max * ADR; widen if < k_min * ADR
         if structural_sl_dist > (k_max * adr):
             self.rejection_stats["sl_too_wide"] += 1
             return None
@@ -256,7 +308,6 @@ class VolatilityEngine:
         effective_sl_dist = max(structural_sl_dist, k_min * adr)
         adapted_sl = (entry - effective_sl_dist) if direction == "BUY" else (entry + effective_sl_dist)
 
-        # 3. Target Sizing & Structural Capping
         ideal_rr_dist = effective_sl_dist * ui_rr
         ideal_rr_target = (entry + ideal_rr_dist) if direction == "BUY" else (entry - ideal_rr_dist)
         strat_tp1 = signal.take_profit_1
@@ -277,7 +328,6 @@ class VolatilityEngine:
 
         tp1 = strat_tp1 if (strat_tp1 and strat_tp1 != 0) else entry + (0.50 * (tp2 - entry))
 
-        # 4. Strict Monotonicity Check
         if direction == "BUY":
             if not (entry < tp1 < tp2):
                 tp1 = entry + (0.50 * (tp2 - entry))
@@ -291,7 +341,6 @@ class VolatilityEngine:
                     self.rejection_stats["monotonicity"] += 1
                     return None
 
-        # 5. TP3 Runner (R2/S2 capped by 85% AWR)
         pivot_r2_s2 = session_levels.get("pivot_r2" if direction == "BUY" else "pivot_s2")
         awr = vol_metrics["awr"]
         weekly_cap = (weekly_open + (0.85 * awr)) if direction == "BUY" else (weekly_open - (0.85 * awr))
@@ -299,7 +348,6 @@ class VolatilityEngine:
         if pivot_r2_s2 and pivot_r2_s2 != 0:
             candidate_tp3 = min(pivot_r2_s2, weekly_cap) if direction == "BUY" else max(pivot_r2_s2, weekly_cap)
         else:
-            # [PROPOSED]: Extended R:R fallback when Pivot R2/S2 is missing
             candidate_tp3 = (entry + (effective_sl_dist * (ui_rr + 1.0))) if direction == "BUY" else (entry - (effective_sl_dist * (ui_rr + 1.0)))
 
         if (direction == "BUY" and candidate_tp3 <= tp2) or (direction == "SELL" and candidate_tp3 >= tp2):
@@ -307,7 +355,6 @@ class VolatilityEngine:
         else:
             final_tp3 = round(candidate_tp3, 5)
 
-        # 6. Apply updates without altering original strategy trail_mode
         signal.stop_loss = round(adapted_sl, 5)
         signal.take_profit = round(tp2, 5)
         signal.take_profit_1 = round(tp1, 5)
@@ -317,5 +364,4 @@ class VolatilityEngine:
         return signal
 
 
-# Module-level singleton instance for engine import
 volatility_engine = VolatilityEngine()

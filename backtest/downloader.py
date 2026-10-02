@@ -18,12 +18,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from engine.matrix import ConfigManager, CTraderClient, CTraderTrendbarPeriod
+from backtest.paths import DATA_DIR
 
 # Target whitelist assets
 WHITELIST_SYMBOLS = ["GOLD", "US30", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"]
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
 
 async def fetch_chunked_bars(
     client: CTraderClient,
@@ -146,7 +144,6 @@ async def run_downloader(days_back: int = 365):
         print("[!] Connection failed. Check CTRADER credentials in your .env file.", flush=True)
         return
 
-    # Dynamic rolling 365-day window from current time
     now_utc = datetime.now(timezone.utc)
     test_start = now_utc - timedelta(days=days_back)
 

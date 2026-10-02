@@ -30,9 +30,12 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
 
     df = pd.DataFrame(trades)
     df["hour_sast"] = pd.to_datetime(df["signal_time_sast"]).dt.hour
-    df["weekday"] = pd.to_datetime(df["date"]).dt.day_name()
 
-    dates = pd.to_datetime(df["date"])
+    effective_date = df["date_sast"] if "date_sast" in df.columns else df["date"]
+    effective_date = effective_date.fillna(df["date"])
+    df["weekday"] = pd.to_datetime(effective_date).dt.day_name()
+
+    dates = pd.to_datetime(effective_date)
     total_days = max(1, (dates.max() - dates.min()).days)
 
     # =========================================================================
@@ -95,7 +98,6 @@ def generate_improvement_tips(trades: List[Dict[str, Any]], symbol: str, mode: s
             net = float(h_df["money_pnl"].sum())
             hourly_stats.append((h, cnt, wr, net))
 
-    # Flag poor performing hours
     for h, cnt, wr, net in hourly_stats:
         if wr <= 35.0 and net < 0:
             tips.append({

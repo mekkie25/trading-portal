@@ -4,6 +4,7 @@ Generates a standalone, double-clickable interactive HTML backtest report:
 - Summary KPI Matrix (Win Rate, Expectancy in R, Profit Factor, Drawdown, Inconclusive Badges)
 - Interactive M5 Candlestick Chart per day with labeled price levels and trade markers
 - Calendar Ledger table with filters
+- SAST-aligned candle and trade day grouping
 """
 
 import sys
@@ -14,7 +15,12 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from core.session_config import TZ_SAST
+from backtest.paths import DATA_DIR
 
 def calculate_kpis(trades: list) -> dict:
     if not trades:
@@ -40,7 +46,6 @@ def calculate_kpis(trades: list) -> dict:
     gross_loss = float(abs(losses["money_pnl"].sum())) if len(losses) > 0 else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 99.0
 
-    # Max Drawdown
     df["cum_pnl"] = df["money_pnl"].cumsum()
     df["peak"] = df["cum_pnl"].cummax()
     df["dd"] = df["peak"] - df["cum_pnl"]
@@ -83,27 +88,29 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
     df_trades = pd.DataFrame(trades)
     global_kpis = calculate_kpis(trades)
 
-    # Strategy breakdown
+    if "date_sast" in df_trades.columns:
+        df_trades["display_date"] = df_trades["date_sast"].fillna(df_trades["date"])
+    else:
+        df_trades["display_date"] = df_trades["date"]
+
     strat_kpis = {}
     for strat, group in df_trades.groupby("strategy"):
         strat_kpis[strat] = calculate_kpis(group.to_dict("records"))
 
-    # Day of week breakdown
-    df_trades["weekday"] = pd.to_datetime(df_trades["date"]).dt.day_name()
+    df_trades["weekday"] = pd.to_datetime(df_trades["display_date"]).dt.day_name()
     dow_kpis = {}
     for dow, group in df_trades.groupby("weekday"):
         dow_kpis[dow] = calculate_kpis(group.to_dict("records"))
 
-    # Load M5 candles grouped by date for the Day Chart Inspector
     m5_df = pd.read_csv(m5_file)
     m5_df["dt"] = pd.to_datetime(m5_df["time"], utc=True)
-    m5_df["date_str"] = m5_df["dt"].dt.strftime("%Y-%m-%d")
+    m5_df["date_sast_str"] = m5_df["dt"].dt.tz_convert(TZ_SAST).dt.strftime("%Y-%m-%d")
 
-    trading_dates = sorted(df_trades["date"].unique().tolist())
+    trading_dates = sorted(df_trades["display_date"].unique().tolist())
     day_charts_data = {}
 
     for d_str in trading_dates:
-        sub_m5 = m5_df[m5_df["date_str"] == d_str]
+        sub_m5 = m5_df[m5_df["date_sast_str"] == d_str]
         candles_list = []
         for _, r in sub_m5.iterrows():
             candles_list.append({
@@ -114,9 +121,7 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
                 "close": float(r["close"])
             })
 
-        # Day trades
-        day_t = df_trades[df_trades["date"] == d_str].to_dict("records")
-        # Extract levels from first trade of day if available
+        day_t = df_trades[df_trades["display_date"] == d_str].to_dict("records")
         first_t = day_t[0] if day_t else {}
         ref_levels = first_t.get("ref_levels", {})
 
@@ -296,7 +301,7 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
         <thead>
           <tr>
             <th>Trade ID</th>
-            <th>Date</th>
+            <th>Date (SAST)</th>
             <th>Strategy</th>
             <th>Dir</th>
             <th>Lots</th>
@@ -313,7 +318,7 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
         <tbody>
           {"".join([f'''<tr>
             <td>{t.get('trade_id', t.get('ticket', ''))}</td>
-            <td>{t['date']}</td>
+            <td>{t.get('date_sast', t.get('date', ''))}</td>
             <td><strong>{t['strategy']}</strong></td>
             <td style="color:{'#10b981' if t['direction']=='BUY' else '#ef4444'}">{t['direction']}</td>
             <td>{t['lots']}</td>
@@ -372,7 +377,6 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
       }});
       candleSeries.setData(data.candles);
 
-      // Plot session levels
       const lvls = data.levels;
       if (lvls.asia_high) candleSeries.createPriceLine({{ price: lvls.asia_high, color: '#3b82f6', lineWidth: 1, lineStyle: 2, title: 'ASIA HIGH' }});
       if (lvls.asia_low) candleSeries.createPriceLine({{ price: lvls.asia_low, color: '#3b82f6', lineWidth: 1, lineStyle: 2, title: 'ASIA LOW' }});
@@ -380,7 +384,6 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
       if (lvls.pdh) candleSeries.createPriceLine({{ price: lvls.pdh, color: '#a855f7', lineWidth: 1, lineStyle: 2, title: 'PDH' }});
       if (lvls.pdl) candleSeries.createPriceLine({{ price: lvls.pdl, color: '#a855f7', lineWidth: 1, lineStyle: 2, title: 'PDL' }});
 
-      // Trade Markers
       const markers = [];
       data.trades.forEach(t => {{
         const openEpoch = Math.floor(new Date(t.signal_time_utc).getTime() / 1000);
@@ -395,7 +398,6 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
       markers.sort((a,b) => a.time - b.time);
       candleSeries.setMarkers(markers);
 
-      // Render Day Trades Table
       let tableHtml = `<h4 style="font-size: 13px; color: #fff; margin-bottom: 8px;">Trades for ${{day}} (${{data.trades.length}} trades)</h4>`;
       tableHtml += `<table><thead><tr><th>Trade ID</th><th>Strategy</th><th>Dir</th><th>Lots</th><th>Entry</th><th>Exit</th><th>R</th><th>P&L</th><th>Reason</th></tr></thead><tbody>`;
       data.trades.forEach(t => {{

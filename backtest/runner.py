@@ -2,10 +2,11 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Runner.
 - Incremental data store with STORE_TARGET_DAYS=365 and STORE_MAX_DAYS=400.
-- Atomic file writes (temp file then replace) protecting data files against corruption.
-- Window simulation: --days specifies the test window; earlier data is preserved as history.
-- Adaptive honesty tracking: records adaptive_effective_pct and warns if below 90%.
-- GERMAN30 support: automatically ensures EURUSD data store and converts EUR to USD scale.
+- Offline fallback: uses existing stored data if broker is unavailable.
+- Intraday volatility refresh on every bar; throttles failed metrics retries to once per SAST hour.
+- SAST-aligned day grouping for charts and reports.
+- Comprehensive skipped signals breakdown (by reason, strategy, SAST hour).
+- Centralized paths via backtest.paths.
 """
 
 import sys
@@ -27,20 +28,16 @@ from strategies.strategy_manager import StrategyManager
 from core.session_levels import build_session_levels
 from core.indicators import get_session_volume_profile
 from core.volatility_engine import volatility_engine
-from core.session_config import GLOBAL_PARAMS
+from core.session_config import GLOBAL_PARAMS, TZ_SAST
 from backtest.bar_aggregator import ZeroLookAheadAggregator
 from backtest.simulator import TradeSimulator, ASSETS
 from backtest.report import calculate_kpis
 from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
 from backtest.advisor import generate_improvement_tips
+from backtest.paths import DATA_DIR, OUTPUT_DIR
 
 STORE_TARGET_DAYS = 365
 STORE_MAX_DAYS = 400
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
     dirname = os.path.dirname(target_path)
@@ -58,15 +55,6 @@ def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
         raise
 
 async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
-    """
-    Incremental store:
-    - Missing: downloads last STORE_TARGET_DAYS (365 days).
-    - Existing: fetches from (last bar minus 1 day) to now, merges, keeps newest duplicate.
-    - If first bar > (now minus 365 days), backfills older missing history.
-    - Drops bars older than STORE_MAX_DAYS (400 days).
-    - Writes M5 atomically and rebuilds H1/H4/D1.
-    - Prints summary: new bars added, total bars, first and last bar dates.
-    """
     m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
     now_utc = datetime.now(timezone.utc)
     target_start = now_utc - timedelta(days=STORE_TARGET_DAYS)
@@ -91,7 +79,6 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
 
     try:
         if existing_df.empty:
-            # Full 365-day initial download
             print(f"[*] Initial download for {symbol}: fetching last {STORE_TARGET_DAYS} days...", flush=True)
             if not client.is_authorized:
                 if not await client.connect():
@@ -108,25 +95,25 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
             last_bar_time = existing_df['dt'].iloc[-1].to_pydatetime()
             first_bar_time = existing_df['dt'].iloc[0].to_pydatetime()
 
-            # 1. Forward fetch from (last bar minus 1 day) to now
             forward_start = max(target_start, last_bar_time - timedelta(days=1))
             if forward_start < now_utc:
                 if not client.is_authorized:
                     if not await client.connect():
-                        print(f"ERROR: Could not connect to cTrader for {symbol} update.", flush=True)
-                        return False
+                        last_d = existing_df['dt'].iloc[-1].strftime('%Y-%m-%d')
+                        print(f"WARNING: broker unavailable, using stored data up to {last_d}", flush=True)
+                        return True
 
                 forward_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, forward_start, now_utc)
                 if not forward_df.empty:
                     forward_df['dt'] = pd.to_datetime(forward_df['time'], utc=True)
                     chunks_to_merge.append(forward_df)
 
-            # 2. Backfill older missing history if file starts later than 365 days ago
             if first_bar_time > (target_start + timedelta(days=2)):
                 if not client.is_authorized:
                     if not await client.connect():
-                        print(f"ERROR: Could not connect to cTrader for {symbol} backfill.", flush=True)
-                        return False
+                        last_d = existing_df['dt'].iloc[-1].strftime('%Y-%m-%d')
+                        print(f"WARNING: broker unavailable, using stored data up to {last_d}", flush=True)
+                        return True
 
                 backfill_end = first_bar_time + timedelta(days=1)
                 print(f"[*] Backfilling older history for {symbol} from {target_start.strftime('%Y-%m-%d')} to {backfill_end.strftime('%Y-%m-%d')}...", flush=True)
@@ -135,12 +122,10 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
                     backfill_df['dt'] = pd.to_datetime(backfill_df['time'], utc=True)
                     chunks_to_merge.append(backfill_df)
 
-        # Merge, drop duplicate timestamps keeping newest, sort by time
         combined = pd.concat(chunks_to_merge, ignore_index=True)
         combined.drop_duplicates(subset=['time'], keep='last', inplace=True)
         combined.sort_values('dt', inplace=True)
 
-        # Drop bars older than STORE_MAX_DAYS (400 days)
         combined = combined[combined['dt'] >= max_history_start].copy()
         combined.reset_index(drop=True, inplace=True)
 
@@ -152,15 +137,18 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
         out_df = combined[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
         _atomic_write_csv(out_df, m5_path)
 
-        # Rebuild H1/H4/D1 from merged M5
         build_higher_timeframes_from_m5(out_df, symbol)
 
         print(f"[{symbol} Store]: {added_bars:,} new bars added | Total: {new_count:,} bars | Span: {first_date} to {last_date}", flush=True)
         return True
 
     except Exception as e:
+        if not existing_df.empty:
+            last_d = existing_df['dt'].iloc[-1].strftime('%Y-%m-%d')
+            print(f"WARNING: broker unavailable, using stored data up to {last_d}", flush=True)
+            return True
         print(f"ERROR: Failed updating data store for {symbol} ({e}). Preserving existing files.", flush=True)
-        return len(existing_df) > 0
+        return False
 
 def run_backtest_for_symbol(
     symbol: str = "US30",
@@ -198,7 +186,6 @@ def run_backtest_for_symbol(
         print(f"ERROR: Insufficient data bars for {symbol} ({total_bars} bars).", flush=True)
         return False
 
-    # Determine simulation window: start at first bar >= (last bar time - days_count), never before index 120
     last_bar_time = m5_df['time'].iloc[-1]
     window_cutoff = last_bar_time - timedelta(days=days_count)
 
@@ -221,6 +208,7 @@ def run_backtest_for_symbol(
     print(f"[*] Simulating {simulated_bars_count:,} M5 candles | Window: {window_start_str} to {window_end_str} (History: {history_days_before_window} days)...", flush=True)
 
     last_vol_date = None
+    last_vol_retry_hour = None
     vol_metrics = {"valid": False}
     adr_val = None
     regime = "NORMAL"
@@ -233,6 +221,8 @@ def run_backtest_for_symbol(
         curr_bar = m5_slice.iloc[-1]
         curr_time = curr_bar['time'].to_pydatetime()
         curr_date = curr_time.date()
+        sast_dt = curr_time.astimezone(TZ_SAST)
+        sast_hour_key = (sast_dt.date(), sast_dt.hour)
 
         rel_idx = i - sim_start_idx
         if rel_idx % step_interval == 0:
@@ -243,7 +233,12 @@ def run_backtest_for_symbol(
 
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
 
-        if curr_date != last_vol_date or not vol_metrics.get("valid", False):
+        # Full volatility computation when UTC date changes OR when retrying invalid metrics at most once per SAST hour
+        need_full_recalc = (curr_date != last_vol_date)
+        if not vol_metrics.get("valid", False) and sast_hour_key != last_vol_retry_hour:
+            need_full_recalc = True
+
+        if need_full_recalc:
             vol_metrics = volatility_engine.compute_symbol_volatility(
                 d1_df=d1_view,
                 m5_df=m5_slice,
@@ -255,9 +250,20 @@ def run_backtest_for_symbol(
                 adr_val = vol_metrics.get("adr")
                 regime = vol_metrics.get("regime", "NORMAL")
             last_vol_date = curr_date
+            last_vol_retry_hour = sast_hour_key
 
+        # Refresh intraday range on every bar
         if vol_metrics.get("valid", False):
+            active_vol = volatility_engine.refresh_intraday(
+                vol_metrics=vol_metrics,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                d1_view=d1_view,
+                as_of=curr_time
+            )
             valid_vol_bars += 1
+        else:
+            active_vol = vol_metrics
 
         vp = get_session_volume_profile(m5_slice)
         session_levels = build_session_levels(
@@ -280,14 +286,14 @@ def run_backtest_for_symbol(
         )
 
         if signal and adaptive_mode:
-            if vol_metrics.get("valid", False):
-                adapted = volatility_engine.adapt_signal(signal, vol_metrics, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+            if active_vol.get("valid", False):
+                adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
                 if adapted:
                     spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
                     sl_dist = abs(adapted.entry_price - adapted.stop_loss)
                     tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
                     vol_ok, _ = volatility_engine.evaluate_volatility_filters(
-                        vol_metrics, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                        active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
                     )
                     signal = adapted if vol_ok else None
                 else:
@@ -298,11 +304,9 @@ def run_backtest_for_symbol(
             if not has_open:
                 sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
 
-    # Close open positions at end of historical data
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
 
-    # Adaptive honesty calculations
     adaptive_pct = round((valid_vol_bars / max(1, simulated_bars_count)) * 100.0, 1)
     report_warnings = []
     if adaptive_mode and adaptive_pct < 90.0:
@@ -314,28 +318,36 @@ def run_backtest_for_symbol(
     df_trades = pd.DataFrame(all_trades)
     global_kpis = calculate_kpis(all_trades)
 
+    if not df_trades.empty:
+        if "date_sast" in df_trades.columns:
+            df_trades["display_date"] = df_trades["date_sast"].fillna(df_trades["date"])
+        else:
+            df_trades["display_date"] = df_trades["date"]
+    else:
+        df_trades["display_date"] = []
+
     strat_kpis = {}
     dow_kpis = {}
     if not df_trades.empty:
         for s_name, s_group in df_trades.groupby("strategy"):
             strat_kpis[s_name] = calculate_kpis(s_group.to_dict("records"))
 
-        df_trades["weekday"] = pd.to_datetime(df_trades["date"]).dt.day_name()
+        df_trades["weekday"] = pd.to_datetime(df_trades["display_date"]).dt.day_name()
         for dow, dow_group in df_trades.groupby("weekday"):
             dow_kpis[dow] = calculate_kpis(dow_group.to_dict("records"))
 
     m5_df["dt"] = m5_df["time"]
-    m5_df["date_str"] = m5_df["dt"].dt.strftime("%Y-%m-%d")
-    trading_dates = sorted(df_trades["date"].unique().tolist()) if not df_trades.empty else []
+    m5_df["date_sast_str"] = m5_df["dt"].dt.tz_convert(TZ_SAST).dt.strftime("%Y-%m-%d")
+    trading_dates = sorted(df_trades["display_date"].unique().tolist()) if not df_trades.empty else []
 
     day_charts_data = {}
     for d_str in trading_dates:
-        sub_m5 = m5_df[m5_df["date_str"] == d_str]
+        sub_m5 = m5_df[m5_df["date_sast_str"] == d_str]
         candles_list = [
             {"time": int(r["dt"].timestamp()), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
             for _, r in sub_m5.iterrows()
         ]
-        day_t = df_trades[df_trades["date"] == d_str].to_dict("records")
+        day_t = df_trades[df_trades["display_date"] == d_str].to_dict("records")
         first_t = day_t[0] if day_t else {}
         ref_levels = first_t.get("ref_levels", {})
 
@@ -363,6 +375,8 @@ def run_backtest_for_symbol(
         f"adaptive_effective_pct: {adaptive_pct}%"
     )
 
+    full_skip_summary = sim.skip_summary()
+
     report_payload = {
         "symbol": symbol,
         "mode": mode_str,
@@ -379,7 +393,8 @@ def run_backtest_for_symbol(
         "trading_dates": trading_dates,
         "day_data": day_charts_data,
         "all_trades": all_trades,
-        "skipped_summary": sim.skip_summary(),
+        "skipped_summary": full_skip_summary.get("by_reason", full_skip_summary),
+        "skipped_detail": full_skip_summary,
         "improvement_tips": improvement_tips
     }
 
@@ -401,7 +416,6 @@ async def main():
     parser.add_argument("--supertrend", type=str, default="on", choices=["on", "off"], help="SuperTrend trail on/off (default: on)")
     args = parser.parse_args()
 
-    # Decide adaptive mode: --mode takes precedence; if omitted, fallback to --adaptive
     if args.mode is not None:
         adaptive_selected = (args.mode.lower() == "adaptive")
     else:
@@ -414,10 +428,8 @@ async def main():
 
     client = CTraderClient()
 
-    # Ensure symbol data in incremental store
     ok = await ensure_symbol_data(client, args.symbol)
 
-    # For GERMAN30, also ensure EURUSD store and load EURUSD M5 for FX conversion
     eurusd_df: Optional[pd.DataFrame] = None
     if args.symbol.upper() == "GERMAN30":
         eurusd_ok = await ensure_symbol_data(client, "EURUSD")

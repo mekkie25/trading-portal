@@ -7,10 +7,9 @@ Replicates the exact single-order live position management of engine/matrix.py:
 - SuperTrend 5M trailing exit gated by GLOBAL_PARAMS.use_supertrend_trail
 - Daily trade cap tracked per SAST calendar date (max_daily_trades)
 - Minimum-lot risk tolerance check matching live bot
-- Skip logging and skip_summary() method
-- USD account currency scaling:
-    * USDJPY: converted to USD by dividing by entry/exit price
-    * GERMAN30: converted to USD by multiplying by EURUSD rate at or before trade time
+- Skip logging and skip_summary() method returning by_reason, by_strategy, by_hour_sast
+- date_sast recorded on every trade record alongside date
+- USD account currency scaling (USDJPY divided by price, GERMAN30 converted via EURUSD history)
 - Fix false post-stop recovery by ignoring creation candle
 - Deadline-based EOD close (first candle >= 21:00 SAST)
 - close_all(symbol, last_candle) method for END_OF_DATA
@@ -25,7 +24,7 @@ import math
 import bisect
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
@@ -66,7 +65,6 @@ class TradeSimulator:
         self.daily_trade_counts: Dict[str, int] = {}
         self._trade_counter: int = 0
 
-        # Sorted cache of EURUSD (timestamp_epoch, close_price) for zero-lookahead GERMAN30 conversion
         self._eurusd_times: List[float] = []
         self._eurusd_prices: List[float] = []
         if eurusd_df is not None and not eurusd_df.empty:
@@ -86,19 +84,32 @@ class TradeSimulator:
             return self._eurusd_prices[idx]
         return None
 
-    def skip_summary(self) -> Dict[str, int]:
-        summary: Dict[str, int] = {}
+    def skip_summary(self) -> Dict[str, Any]:
+        by_reason: Dict[str, int] = {}
+        by_strategy: Dict[str, int] = {}
+        by_hour_sast: Dict[int, int] = {}
         for s in self.skipped:
             reason = s.get("reason", "UNKNOWN")
-            summary[reason] = summary.get(reason, 0) + 1
-        return summary
+            strat = s.get("strategy", "UNKNOWN")
+            h = s.get("hour_sast", 0)
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+            by_strategy[strat] = by_strategy.get(strat, 0) + 1
+            by_hour_sast[h] = by_hour_sast.get(h, 0) + 1
+
+        res = dict(by_reason)
+        res["by_reason"] = by_reason
+        res["by_strategy"] = by_strategy
+        res["by_hour_sast"] = by_hour_sast
+        return res
 
     def _record_skip(self, current_time: datetime, symbol: str, strategy: str, reason: str) -> bool:
+        sast_hour = current_time.astimezone(TZ_SAST).hour
         self.skipped.append({
             "time": current_time.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
             "strategy": strategy,
-            "reason": reason
+            "reason": reason,
+            "hour_sast": sast_hour
         })
         return False
 
@@ -113,7 +124,6 @@ class TradeSimulator:
         if sl_dist <= 0:
             return self._record_skip(current_time, symbol, strategy, "INVALID_SL_DIST")
 
-        # Daily trade cap check by SAST calendar date
         sast_time = current_time.astimezone(TZ_SAST)
         sast_date_str = sast_time.strftime("%Y-%m-%d")
         current_daily_count = self.daily_trade_counts.get(sast_date_str, 0)
@@ -121,7 +131,6 @@ class TradeSimulator:
         if current_daily_count >= max_daily:
             return self._record_skip(current_time, symbol, strategy, "DAILY_CAP")
 
-        # Fixed R:R target computation and structural room check
         fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr)
         if fixed_tp is None:
             return self._record_skip(current_time, symbol, strategy, "NO_ROOM")
@@ -133,7 +142,6 @@ class TradeSimulator:
 
         actual_entry = (entry_price + (spread_pts / 2.0)) if direction == "BUY" else (entry_price - (spread_pts / 2.0))
 
-        # Currency conversion: USDJPY (divide by entry), GERMAN30 (multiply by EURUSD rate at or before trade time)
         if symbol == "USDJPY":
             fx_rate = (1.0 / entry_price) if entry_price > 0 else 1.0
         elif symbol == "GERMAN30":
@@ -154,7 +162,6 @@ class TradeSimulator:
         min_lots = cfg["min_lots"]
         tolerance = getattr(GLOBAL_PARAMS, 'min_lot_risk_tolerance', 1.5)
 
-        # Minimum-lot check matching the live bot
         if raw_lots < min_lots:
             min_lot_cash_risk = min_lots * risk_per_lot
             if min_lot_cash_risk > (tolerance * risk_cash):
@@ -164,7 +171,6 @@ class TradeSimulator:
             stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
             total_lots = round(max(stepped_lots, min_lots), 2)
 
-        # SAST 21:00 EOD deadline for this trade
         eod_deadline = sast_time.replace(hour=21, minute=0, second=0, microsecond=0)
         if sast_time >= eod_deadline:
             eod_deadline += timedelta(days=1)
@@ -223,7 +229,6 @@ class TradeSimulator:
             direction = pos["direction"]
             sl_dist = pos["initial_sl_dist"]
 
-            # Update MFE, MAE, and Profit-First flags
             if direction == "BUY":
                 pos["mfe_price"] = max(pos["mfe_price"], c_high)
                 pos["mae_price"] = min(pos["mae_price"], c_low)
@@ -243,7 +248,6 @@ class TradeSimulator:
                 if c_high > entry:
                     pos["loss_seen"] = True
 
-            # Collision Check (Conservative: SL hit first)
             sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
             tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
 
@@ -259,7 +263,6 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            # Dynamic 80% R:R Break-Even Rule (gated by GLOBAL_PARAMS.use_breakeven)
             if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
@@ -267,7 +270,6 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            # SuperTrend 5M Trailing Stop Exit (gated by GLOBAL_PARAMS.use_supertrend_trail)
             if GLOBAL_PARAMS.use_supertrend_trail and pos["trail_mode"] == "SUPERTREND" and len(m5_slice) >= 15:
                 st = calculate_supertrend(m5_slice, period=10, factor=1.6)
                 curr_dir = int(st['supertrend_direction'].iloc[-1])
@@ -275,7 +277,6 @@ class TradeSimulator:
                     self._close_position(pos, c_close, curr_time, "SUPERTREND_TRAIL")
                     continue
 
-            # EOD close: close on first candle whose SAST time >= eod_deadline_sast
             if sast_time >= pos["eod_deadline_sast"]:
                 self._close_position(pos, c_close, curr_time, "EOD_LOCKDOWN")
                 continue
@@ -284,14 +285,12 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
-        # Strict Post-SL Recovery Monitor (Max 2 hours, max 0.5x SL adverse breach)
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
                 active_pending.append(pending)
                 continue
 
-            # Avoid false recovery label on the candle that triggered the stop
             if curr_time == pending["created_candle_time"]:
                 active_pending.append(pending)
                 continue
@@ -300,14 +299,12 @@ class TradeSimulator:
             target_tp = pending["target_tp"]
             max_adverse = pending["max_adverse_allowed"]
 
-            # Check if market blew past adverse tolerance
             if not pending["adverse_blown"]:
                 if direction == "BUY" and c_low <= max_adverse:
                     pending["adverse_blown"] = True
                 elif direction == "SELL" and c_high >= max_adverse:
                     pending["adverse_blown"] = True
 
-            # If adverse move was modest, check if it reached original TP within 2 hours
             if not pending["adverse_blown"]:
                 reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
                 if reached_tp:
@@ -343,12 +340,8 @@ class TradeSimulator:
         pip_size = pos.get("pip_size", 0.01)
         spread_pts = pos.get("spread_pts", 0.0)
 
-        # Half spread charged on exit (deducted from price difference)
         actual_exit = (exit_price - (spread_pts / 2.0)) if direction == "BUY" else (exit_price + (spread_pts / 2.0))
 
-        # Currency conversion for P&L:
-        # USDJPY: convert JPY to USD by dividing by actual_exit
-        # GERMAN30: convert EUR to USD by multiplying by EURUSD rate at or before exit_time
         if pos["symbol"] == "USDJPY":
             fx_exit = (1.0 / actual_exit) if actual_exit > 0 else 1.0
         elif pos["symbol"] == "GERMAN30":
@@ -361,7 +354,6 @@ class TradeSimulator:
         r_multiple = round(price_diff / sl_dist, 2) if sl_dist > 0 else 0.0
         money_pnl = round(price_diff * lots * contract_size * fx_exit, 2)
 
-        # MFE and MAE calculations
         if direction == "BUY":
             mfe_dist = max(0.0, pos["mfe_price"] - entry)
             mae_dist = max(0.0, entry - pos["mae_price"])
@@ -374,7 +366,6 @@ class TradeSimulator:
         mfe_pips = round(mfe_dist / pip_size, 1) if pip_size > 0 else 0.0
         mae_pips = round(mae_dist / pip_size, 1) if pip_size > 0 else 0.0
 
-        # Classify result strictly by R: WIN if r_multiple > 0.1, LOSS if r_multiple < -0.1, else BREAKEVEN
         if r_multiple > 0.1:
             result = "WIN"
         elif r_multiple < -0.1:
@@ -384,7 +375,6 @@ class TradeSimulator:
 
         duration_min = int((exit_time - pos["open_time"]).total_seconds() / 60)
 
-        # Initial failure categorization
         target_dist = abs(pos["take_profit"] - entry)
         if result == "WIN":
             failure_reason = "NONE_WIN"
@@ -395,9 +385,12 @@ class TradeSimulator:
         else:
             failure_reason = "CLEAN_LOSS"
 
+        sast_date = pos["open_time"].astimezone(TZ_SAST).strftime("%Y-%m-%d")
+
         record = {
             "trade_id": pos["trade_id"],
             "date": pos["open_time"].strftime("%Y-%m-%d"),
+            "date_sast": sast_date,
             "symbol": pos["symbol"],
             "strategy": pos["strategy"],
             "direction": direction,
@@ -426,7 +419,6 @@ class TradeSimulator:
             "regime": pos["regime"]
         }
 
-        # If trade stopped out, register for post-SL tracking (skipping the creation candle)
         if result == "LOSS" and "SL" in reason:
             max_adverse = (pos["stop_loss"] - (0.50 * sl_dist)) if direction == "BUY" else (pos["stop_loss"] + (0.50 * sl_dist))
             self.pending_sl_evaluations.append({
