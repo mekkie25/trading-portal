@@ -28,7 +28,7 @@ from core.indicators import get_session_volume_profile
 from core.volatility_engine import volatility_engine
 from core.session_config import GLOBAL_PARAMS
 from backtest.bar_aggregator import ZeroLookAheadAggregator
-from backtest.simulator import TradeSimulator
+from backtest.simulator import TradeSimulator, ASSETS
 from backtest.report import calculate_kpis
 from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
 from backtest.advisor import generate_improvement_tips
@@ -70,10 +70,10 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str, days_back: int 
         print(f"ERROR: Failed downloading M5 candles for {symbol}", flush=True)
         return False
 
-def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, balance: float = 1000.0, risk_pct: float = 1.0) -> bool:
+def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, balance: float = 1000.0, risk_pct: float = 1.0, days_count: int = 60) -> bool:
     mode_str = "adaptive" if adaptive_mode else "legacy"
     print(f"\n=======================================================", flush=True)
-    print(f"STARTING HIGH-SPEED BACKTEST: {symbol} ({mode_str.upper()}) | Target R:R: {GLOBAL_PARAMS.target_rr} | BE: {GLOBAL_PARAMS.use_breakeven}", flush=True)
+    print(f"STARTING HIGH-SPEED BACKTEST: {symbol} ({mode_str.upper()}) | Target R:R: {GLOBAL_PARAMS.target_rr} | BE: {GLOBAL_PARAMS.use_breakeven} | Trail: {GLOBAL_PARAMS.use_supertrend_trail}", flush=True)
     print(f"=======================================================", flush=True)
 
     GLOBAL_PARAMS.adaptive_mode = adaptive_mode
@@ -163,7 +163,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
             if vol_metrics.get("valid", False):
                 adapted = volatility_engine.adapt_signal(signal, vol_metrics, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
                 if adapted:
-                    spread = 2.50 if symbol == "US30" else (0.30 if symbol == "GOLD" else 0.00010)
+                    spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
                     sl_dist = abs(adapted.entry_price - adapted.stop_loss)
                     tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
                     vol_ok, _ = volatility_engine.evaluate_volatility_filters(
@@ -177,6 +177,10 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
                 sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
+
+    # Close remaining positions at end of historical data
+    if len(m5_df) > 0 and len(sim.open_positions) > 0:
+        sim.close_all(symbol, m5_df.iloc[-1])
 
     all_trades = sim.completed_trades
     df_trades = pd.DataFrame(all_trades)
@@ -224,9 +228,16 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
 
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
+    run_settings_text = (
+        f"mode: {mode_str}, target_rr: {GLOBAL_PARAMS.target_rr}, "
+        f"use_breakeven: {GLOBAL_PARAMS.use_breakeven}, "
+        f"use_supertrend_trail: {GLOBAL_PARAMS.use_supertrend_trail}, days: {days_count}"
+    )
+
     report_payload = {
         "symbol": symbol,
         "mode": mode_str,
+        "run_settings": run_settings_text,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "global_kpis": global_kpis,
         "strategy_kpis": strat_kpis,
@@ -234,6 +245,7 @@ def run_backtest_for_symbol(symbol: str = "US30", adaptive_mode: bool = True, ba
         "trading_dates": trading_dates,
         "day_data": day_charts_data,
         "all_trades": all_trades,
+        "skipped_summary": sim.skip_summary(),
         "improvement_tips": improvement_tips
     }
 
@@ -248,19 +260,38 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
     parser.add_argument("--days", type=int, default=60)
-    parser.add_argument("--adaptive", action="store_true", default=True)
+    parser.add_argument("--mode", type=str, default=None, choices=["adaptive", "legacy"], help="Execution mode")
+    parser.add_argument("--adaptive", action="store_true", default=True, help="Legacy flag passed by server.ts")
     parser.add_argument("--rr", type=float, default=1.0, help="Fixed target R:R multiplier (default: 1.0)")
     parser.add_argument("--breakeven", type=str, default="off", choices=["on", "off"], help="Break-even on/off (default: off)")
+    parser.add_argument("--supertrend", type=str, default="on", choices=["on", "off"], help="SuperTrend trail on/off (default: on)")
     args = parser.parse_args()
 
+    # Rule f: Immediate refusal for GERMAN30
+    if args.symbol.upper() == "GERMAN30":
+        print("ERROR: GERMAN30 is not supported in backtest yet (needs EURUSD history)", flush=True)
+        sys.exit(1)
+
+    # Decide adaptive mode: --mode takes precedence; if omitted, fallback to --adaptive
+    if args.mode is not None:
+        adaptive_selected = (args.mode.lower() == "adaptive")
+    else:
+        adaptive_selected = bool(args.adaptive)
+
+    GLOBAL_PARAMS.adaptive_mode = adaptive_selected
     GLOBAL_PARAMS.target_rr = args.rr
     GLOBAL_PARAMS.use_breakeven = (args.breakeven.lower() == "on")
+    GLOBAL_PARAMS.use_supertrend_trail = (args.supertrend.lower() == "on")
 
     client = CTraderClient()
     ok = await ensure_symbol_data(client, args.symbol, days_back=args.days)
     success = False
     if ok:
-        success = run_backtest_for_symbol(symbol=args.symbol, adaptive_mode=args.adaptive)
+        success = run_backtest_for_symbol(
+            symbol=args.symbol,
+            adaptive_mode=adaptive_selected,
+            days_count=args.days
+        )
 
     if client.ws:
         try:

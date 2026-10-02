@@ -21,6 +21,7 @@ class StrategyParameters:
     adaptive_mode: bool = False                  # False = Legacy fixed bands; True = Adaptive ADR Engine
     target_rr: float = 1.0                       # Fixed risk-to-reward target multiplier
     use_breakeven: bool = False                  # Move stop to BE at 80% R:R if enabled
+    use_supertrend_trail: bool = True            # Dynamic SuperTrend trailing exit gate
 
     # Risk & Execution Caps (Spec Section 5 & 7)
     base_risk_per_trade_pct: float = 1.0         # Baseline risk 1%

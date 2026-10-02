@@ -1564,8 +1564,9 @@ class MatrixEngineMaster:
                     if quote <= 0:
                         continue
 
+                   
                     # Dynamic SuperTrend Trailing Stop (Spec Sec 2 & 8)
-                    if trail_mode == "SUPERTREND":
+                    if GLOBAL_PARAMS.use_supertrend_trail and trail_mode == "SUPERTREND":
                         m5_candles = await self.ctrader.fetch_ohlc_candles(sym, CTraderTrendbarPeriod.M5, count=25)
                         if not m5_candles.empty and len(m5_candles) >= 12:
                             st_df = calculate_supertrend(m5_candles, period=10, factor=1.6)
@@ -1588,7 +1589,7 @@ class MatrixEngineMaster:
                             await whatsapp.send_alert(alert)
 
                     # Dynamic Breakeven Trigger (Spec Q2: 80% to target AND at least 0.5x SL distance)
-                    if not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
+                    if GLOBAL_PARAMS.use_breakeven and not be_moved and not pos.get("is_be_moved", False) and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
                         log.info(f"DYNAMIC BREAKEVEN HIT ON {sym} (Pos #{pid})! Moving SL to Break-Even.")
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
                         if success:
