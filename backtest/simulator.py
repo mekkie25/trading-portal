@@ -131,7 +131,7 @@ class TradeSimulator:
         if current_daily_count >= max_daily:
             return self._record_skip(current_time, symbol, strategy, "DAILY_CAP")
 
-        fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr)
+        fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
         if fixed_tp is None:
             return self._record_skip(current_time, symbol, strategy, "NO_ROOM")
 
@@ -208,7 +208,7 @@ class TradeSimulator:
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
         self.open_positions.append(position)
         return True
-
+    
     def process_candle(self, symbol: str, candle: pd.Series, m5_slice: pd.DataFrame):
         c_high = float(candle['high'])
         c_low = float(candle['low'])

@@ -172,6 +172,9 @@ def run_backtest_for_symbol(
     days_count: int = 60,
     eurusd_df: Optional[pd.DataFrame] = None
 ) -> Optional[Dict[str, Any]]:
+    # Reset rejection counters per combination run
+    volatility_engine.reset_rejection_stats()
+
     mode_str = "adaptive" if adaptive_mode else "legacy"
 
     GLOBAL_PARAMS.adaptive_mode = adaptive_mode
@@ -224,8 +227,12 @@ def run_backtest_for_symbol(
 
     valid_vol_bars = 0
 
-    # Diagnostic Funnel Tracking
+    # Diagnostic Funnel & Setup Tracking
+    unique_setups = 0
+    prev_signal_key = None
+
     funnel = {
+        "unique_setups": 0,
         "raw_signals_fired": 0,
         "adapted_signals_passed": 0,
         "vol_filters_blocked": 0,
@@ -298,6 +305,11 @@ def run_backtest_for_symbol(
         )
 
         if signal:
+            current_signal_key = (signal.strategy, signal.direction)
+            if current_signal_key != prev_signal_key:
+                unique_setups += 1
+            prev_signal_key = current_signal_key
+
             funnel["raw_signals_fired"] += 1
 
             if adaptive_mode:
@@ -328,6 +340,8 @@ def run_backtest_for_symbol(
                     signal = None
             else:
                 funnel["adapted_signals_passed"] += 1
+        else:
+            prev_signal_key = None
 
         if signal:
             funnel["sim_trades_attempted"] += 1
@@ -339,6 +353,8 @@ def run_backtest_for_symbol(
 
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
+
+    funnel["unique_setups"] = unique_setups
 
     adaptive_pct = round((valid_vol_bars / max(1, simulated_bars_count)) * 100.0, 1)
     report_warnings = []
@@ -404,7 +420,8 @@ def run_backtest_for_symbol(
         f"adaptive_effective_pct: {adaptive_pct}%, "
         f"funnel: {json.dumps(funnel)}, "
         f"vol_block_reasons: {json.dumps(vol_block_reasons)}, "
-        f"strategy_errors: {json.dumps(strategy_errors)}"
+        f"strategy_errors: {json.dumps(strategy_errors)}, "
+        f"rejection_stats: {json.dumps(volatility_engine.get_rejection_stats())}"
     )
 
     full_skip_summary = sim.skip_summary()
@@ -423,6 +440,7 @@ def run_backtest_for_symbol(
         "funnel": funnel,
         "vol_block_reasons": vol_block_reasons,
         "strategy_errors": strategy_errors,
+        "rejection_stats": volatility_engine.get_rejection_stats(),
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "global_kpis": global_kpis,
         "strategy_kpis": strat_kpis,

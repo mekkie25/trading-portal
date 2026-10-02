@@ -24,6 +24,11 @@ class VolatilityEngine:
         "ORB_CRACKER"
     }
 
+    def reset_rejection_stats(self) -> None:
+        """Resets all rejection telemetry counters back to zero."""
+        for k in self.rejection_stats:
+            self.rejection_stats[k] = 0
+            
     def __init__(self):
         # Per-symbol cache: symbol -> (timestamp_epoch, metrics_dict)
         self._vol_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
