@@ -23,7 +23,8 @@ import {
   Layers,
   Square,
   Copy,
-  Check
+  Check,
+  X
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -43,10 +44,22 @@ function formatNum(val: any, decimals = 2): string {
   return isNaN(parsed) ? '0.00' : parsed.toFixed(decimals);
 }
 
+function formatPriceBySymbol(price: any, symbol?: string): string {
+  const num = parseFloat(price);
+  if (isNaN(num)) return '--';
+  const sym = (symbol || '').toUpperCase();
+  if (sym.includes('EURUSD') || sym.includes('GBPUSD')) {
+    return num.toFixed(5);
+  }
+  if (sym.includes('USDJPY')) {
+    return num.toFixed(3);
+  }
+  return num.toFixed(2);
+}
+
 function buildReportMarkdown(r: BacktestReportPayload): string {
   const sections: string[] = [];
 
-  // 1. Header & Instructions
   sections.push(
     `# BACKTEST REPORT FOR AI REVIEW\n` +
     `You are reviewing results from a rules-based trading bot backtest. Be honest and skeptical. ` +
@@ -55,7 +68,6 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     `say what extra data would confirm each one, and give changes as small testable steps.`
   );
 
-  // 2. Settings
   const settingsList: string[] = [];
   if (r.symbol) settingsList.push(`- Symbol: ${r.symbol}`);
   if (r.mode) settingsList.push(`- Mode: ${r.mode}`);
@@ -65,7 +77,6 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     sections.push(`## Settings\n${settingsList.join('\n')}`);
   }
 
-  // 3. Overall stats from global_kpis
   if (r.global_kpis) {
     const g = r.global_kpis;
     sections.push(
@@ -81,7 +92,6 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     );
   }
 
-  // 4. Table of strategy_kpis
   if (r.strategy_kpis && Object.keys(r.strategy_kpis).length > 0) {
     const rows = Object.entries(r.strategy_kpis).map(([strat, k]) => {
       const inconcl = k.is_inconclusive ? 'Yes' : 'No';
@@ -95,7 +105,6 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     );
   }
 
-  // 5. Table of dow_kpis
   if (r.dow_kpis && Object.keys(r.dow_kpis).length > 0) {
     const rows = Object.entries(r.dow_kpis).map(([dow, k]) => {
       const inconcl = k.is_inconclusive ? 'Yes' : 'No';
@@ -109,7 +118,6 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     );
   }
 
-  // 6. Improvement Tips
   if (r.improvement_tips && r.improvement_tips.length > 0) {
     const tipBlocks = r.improvement_tips.map((t, idx) => {
       return (
@@ -123,14 +131,12 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     sections.push(`## Improvement Tips\n${tipBlocks.join('\n\n')}`);
   }
 
-  // 7. Skipped Summary
   const skipped = (r as any).skipped_summary;
   if (skipped && typeof skipped === 'object' && Object.keys(skipped).length > 0) {
     const lines = Object.entries(skipped).map(([reason, count]) => `- ${reason}: ${count}`);
     sections.push(`## Skipped Signals Summary\n${lines.join('\n')}`);
   }
 
-  // 8. Trades CSV (up to 150 most recent)
   if (r.all_trades && Array.isArray(r.all_trades) && r.all_trades.length > 0) {
     const totalCount = r.all_trades.length;
     const recent = r.all_trades.slice(-150);
@@ -139,13 +145,13 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     const csvHeader = 'trade_id,date,strategy,direction,signal_time_sast,entry_price,sl,tp,exit_reason,r_multiple,money_pnl,mfe_r,mae_r,result';
     const csvRows = recent.map((t: any) => {
       const tid = t.trade_id || t.ticket || '';
-      const date = t.date || '';
+      const date = t.date_sast || t.date || '';
       const strat = t.strategy || '';
       const dir = t.direction || '';
       const sast = t.signal_time_sast || '';
       const entry = formatNum(t.entry_price);
-      const sl = formatNum(t.sl);
-      const tp = formatNum(t.tp);
+      const sl = formatPriceBySymbol(t.sl, t.symbol);
+      const tp = formatPriceBySymbol(t.tp, t.symbol);
       const reason = t.exit_reason || '';
       const rMult = formatNum(t.r_multiple);
       const pnl = formatNum(t.money_pnl);
@@ -159,7 +165,6 @@ function buildReportMarkdown(r: BacktestReportPayload): string {
     sections.push(`## Trades\n${note}\`\`\`csv\n${csvHeader}\n${csvRows.join('\n')}\n\`\`\``);
   }
 
-  // 9. Final Question
   sections.push(`QUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
 
   return sections.join('\n\n');
@@ -175,24 +180,28 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
-  // Runner & Live Progress State
+  // Runner Controls
   const [testSymbol, setTestSymbol] = useState<string>('US30');
   const [testDays, setTestDays] = useState<number>(60);
+  const [testMode, setTestMode] = useState<'adaptive' | 'legacy'>('adaptive');
+  const [testRr, setTestRr] = useState<number>(1.0);
+  const [testBreakeven, setTestBreakeven] = useState<'off' | 'on'>('off');
+  const [testSupertrend, setTestSupertrend] = useState<'on' | 'off'>('on');
+
+  // Execution & Results State
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
-  const [successBanner, setSuccessBanner] = useState<string | null>(null);
-  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [runResults, setRunResults] = useState<Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string }>>([]);
 
   // Copy for AI State
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
   const [fallbackCopyText, setFallbackCopyText] = useState<string>('');
 
-  // Table & Tip Filters
+  // Filters
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
   const [tipFilter, setTipFilter] = useState<string>('ALL');
 
-  // Dismissed tips persistent storage
   const [dismissedTipIds, setDismissedTipIds] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem('dismissed_improvement_tips');
@@ -205,7 +214,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
 
-  // 1. Initial status poll on mount (syncs running state even if page refreshed)
   useEffect(() => {
     const checkInitialStatus = async () => {
       try {
@@ -216,13 +224,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             setIsRunning(true);
             setProgressText(json.progress || 'Simulation in progress...');
           }
+          if (Array.isArray(json.results) && json.results.length > 0) {
+            setRunResults(json.results);
+          }
         }
       } catch {}
     };
     checkInitialStatus();
   }, []);
 
-  // 2. Fetch available report files
   const fetchReportList = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/reports');
@@ -242,7 +252,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchReportList();
   }, [fetchReportList]);
 
-  // 3. Fetch selected report JSON payload
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
@@ -264,7 +273,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     loadReport();
   }, [selectedFile]);
 
-  // 4. Live Polling for Background Backtest Runner
   useEffect(() => {
     if (!isRunning) return;
 
@@ -276,17 +284,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           if (json.progress) {
             setProgressText(json.progress);
           }
+          if (Array.isArray(json.results) && json.results.length > 0) {
+            setRunResults(json.results);
+          }
           if (!json.isRunning) {
             setIsRunning(false);
-            if (json.exitCode === 0 && !json.lastError) {
-              setSuccessBanner(`Backtest completed successfully! Updated report loaded.`);
-              setErrorBanner(null);
-            } else {
-              setErrorBanner(json.lastError || 'Backtest failed or stopped.');
-              setSuccessBanner(null);
-            }
             await fetchReportList();
-            setTimeout(() => setSuccessBanner(null), 5000);
           }
         }
       } catch (err) {
@@ -297,44 +300,45 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList]);
 
-  // 5. Trigger Backtest Function
   const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
-    setErrorBanner(null);
-    setSuccessBanner(null);
-    setProgressText(`Connecting to broker & preparing historical data for ${targetSym}...`);
+    setRunResults([]);
+    setProgressText(`Preparing simulation for ${targetSym}...`);
 
     try {
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: targetSym, days: testDays, adaptive: true }),
+        body: JSON.stringify({ 
+          symbol: targetSym, 
+          days: testDays, 
+          mode: testMode,
+          rr: testRr,
+          breakeven: testBreakeven,
+          supertrend: testSupertrend
+        }),
       });
 
       if (!res.ok) {
         const errJson = await res.json();
-        setErrorBanner(errJson.message || 'Failed to initiate backtest');
+        setRunResults([{ symbol: targetSym, status: 'FAILED', message: errJson.message || 'Run request failed' }]);
         setIsRunning(false);
       }
     } catch {
-      setErrorBanner('Network error connecting to backtest engine.');
+      setRunResults([{ symbol: targetSym, status: 'FAILED', message: 'Network error connecting to backtest server' }]);
       setIsRunning(false);
     }
   };
 
-  // 6. Stop / Cancel Running Backtest
   const handleStopBacktest = async () => {
     try {
       await fetch('/api/backtest/stop', { method: 'POST' });
       setIsRunning(false);
       setProgressText('Backtest cancelled.');
-    } catch {
-      setErrorBanner('Failed to stop backtest process.');
-    }
+    } catch {}
   };
 
-  // 7. Copy for AI Handler
   const handleCopyForAI = async () => {
     if (!reportData) return;
     const text = buildReportMarkdown(reportData);
@@ -352,7 +356,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }
   };
 
-  // 8. Dismiss Tip handler
   const handleDismissTip = (tipId: string) => {
     const updated = [...dismissedTipIds, tipId];
     setDismissedTipIds(updated);
@@ -368,7 +371,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
-  // 9. Render Lightweight-Chart for the selected day
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -422,54 +424,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
     const lvls = dayData.levels || {};
     if (lvls.asia_high) {
-      candleSeries.createPriceLine({
-        price: lvls.asia_high,
-        color: '#3b82f6',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: 'ASIA HIGH',
-      });
+      candleSeries.createPriceLine({ price: lvls.asia_high, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'ASIA HIGH' });
     }
     if (lvls.asia_low) {
-      candleSeries.createPriceLine({
-        price: lvls.asia_low,
-        color: '#3b82f6',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: 'ASIA LOW',
-      });
+      candleSeries.createPriceLine({ price: lvls.asia_low, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'ASIA LOW' });
     }
     if (lvls.daily_eq) {
-      candleSeries.createPriceLine({
-        price: lvls.daily_eq,
-        color: '#f59e0b',
-        lineWidth: 2,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: 'DAILY EQ',
-      });
+      candleSeries.createPriceLine({ price: lvls.daily_eq, color: '#f59e0b', lineWidth: 2, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'DAILY EQ' });
     }
     if (lvls.pdh) {
-      candleSeries.createPriceLine({
-        price: lvls.pdh,
-        color: '#a855f7',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: 'PDH',
-      });
+      candleSeries.createPriceLine({ price: lvls.pdh, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'PDH' });
     }
     if (lvls.pdl) {
-      candleSeries.createPriceLine({
-        price: lvls.pdl,
-        color: '#a855f7',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: 'PDL',
-      });
+      candleSeries.createPriceLine({ price: lvls.pdl, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'PDL' });
     }
 
     if (dayData.trades && dayData.trades.length > 0) {
@@ -529,9 +496,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     return !isDismissed && matchFilter;
   });
 
+  const skippedDetail = (reportData as any)?.skipped_detail || {};
+
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
-      {/* Header with Test Controls */}
+      {/* Header */}
       <motion.div 
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
@@ -545,13 +514,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Replays 5-minute broker candles across all 8 strategies with actionable improvement advice.
+            Replays 5-minute broker candles across all strategies with actionable improvement advice.
           </p>
         </div>
 
         {/* Action Controls */}
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="flex items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1 rounded-xl border border-slate-300 dark:border-[#1a2030]">
+          <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1.5 rounded-xl border border-slate-300 dark:border-[#1a2030]">
             <select
               value={testSymbol}
               onChange={(e) => setTestSymbol(e.target.value)}
@@ -569,11 +538,57 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               disabled={isRunning}
               className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
             >
-              <option value={30}>30 Days (~15s)</option>
-              <option value={60}>60 Days (~30s)</option>
-              <option value={90}>90 Days (~45s)</option>
-              <option value={180}>180 Days (~1.5m)</option>
-              <option value={365}>365 Days (1 Yr)</option>
+              <option value={60}>60 Days</option>
+              <option value={90}>90 Days</option>
+              <option value={180}>180 Days</option>
+              <option value={365}>365 Days</option>
+            </select>
+
+            <select
+              value={testMode}
+              onChange={(e) => setTestMode(e.target.value as any)}
+              disabled={isRunning}
+              className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
+              title="Execution Mode"
+            >
+              <option value="adaptive">Adaptive</option>
+              <option value="legacy">Legacy</option>
+            </select>
+
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+              <span className="text-[10px] font-bold text-slate-500">R:R</span>
+              <input
+                type="number"
+                step="0.1"
+                min="0.5"
+                max="5.0"
+                value={testRr}
+                onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)}
+                disabled={isRunning}
+                className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none"
+              />
+            </div>
+
+            <select
+              value={testBreakeven}
+              onChange={(e) => setTestBreakeven(e.target.value as any)}
+              disabled={isRunning}
+              className="px-2 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
+              title="Break-even Move at 80% R:R"
+            >
+              <option value="off">BE: Off</option>
+              <option value="on">BE: On</option>
+            </select>
+
+            <select
+              value={testSupertrend}
+              onChange={(e) => setTestSupertrend(e.target.value as any)}
+              disabled={isRunning}
+              className="px-2 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
+              title="SuperTrend 5M Trailing Stop"
+            >
+              <option value="on">Trail: On</option>
+              <option value="off">Trail: Off</option>
             </select>
 
             {!isRunning ? (
@@ -591,10 +606,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   type="button"
                   onClick={() => handleRunBacktest('ALL')}
                   className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white"
-                  title="Sequentially runs backtest across all 7 whitelist pairs"
+                  title="Sequentially runs backtest across all whitelist pairs"
                 >
                   <Layers className="w-3.5 h-3.5" />
-                  <span>Run All 7</span>
+                  <span>Run All</span>
                 </button>
               </>
             ) : (
@@ -604,7 +619,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white"
               >
                 <Square className="w-3.5 h-3.5" />
-                <span>Stop Backtest</span>
+                <span>Stop</span>
               </button>
             )}
           </div>
@@ -621,7 +636,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               className="px-3 py-2 rounded-xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
             >
               {reportFiles.length === 0 ? (
-                <option value="">No reports found (Click Run above)</option>
+                <option value="">No reports found</option>
               ) : (
                 reportFiles.map((f) => (
                   <option key={f} value={f}>{f}</option>
@@ -634,7 +649,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 type="button"
                 onClick={handleCopyForAI}
                 className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
-                title="Copy markdown report for AI analysis"
+                title="Copy markdown report for AI review"
               >
                 {copyStatus === 'copied' ? (
                   <>
@@ -653,11 +668,61 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       </motion.div>
 
+      {/* Adaptive Coverage & Warnings Bar */}
+      {reportData && (
+        <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs">
+          <div className="flex items-center gap-2">
+            <span className="font-bold text-slate-500">Adaptive Coverage:</span>
+            <span className="font-mono font-bold text-blue-600 dark:text-blue-400">
+              {(reportData as any).adaptive_effective_pct !== undefined ? `${(reportData as any).adaptive_effective_pct}%` : '100%'}
+            </span>
+            {(reportData as any).run_settings && (
+              <span className="text-[11px] text-slate-500 font-mono hidden md:inline">
+                ({(reportData as any).run_settings})
+              </span>
+            )}
+          </div>
+          {(reportData as any).warnings && (reportData as any).warnings.length > 0 && (
+            <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 font-semibold text-[11px]">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+              <span>{(reportData as any).warnings.join(' | ')}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Per-Symbol Results Box */}
+      {runResults.length > 0 && (
+        <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-2 animate-in fade-in">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold text-black dark:text-white">Backtest Run Results</span>
+            <button
+              onClick={() => setRunResults([])}
+              className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer"
+            >
+              Dismiss
+            </button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 pt-1">
+            {runResults.map((r, i) => (
+              <div key={i} className={`p-2.5 rounded-xl border flex items-center justify-between text-xs font-mono ${
+                r.status === 'OK'
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
+                  : 'bg-rose-500/10 border-rose-500/30 text-rose-600'
+              }`}>
+                <span className="font-bold">{r.symbol}</span>
+                <span className="text-[11px] truncate max-w-[170px]" title={r.message}>{r.status}: {r.message}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Fallback Textarea if Clipboard is Blocked */}
       {fallbackCopyText && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-amber-500/40 shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between text-xs font-bold text-amber-600 dark:text-amber-400">
-            <span>Clipboard write was blocked by the browser. Select all and copy the text below:</span>
+            <span>Clipboard write was blocked. Select all and copy the text below:</span>
             <button
               type="button"
               onClick={() => setFallbackCopyText('')}
@@ -676,7 +741,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* Live Running Progress Banner */}
+      {/* Live Running Banner */}
       {isRunning && (
         <div className="p-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-between text-xs animate-in fade-in">
           <div className="flex items-center gap-3">
@@ -696,28 +761,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* Error Banner */}
-      {errorBanner && (
-        <div className="p-4 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-700 dark:text-rose-400 text-xs font-semibold flex items-center justify-between animate-in fade-in">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>{errorBanner}</span>
-          </div>
-          <button onClick={() => setErrorBanner(null)} className="text-slate-400 hover:text-black dark:hover:text-white cursor-pointer">
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {/* Completion Toast */}
-      {successBanner && (
-        <div className="p-3.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-700 dark:text-emerald-400 text-xs font-semibold flex items-center gap-2 animate-in fade-in">
-          <CheckCircle2 className="w-4 h-4 shrink-0" />
-          <span>{successBanner}</span>
-        </div>
-      )}
-
-      {/* 4 Navigation Sub-Tabs */}
+      {/* Navigation Sub-Tabs */}
       <div className="flex flex-wrap gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
         <button
           onClick={() => setActiveSubTab('summary')}
@@ -830,6 +874,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
+          {/* Strategy Performance */}
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
             <h3 className="text-sm font-bold text-black dark:text-white mb-3">Performance by Strategy</h3>
             <div className="overflow-x-auto">
@@ -877,6 +922,100 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               </table>
             </div>
           </div>
+
+          {/* Weekday Performance */}
+          <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+            <h3 className="text-sm font-bold text-black dark:text-white mb-3">Performance by Day of Week</h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs font-mono">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                    <th className="py-2.5 px-3">Weekday</th>
+                    <th className="py-2.5 px-3 text-center">Trades</th>
+                    <th className="py-2.5 px-3 text-center">Win Rate</th>
+                    <th className="py-2.5 px-3 text-center">Avg R</th>
+                    <th className="py-2.5 px-3 text-center">Expectancy</th>
+                    <th className="py-2.5 px-3 text-right">Net P&L</th>
+                    <th className="py-2.5 px-3 text-center">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                  {Object.entries(reportData?.dow_kpis || {}).map(([dow, k]) => (
+                    <tr key={dow} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
+                      <td className="py-3 px-3 font-bold text-black dark:text-white">{dow}</td>
+                      <td className="py-3 px-3 text-center font-bold">{k.count}</td>
+                      <td className={`py-3 px-3 text-center font-bold ${k.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        {k.win_rate}%
+                      </td>
+                      <td className="py-3 px-3 text-center">{k.avg_r}R</td>
+                      <td className="py-3 px-3 text-center">{k.expectancy}R</td>
+                      <td className={`py-3 px-3 text-right font-bold ${k.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        ${k.net_pnl}
+                      </td>
+                      <td className="py-3 px-3 text-center">
+                        {k.is_inconclusive ? (
+                          <span className="text-[9px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                            INCONCLUSIVE (&lt;30)
+                          </span>
+                        ) : (
+                          <span className="text-[9px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
+                            VALID
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Skipped Signals Summary */}
+          {skippedDetail && (skippedDetail.by_reason || Object.keys(skippedDetail).length > 0) && (
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-4">
+              <h3 className="text-sm font-bold text-black dark:text-white">Skipped Signals Summary</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
+                {/* By Reason */}
+                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
+                  <div className="text-[10px] font-bold text-slate-500 uppercase">By Skip Reason</div>
+                  <div className="space-y-1">
+                    {Object.entries(skippedDetail.by_reason || {}).map(([r, count]: any) => (
+                      <div key={r} className="flex justify-between">
+                        <span className="text-slate-600 dark:text-slate-300">{r}</span>
+                        <span className="font-bold text-black dark:text-white">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* By Strategy */}
+                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
+                  <div className="text-[10px] font-bold text-slate-500 uppercase">By Strategy</div>
+                  <div className="space-y-1">
+                    {Object.entries(skippedDetail.by_strategy || {}).map(([s, count]: any) => (
+                      <div key={s} className="flex justify-between">
+                        <span className="text-slate-600 dark:text-slate-300">{s}</span>
+                        <span className="font-bold text-black dark:text-white">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* By SAST Hour */}
+                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
+                  <div className="text-[10px] font-bold text-slate-500 uppercase">By Hour (SAST)</div>
+                  <div className="space-y-1 max-h-36 overflow-y-auto">
+                    {Object.entries(skippedDetail.by_hour_sast || {}).map(([h, count]: any) => (
+                      <div key={h} className="flex justify-between">
+                        <span className="text-slate-600 dark:text-slate-300">{String(h).padStart(2, '0')}:00 SAST</span>
+                        <span className="font-bold text-black dark:text-white">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -918,9 +1057,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           {activeTips.length === 0 ? (
             <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center space-y-3">
               <Sparkles className="w-8 h-8 text-amber-400 mx-auto" />
-              <div className="text-sm font-bold text-black dark:text-white">All Improvement Tips Reviewed!</div>
+              <div className="text-sm font-bold text-black dark:text-white">
+                No tip rules triggered (sample too small or no pattern above thresholds)
+              </div>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
-                No active recommendations pending. Run a backtest or click "Restore Dismissed Tips" above.
+                No active recommendations pending. Run simulation across more session opportunities to detect high-probability tweaks.
               </p>
             </div>
           ) : (
@@ -1048,8 +1189,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                         {t.direction}
                       </td>
                       <td className="py-2.5 px-3">{t.lots}</td>
-                      <td className="py-2.5 px-3">{t.entry_price}</td>
-                      <td className="py-2.5 px-3">{t.exit_price}</td>
+                      <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
+                      <td className="py-2.5 px-3">{formatPriceBySymbol(t.exit_price, t.symbol)}</td>
                       <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
                         {t.r_multiple}R
                       </td>
@@ -1104,16 +1245,16 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <table className="w-full text-left text-xs font-mono">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500 bg-slate-50 dark:bg-[#08090d]/50">
-                    <th className="py-3 px-3">Date</th>
+                    <th className="py-3 px-3">Date (SAST)</th>
                     <th className="py-3 px-3">Strategy</th>
                     <th className="py-3 px-3 text-center">Dir</th>
                     <th className="py-3 px-3">Lots</th>
                     <th className="py-3 px-3">Entry</th>
                     <th className="py-3 px-3">SL</th>
                     <th className="py-3 px-3">TP</th>
-                    <th className="py-3 px-3">MFE (R/Pips)</th>
-                    <th className="py-3 px-3">MAE (R/Pips)</th>
-                    <th className="py-3 px-3">Classification</th>
+                    <th className="py-3 px-3">Exit Time</th>
+                    <th className="py-3 px-3">Exit Reason</th>
+                    <th className="py-3 px-3 text-center">R</th>
                     <th className="py-3 px-3 text-right">Net P&L</th>
                     <th className="py-3 px-3 text-center">Result</th>
                   </tr>
@@ -1121,31 +1262,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
                   {filteredTrades.map((t: any, idx: number) => (
                     <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
-                      <td className="py-2.5 px-3 text-slate-400">{t.date}</td>
+                      <td className="py-2.5 px-3 text-slate-400">{t.date_sast || t.date}</td>
                       <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
                       <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
                         {t.direction}
                       </td>
                       <td className="py-2.5 px-3">{t.lots}</td>
-                      <td className="py-2.5 px-3">{t.entry_price}</td>
-                      <td className="py-2.5 px-3 text-rose-500">{t.sl}</td>
-                      <td className="py-2.5 px-3 text-emerald-500">{t.tp}</td>
-                      <td className="py-2.5 px-3 text-emerald-500 font-semibold">
-                        +{t.mfe_r ?? 0}R ({t.mfe_pips ?? 0}p)
-                      </td>
-                      <td className="py-2.5 px-3 text-rose-500 font-semibold">
-                        -{t.mae_r ?? 0}R ({t.mae_pips ?? 0}p)
-                      </td>
-                      <td className="py-2.5 px-3">
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${
-                          t.failure_reason === 'NOISE_STOPOUT_RECOVERED'
-                            ? 'bg-amber-500/15 text-amber-500 border border-amber-500/30'
-                            : t.failure_reason === 'NEAR_TP_REVERSAL'
-                            ? 'bg-purple-500/15 text-purple-500 border border-purple-500/30'
-                            : 'bg-slate-100 dark:bg-[#0d1017] text-slate-400'
-                        }`}>
-                          {t.failure_reason || t.exit_reason}
-                        </span>
+                      <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
+                      <td className="py-2.5 px-3 text-rose-500">{formatPriceBySymbol(t.sl, t.symbol)}</td>
+                      <td className="py-2.5 px-3 text-emerald-500">{formatPriceBySymbol(t.tp, t.symbol)}</td>
+                      <td className="py-2.5 px-3 text-slate-400">{t.exit_time}</td>
+                      <td className="py-2.5 px-3 text-slate-400">{t.exit_reason}</td>
+                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        {t.r_multiple}R
                       </td>
                       <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
                         ${t.money_pnl}

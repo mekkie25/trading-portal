@@ -83,13 +83,18 @@ const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
 const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
 const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
 const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
-const BACKTEST_OUTPUT_DIR = path.join(process.cwd(), 'backtest', 'output');
+
+const storageBase = (process.env.BACKTEST_STORAGE_DIR || '').trim();
+const BACKTEST_OUTPUT_DIR = storageBase
+  ? path.join(storageBase, 'output')
+  : path.join(process.cwd(), 'backtest', 'output');
 
 let backtestRunning = false;
 let backtestProgress = '';
 let backtestLastError: string | null = null;
 let backtestExitCode: number | null = null;
 let activeBacktestProcess: ChildProcess | null = null;
+let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string }> = [];
 
 const SEED_TRADES = [
   {
@@ -361,7 +366,8 @@ async function startServer() {
       isRunning: backtestRunning, 
       progress: backtestProgress,
       lastError: backtestLastError,
-      exitCode: backtestExitCode 
+      exitCode: backtestExitCode,
+      results: backtestResults
     });
   });
 
@@ -386,8 +392,12 @@ async function startServer() {
 
     const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
     const days = parseInt(req.body?.days || '60', 10);
-    const adaptive = req.body?.adaptive !== false;
+    const mode = String(req.body?.mode || 'adaptive').toLowerCase();
+    const rr = parseFloat(req.body?.rr || 1.0);
+    const breakeven = String(req.body?.breakeven || 'off').toLowerCase();
+    const supertrend = String(req.body?.supertrend || 'on').toLowerCase();
 
+    backtestResults = [];
     backtestRunning = true;
     backtestProgress = `Starting simulation...`;
     backtestLastError = null;
@@ -406,8 +416,16 @@ async function startServer() {
         backtestProgress = `[${i + 1}/${symbolsQueue.length}] Simulating ${sym} (${days} Days)...`;
         console.log(`[Backtest Runner Queue]: Starting ${sym}...`);
 
-        const runnerArgs = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
-        if (adaptive) runnerArgs.push('--adaptive');
+        let symbolLastError = '';
+        const runnerArgs = [
+          'backtest/runner.py',
+          '--symbol', sym,
+          '--days', String(days),
+          '--mode', mode,
+          '--rr', String(rr),
+          '--breakeven', breakeven,
+          '--supertrend', supertrend
+        ];
 
         await new Promise<void>((resolve) => {
           const proc = spawn(pythonCmd, runnerArgs, {
@@ -419,53 +437,52 @@ async function startServer() {
             const text = data.toString().trim();
             if (text) {
               const lines = text.split('\n');
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith('ERROR:')) {
+                  symbolLastError = trimmed;
+                  backtestLastError = trimmed;
+                }
+              }
               const lastLine = lines[lines.length - 1];
               backtestProgress = `[${i + 1}/${symbolsQueue.length}] ${sym}: ${lastLine}`;
               console.log(`[Backtest Runner]: ${lastLine}`);
-              if (lastLine.startsWith('ERROR:')) {
-                backtestLastError = lastLine;
-              }
             }
           });
 
           proc.stderr.on('data', (data) => {
             const errText = data.toString().trim();
             console.error(`[Backtest Error]: ${errText}`);
-            if (!backtestLastError && errText.includes('Traceback')) {
-              backtestLastError = `ERROR in ${sym}: Python execution crashed.`;
+            if (!symbolLastError && errText.includes('Traceback')) {
+              symbolLastError = `ERROR in ${sym}: Python execution crashed.`;
+              backtestLastError = symbolLastError;
             }
           });
 
           proc.on('exit', (code) => {
-            backtestExitCode = code;
             activeBacktestProcess = null;
-            if (code !== 0 && !backtestLastError) {
-              backtestLastError = `ERROR: ${sym} simulation exited with code ${code}`;
+            if (code === 0) {
+              backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed' });
+            } else {
+              backtestResults.push({ symbol: sym, status: 'FAILED', message: symbolLastError || `Exited with code ${code}` });
             }
             resolve();
           });
 
           proc.on('error', (err) => {
             activeBacktestProcess = null;
-            backtestLastError = `ERROR: Failed to spawn Python process: ${err.message}`;
+            symbolLastError = `ERROR: Failed to spawn Python process: ${err.message}`;
+            backtestLastError = symbolLastError;
+            backtestResults.push({ symbol: sym, status: 'FAILED', message: symbolLastError });
             resolve();
           });
         });
-
-        if (backtestExitCode !== 0) {
-          console.warn(`[Backtest Runner Queue]: Aborting remaining queue due to error on ${sym}`);
-          break;
-        }
       }
 
       backtestRunning = false;
-      if (backtestExitCode === 0) {
-        backtestProgress = requestedSymbol === 'ALL'
-          ? 'Completed all 7 pairs successfully!'
-          : `Completed ${requestedSymbol} successfully!`;
-      } else {
-        backtestProgress = `Failed: ${backtestLastError || 'Non-zero exit'}`;
-      }
+      const anyFailed = backtestResults.some(r => r.status === 'FAILED');
+      backtestExitCode = anyFailed ? 1 : 0;
+      backtestProgress = `Batch run finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} passed.`;
       console.log(`[Backtest Finished]: ${backtestProgress}`);
     }
 
