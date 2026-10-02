@@ -21,7 +21,9 @@ import {
   RotateCcw,
   Sparkles,
   Layers,
-  Square
+  Square,
+  Copy,
+  Check
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -32,6 +34,136 @@ interface BacktestViewProps {
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
+
+function formatNum(val: any, decimals = 2): string {
+  if (typeof val === 'number') {
+    return isNaN(val) ? '0.00' : val.toFixed(decimals);
+  }
+  const parsed = parseFloat(val);
+  return isNaN(parsed) ? '0.00' : parsed.toFixed(decimals);
+}
+
+function buildReportMarkdown(r: BacktestReportPayload): string {
+  const sections: string[] = [];
+
+  // 1. Header & Instructions
+  sections.push(
+    `# BACKTEST REPORT FOR AI REVIEW\n` +
+    `You are reviewing results from a rules-based trading bot backtest. Be honest and skeptical. ` +
+    `Treat any group with fewer than 30 trades as inconclusive. Spreads are estimated. ` +
+    `Do not recommend changes based on tiny samples. Rank suggestions by confidence, ` +
+    `say what extra data would confirm each one, and give changes as small testable steps.`
+  );
+
+  // 2. Settings
+  const settingsList: string[] = [];
+  if (r.symbol) settingsList.push(`- Symbol: ${r.symbol}`);
+  if (r.mode) settingsList.push(`- Mode: ${r.mode}`);
+  if ((r as any).generated_at) settingsList.push(`- Generated At: ${(r as any).generated_at}`);
+  if ((r as any).run_settings) settingsList.push(`- Run Settings: ${(r as any).run_settings}`);
+  if (settingsList.length > 0) {
+    sections.push(`## Settings\n${settingsList.join('\n')}`);
+  }
+
+  // 3. Overall stats from global_kpis
+  if (r.global_kpis) {
+    const g = r.global_kpis;
+    sections.push(
+      `## Overall Stats\n` +
+      `- Trades: ${g.count ?? 0}\n` +
+      `- Win Rate: ${formatNum(g.win_rate)}%\n` +
+      `- Expectancy: ${formatNum(g.expectancy)}R\n` +
+      `- Avg R: ${formatNum(g.avg_r)}R\n` +
+      `- Profit Factor: ${formatNum(g.profit_factor)}\n` +
+      `- Max Drawdown: $${formatNum(g.max_dd_money)}\n` +
+      `- Net Realized P&L: $${formatNum(g.net_pnl)}\n` +
+      `- Sample Status: ${g.is_inconclusive ? 'INCONCLUSIVE (<30 trades)' : 'VALID'}`
+    );
+  }
+
+  // 4. Table of strategy_kpis
+  if (r.strategy_kpis && Object.keys(r.strategy_kpis).length > 0) {
+    const rows = Object.entries(r.strategy_kpis).map(([strat, k]) => {
+      const inconcl = k.is_inconclusive ? 'Yes' : 'No';
+      return `| ${strat} | ${k.count ?? 0} | ${formatNum(k.win_rate)}% | ${formatNum(k.expectancy)}R | ${formatNum(k.profit_factor)} | $${formatNum(k.net_pnl)} | ${inconcl} |`;
+    });
+    sections.push(
+      `## Strategy Performance\n` +
+      `| Strategy | Trades | Win Rate | Expectancy | Profit Factor | Net P&L | Inconclusive |\n` +
+      `| --- | --- | --- | --- | --- | --- | --- |\n` +
+      rows.join('\n')
+    );
+  }
+
+  // 5. Table of dow_kpis
+  if (r.dow_kpis && Object.keys(r.dow_kpis).length > 0) {
+    const rows = Object.entries(r.dow_kpis).map(([dow, k]) => {
+      const inconcl = k.is_inconclusive ? 'Yes' : 'No';
+      return `| ${dow} | ${k.count ?? 0} | ${formatNum(k.win_rate)}% | ${formatNum(k.expectancy)}R | ${formatNum(k.profit_factor)} | $${formatNum(k.net_pnl)} | ${inconcl} |`;
+    });
+    sections.push(
+      `## Day of Week Performance\n` +
+      `| Day | Trades | Win Rate | Expectancy | Profit Factor | Net P&L | Inconclusive |\n` +
+      `| --- | --- | --- | --- | --- | --- | --- |\n` +
+      rows.join('\n')
+    );
+  }
+
+  // 6. Improvement Tips
+  if (r.improvement_tips && r.improvement_tips.length > 0) {
+    const tipBlocks = r.improvement_tips.map((t, idx) => {
+      return (
+        `### Tip ${idx + 1}: ${t.title || 'Recommendation'}\n` +
+        `- Severity: ${t.severity || 'N/A'}\n` +
+        `- Strategy: ${t.strategy || 'ALL'}\n` +
+        `- Description: ${t.description || ''}\n` +
+        `- Action: ${t.action || ''}`
+      );
+    });
+    sections.push(`## Improvement Tips\n${tipBlocks.join('\n\n')}`);
+  }
+
+  // 7. Skipped Summary
+  const skipped = (r as any).skipped_summary;
+  if (skipped && typeof skipped === 'object' && Object.keys(skipped).length > 0) {
+    const lines = Object.entries(skipped).map(([reason, count]) => `- ${reason}: ${count}`);
+    sections.push(`## Skipped Signals Summary\n${lines.join('\n')}`);
+  }
+
+  // 8. Trades CSV (up to 150 most recent)
+  if (r.all_trades && Array.isArray(r.all_trades) && r.all_trades.length > 0) {
+    const totalCount = r.all_trades.length;
+    const recent = r.all_trades.slice(-150);
+    const omitted = totalCount - recent.length;
+
+    const csvHeader = 'trade_id,date,strategy,direction,signal_time_sast,entry_price,sl,tp,exit_reason,r_multiple,money_pnl,mfe_r,mae_r,result';
+    const csvRows = recent.map((t: any) => {
+      const tid = t.trade_id || t.ticket || '';
+      const date = t.date || '';
+      const strat = t.strategy || '';
+      const dir = t.direction || '';
+      const sast = t.signal_time_sast || '';
+      const entry = formatNum(t.entry_price);
+      const sl = formatNum(t.sl);
+      const tp = formatNum(t.tp);
+      const reason = t.exit_reason || '';
+      const rMult = formatNum(t.r_multiple);
+      const pnl = formatNum(t.money_pnl);
+      const mfe = formatNum(t.mfe_r);
+      const mae = formatNum(t.mae_r);
+      const res = t.result || '';
+      return `${tid},${date},${strat},${dir},${sast},${entry},${sl},${tp},${reason},${rMult},${pnl},${mfe},${mae},${res}`;
+    });
+
+    const note = omitted > 0 ? `*(Showing 150 most recent trades. ${omitted} older trades omitted.)*\n\n` : '';
+    sections.push(`## Trades\n${note}\`\`\`csv\n${csvHeader}\n${csvRows.join('\n')}\n\`\`\``);
+  }
+
+  // 9. Final Question
+  sections.push(`QUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
+
+  return sections.join('\n\n');
+}
 
 export const BacktestView: React.FC<BacktestViewProps> = ({
   themeMode = 'dark',
@@ -50,6 +182,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [progressText, setProgressText] = useState<string>('');
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+
+  // Copy for AI State
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
+  const [fallbackCopyText, setFallbackCopyText] = useState<string>('');
 
   // Table & Tip Filters
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
@@ -198,7 +334,25 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }
   };
 
-  // 7. Dismiss Tip handler
+  // 7. Copy for AI Handler
+  const handleCopyForAI = async () => {
+    if (!reportData) return;
+    const text = buildReportMarkdown(reportData);
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        setCopyStatus('copied');
+        setFallbackCopyText('');
+        setTimeout(() => setCopyStatus('idle'), 2000);
+      } else {
+        setFallbackCopyText(text);
+      }
+    } catch {
+      setFallbackCopyText(text);
+    }
+  };
+
+  // 8. Dismiss Tip handler
   const handleDismissTip = (tipId: string) => {
     const updated = [...dismissedTipIds, tipId];
     setDismissedTipIds(updated);
@@ -214,7 +368,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
-  // 8. Render Lightweight-Chart for the selected day
+  // 9. Render Lightweight-Chart for the selected day
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -327,7 +481,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           position: t.direction === 'BUY' ? 'belowBar' : 'aboveBar',
           color: t.direction === 'BUY' ? '#10b981' : '#ef4444',
           shape: t.direction === 'BUY' ? 'arrowUp' : 'arrowDown',
-          text: `${t.direction} Leg ${t.leg} (${t.strategy})`,
+          text: `${t.direction} (${t.strategy})`,
         });
       });
       markers.sort((a, b) => (a.time as number) - (b.time as number));
@@ -457,7 +611,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
           <div className="h-6 w-px bg-slate-300 dark:border-[#1a2030] hidden sm:block" />
 
-          {/* Report Viewer Dropdown */}
+          {/* Report Viewer Dropdown & Copy for AI */}
           <div className="flex items-center gap-2">
             <span className="text-xs font-bold text-slate-500">Report:</span>
             <select
@@ -474,9 +628,53 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 ))
               )}
             </select>
+
+            {reportData && (
+              <button
+                type="button"
+                onClick={handleCopyForAI}
+                className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                title="Copy markdown report for AI analysis"
+              >
+                {copyStatus === 'copied' ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-500" />
+                    <span className="text-emerald-500 font-bold">Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5 text-blue-500" />
+                    <span>Copy for AI</span>
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </motion.div>
+
+      {/* Fallback Textarea if Clipboard is Blocked */}
+      {fallbackCopyText && (
+        <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-amber-500/40 shadow-xs space-y-2 animate-in fade-in">
+          <div className="flex items-center justify-between text-xs font-bold text-amber-600 dark:text-amber-400">
+            <span>Clipboard write was blocked by the browser. Select all and copy the text below:</span>
+            <button
+              type="button"
+              onClick={() => setFallbackCopyText('')}
+              className="text-slate-400 hover:text-black dark:hover:text-white cursor-pointer text-xs"
+            >
+              Dismiss
+            </button>
+          </div>
+          <textarea
+            readOnly
+            value={fallbackCopyText}
+            rows={10}
+            onFocus={(e) => e.target.select()}
+            className="w-full p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none"
+          />
+        </div>
+      )}
 
       {/* Live Running Progress Banner */}
       {isRunning && (
@@ -580,7 +778,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Filled Legs</div>
+              <div className="text-[10px] uppercase font-bold text-slate-500">Total Trades</div>
               <div className="text-2xl font-bold font-mono text-blue-600 dark:text-blue-400 mt-1">{kpis.count}</div>
               <div className="mt-1">
                 {kpis.is_inconclusive ? (
@@ -826,14 +1024,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
             <h4 className="text-xs font-bold text-black dark:text-white uppercase mb-3">
-              Trades for {selectedDay} ({reportData?.day_data?.[selectedDay]?.trades?.length || 0} legs)
+              Trades for {selectedDay} ({reportData?.day_data?.[selectedDay]?.trades?.length || 0} trades)
             </h4>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs font-mono">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
                     <th className="py-2 px-3">Strategy</th>
-                    <th className="py-2 px-3 text-center">Leg</th>
                     <th className="py-2 px-3 text-center">Dir</th>
                     <th className="py-2 px-3">Lots</th>
                     <th className="py-2 px-3">Entry</th>
@@ -847,7 +1044,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   {(reportData?.day_data?.[selectedDay]?.trades || []).map((t: any, idx: number) => (
                     <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
                       <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
-                      <td className="py-2.5 px-3 text-center">{t.leg}</td>
                       <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
                         {t.direction}
                       </td>
@@ -910,7 +1106,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500 bg-slate-50 dark:bg-[#08090d]/50">
                     <th className="py-3 px-3">Date</th>
                     <th className="py-3 px-3">Strategy</th>
-                    <th className="py-3 px-3 text-center">Leg</th>
                     <th className="py-3 px-3 text-center">Dir</th>
                     <th className="py-3 px-3">Lots</th>
                     <th className="py-3 px-3">Entry</th>
@@ -928,7 +1123,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                     <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
                       <td className="py-2.5 px-3 text-slate-400">{t.date}</td>
                       <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
-                      <td className="py-2.5 px-3 text-center">{t.leg}</td>
                       <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
                         {t.direction}
                       </td>
