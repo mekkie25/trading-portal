@@ -214,6 +214,8 @@ def run_backtest_for_symbol(
     regime = "NORMAL"
 
     valid_vol_bars = 0
+    funnel = {"raw_signals": 0, "adapt_none": 0, "vol_filter_blocked": 0, "vol_invalid_passthrough": 0, "reached_open_trade": 0, "blocked_has_open": 0}
+    vol_block_reasons = {}
     step_interval = max(1, simulated_bars_count // 10)
 
     for i in range(sim_start_idx, total_bars):
@@ -284,6 +286,8 @@ def run_backtest_for_symbol(
             session_levels=session_levels,
             data_h1=h1_view
         )
+        if signal:
+            funnel["raw_signals"] += 1
 
         if signal and adaptive_mode:
             if active_vol.get("valid", False):
@@ -292,17 +296,27 @@ def run_backtest_for_symbol(
                     spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
                     sl_dist = abs(adapted.entry_price - adapted.stop_loss)
                     tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
-                    vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+                    vol_ok, vol_reason = volatility_engine.evaluate_volatility_filters(
                         active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
                     )
+                    if not vol_ok:
+                        funnel["vol_filter_blocked"] += 1
+                        reason_key = str(vol_reason).split("(")[0].split(":")[0].strip()[:40]
+                        vol_block_reasons[reason_key] = vol_block_reasons.get(reason_key, 0) + 1
                     signal = adapted if vol_ok else None
                 else:
+                    funnel["adapt_none"] += 1
                     signal = None
+            else:
+                funnel["vol_invalid_passthrough"] += 1
 
         if signal:
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
+                funnel["reached_open_trade"] += 1
                 sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
+            else:
+                funnel["blocked_has_open"] += 1
 
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
@@ -372,7 +386,8 @@ def run_backtest_for_symbol(
         f"mode: {mode_str}, target_rr: {GLOBAL_PARAMS.target_rr}, "
         f"use_breakeven: {GLOBAL_PARAMS.use_breakeven}, "
         f"use_supertrend_trail: {GLOBAL_PARAMS.use_supertrend_trail}, days: {days_count}, "
-        f"adaptive_effective_pct: {adaptive_pct}%"
+        f"adaptive_effective_pct: {adaptive_pct}%, "
+        f"funnel: {funnel}, vol_block_reasons: {vol_block_reasons}, strategy_errors: {sm.error_count}"
     )
 
     full_skip_summary = sim.skip_summary()
