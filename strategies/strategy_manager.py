@@ -46,6 +46,7 @@ class StrategyManager:
     }
 
     def __init__(self):
+        self.error_count = 0
         self.strategies = [
             GrubberKick(),
             Strategy513(),
@@ -110,6 +111,7 @@ class StrategyManager:
                     valid_signals.append(signal)
 
             except Exception as e:
+                self.error_count += 1
                 log.error(f"Error evaluating {strat_name} on {symbol}: {e}")
                 continue
 
