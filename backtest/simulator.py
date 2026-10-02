@@ -8,7 +8,9 @@ Replicates the exact single-order live position management of engine/matrix.py:
 - Daily trade cap tracked per SAST calendar date (max_daily_trades)
 - Minimum-lot risk tolerance check matching live bot
 - Skip logging and skip_summary() method
-- USD account currency scaling (USDJPY conversion by price, GERMAN30 refusal)
+- USD account currency scaling:
+    * USDJPY: converted to USD by dividing by entry/exit price
+    * GERMAN30: converted to USD by multiplying by EURUSD rate at or before trade time
 - Fix false post-stop recovery by ignoring creation candle
 - Deadline-based EOD close (first candle >= 21:00 SAST)
 - close_all(symbol, last_candle) method for END_OF_DATA
@@ -20,9 +22,10 @@ Replicates the exact single-order live position management of engine/matrix.py:
 import sys
 import os
 import math
+import bisect
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
@@ -44,7 +47,13 @@ ASSETS = {
 }
 
 class TradeSimulator:
-    def __init__(self, starting_balance: float = 1000.0, risk_pct: float = 1.0, account_currency: str = "USD"):
+    def __init__(
+        self,
+        starting_balance: float = 1000.0,
+        risk_pct: float = 1.0,
+        account_currency: str = "USD",
+        eurusd_df: Optional[pd.DataFrame] = None
+    ):
         self.starting_balance = starting_balance
         self.balance = starting_balance
         self.equity = starting_balance
@@ -56,6 +65,26 @@ class TradeSimulator:
         self.skipped: List[Dict[str, Any]] = []
         self.daily_trade_counts: Dict[str, int] = {}
         self._trade_counter: int = 0
+
+        # Sorted cache of EURUSD (timestamp_epoch, close_price) for zero-lookahead GERMAN30 conversion
+        self._eurusd_times: List[float] = []
+        self._eurusd_prices: List[float] = []
+        if eurusd_df is not None and not eurusd_df.empty:
+            df_e = eurusd_df.copy()
+            if not pd.api.types.is_datetime64_any_dtype(df_e['time']):
+                df_e['time'] = pd.to_datetime(df_e['time'], utc=True)
+            df_e.sort_values('time', inplace=True)
+            self._eurusd_times = [t.timestamp() for t in df_e['time']]
+            self._eurusd_prices = [float(p) for p in df_e['close']]
+
+    def _get_eurusd_rate_at_or_before(self, dt: datetime) -> Optional[float]:
+        if not self._eurusd_times:
+            return None
+        target_epoch = dt.timestamp()
+        idx = bisect.bisect_right(self._eurusd_times, target_epoch) - 1
+        if idx >= 0:
+            return self._eurusd_prices[idx]
+        return None
 
     def skip_summary(self) -> Dict[str, int]:
         summary: Dict[str, int] = {}
@@ -84,10 +113,6 @@ class TradeSimulator:
         if sl_dist <= 0:
             return self._record_skip(current_time, symbol, strategy, "INVALID_SL_DIST")
 
-        # Currency rule: GERMAN30 requires EURUSD conversion history, refuse if missing
-        if symbol == "GERMAN30":
-            return self._record_skip(current_time, symbol, strategy, "UNSUPPORTED_SYMBOL_NO_FX")
-
         # Daily trade cap check by SAST calendar date
         sast_time = current_time.astimezone(TZ_SAST)
         sast_date_str = sast_time.strftime("%Y-%m-%d")
@@ -108,8 +133,16 @@ class TradeSimulator:
 
         actual_entry = (entry_price + (spread_pts / 2.0)) if direction == "BUY" else (entry_price - (spread_pts / 2.0))
 
-        # Currency conversion: USDJPY is quoted in JPY, divide by entry_price to scale pip value to USD
-        fx_rate = (1.0 / entry_price) if symbol == "USDJPY" else 1.0
+        # Currency conversion: USDJPY (divide by entry), GERMAN30 (multiply by EURUSD rate at or before trade time)
+        if symbol == "USDJPY":
+            fx_rate = (1.0 / entry_price) if entry_price > 0 else 1.0
+        elif symbol == "GERMAN30":
+            rate = self._get_eurusd_rate_at_or_before(current_time)
+            if rate is None or rate <= 0:
+                return self._record_skip(current_time, symbol, strategy, "UNSUPPORTED_SYMBOL_NO_FX")
+            fx_rate = rate
+        else:
+            fx_rate = 1.0
 
         risk_cash = self.equity * (self.risk_pct / 100.0)
         pips_at_risk = sl_dist / pip_size
@@ -313,8 +346,16 @@ class TradeSimulator:
         # Half spread charged on exit (deducted from price difference)
         actual_exit = (exit_price - (spread_pts / 2.0)) if direction == "BUY" else (exit_price + (spread_pts / 2.0))
 
-        # Currency conversion for P&L: for USDJPY, divide by actual_exit to convert JPY profit to USD
-        fx_exit = (1.0 / actual_exit) if (pos["symbol"] == "USDJPY" and actual_exit > 0) else 1.0
+        # Currency conversion for P&L:
+        # USDJPY: convert JPY to USD by dividing by actual_exit
+        # GERMAN30: convert EUR to USD by multiplying by EURUSD rate at or before exit_time
+        if pos["symbol"] == "USDJPY":
+            fx_exit = (1.0 / actual_exit) if actual_exit > 0 else 1.0
+        elif pos["symbol"] == "GERMAN30":
+            rate = self._get_eurusd_rate_at_or_before(exit_time)
+            fx_exit = rate if (rate is not None and rate > 0) else 1.0
+        else:
+            fx_exit = 1.0
 
         price_diff = (actual_exit - entry) if direction == "BUY" else (entry - actual_exit)
         r_multiple = round(price_diff / sl_dist, 2) if sl_dist > 0 else 0.0
