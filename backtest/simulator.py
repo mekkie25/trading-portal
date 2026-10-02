@@ -1,197 +1,406 @@
 """
-backtest/tests/test_simulator_rules.py
-Unit tests verifying the TradeSimulator against synthetic price action:
-- Stop Loss execution (single trade)
-- Fixed R:R target execution
-- Break-Even gating (only active when use_breakeven is True)
-- Conservative collision rule (SL hit first if both SL and TP breached in same candle)
-- 21:00 SAST EOD close
-- Daily trade cap blocks 3rd trade of SAST day (NEW)
-- Min-lot gate rejects trade on small balance with large stop (NEW)
-- EOD close happens even if there is no exact 21:00 candle (NEW)
-- Candle touching both SL and TP gives a loss and is NOT labelled NOISE_STOPOUT_RECOVERED (NEW)
-- USDJPY P&L is scaled to USD (NEW)
-- GERMAN30 is refused with UNSUPPORTED_SYMBOL_NO_FX (NEW)
-- close_all closes open positions with END_OF_DATA (NEW)
+backtest/simulator.py
+Replicates the exact single-order live position management of engine/matrix.py:
+- Single market order with full lot size
+- Fixed R:R target via compute_fixed_target
+- 80% R:R Break-Even trigger gated by GLOBAL_PARAMS.use_breakeven
+- SuperTrend 5M trailing exit gated by GLOBAL_PARAMS.use_supertrend_trail
+- Daily trade cap tracked per SAST calendar date (max_daily_trades)
+- Minimum-lot risk tolerance check matching live bot
+- Skip logging and skip_summary() method
+- USD account currency scaling (USDJPY conversion by price, GERMAN30 refusal)
+- Fix false post-stop recovery by ignoring creation candle
+- Deadline-based EOD close (first candle >= 21:00 SAST)
+- close_all(symbol, last_candle) method for END_OF_DATA
+- Conservative collision rule (SL hit first if same candle touches both SL and TP)
+- Half spread charged on entry AND half spread charged on exit
+- Classification by R: WIN if r_multiple > 0.1, LOSS if r_multiple < -0.1, else BREAKEVEN
 """
 
 import sys
 import os
-import pytest
+import math
 import pandas as pd
-from datetime import datetime, timezone
-from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Any
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from core.session_config import GLOBAL_PARAMS
-from backtest.simulator import TradeSimulator
+from core.session_config import TZ_SAST, GLOBAL_PARAMS
+from core.indicators import calculate_supertrend
+from core.targets import compute_fixed_target
 
-@dataclass
-class DummySignal:
-    symbol: str = "US30"
-    direction: str = "BUY"
-    entry_price: float = 43000.0
-    stop_loss: float = 42965.0
-    take_profit: float = 43035.0
-    take_profit_1: float = 43035.0
-    take_profit_2: float = 43070.0
-    strategy: str = "GRUBBER_KICK"
-    trail_mode: str = "MOVE_TO_BE_80"
+# Whitelist asset specifications
+ASSETS = {
+    "GOLD": {"pip_size": 0.01, "contract_size": 100.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
+    "US30": {"pip_size": 1.0, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 2.50},
+    "NAS100": {"pip_size": 0.1, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 1.50},
+    "GERMAN30": {"pip_size": 0.1, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 1.80},
+    "EURUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00010},
+    "USDJPY": {"pip_size": 0.01, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
+    "GBPUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
+}
 
-def test_sl_execution():
-    GLOBAL_PARAMS.target_rr = 1.0
-    GLOBAL_PARAMS.use_breakeven = False
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal()
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    sim.open_trade(sig, t0, adr_val=300.0, regime="NORMAL", ref_levels={})
+class TradeSimulator:
+    def __init__(self, starting_balance: float = 1000.0, risk_pct: float = 1.0, account_currency: str = "USD"):
+        self.starting_balance = starting_balance
+        self.balance = starting_balance
+        self.equity = starting_balance
+        self.risk_pct = risk_pct
+        self.account_currency = account_currency
+        self.open_positions: List[Dict[str, Any]] = []
+        self.completed_trades: List[Dict[str, Any]] = []
+        self.pending_sl_evaluations: List[Dict[str, Any]] = []
+        self.skipped: List[Dict[str, Any]] = []
+        self.daily_trade_counts: Dict[str, int] = {}
+        self._trade_counter: int = 0
 
-    # Candle dips to 42950 (breaches SL of 42965)
-    c1 = pd.Series({'time': '2026-09-30 08:05:00', 'open': 43000, 'high': 43010, 'low': 42950, 'close': 42960})
-    sim.process_candle("US30", c1, pd.DataFrame())
+    def skip_summary(self) -> Dict[str, int]:
+        summary: Dict[str, int] = {}
+        for s in self.skipped:
+            reason = s.get("reason", "UNKNOWN")
+            summary[reason] = summary.get(reason, 0) + 1
+        return summary
 
-    assert len(sim.completed_trades) == 1
-    assert sim.completed_trades[0]["result"] == "LOSS"
-    assert "trade_id" in sim.completed_trades[0]
-    assert sim.balance < 1000.0
+    def _record_skip(self, current_time: datetime, symbol: str, strategy: str, reason: str) -> bool:
+        self.skipped.append({
+            "time": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "strategy": strategy,
+            "reason": reason
+        })
+        return False
 
-def test_fixed_rr_tp_execution():
-    GLOBAL_PARAMS.target_rr = 1.0
-    GLOBAL_PARAMS.use_breakeven = False
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal()  # SL dist = 35 -> Fixed TP at 43035
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    sim.open_trade(sig, t0, adr_val=300.0, regime="NORMAL", ref_levels={})
+    def open_trade(self, signal: Any, current_time: datetime, adr_val: Optional[float], regime: str, ref_levels: dict) -> bool:
+        symbol = signal.symbol
+        direction = signal.direction.upper()
+        strategy = getattr(signal, "strategy", "UNKNOWN")
+        entry_price = float(signal.entry_price)
+        sl = float(signal.stop_loss)
+        sl_dist = abs(entry_price - sl)
 
-    # Candle rallies to 43040 (hits fixed TP of 43035)
-    c1 = pd.Series({'time': '2026-09-30 08:05:00', 'open': 43000, 'high': 43040, 'low': 42990, 'close': 43035})
-    sim.process_candle("US30", c1, pd.DataFrame())
+        if sl_dist <= 0:
+            return self._record_skip(current_time, symbol, strategy, "INVALID_SL_DIST")
 
-    assert len(sim.completed_trades) == 1
-    assert sim.completed_trades[0]["result"] == "WIN"
-    assert sim.completed_trades[0]["exit_reason"] == "TP"
-    assert len(sim.open_positions) == 0
+        # Currency rule: GERMAN30 requires EURUSD conversion history, refuse if missing
+        if symbol == "GERMAN30":
+            return self._record_skip(current_time, symbol, strategy, "UNSUPPORTED_SYMBOL_NO_FX")
 
-def test_be_gating_behavior():
-    # 1. When use_breakeven is False, stop should NOT move to entry
-    GLOBAL_PARAMS.target_rr = 2.0
-    GLOBAL_PARAMS.use_breakeven = False
-    sim1 = TradeSimulator(starting_balance=1000.0)
-    sig1 = DummySignal(take_profit=43070.0, take_profit_1=43070.0)
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    sim1.open_trade(sig1, t0, adr_val=300.0, regime="NORMAL", ref_levels={})
+        # Daily trade cap check by SAST calendar date
+        sast_time = current_time.astimezone(TZ_SAST)
+        sast_date_str = sast_time.strftime("%Y-%m-%d")
+        current_daily_count = self.daily_trade_counts.get(sast_date_str, 0)
+        max_daily = getattr(GLOBAL_PARAMS, 'max_daily_trades', 2)
+        if current_daily_count >= max_daily:
+            return self._record_skip(current_time, symbol, strategy, "DAILY_CAP")
 
-    c1 = pd.Series({'time': '2026-09-30 08:05:00', 'open': 43000, 'high': 43065, 'low': 42990, 'close': 43060})
-    sim1.process_candle("US30", c1, pd.DataFrame())
-    assert sim1.open_positions[0]["is_be_moved"] is False
+        # Fixed R:R target computation and structural room check
+        fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr)
+        if fixed_tp is None:
+            return self._record_skip(current_time, symbol, strategy, "NO_ROOM")
 
-    # 2. When use_breakeven is True, stop DOES move to entry
-    GLOBAL_PARAMS.use_breakeven = True
-    sim2 = TradeSimulator(starting_balance=1000.0)
-    sim2.open_trade(sig1, t0, adr_val=300.0, regime="NORMAL", ref_levels={})
-    sim2.process_candle("US30", c1, pd.DataFrame())
-    assert sim2.open_positions[0]["is_be_moved"] is True
-    assert sim2.open_positions[0]["stop_loss"] == sim2.open_positions[0]["entry_price"]
+        cfg = ASSETS.get(symbol, {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.0001})
+        contract_size = cfg["contract_size"]
+        pip_size = cfg["pip_size"]
+        spread_pts = cfg["spread"]
 
-def test_same_candle_collision_conservative_rule():
-    GLOBAL_PARAMS.target_rr = 1.0
-    GLOBAL_PARAMS.use_breakeven = False
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal()
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    sim.open_trade(sig, t0, adr_val=300.0, regime="NORMAL", ref_levels={})
+        actual_entry = (entry_price + (spread_pts / 2.0)) if direction == "BUY" else (entry_price - (spread_pts / 2.0))
 
-    # Volatile candle touches BOTH SL (42965) and TP (43035)
-    c_wild = pd.Series({'time': '2026-09-30 08:05:00', 'open': 43000, 'high': 43050, 'low': 42950, 'close': 43000})
-    sim.process_candle("US30", c_wild, pd.DataFrame())
+        # Currency conversion: USDJPY is quoted in JPY, divide by entry_price to scale pip value to USD
+        fx_rate = (1.0 / entry_price) if symbol == "USDJPY" else 1.0
 
-    # Conservative rule: SL must hit first, resulting in single LOSS
-    assert len(sim.completed_trades) == 1
-    assert sim.completed_trades[0]["exit_reason"] == "SL_CONSERVATIVE_COLLISION"
-    assert sim.completed_trades[0]["result"] == "LOSS"
-    # Verify it is not falsely labelled as recovered
-    assert sim.completed_trades[0]["failure_reason"] != "NOISE_STOPOUT_RECOVERED"
+        risk_cash = self.equity * (self.risk_pct / 100.0)
+        pips_at_risk = sl_dist / pip_size
+        pip_value_per_lot = (pip_size * contract_size) * fx_rate
+        risk_per_lot = pips_at_risk * pip_value_per_lot
+        raw_lots = risk_cash / (risk_per_lot + 1e-9)
 
-# --- NEW TESTS ---
+        lot_step = cfg["lot_step"]
+        min_lots = cfg["min_lots"]
+        tolerance = getattr(GLOBAL_PARAMS, 'min_lot_risk_tolerance', 1.5)
 
-def test_daily_cap_blocks_third_trade():
-    """NEW: Verifies daily trade quota blocks the 3rd trade on the same SAST date."""
-    GLOBAL_PARAMS.max_daily_trades = 2
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal()
-    t1 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    t2 = datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)
-    t3 = datetime(2026, 9, 30, 10, 0, tzinfo=timezone.utc)
+        # Minimum-lot check matching the live bot
+        if raw_lots < min_lots:
+            min_lot_cash_risk = min_lots * risk_per_lot
+            if min_lot_cash_risk > (tolerance * risk_cash):
+                return self._record_skip(current_time, symbol, strategy, "MIN_LOT_TOO_RISKY")
+            total_lots = min_lots
+        else:
+            stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
+            total_lots = round(max(stepped_lots, min_lots), 2)
 
-    assert sim.open_trade(sig, t1, 300.0, "NORMAL", {}) is True
-    assert sim.open_trade(sig, t2, 300.0, "NORMAL", {}) is True
-    assert sim.open_trade(sig, t3, 300.0, "NORMAL", {}) is False
-    assert sim.skip_summary().get("DAILY_CAP", 0) == 1
+        # SAST 21:00 EOD deadline for this trade
+        eod_deadline = sast_time.replace(hour=21, minute=0, second=0, microsecond=0)
+        if sast_time >= eod_deadline:
+            eod_deadline += timedelta(days=1)
 
-def test_min_lot_gate_rejects_on_small_balance():
-    """NEW: Verifies min-lot risk gate rejects a trade on a tiny account with wide stop."""
-    GLOBAL_PARAMS.min_lot_risk_tolerance = 1.5
-    sim = TradeSimulator(starting_balance=10.0, risk_pct=1.0)  # $0.10 allowable risk
-    # Stop distance = 100 points on US30 ($1/pt) -> 0.01 lots risks $1.00, which is 10x risk budget
-    sig = DummySignal(symbol="US30", entry_price=43000.0, stop_loss=42900.0, take_profit=43100.0, take_profit_1=43100.0)
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+        self._trade_counter += 1
+        trade_id = f"{symbol}_{int(current_time.timestamp())}_{self._trade_counter}"
 
-    assert sim.open_trade(sig, t0, 300.0, "NORMAL", {}) is False
-    assert sim.skip_summary().get("MIN_LOT_TOO_RISKY", 0) == 1
+        position = {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "strategy": strategy,
+            "direction": direction,
+            "lots": total_lots,
+            "entry_price": actual_entry,
+            "stop_loss": sl,
+            "take_profit": fixed_tp,
+            "initial_sl_dist": sl_dist,
+            "open_time": current_time,
+            "contract_size": contract_size,
+            "pip_size": pip_size,
+            "spread_pts": spread_pts,
+            "adr_val": adr_val,
+            "regime": regime,
+            "ref_levels": ref_levels,
+            "trail_mode": getattr(signal, "trail_mode", "MOVE_TO_BE_80"),
+            "is_be_moved": False,
+            "mfe_price": actual_entry,
+            "mae_price": actual_entry,
+            "profit_seen": False,
+            "loss_seen": False,
+            "profit_first": False,
+            "eod_deadline_sast": eod_deadline
+        }
 
-def test_eod_close_without_exact_2100_candle():
-    """NEW: Verifies EOD close happens on the first candle >= 21:00 SAST (19:00 UTC) even if 19:00 is skipped."""
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal()
-    t0 = datetime(2026, 9, 30, 14, 0, tzinfo=timezone.utc)
-    sim.open_trade(sig, t0, 300.0, "NORMAL", {})
+        self.daily_trade_counts[sast_date_str] = current_daily_count + 1
+        self.open_positions.append(position)
+        return True
 
-    # Candle arrives at 19:05 UTC (21:05 SAST)
-    c_late = pd.Series({'time': '2026-09-30 19:05:00', 'open': 43010, 'high': 43020, 'low': 43005, 'close': 43015})
-    sim.process_candle("US30", c_late, pd.DataFrame())
+    def process_candle(self, symbol: str, candle: pd.Series, m5_slice: pd.DataFrame):
+        c_high = float(candle['high'])
+        c_low = float(candle['low'])
+        c_close = float(candle['close'])
+        curr_time = pd.to_datetime(candle['time'], utc=True).to_pydatetime()
+        sast_time = curr_time.astimezone(TZ_SAST)
 
-    assert len(sim.completed_trades) == 1
-    assert sim.completed_trades[0]["exit_reason"] == "EOD_LOCKDOWN"
+        remaining_positions = []
 
-def test_usdjpy_pnl_in_usd_scale():
-    """NEW: Verifies USDJPY P&L is converted from JPY to USD by dividing by price."""
-    sim = TradeSimulator(starting_balance=1000.0)
-    # USDJPY entry = 150.00, sl = 149.50, tp = 150.50
-    sig = DummySignal(symbol="USDJPY", entry_price=150.00, stop_loss=149.50, take_profit=150.50, take_profit_1=150.50)
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    sim.open_trade(sig, t0, 1.0, "NORMAL", {})
+        for pos in self.open_positions:
+            if pos["symbol"] != symbol:
+                remaining_positions.append(pos)
+                continue
 
-    # Hits TP at 150.50
-    c1 = pd.Series({'time': '2026-09-30 08:05:00', 'open': 150.00, 'high': 150.60, 'low': 149.90, 'close': 150.50})
-    sim.process_candle("USDJPY", c1, pd.DataFrame())
+            entry = pos["entry_price"]
+            sl = pos["stop_loss"]
+            tp = pos["take_profit"]
+            direction = pos["direction"]
+            sl_dist = pos["initial_sl_dist"]
 
-    assert len(sim.completed_trades) == 1
-    trade = sim.completed_trades[0]
-    assert trade["result"] == "WIN"
-    # Profit in JPY would be ~10,000 JPY per lot; in USD it must be around $60 - $70, not thousands
-    assert trade["money_pnl"] < 500.0
+            # Update MFE, MAE, and Profit-First flags
+            if direction == "BUY":
+                pos["mfe_price"] = max(pos["mfe_price"], c_high)
+                pos["mae_price"] = min(pos["mae_price"], c_low)
+                if c_high > entry and not pos["loss_seen"]:
+                    pos["profit_first"] = True
+                if c_high > entry:
+                    pos["profit_seen"] = True
+                if c_low < entry:
+                    pos["loss_seen"] = True
+            else:
+                pos["mfe_price"] = min(pos["mfe_price"], c_low)
+                pos["mae_price"] = max(pos["mae_price"], c_high)
+                if c_low < entry and not pos["loss_seen"]:
+                    pos["profit_first"] = True
+                if c_low < entry:
+                    pos["profit_seen"] = True
+                if c_high > entry:
+                    pos["loss_seen"] = True
 
-def test_german30_refused_no_fx():
-    """NEW: Verifies GERMAN30 is refused because EURUSD history is not loaded."""
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal(symbol="GERMAN30", entry_price=18000.0, stop_loss=17950.0, take_profit=18050.0, take_profit_1=18050.0)
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+            # Collision Check (Conservative: SL hit first)
+            sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
+            tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
 
-    assert sim.open_trade(sig, t0, 200.0, "NORMAL", {}) is False
-    assert sim.skip_summary().get("UNSUPPORTED_SYMBOL_NO_FX", 0) == 1
+            if sl_hit and tp_hit:
+                self._close_position(pos, sl, curr_time, "SL_CONSERVATIVE_COLLISION")
+                continue
 
-def test_close_all_closes_open_positions():
-    """NEW: Verifies close_all closes in-flight trades at end of data."""
-    sim = TradeSimulator(starting_balance=1000.0)
-    sig = DummySignal()
-    t0 = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
-    sim.open_trade(sig, t0, 300.0, "NORMAL", {})
-    assert len(sim.open_positions) == 1
+            if sl_hit:
+                self._close_position(pos, sl, curr_time, "SL")
+                continue
 
-    last_candle = pd.Series({'time': '2026-09-30 18:00:00', 'open': 43010, 'high': 43020, 'low': 43000, 'close': 43015})
-    sim.close_all("US30", last_candle)
+            if tp_hit:
+                self._close_position(pos, tp, curr_time, "TP")
+                continue
 
-    assert len(sim.open_positions) == 0
-    assert len(sim.completed_trades) == 1
-    assert sim.completed_trades[0]["exit_reason"] == "END_OF_DATA"
+            # Dynamic 80% R:R Break-Even Rule (gated by GLOBAL_PARAMS.use_breakeven)
+            if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
+                progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
+                target_dist = abs(tp - entry)
+                if target_dist > 0 and (progress / target_dist) >= 0.80 and progress >= (0.50 * sl_dist):
+                    pos["stop_loss"] = entry
+                    pos["is_be_moved"] = True
+
+            # SuperTrend 5M Trailing Stop Exit (gated by GLOBAL_PARAMS.use_supertrend_trail)
+            if GLOBAL_PARAMS.use_supertrend_trail and pos["trail_mode"] == "SUPERTREND" and len(m5_slice) >= 15:
+                st = calculate_supertrend(m5_slice, period=10, factor=1.6)
+                curr_dir = int(st['supertrend_direction'].iloc[-1])
+                if (direction == "BUY" and curr_dir == -1) or (direction == "SELL" and curr_dir == 1):
+                    self._close_position(pos, c_close, curr_time, "SUPERTREND_TRAIL")
+                    continue
+
+            # EOD close: close on first candle whose SAST time >= eod_deadline_sast
+            if sast_time >= pos["eod_deadline_sast"]:
+                self._close_position(pos, c_close, curr_time, "EOD_LOCKDOWN")
+                continue
+
+            remaining_positions.append(pos)
+
+        self.open_positions = remaining_positions
+
+        # Strict Post-SL Recovery Monitor (Max 2 hours, max 0.5x SL adverse breach)
+        active_pending = []
+        for pending in self.pending_sl_evaluations:
+            if pending["symbol"] != symbol:
+                active_pending.append(pending)
+                continue
+
+            # Avoid false recovery label on the candle that triggered the stop
+            if curr_time == pending["created_candle_time"]:
+                active_pending.append(pending)
+                continue
+
+            direction = pending["direction"]
+            target_tp = pending["target_tp"]
+            max_adverse = pending["max_adverse_allowed"]
+
+            # Check if market blew past adverse tolerance
+            if not pending["adverse_blown"]:
+                if direction == "BUY" and c_low <= max_adverse:
+                    pending["adverse_blown"] = True
+                elif direction == "SELL" and c_high >= max_adverse:
+                    pending["adverse_blown"] = True
+
+            # If adverse move was modest, check if it reached original TP within 2 hours
+            if not pending["adverse_blown"]:
+                reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
+                if reached_tp:
+                    pending["record"]["failure_reason"] = "NOISE_STOPOUT_RECOVERED"
+                    pending["record"]["recovered_to_tp"] = True
+                    pending["bars_remaining"] = 0
+
+            pending["bars_remaining"] -= 1
+
+            if pending["bars_remaining"] > 0 and sast_time < pending["eod_deadline_sast"]:
+                active_pending.append(pending)
+
+        self.pending_sl_evaluations = active_pending
+
+    def close_all(self, symbol: str, last_candle: pd.Series):
+        c_close = float(last_candle['close'])
+        curr_time = pd.to_datetime(last_candle['time'], utc=True).to_pydatetime()
+
+        remaining_positions = []
+        for pos in self.open_positions:
+            if pos["symbol"] == symbol:
+                self._close_position(pos, c_close, curr_time, "END_OF_DATA")
+            else:
+                remaining_positions.append(pos)
+        self.open_positions = remaining_positions
+
+    def _close_position(self, pos: Dict[str, Any], exit_price: float, exit_time: datetime, reason: str):
+        direction = pos["direction"]
+        entry = pos["entry_price"]
+        sl_dist = pos["initial_sl_dist"]
+        lots = pos["lots"]
+        contract_size = pos["contract_size"]
+        pip_size = pos.get("pip_size", 0.01)
+        spread_pts = pos.get("spread_pts", 0.0)
+
+        # Half spread charged on exit (deducted from price difference)
+        actual_exit = (exit_price - (spread_pts / 2.0)) if direction == "BUY" else (exit_price + (spread_pts / 2.0))
+
+        # Currency conversion for P&L: for USDJPY, divide by actual_exit to convert JPY profit to USD
+        fx_exit = (1.0 / actual_exit) if (pos["symbol"] == "USDJPY" and actual_exit > 0) else 1.0
+
+        price_diff = (actual_exit - entry) if direction == "BUY" else (entry - actual_exit)
+        r_multiple = round(price_diff / sl_dist, 2) if sl_dist > 0 else 0.0
+        money_pnl = round(price_diff * lots * contract_size * fx_exit, 2)
+
+        # MFE and MAE calculations
+        if direction == "BUY":
+            mfe_dist = max(0.0, pos["mfe_price"] - entry)
+            mae_dist = max(0.0, entry - pos["mae_price"])
+        else:
+            mfe_dist = max(0.0, entry - pos["mfe_price"])
+            mae_dist = max(0.0, pos["mae_price"] - entry)
+
+        mfe_r = round(mfe_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+        mae_r = round(mae_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+        mfe_pips = round(mfe_dist / pip_size, 1) if pip_size > 0 else 0.0
+        mae_pips = round(mae_dist / pip_size, 1) if pip_size > 0 else 0.0
+
+        # Classify result strictly by R: WIN if r_multiple > 0.1, LOSS if r_multiple < -0.1, else BREAKEVEN
+        if r_multiple > 0.1:
+            result = "WIN"
+        elif r_multiple < -0.1:
+            result = "LOSS"
+        else:
+            result = "BREAKEVEN"
+
+        duration_min = int((exit_time - pos["open_time"]).total_seconds() / 60)
+
+        # Initial failure categorization
+        target_dist = abs(pos["take_profit"] - entry)
+        if result == "WIN":
+            failure_reason = "NONE_WIN"
+        elif target_dist > 0 and (mfe_dist / target_dist) >= 0.75:
+            failure_reason = "NEAR_TP_REVERSAL"
+        elif mfe_r < 0.25:
+            failure_reason = "STRAIGHT_DRAWDOWN"
+        else:
+            failure_reason = "CLEAN_LOSS"
+
+        record = {
+            "trade_id": pos["trade_id"],
+            "date": pos["open_time"].strftime("%Y-%m-%d"),
+            "symbol": pos["symbol"],
+            "strategy": pos["strategy"],
+            "direction": direction,
+            "signal_time_utc": pos["open_time"].strftime("%Y-%m-%d %H:%M:%S"),
+            "signal_time_sast": pos["open_time"].astimezone(TZ_SAST).strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_price": round(entry, 5),
+            "exit_price": round(actual_exit, 5),
+            "sl": round(pos["stop_loss"], 5),
+            "tp": round(pos["take_profit"], 5),
+            "lots": lots,
+            "exit_time": exit_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_reason": reason,
+            "duration_minutes": duration_min,
+            "result": result,
+            "r_multiple": r_multiple,
+            "money_pnl": money_pnl,
+            "mfe_r": mfe_r,
+            "mae_r": mae_r,
+            "mfe_pips": mfe_pips,
+            "mae_pips": mae_pips,
+            "profit_first": pos["profit_first"],
+            "failure_reason": failure_reason,
+            "recovered_to_tp": False,
+            "spread_paid": spread_pts,
+            "adr": pos["adr_val"],
+            "regime": pos["regime"]
+        }
+
+        # If trade stopped out, register for post-SL tracking (skipping the creation candle)
+        if result == "LOSS" and "SL" in reason:
+            max_adverse = (pos["stop_loss"] - (0.50 * sl_dist)) if direction == "BUY" else (pos["stop_loss"] + (0.50 * sl_dist))
+            self.pending_sl_evaluations.append({
+                "record": record,
+                "symbol": pos["symbol"],
+                "direction": direction,
+                "target_tp": pos["take_profit"],
+                "max_adverse_allowed": max_adverse,
+                "adverse_blown": False,
+                "bars_remaining": 24,
+                "pip_size": pip_size,
+                "created_candle_time": exit_time,
+                "eod_deadline_sast": pos["eod_deadline_sast"]
+            })
+
+        self.balance += money_pnl
+        self.equity = self.balance
+        self.completed_trades.append(record)
