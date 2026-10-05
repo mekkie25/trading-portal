@@ -8,6 +8,7 @@ import {
   TrendingDown, 
   ShieldAlert, 
   Clock,
+  Info
 } from 'lucide-react';
 import { CALENDAR_DATA_SEPTEMBER_2026 } from '../../data/mockTradingData';
 import { CalendarDayData, MacroRelease, ThemeMode } from '../../types';
@@ -23,14 +24,38 @@ const MONTH_NAMES = [
 
 const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
+// Picks the latest "YYYY-MM" key present in the calendar data map.
+// Used to auto-jump the view to a month that actually has events.
+function latestDataMonth(data: Record<string, CalendarDayData>): { year: number; month: number } | null {
+  const keys = Object.keys(data).sort();
+  if (keys.length === 0) return null;
+  const last = keys[keys.length - 1];
+  const y = parseInt(last.slice(0, 4), 10);
+  const m = parseInt(last.slice(5, 7), 10);
+  if (!Number.isFinite(y) || !Number.isFinite(m)) return null;
+  return { year: y, month: m };
+}
+
 export const EconomicCalendarView: React.FC<EconomicCalendarViewProps> = ({ themeMode = 'dark' }) => {
-  const today = new Date();
-  const [viewYear, setViewYear] = useState<number>(today.getFullYear());
-  const [viewMonth, setViewMonth] = useState<number>(today.getMonth() + 1); // 1-12
+  const allData = CALENDAR_DATA_SEPTEMBER_2026;
+
+  // PROPOSED: default the view to the most recent month that has data.
+  // If today's month has no entries (very common), this avoids an empty grid.
+  const initial = useMemo(() => {
+    const now = new Date();
+    const todayPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const hasTodayMonth = Object.keys(allData).some((k) => k.startsWith(todayPrefix));
+    if (hasTodayMonth) return { year: now.getFullYear(), month: now.getMonth() + 1 };
+    const fallback = latestDataMonth(allData);
+    if (fallback) return fallback;
+    return { year: now.getFullYear(), month: now.getMonth() + 1 };
+  }, [allData]);
+
+  const [viewYear, setViewYear] = useState<number>(initial.year);
+  const [viewMonth, setViewMonth] = useState<number>(initial.month); // 1-12
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [activeReleaseId, setActiveReleaseId] = useState<string>('');
 
-  const allData = CALENDAR_DATA_SEPTEMBER_2026;
   const monthPrefix = `${viewYear}-${String(viewMonth).padStart(2, '0')}`;
 
   // Calendar grid sizing for the viewed month.
@@ -75,10 +100,16 @@ export const EconomicCalendarView: React.FC<EconomicCalendarViewProps> = ({ them
     if (viewMonth === 12) { setViewMonth(1); setViewYear((y) => y + 1); }
     else setViewMonth((m) => m + 1);
   };
-  const goToday = () => {
-    const now = new Date();
-    setViewYear(now.getFullYear());
-    setViewMonth(now.getMonth() + 1);
+  const goToLatestData = () => {
+    const latest = latestDataMonth(allData);
+    if (latest) {
+      setViewYear(latest.year);
+      setViewMonth(latest.month);
+    } else {
+      const now = new Date();
+      setViewYear(now.getFullYear());
+      setViewMonth(now.getMonth() + 1);
+    }
   };
 
   const handleSelectDay = (dateStr: string) => {
@@ -136,13 +167,16 @@ export const EconomicCalendarView: React.FC<EconomicCalendarViewProps> = ({ them
           <span className="text-base font-bold text-slate-900 dark:text-white tracking-tight">
             {MONTH_NAMES[viewMonth - 1]} {viewYear}
           </span>
-          <button
-            type="button"
-            onClick={goToday}
-            className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 cursor-pointer hover:bg-blue-500/20 transition-colors"
-          >
-            Today
-          </button>
+          {!monthHasAnyData && (
+            <button
+              type="button"
+              onClick={goToLatestData}
+              className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30 cursor-pointer hover:bg-amber-500/25 transition-colors"
+              title="Jump to the most recent month with events"
+            >
+              Jump to latest events
+            </button>
+          )}
         </div>
 
         <button
@@ -222,6 +256,16 @@ export const EconomicCalendarView: React.FC<EconomicCalendarViewProps> = ({ them
               {activeRelease?.title || (monthHasAnyData ? 'No event on this date' : 'No scheduled macro events for this month')}
             </h3>
           </div>
+
+          {!monthHasAnyData && (
+            <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-start gap-2.5 text-xs text-amber-800 dark:text-amber-300">
+              <Info className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <strong className="block text-amber-700 dark:text-amber-400 mb-0.5">This month has no scheduled events in the portal yet.</strong>
+                <span>Click <em>Jump to latest events</em> above to see the most recent populated month.</span>
+              </div>
+            </div>
+          )}
 
           {activeRelease && (
             <div className="space-y-4">
