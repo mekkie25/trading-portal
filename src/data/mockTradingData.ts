@@ -1,13 +1,13 @@
-import { 
-  TradeRecord, 
-  TopMetrics, 
-  BotSettings, 
-  AdvancedLimits, 
-  BrokerConfig, 
-  GoogleSheetsConfig, 
-  SiteBrandingConfig, 
-  MarketAsset, 
-  CalendarDayData 
+import {
+  TradeRecord,
+  TopMetrics,
+  BotSettings,
+  AdvancedLimits,
+  BrokerConfig,
+  GoogleSheetsConfig,
+  SiteBrandingConfig,
+  MarketAsset,
+  CalendarDayData
 } from '../types';
 
 // ============================================================================
@@ -30,7 +30,6 @@ export const INITIAL_METRICS: TopMetrics = {
 export const INITIAL_BOT_SETTINGS: BotSettings = {
   masterExecution: true,
   riskPerTradePct: 25.0,
-  riskToReward: 2.0,
   maxDailyTrades: 4,
   trailingStopActive: true,
   autoBreakevenPips: 15,
@@ -51,6 +50,8 @@ export const INITIAL_BOT_SETTINGS: BotSettings = {
   }
 };
 
+// PROPOSED (Gap 2): default USD loss caps are 0 so a fresh install never
+// silently overrides the active profile's percentage cap.
 export const INITIAL_ADVANCED_LIMITS: AdvancedLimits = {
   maxDailyDrawdownPct: 20.0,
   currentDailyDrawdownPct: 1.80,
@@ -63,15 +64,16 @@ export const INITIAL_ADVANCED_LIMITS: AdvancedLimits = {
   trailingDrawdownLock: true,
   breakerAction: 'HALT_PREVENT_NEW',
   breakerTriggered: false,
-  maxDailyLossUsd: 2,
+  maxDailyLossUsd: 0,
   currentDailyLossUsd: 0,
-  maxWeeklyLossUsd: 5,
+  maxWeeklyLossUsd: 0,
   currentWeeklyLossUsd: 0,
-  maxMonthlyLossUsd: 10,
+  maxMonthlyLossUsd: 0,
   currentMonthlyLossUsd: 0,
   maxOpenPositions: 4,
   autoLiquidateAllOnTrip: false,
   activeTripScope: 'NONE',
+  useProfileDrawdownPct: true,
 };
 
 export const INITIAL_BROKER_CONFIG: BrokerConfig = {
@@ -103,7 +105,7 @@ export const INITIAL_BRANDING_CONFIG: SiteBrandingConfig = {
 };
 
 // ============================================================================
-// 2. AUDITED TRADE JOURNAL (STRICT 7 ALLOWED ASSETS + STRATEGIES)
+// 2. AUDITED TRADE JOURNAL
 // ============================================================================
 
 export const INITIAL_TRADES: TradeRecord[] = [
@@ -228,7 +230,6 @@ export const INITIAL_TRADES: TradeRecord[] = [
   },
 ];
 
-// Backwards compatibility alias
 export const mockTradeHistory = INITIAL_TRADES;
 
 // ============================================================================
@@ -264,7 +265,7 @@ export const EQUITY_TIMEFRAME_DATA: Record<string, { labels: string[]; equity: n
 };
 
 // ============================================================================
-// 4. LIVE FEED WHITELISTED ASSETS (7 ASSETS ONLY)
+// 4. LIVE FEED WHITELISTED ASSETS
 // ============================================================================
 
 export const MARKET_ASSETS: MarketAsset[] = [
@@ -278,7 +279,7 @@ export const MARKET_ASSETS: MarketAsset[] = [
 ];
 
 // ============================================================================
-// 5. ECONOMIC CALENDAR DATA (SEPTEMBER 2026)
+// 5. ECONOMIC CALENDAR DATA
 // ============================================================================
 
 export const CALENDAR_DATA_SEPTEMBER_2026: Record<string, CalendarDayData> = {

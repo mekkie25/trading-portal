@@ -10,23 +10,23 @@ import { SettingsView } from './components/views/SettingsView';
 import { BacktestView } from './components/views/BacktestView';
 import { BrokerVsCodeBridgeModal } from './components/BrokerVsCodeBridgeModal';
 
-import { 
-  INITIAL_BOT_SETTINGS, 
-  INITIAL_ADVANCED_LIMITS, 
-  INITIAL_BROKER_CONFIG, 
-  INITIAL_GOOGLE_SHEETS_CONFIG, 
-  INITIAL_BRANDING_CONFIG 
+import {
+  INITIAL_BOT_SETTINGS,
+  INITIAL_ADVANCED_LIMITS,
+  INITIAL_BROKER_CONFIG,
+  INITIAL_GOOGLE_SHEETS_CONFIG,
+  INITIAL_BRANDING_CONFIG
 } from './data/mockTradingData';
-import { 
-  TabId, 
-  TopMetrics, 
-  BotSettings, 
-  AdvancedLimits, 
-  TradeRecord, 
-  ThemeMode, 
-  BrokerConfig, 
-  GoogleSheetsConfig, 
-  SiteBrandingConfig 
+import {
+  TabId,
+  TopMetrics,
+  BotSettings,
+  AdvancedLimits,
+  TradeRecord,
+  ThemeMode,
+  BrokerConfig,
+  GoogleSheetsConfig,
+  SiteBrandingConfig
 } from './types';
 
 const safeStorage = {
@@ -108,7 +108,6 @@ export default function App() {
     return safeStorage.getItem('portal_bot_settings', {
       ...INITIAL_BOT_SETTINGS,
       riskPerTradePct: 25.0,
-      riskToReward: 2.0,
       maxDailyTrades: 4,
       weeklyDepositBaseline: 10,
       weeklyGoalTarget: 20,
@@ -116,20 +115,22 @@ export default function App() {
     });
   });
 
+  // PROPOSED (Gap 2): default USD loss caps of 0 so a fresh install lets the
+  // active profile's percentage caps act as the source of truth.
   const [limits, setLimits] = useState<AdvancedLimits>(() => {
     return safeStorage.getItem('portal_limits', {
       ...INITIAL_ADVANCED_LIMITS,
-      maxDailyLossUsd: 10,
-      maxWeeklyLossUsd: 25,
-      maxMonthlyLossUsd: 50,
+      maxDailyLossUsd: 0,
+      maxWeeklyLossUsd: 0,
+      maxMonthlyLossUsd: 0,
       maxDailyDrawdownPct: 20.0,
       autoLiquidateAllOnTrip: false,
+      useProfileDrawdownPct: true,
     });
   });
 
   const [trades, setTrades] = useState<TradeRecord[]>([]);
 
-  // Starting verified metrics from your cTrader execution
   const [metrics, setMetrics] = useState<TopMetrics>({
     netProfit: 4.62,
     netProfitPct: 46.2,
@@ -261,7 +262,7 @@ export default function App() {
     <div className={`flex flex-col h-screen w-screen overflow-hidden font-sans selection:bg-blue-600 selection:text-white ${
       themeMode === 'dark' ? 'dark bg-[#07090e] text-slate-100' : 'bg-white text-black'
     }`}>
-      <HeaderClocks 
+      <HeaderClocks
         botActive={botSettings.masterExecution && !limits.breakerTriggered}
         onToggleBotActive={() => handleSaveBotSettings({ ...botSettings, masterExecution: !botSettings.masterExecution })}
         themeMode={themeMode}
@@ -358,8 +359,6 @@ export default function App() {
           )}
         </main>
       </div>
-
-      
 
       <BrokerVsCodeBridgeModal
         isOpen={isBridgeOpen}

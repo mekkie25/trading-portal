@@ -379,3 +379,90 @@ def test_profile_switch_resets_weekly_monthly(tmp_path, monkeypatch):
     rm.sync_ui_config()
     assert rm.max_weekly_loss_pct == GLOBAL_PARAMS.max_weekly_loss_pct
     assert rm.max_monthly_loss_pct == GLOBAL_PARAMS.max_monthly_loss_pct
+
+def test_gap2_profile_with_switch_on_ignores_usd(tmp_path, monkeypatch):
+    """Gap 2: profile active + switch ON (default) -> USD limits zeroed."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Max Growth",
+        "useProfileDrawdownPct": True,
+        "maxDailyLossUsd": 10,
+        "maxWeeklyLossUsd": 25,
+        "maxMonthlyLossUsd": 50,
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_daily_loss_usd == 0.0
+    assert rm.max_weekly_loss_usd == 0.0
+    assert rm.max_monthly_loss_usd == 0.0
+
+
+def test_gap2_profile_with_switch_off_uses_usd(tmp_path, monkeypatch):
+    """Gap 2: profile active + switch OFF -> USD > 0 wins."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Max Growth",
+        "useProfileDrawdownPct": False,
+        "maxDailyLossUsd": 10,
+        "maxWeeklyLossUsd": 25,
+        "maxMonthlyLossUsd": 50,
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_daily_loss_usd == 10.0
+    assert rm.max_weekly_loss_usd == 25.0
+    assert rm.max_monthly_loss_usd == 50.0
+
+
+def test_gap2_no_profile_usd_unchanged(tmp_path, monkeypatch):
+    """Gap 2 regression: profile null keeps USD precedence."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": None,
+        "useProfileDrawdownPct": True,
+        "maxDailyLossUsd": 10,
+        "maxWeeklyLossUsd": 25,
+        "maxMonthlyLossUsd": 50,
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_daily_loss_usd == 10.0
+    assert rm.max_weekly_loss_usd == 25.0
+    assert rm.max_monthly_loss_usd == 50.0
+
+
+def test_gap2_default_switch_true_when_key_missing(tmp_path, monkeypatch):
+    """Gap 2: missing key defaults to True, so profile % wins."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Steady",
+        "maxDailyLossUsd": 10,
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.use_profile_drawdown_pct is True
+    assert rm.max_daily_loss_usd == 0.0

@@ -1,14 +1,15 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { 
-  RotateCcw, 
-  Sliders, 
+import {
+  RotateCcw,
+  Sliders,
   Clock,
   Calendar,
   Layers,
   CheckCircle2,
   TrendingUp,
-  Target
+  Target,
+  Shield
 } from 'lucide-react';
 import { AdvancedLimits, ThemeMode } from '../../types';
 
@@ -68,7 +69,7 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
-      <motion.div 
+      <motion.div
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200 dark:border-[#212838]"
@@ -96,8 +97,7 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
         )}
       </motion.div>
 
-      {/* 3 Tier Loss Limit Monitor Cards */}
-      <motion.div 
+      <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="grid grid-cols-1 md:grid-cols-3 gap-6"
@@ -163,11 +163,10 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Form supporting currency ceilings */}
-      <motion.form 
+      <motion.form
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
-        onSubmit={handleSave} 
+        onSubmit={handleSave}
         className="rounded-2xl bg-white dark:bg-[#151922] border border-slate-200 dark:border-[#212838] shadow-sm p-6 space-y-6"
       >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100 dark:border-[#212838]">
@@ -191,6 +190,37 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
               <span>Limits Saved & Confirmed</span>
             </div>
           )}
+        </div>
+
+        {/* PROPOSED (Gap 2): switch between profile % and USD ceilings when a profile is active */}
+        <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="p-2 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 shrink-0">
+              <Shield className="w-4 h-4" />
+            </div>
+            <div>
+              <span className="font-bold text-slate-900 dark:text-white text-xs">
+                Use Risk Profile's Percentage Limits
+              </span>
+              <p className="text-[11px] text-slate-500 mt-1 max-w-2xl leading-relaxed">
+                When <strong>on</strong> and a risk profile is active, the profile's daily / weekly / monthly
+                percentages decide when trading halts, and the USD values below are ignored. Turn
+                <strong> off</strong> if you want the USD ceilings to override the profile.
+                When no profile is selected, USD values always win if they are &gt; 0.
+              </p>
+            </div>
+          </div>
+          <label className="relative inline-flex items-center cursor-pointer shrink-0 mt-1">
+            <input
+              type="checkbox"
+              checked={Boolean(formLimits.useProfileDrawdownPct ?? true)}
+              onChange={(e) =>
+                setFormLimits({ ...formLimits, useProfileDrawdownPct: e.target.checked })
+              }
+              className="sr-only peer"
+            />
+            <div className="w-11 h-6 bg-slate-300 dark:bg-slate-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+          </label>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-xs">
@@ -266,4 +296,4 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
       </motion.form>
     </div>
   );
-};
+};S

@@ -1,4 +1,4 @@
-export type TabId = 
+export type TabId =
   | 'dashboard'
   | 'journal'
   | 'limits'
@@ -53,8 +53,6 @@ export interface TopMetrics {
 
 export type RiskProfileName = 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth';
 
-export type RiskProfileName = 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth';
-
 export interface BotSettings {
   masterExecution: boolean;
   riskPerTradePct: number;
@@ -67,7 +65,7 @@ export interface BotSettings {
   currency?: string;
   lastAppliedTimestamp?: string;
   strategyModes: Record<string, StrategyExecutionMode>;
-  
+
   dailyGoalTarget?: number;
   weeklyGoalTarget?: number;
   monthlyGoalTarget?: number;
@@ -119,6 +117,10 @@ export interface AdvancedLimits {
   autoLiquidateAllOnTrip?: boolean;
   activeTripScope?: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'CURRENCY';
   haltUntilTimestamp?: string;
+
+  // PROPOSED (Gap 2): when true and a risk profile is active, the profile's %
+  // loss caps win over the USD limits above. Default true.
+  useProfileDrawdownPct?: boolean;
 }
 
 export interface MacroRelease {

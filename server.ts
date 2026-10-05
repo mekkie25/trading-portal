@@ -19,12 +19,11 @@ interface BotGatewayConfig {
   maxDailyTrades: number;
   trailingStopActive: boolean;
   autoBreakevenPips: number;
-    currency: string;
+  currency: string;
   updatedAt: string;
   version: number;
   strategyModes?: Record<string, string>;
   limitsConfirmedAt?: string;
-  // PROPOSED: Selectable risk profile. null = legacy fixed-risk behaviour.
   riskProfile?: 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth' | null;
 }
 
@@ -35,6 +34,8 @@ interface RiskLimitsConfig {
   maxDailyDrawdownPct?: number;
   autoLiquidateAllOnTrip?: boolean;
   breakerAction: 'HALT_PREVENT_NEW';
+  // PROPOSED (Gap 2): when true and a profile is active, profile % wins over USD limits.
+  useProfileDrawdownPct?: boolean;
 }
 
 interface RiskState {
@@ -83,7 +84,6 @@ interface BrokerTelemetry {
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
 
-// PROPOSED: Support unified DATA_DIR persistent storage volume
 const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
 if (!fs.existsSync(DATA_DIR)) {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
@@ -135,6 +135,7 @@ let riskLimits: RiskLimitsConfig = {
   maxDailyDrawdownPct: 5.0,
   autoLiquidateAllOnTrip: false,
   breakerAction: 'HALT_PREVENT_NEW',
+  useProfileDrawdownPct: true,
 };
 
 if (fs.existsSync(BOT_CONFIG_FILE)) {
@@ -152,6 +153,9 @@ if (fs.existsSync(BOT_CONFIG_FILE)) {
       if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) {
         riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
       }
+      if (saved.useProfileDrawdownPct !== undefined) {
+        riskLimits.useProfileDrawdownPct = Boolean(saved.useProfileDrawdownPct);
+      }
     }
   } catch (e) {
     console.error('CRITICAL: Failed to load bot_config.json on startup:', e);
@@ -167,7 +171,6 @@ let riskState: RiskState = {
   lastTriggerReason: undefined,
 };
 
-// PROPOSED: Atomic writes and loud error logging
 function saveTradesToDisk(tradesList: any[]) {
   try {
     const tempPath = path.join(DATA_DIR, `.tmp_trades_${Date.now()}.json`);
@@ -240,7 +243,6 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   trades: [],
 };
 
-// Strict rule-based suggestion evaluator (>= 30 trades required)
 function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> {
   const suggestions: Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> = [];
   const combos: any[] = pairPayload.combinations || [];
@@ -248,7 +250,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
   const symbol = pairPayload.symbol;
   const totalTrades = best.total_trades || 0;
 
-  // Rule 8: Unviable pair across all combinations (>= 30 trades on valid combos)
   const validCombos30 = combos.filter(c => (c.total_trades || 0) >= 30);
   if (validCombos30.length >= 4 && validCombos30.every(c => (c.profit_factor || 0) < 1.0)) {
     const totalLoss = validCombos30.reduce((acc, c) => acc + (c.net_pnl < 0 ? Math.abs(c.net_pnl) : 0), 0);
@@ -267,7 +268,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
   const stratKpis = best.strategy_kpis || {};
   const adpCov = best.adaptive_effective_pct ?? 100;
 
-  // Rule 1: Strategy PF < 1.0 with net loss (>= 30 trades)
   Object.entries<any>(stratKpis).forEach(([sName, s]) => {
     const count = s.count || 0;
     const pf = s.profit_factor || 0;
@@ -284,7 +284,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   });
 
-  // Rule 2: Strategy PF >= 1.3 with net profit (>= 30 trades)
   Object.entries<any>(stratKpis).forEach(([sName, s]) => {
     const count = s.count || 0;
     const pf = s.profit_factor || 0;
@@ -300,7 +299,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   });
 
-  // Rule 3: Weekday with negative expectancy (>= 30 trades)
   const dowKpis = best.dow_kpis || {};
   Object.entries<any>(dowKpis).forEach(([dow, d]) => {
     const count = d.count || 0;
@@ -318,7 +316,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   });
 
-  // Rule 4: Adaptive vs Legacy comparison (gap >= 0.20, >= 30 trades each)
   const adpCombos = combos.filter(c => c.mode === 'adaptive' && (c.total_trades || 0) >= 30);
   const legCombos = combos.filter(c => c.mode === 'legacy' && (c.total_trades || 0) >= 30);
   if (adpCombos.length > 0 && legCombos.length > 0) {
@@ -348,7 +345,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   }
 
-  // Rule 5: BE and Trail recommendation (>= 30 trades)
   const beOffCombos = combos.filter(c => c.be === 'off' && (c.total_trades || 0) >= 30);
   const beOnCombos = combos.filter(c => c.be === 'on' && (c.total_trades || 0) >= 30);
   if (beOffCombos.length > 0 && beOnCombos.length > 0) {
@@ -391,7 +387,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   }
 
-  // Rule 6: Skip reasons > 30% of unique setups skipped (>= 30 total unique skips)
   const skipSummary = best.skipped_summary || {};
   let totalUniqueSkips = 0;
   if (typeof skipSummary === 'object' && skipSummary !== null) {
@@ -417,7 +412,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   }
 
-  // Rule 7: Adaptive coverage below 90% (>= 30 trades)
   if (adpCov < 90.0) {
     suggestions.push({
       tag: '[TEST NEEDED]',
@@ -481,7 +475,7 @@ function generateExportDataPayload(): any {
       const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
       result.days = summary.days || result.days;
       result.target_rr = summary.target_rr || result.target_rr;
-      
+
       const pairSeconds = (typeof summary.total_seconds === 'number' && summary.total_seconds > 0) ? summary.total_seconds : null;
       if (pairSeconds !== null) {
         totalTime += pairSeconds;
@@ -606,7 +600,6 @@ function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; 
       }
     });
 
-    // Skipped-signal summary counts per reason: candle-skips AND unique setups
     const skipSummary = b.skipped_summary || {};
     const skipEntries = Object.entries(skipSummary);
     if (skipEntries.length > 0) {
@@ -696,7 +689,6 @@ async function startServer() {
     }
   });
 
-  // BACKTEST EXPORT APIS
   app.get('/api/backtest/export-data', (_req, res) => {
     try {
       const data = generateExportDataPayload();
@@ -1099,12 +1091,14 @@ async function startServer() {
 
   app.post('/api/limits', (req, res) => {
     try {
-      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, resetBreaker } = req.body;
+      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, resetBreaker, useProfileDrawdownPct } = req.body;
       if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
       if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
       if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
       if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
       if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
+      // PROPOSED (Gap 2): persist the switch so the Python engine picks it up next scan.
+      if (typeof useProfileDrawdownPct === 'boolean') riskLimits.useProfileDrawdownPct = useProfileDrawdownPct;
 
       if (resetBreaker) {
         riskState.breakerTriggered = false;
