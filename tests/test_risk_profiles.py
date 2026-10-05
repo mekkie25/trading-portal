@@ -466,3 +466,66 @@ def test_gap2_default_switch_true_when_key_missing(tmp_path, monkeypatch):
     rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
     assert rm.use_profile_drawdown_pct is True
     assert rm.max_daily_loss_usd == 0.0
+
+    def test_max_growth_ignores_dow_reduction():
+    """Max Growth: Monday risk == Wednesday risk (35% band on R360-equivalent)."""
+    rm = RiskManager(config_file="nonexistent.json", state_file="/tmp/test_dow_mg.json")
+    rm.active_profile_name = "Max Growth"
+    rm.active_profile = RISK_PROFILES["Max Growth"]
+    rm.starting_day_equity = 20.0
+
+    monday = rm.combined_risk_pct(20.0, dow_mult=0.5, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    wednesday = rm.combined_risk_pct(20.0, dow_mult=1.0, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    assert monday == wednesday == 35.0
+
+
+def test_aggressive_ignores_dow_reduction():
+    """Aggressive: Monday risk == Wednesday risk (30% band on R360-equivalent)."""
+    rm = RiskManager(config_file="nonexistent.json", state_file="/tmp/test_dow_ag.json")
+    rm.active_profile_name = "Aggressive"
+    rm.active_profile = RISK_PROFILES["Aggressive"]
+    rm.starting_day_equity = 20.0
+
+    monday = rm.combined_risk_pct(20.0, dow_mult=0.5, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    wednesday = rm.combined_risk_pct(20.0, dow_mult=1.0, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    assert monday == wednesday == 30.0
+
+
+def test_steady_still_halves_on_monday():
+    """Steady: Monday = half of Wednesday (5% -> 2.5%)."""
+    rm = RiskManager(config_file="nonexistent.json", state_file="/tmp/test_dow_steady.json")
+    rm.active_profile_name = "Steady"
+    rm.active_profile = RISK_PROFILES["Steady"]
+    rm.starting_day_equity = 20.0
+
+    monday = rm.combined_risk_pct(20.0, dow_mult=0.5, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    wednesday = rm.combined_risk_pct(20.0, dow_mult=1.0, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    assert monday == 2.5
+    assert wednesday == 5.0
+
+
+def test_balanced_still_halves_on_monday():
+    """Balanced: Monday = half of Wednesday (10% -> 5%)."""
+    rm = RiskManager(config_file="nonexistent.json", state_file="/tmp/test_dow_balanced.json")
+    rm.active_profile_name = "Balanced"
+    rm.active_profile = RISK_PROFILES["Balanced"]
+    rm.starting_day_equity = 20.0
+
+    monday = rm.combined_risk_pct(20.0, dow_mult=0.5, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    wednesday = rm.combined_risk_pct(20.0, dow_mult=1.0, ai_factor=1.0, account_currency="USD", usd_zar_rate=18.0)
+    assert monday == 5.0
+    assert wednesday == 10.0
+
+
+def test_no_profile_still_halves_on_monday():
+    """Legacy: 2% UI risk -> 1% Monday, 2% Wednesday."""
+    rm = RiskManager(config_file="nonexistent.json", state_file="/tmp/test_dow_none.json")
+    rm.active_profile = None
+    rm.active_profile_name = None
+    rm.risk_per_trade_pct = 2.0
+    rm.consecutive_losses = 0
+
+    monday = rm.combined_risk_pct(100.0, dow_mult=0.5, ai_factor=1.0, account_currency="USD")
+    wednesday = rm.combined_risk_pct(100.0, dow_mult=1.0, ai_factor=1.0, account_currency="USD")
+    assert monday == 1.0
+    assert wednesday == 2.0

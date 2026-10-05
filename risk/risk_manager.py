@@ -43,6 +43,7 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "monthly_loss_stop_pct": 15.0,
         "min_rr_floor": 1.0,
         "max_daily_trades": 2,
+        "apply_dow_reduction": True,
     },
     "Balanced": {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
@@ -52,6 +53,7 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "monthly_loss_stop_pct": 40.0,
         "min_rr_floor": 1.5,
         "max_daily_trades": 3,
+        "apply_dow_reduction": True,
     },
     "Aggressive": {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
@@ -61,6 +63,7 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "monthly_loss_stop_pct": 70.0,
         "min_rr_floor": 2.0,
         "max_daily_trades": 4,
+        "apply_dow_reduction": False,
     },
     "Max Growth": {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
@@ -70,6 +73,7 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "monthly_loss_stop_pct": 85.0,
         "min_rr_floor": 2.0,
         "max_daily_trades": 4,
+        "apply_dow_reduction": False,
     },
 }
 
@@ -431,7 +435,7 @@ class RiskManager:
         else:
             return risks[4]
 
-    def combined_risk_pct(
+        def combined_risk_pct(
         self,
         current_equity: float,
         dow_mult: float = 1.0,
@@ -439,6 +443,11 @@ class RiskManager:
         account_currency: Optional[str] = "USD",
         usd_zar_rate: Optional[float] = None
     ) -> float:
+        # PROPOSED: Aggressive and Max Growth ignore the Monday/Friday halving.
+        # Steady, Balanced and no-profile keep the existing day-of-week reduction.
+         if self.active_profile is not None and not self.active_profile.get("apply_dow_reduction", True):
+          dow_mult = 1.0
+
         if self.active_profile is None:
             micro_mode = getattr(GLOBAL_PARAMS, 'micro_account_mode', False)
             if micro_mode:
