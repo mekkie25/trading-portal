@@ -1176,7 +1176,7 @@ class InstitutionalRiskEngine:
 
         return True, "Spread optimal", spread
 
-            def calculate_smart_lot_size(
+    def calculate_smart_lot_size(
         self,
         current_equity: float,
         sl_distance: float,
@@ -1409,12 +1409,6 @@ class CloudExecutionEngine:
 
         quote, bid, ask = await self.ctrader.get_live_quote(symbol)
 
-        if not is_ok:
-            log.warning(f"ORDER BLOCKED BY RISK GATE: {reason}")
-            # PROPOSED: Capture last risk block reason for status reporting
-            self.risk.persistent_risk.last_trigger_reason = reason
-            return False
-
         def quote_lookup(pair: str) -> Optional[Tuple[float, float, float]]:
             sid = self.ctrader.resolve_symbol_id(pair, use_fx_aliases=True)
             if not sid or sid not in self.ctrader.live_quotes:
@@ -1455,6 +1449,8 @@ class CloudExecutionEngine:
 
         if not is_ok:
             log.warning(f"ORDER BLOCKED BY RISK GATE: {reason}")
+            # PROPOSED: Capture last risk block reason for status reporting
+            self.risk.persistent_risk.last_trigger_reason = reason
             return False
 
         is_dry_run = getattr(signal, 'is_dry_run', False) or bp.get("is_dry_run", False)

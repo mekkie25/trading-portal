@@ -503,10 +503,13 @@ class RiskManager:
             nominal_risk_cash = min(max_cash_cap, nominal_risk_cash + house_money_allowance)
 
         # Circuit Breaker Safety: Single trade risk cannot exceed remaining daily allowance
+                # Circuit Breaker Safety: Single trade risk cannot exceed remaining daily allowance
+        # PROPOSED: Fall back to current_equity when starting_day_equity is still 0 (cold start).
+        effective_day_start = self.starting_day_equity if self.starting_day_equity > 0 else current_equity
         max_daily_usd = self.max_daily_loss_usd if self.max_daily_loss_usd > 0 else (
-            self.starting_day_equity * (self.active_profile["daily_loss_stop_pct"] / 100.0)
+            effective_day_start * (self.active_profile["daily_loss_stop_pct"] / 100.0)
         )
-        daily_dd_usd = max(0.0, self.starting_day_equity - current_equity) if self.starting_day_equity > 0 else self.current_daily_loss
+        daily_dd_usd = max(0.0, effective_day_start - current_equity)
         remaining_daily_cash = max(0.0, max_daily_usd - daily_dd_usd)
 
         if remaining_daily_cash > 0:
@@ -516,6 +519,61 @@ class RiskManager:
 
         final_pct = (final_risk_cash / current_equity) * 100.0 if current_equity > 0 else 0.0
         return max(0.0, final_pct)
+
+    def get_sizing_snapshot(
+        self,
+        current_equity: float,
+        account_currency: Optional[str] = None,
+        usd_zar_rate: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        PROPOSED: Read-only snapshot of current sizing state for logging / UI.
+        Does not change any state. Safe to call every scan.
+        """
+        curr = (account_currency or "USD").upper()
+
+        if self.active_profile is not None:
+            zar_eq = convert_equity_to_zar(current_equity, curr, usd_zar_rate)
+            cap_pct = self._get_profile_band_risk_pct(self.active_profile, zar_eq)
+            profile_label = self.active_profile_name
+        else:
+            cap_pct = self.risk_per_trade_pct
+            profile_label = "None (Legacy)"
+
+        try:
+            chosen_pct = self.combined_risk_pct(
+                current_equity=current_equity,
+                account_currency=curr,
+                usd_zar_rate=usd_zar_rate,
+            )
+        except Exception:
+            chosen_pct = 0.0
+
+                # Daily loss budget
+        # PROPOSED: Fall back to current_equity when starting_day_equity is still 0 (cold start).
+        effective_day_start = self.starting_day_equity if self.starting_day_equity > 0 else current_equity
+        if self.max_daily_loss_usd > 0:
+            daily_max = self.max_daily_loss_usd
+        elif self.active_profile is not None:
+            daily_max = effective_day_start * (self.active_profile["daily_loss_stop_pct"] / 100.0)
+        else:
+            daily_max = effective_day_start * (self.max_daily_loss_pct / 100.0)
+
+        daily_used = max(0.0, effective_day_start - current_equity)
+        daily_left = max(0.0, daily_max - daily_used)
+        
+
+        return {
+            "profile": profile_label,
+            "cap_pct": round(cap_pct, 3),
+            "chosen_pct": round(chosen_pct, 3),
+            "daily_max": round(daily_max, 4),
+            "daily_used": round(daily_used, 4),
+            "daily_left": round(daily_left, 4),
+            "trades_today": self.trades_taken_today,
+            "max_daily_trades": self.max_daily_trades,
+            "currency": curr,
+        }
 
     def validate_min_lot_risk(self, min_lots: float, risk_per_lot: float, risk_cash: float) -> Tuple[bool, str]:
         """
