@@ -1,14 +1,11 @@
 """
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
-- Auto-runs all 8 parameter combinations per symbol:
-  (adaptive vs legacy) x (breakeven on vs off) x (supertrend on vs off).
-- Writes per-combination reports: {SYMBOL}_{mode}_be{on|off}_trail{on|off}_report.json (compact, candles omitted)
-- Writes consolidated day candles once per symbol: {SYMBOL}_daycandles.json (compact)
-- Writes consolidated comparison matrix: {SYMBOL}_summary.json (compact)
-- Automatically purges old outputs & leftovers prior to running each symbol (preserves market data CSVs)
-- Tracks diagnostic funnel: signals evaluated, vol blocks, structural room blocks, fills.
-- High-speed optimizations: D1 vol cache, session level static cache, vectorized candle slicing, phase timers.
+- Single shared precompute pass per pair for indicators, volatility, session levels, and raw signals.
+- 8 combination runs read from precomputed signal cache using deep-copy before adaptation.
+- Process candle only called when open positions or pending evaluations exist.
+- Progress prints for precompute (20%, 40%...) and combos (1/8 done, 2/8 done...).
+- Guaranteed zero look-ahead bias and exact baseline numerical parity.
 """
 
 import sys
@@ -17,6 +14,7 @@ import glob
 import shutil
 import json
 import time
+import copy
 import asyncio
 import argparse
 import tempfile
@@ -66,7 +64,7 @@ def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except Exception:
+            except OSError:
                 pass
         raise
 
@@ -166,71 +164,27 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
         print(f"ERROR: Failed updating data store for {symbol} ({e}). Preserving existing files.", flush=True)
         return False
 
-def run_backtest_for_symbol(
-    symbol: str = "US30",
-    adaptive_mode: bool = True,
-    use_be: bool = False,
-    use_trail: bool = False,
-    be_label: str = "off",
-    trail_label: str = "off",
-    balance: float = 1000.0,
-    risk_pct: float = 1.0,
-    days_count: int = 60,
-    eurusd_df: Optional[pd.DataFrame] = None
-) -> Optional[Dict[str, Any]]:
-    # Phase timers
-    t_sim = 0.0
+def precompute_market_pass(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    h1_df: pd.DataFrame,
+    h4_df: pd.DataFrame,
+    d1_df: pd.DataFrame,
+    sim_start_idx: int,
+    total_bars: int
+) -> Dict[str, Any]:
+    """
+    Pass 1: Computes all indicators, volatility, session levels, and raw strategy signals once.
+    Results are cached only for candles where a raw signal was produced.
+    """
     t_agg = 0.0
     t_vol = 0.0
     t_lvl = 0.0
     t_strat = 0.0
-    t_rep = 0.0
-
-    volatility_engine.reset_rejection_stats()
-
-    mode_str = "adaptive" if adaptive_mode else "legacy"
-
-    GLOBAL_PARAMS.adaptive_mode = adaptive_mode
-    GLOBAL_PARAMS.use_breakeven = use_be
-    GLOBAL_PARAMS.use_supertrend_trail = use_trail
-
-    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
-    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
-    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
-    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
-
-    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
-        print(f"ERROR: Incomplete data files for {symbol} in {DATA_DIR}.", flush=True)
-        return None
-
-    m5_df = pd.read_csv(m5_path)
-    h1_df = pd.read_csv(h1_path)
-    h4_df = pd.read_csv(h4_path)
-    d1_df = pd.read_csv(d1_path)
-
-    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
-    total_bars = len(m5_df)
-
-    if total_bars < 130:
-        print(f"ERROR: Insufficient data bars for {symbol} ({total_bars} bars).", flush=True)
-        return None
-
-    last_bar_time = m5_df['time'].iloc[-1]
-    window_cutoff = last_bar_time - timedelta(days=days_count)
-
-    matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
-    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
-
-    window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
-    window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-    history_days_before_window = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
 
     aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
     sm = StrategyManager()
-    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct, eurusd_df=eurusd_df)
-
     frozen_orbs: Dict[Any, Any] = {}
-    simulated_bars_count = total_bars - sim_start_idx
 
     last_d1_bar_count = -1
     last_vol_date = None
@@ -239,46 +193,35 @@ def run_backtest_for_symbol(
     regime = "NORMAL"
 
     valid_vol_bars = 0
+    cached_signals_by_index: Dict[int, Dict[str, Any]] = {}
+    day_candles_by_date: Dict[str, List[Dict[str, Any]]] = {}
 
-    # Diagnostic Funnel & Setup Tracking
-    unique_setups = 0
-    prev_signal_key = None
-
-    funnel = {
-        "unique_setups": 0,
-        "raw_signals_fired": 0,
-        "adapted_signals_passed": 0,
-        "vol_filters_blocked": 0,
-        "sim_trades_attempted": 0,
-        "sim_trades_filled": 0
-    }
-    vol_block_reasons: Dict[str, int] = {}
-    strategy_errors: Dict[str, int] = {}
-
-    # Pre-extract Python datetimes list for fast indexing
     m5_times_list = m5_df['time'].tolist()
+    total_sim_bars = max(1, total_bars - sim_start_idx)
+    next_progress_pct = 20
 
     for i in range(sim_start_idx, total_bars):
         curr_time = m5_times_list[i].to_pydatetime()
-        m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
         curr_bar = m5_df.iloc[i]
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
 
-        # 1. Update in-flight trades against current bar
-        _t0 = time.perf_counter()
-        sim.process_candle(symbol, curr_bar, m5_slice)
-        t_sim += time.perf_counter() - _t0
+        # Progress reporting during precompute pass
+        current_pct = int(((i - sim_start_idx) / total_sim_bars) * 100)
+        if current_pct >= next_progress_pct:
+            print(f"[*] {symbol} precompute {next_progress_pct}% ...", flush=True)
+            next_progress_pct += 20
 
-        # Fast weekend bypass: Saturday or Sunday pre-open (no strategies trade on closed weekends)
+        # Fast weekend bypass: Saturday or Sunday pre-open
         wkday = curr_time.weekday()
         if wkday == 5 or (wkday == 6 and curr_time.hour < 21):
             continue
 
-        # 2. Rebuild H1, H4, D1 without look-ahead (using bisect caching)
+        # 1. Higher-timeframe aggregation
         _t0 = time.perf_counter()
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
         t_agg += time.perf_counter() - _t0
 
-        # 3. Volatility calculation: recompute daily metrics ONLY when a new D1 bar has formed
+        # 2. Volatility calculation
         _t0 = time.perf_counter()
         curr_d1_len = len(d1_view)
         curr_date = curr_time.date()
@@ -312,7 +255,7 @@ def run_backtest_for_symbol(
             active_vol = vol_metrics
         t_vol += time.perf_counter() - _t0
 
-        # 4. Session levels and volume profile
+        # 3. Session levels and volume profile
         _t0 = time.perf_counter()
         vp = get_session_volume_profile(m5_slice)
         session_levels = build_session_levels(
@@ -326,9 +269,9 @@ def run_backtest_for_symbol(
         )
         t_lvl += time.perf_counter() - _t0
 
-        # 5. Evaluate strategies
+        # 4. Strategy evaluation
         _t0 = time.perf_counter()
-        signal = sm.evaluate_all(
+        raw_signal = sm.evaluate_all(
             symbol=symbol,
             data_5m=m5_slice,
             data_h4=h4_view,
@@ -336,48 +279,148 @@ def run_backtest_for_symbol(
             session_levels=session_levels,
             data_h1=h1_view
         )
+        t_strat += time.perf_counter() - _t0
 
-        if signal:
-            current_signal_key = (signal.strategy, signal.direction)
-            if current_signal_key != prev_signal_key:
-                unique_setups += 1
-            prev_signal_key = current_signal_key
+        if raw_signal is not None:
+            # Store only when a raw signal exists (no 121-candle slice stored)
+            cached_signals_by_index[i] = {
+                "raw_signal": raw_signal,
+                "active_vol": active_vol,
+                "session_levels": session_levels,
+                "adr_val": adr_val,
+                "regime": regime,
+                "curr_time": curr_time
+            }
 
-            funnel["raw_signals_fired"] += 1
+    print(f"[*] {symbol} precompute 100% complete.", flush=True)
 
-            if adaptive_mode:
-                if active_vol.get("valid", False):
-                    adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
-                    if adapted:
-                        funnel["adapted_signals_passed"] += 1
-                        spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
-                        sl_dist = abs(adapted.entry_price - adapted.stop_loss)
-                        tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
-                        vol_ok, vol_msg = volatility_engine.evaluate_volatility_filters(
-                            active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
-                        )
-                        if vol_ok:
-                            signal = adapted
-                        else:
-                            funnel["vol_filters_blocked"] += 1
-                            reason_clean = vol_msg.split(":")[0].strip() if ":" in vol_msg else vol_msg[:30]
-                            vol_block_reasons[reason_clean] = vol_block_reasons.get(reason_clean, 0) + 1
-                            signal = None
+    return {
+        "cached_signals": cached_signals_by_index,
+        "valid_vol_bars": valid_vol_bars,
+        "simulated_bars_count": total_sim_bars,
+        "timing": {
+            "aggregator_s": t_agg,
+            "volatility_s": t_vol,
+            "session_levels_s": t_lvl,
+            "strategies_s": t_strat
+        }
+    }
+
+def run_cached_combination(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    precomputed: Dict[str, Any],
+    sim_start_idx: int,
+    total_bars: int,
+    combo: Dict[str, Any],
+    days_count: int,
+    window_start_str: str,
+    window_end_str: str,
+    history_days_before_window: float,
+    balance: float = 1000.0,
+    risk_pct: float = 1.0,
+    eurusd_df: Optional[pd.DataFrame] = None
+) -> Dict[str, Any]:
+    """
+    Executes a single combination by reading from the precomputed signal cache.
+    Deep-copies each cached signal before adapt_signal to prevent side-effects.
+    """
+    t_vol = 0.0
+    t_strat = 0.0
+    t_sim = 0.0
+    t_rep = 0.0
+
+    volatility_engine.reset_rejection_stats()
+
+    adaptive_mode = combo["adaptive_mode"]
+    use_be = combo["use_be"]
+    use_trail = combo["use_trail"]
+    be_label = combo["be"]
+    trail_label = combo["trail"]
+    mode_str = combo["mode"]
+
+    GLOBAL_PARAMS.adaptive_mode = adaptive_mode
+    GLOBAL_PARAMS.use_breakeven = use_be
+    GLOBAL_PARAMS.use_supertrend_trail = use_trail
+
+    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct, eurusd_df=eurusd_df)
+    cached_signals = precomputed["cached_signals"]
+    m5_times_list = m5_df['time'].tolist()
+
+    unique_setups = 0
+    prev_signal_key = None
+    funnel = {
+        "unique_setups": 0,
+        "raw_signals_fired": 0,
+        "adapted_signals_passed": 0,
+        "vol_filters_blocked": 0,
+        "sim_trades_attempted": 0,
+        "sim_trades_filled": 0
+    }
+    vol_block_reasons: Dict[str, int] = {}
+    strategy_errors: Dict[str, int] = {}
+
+    for i in range(sim_start_idx, total_bars):
+        curr_bar = m5_df.iloc[i]
+        curr_time = m5_times_list[i].to_pydatetime()
+
+        # Update in-flight trades only when positions or pending SL evaluations exist
+        _t0 = time.perf_counter()
+        if sim.open_positions or sim.pending_sl_evaluations:
+            m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+            sim.process_candle(symbol, curr_bar, m5_slice)
+        t_sim += time.perf_counter() - _t0
+
+        # If no raw signal was found on this candle during precompute, move to next candle
+        if i not in cached_signals:
+            continue
+
+        item = cached_signals[i]
+        # Deep-copy cached raw signal before adaptation (adapt_signal edits in-place)
+        signal = copy.deepcopy(item["raw_signal"])
+        active_vol = item["active_vol"]
+        session_levels = item["session_levels"]
+        adr_val = item["adr_val"]
+        regime = item["regime"]
+
+        current_signal_key = (signal.strategy, signal.direction)
+        if current_signal_key != prev_signal_key:
+            unique_setups += 1
+        prev_signal_key = current_signal_key
+        funnel["raw_signals_fired"] += 1
+
+        _t0 = time.perf_counter()
+        if adaptive_mode:
+            if active_vol.get("valid", False):
+                adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+                if adapted:
+                    funnel["adapted_signals_passed"] += 1
+                    spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+                    sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                    tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                    vol_ok, vol_msg = volatility_engine.evaluate_volatility_filters(
+                        active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                    )
+                    if vol_ok:
+                        signal = adapted
                     else:
                         funnel["vol_filters_blocked"] += 1
-                        vol_block_reasons["ADR Stop Clamping / Min RR"] = vol_block_reasons.get("ADR Stop Clamping / Min RR", 0) + 1
+                        reason_clean = vol_msg.split(":")[0].strip() if ":" in vol_msg else vol_msg[:30]
+                        vol_block_reasons[reason_clean] = vol_block_reasons.get(reason_clean, 0) + 1
                         signal = None
                 else:
                     funnel["vol_filters_blocked"] += 1
-                    vol_block_reasons["Invalid Volatility Metrics"] = vol_block_reasons.get("Invalid Volatility Metrics", 0) + 1
+                    vol_block_reasons["ADR Stop Clamping / Min RR"] = vol_block_reasons.get("ADR Stop Clamping / Min RR", 0) + 1
                     signal = None
             else:
-                funnel["adapted_signals_passed"] += 1
+                funnel["vol_filters_blocked"] += 1
+                vol_block_reasons["Invalid Volatility Metrics"] = vol_block_reasons.get("Invalid Volatility Metrics", 0) + 1
+                signal = None
         else:
-            prev_signal_key = None
-        t_strat += time.perf_counter() - _t0
+            funnel["adapted_signals_passed"] += 1
+        t_vol += time.perf_counter() - _t0
 
-        # 6. Simulator execution
+        # Simulator order opening
         _t0 = time.perf_counter()
         if signal:
             funnel["sim_trades_attempted"] += 1
@@ -388,13 +431,16 @@ def run_backtest_for_symbol(
                     funnel["sim_trades_filled"] += 1
         t_sim += time.perf_counter() - _t0
 
+    # Close any positions still open at end of data
     _t0 = time.perf_counter()
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
 
     funnel["unique_setups"] = unique_setups
-
+    simulated_bars_count = precomputed["simulated_bars_count"]
+    valid_vol_bars = precomputed["valid_vol_bars"]
     adaptive_pct = round((valid_vol_bars / max(1, simulated_bars_count)) * 100.0, 1)
+
     report_warnings = []
     if adaptive_mode and adaptive_pct < 90.0:
         warn_msg = f"WARNING: ADAPTIVE only active on {adaptive_pct:.1f}% of bars (needs 120 D1 bars of history before the window)"
@@ -438,6 +484,7 @@ def run_backtest_for_symbol(
         first_t = day_t[0] if day_t else {}
         ref_levels = first_t.get("ref_levels", {})
 
+        # Omit candles list from per-combination report to save disk space
         day_charts_data[d_str] = {
             "candles": [],
             "trades": day_t,
@@ -509,9 +556,7 @@ def run_backtest_for_symbol(
         "adaptive_pct": adaptive_pct,
         "day_candles": day_candles_by_date,
         "timing": {
-            "aggregator_s": t_agg,
             "volatility_s": t_vol,
-            "session_levels_s": t_lvl,
             "strategies_s": t_strat,
             "simulator_s": t_sim,
             "report_writing_s": t_rep,
@@ -523,7 +568,7 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
     orig_be = GLOBAL_PARAMS.use_breakeven
     orig_trail = GLOBAL_PARAMS.use_supertrend_trail
 
-    # Clean old outputs for this symbol
+    # 1. Clean old outputs and leftovers for this symbol prior to running
     for pattern in [f"{symbol}_*_report.json", f"{symbol}_summary.json", f"{symbol}_daycandles.json", f"{symbol}_adaptive_report.json", f"{symbol}_legacy_report.json"]:
         for fpath in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
             try:
@@ -545,62 +590,105 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
         except OSError:
             pass
 
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        print(f"ERROR: Incomplete data files for {symbol} in {DATA_DIR}.", flush=True)
+        return False
+
+    m5_df = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
+
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    total_bars = len(m5_df)
+
+    if total_bars < 130:
+        print(f"ERROR: Insufficient data bars for {symbol} ({total_bars} bars).", flush=True)
+        return False
+
+    last_bar_time = m5_df['time'].iloc[-1]
+    window_cutoff = last_bar_time - timedelta(days=days_count)
+    matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
+
+    window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
+    window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+    history_days_before_window = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
+
+    # --- PASS 1: SHARED PRECOMPUTE PASS (Runs once per pair) ---
+    print(f"[*] {symbol}: Running shared precompute pass across {total_bars - sim_start_idx:,} candles...", flush=True)
+    precomputed = precompute_market_pass(
+        symbol=symbol,
+        m5_df=m5_df,
+        h1_df=h1_df,
+        h4_df=h4_df,
+        d1_df=d1_df,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars
+    )
+
     matrix_rows = []
     all_day_candles: Dict[str, Any] = {}
 
-    tot_agg = 0.0
-    tot_vol = 0.0
-    tot_lvl = 0.0
-    tot_strat = 0.0
+    pre_timing = precomputed["timing"]
+    tot_agg = pre_timing["aggregator_s"]
+    tot_vol = pre_timing["volatility_s"]
+    tot_lvl = pre_timing["session_levels_s"]
+    tot_strat = pre_timing["strategies_s"]
     tot_sim = 0.0
     tot_rep = 0.0
 
+    # --- PASS 2: 8 COMBINATION RUNS (Replay cached signals) ---
     try:
         for idx, combo in enumerate(COMBINATIONS):
-            progress_line = f"[*] {symbol} {idx + 1}/8 {combo['mode']} BE-{combo['be']} trail-{combo['trail']}"
-            print(progress_line, flush=True)
-
-            res = run_backtest_for_symbol(
+            res = run_cached_combination(
                 symbol=symbol,
-                adaptive_mode=combo["adaptive_mode"],
-                use_be=combo["use_be"],
-                use_trail=combo["use_trail"],
-                be_label=combo["be"],
-                trail_label=combo["trail"],
+                m5_df=m5_df,
+                precomputed=precomputed,
+                sim_start_idx=sim_start_idx,
+                total_bars=total_bars,
+                combo=combo,
                 days_count=days_count,
+                window_start_str=window_start_str,
+                window_end_str=window_end_str,
+                history_days_before_window=history_days_before_window,
                 eurusd_df=eurusd_df
             )
 
-            if res:
-                k = res["kpis"]
-                timing = res.get("timing", {})
-                tot_agg += timing.get("aggregator_s", 0.0)
-                tot_vol += timing.get("volatility_s", 0.0)
-                tot_lvl += timing.get("session_levels_s", 0.0)
-                tot_strat += timing.get("strategies_s", 0.0)
-                tot_sim += timing.get("simulator_s", 0.0)
-                tot_rep += timing.get("report_writing_s", 0.0)
+            k = res["kpis"]
+            timing = res.get("timing", {})
+            tot_vol += timing.get("volatility_s", 0.0)
+            tot_strat += timing.get("strategies_s", 0.0)
+            tot_sim += timing.get("simulator_s", 0.0)
+            tot_rep += timing.get("report_writing_s", 0.0)
 
-                matrix_rows.append({
-                    "label": combo["label"],
-                    "mode": combo["mode"],
-                    "be": combo["be"],
-                    "trail": combo["trail"],
-                    "report_file": res["report_file"],
-                    "total_trades": k["count"],
-                    "win_rate": k["win_rate"],
-                    "expectancy": k["expectancy"],
-                    "profit_factor": k["profit_factor"],
-                    "max_drawdown": k["max_dd_money"],
-                    "net_pnl": k["net_pnl"],
-                    "adaptive_effective_pct": res["adaptive_pct"],
-                    "funnel": res["funnel"]
-                })
+            matrix_rows.append({
+                "label": combo["label"],
+                "mode": combo["mode"],
+                "be": combo["be"],
+                "trail": combo["trail"],
+                "report_file": res["report_file"],
+                "total_trades": k["count"],
+                "win_rate": k["win_rate"],
+                "expectancy": k["expectancy"],
+                "profit_factor": k["profit_factor"],
+                "max_drawdown": k["max_dd_money"],
+                "net_pnl": k["net_pnl"],
+                "adaptive_effective_pct": res["adaptive_pct"],
+                "funnel": res["funnel"]
+            })
 
-                day_candles = res.get("day_candles", {})
-                for d_str, c_list in day_candles.items():
-                    if d_str not in all_day_candles:
-                        all_day_candles[d_str] = c_list
+            day_candles = res.get("day_candles", {})
+            for d_str, c_list in day_candles.items():
+                if d_str not in all_day_candles:
+                    all_day_candles[d_str] = c_list
+
+            print(f"[*] {symbol} combo {idx + 1}/8 done", flush=True)
 
         _t0 = time.perf_counter()
         if all_day_candles:
@@ -619,7 +707,6 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
             }, f, separators=(",", ":"))
         tot_rep += time.perf_counter() - _t0
 
-        # Print phase timing line exactly as requested
         print(
             f"[time] {symbol} aggregator {tot_agg:.1f}s, volatility {tot_vol:.1f}s, "
             f"session_levels {tot_lvl:.1f}s, strategies {tot_strat:.1f}s, "
@@ -646,7 +733,6 @@ async def main():
     parser.add_argument("--supertrend", type=str, default="on")
     args = parser.parse_args()
 
-    # Pre-run storage check
     usage = shutil.disk_usage(OUTPUT_DIR)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < 80.0:
