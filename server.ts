@@ -97,7 +97,7 @@ let backtestProgress = '';
 let backtestLastError: string | null = null;
 let backtestExitCode: number | null = null;
 let activeBacktestProcess: ChildProcess | null = null;
-let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string }> = [];
+let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string }> = [];
 
 const SEED_TRADES = [
   {
@@ -604,6 +604,8 @@ async function startServer() {
         console.log(`[Backtest Matrix Queue]: Starting ${sym}...`);
 
         let symbolLastError = '';
+        let symbolTiming = '';
+
         const runnerArgs = [
           'backtest/runner.py',
           '--symbol', sym,
@@ -623,6 +625,9 @@ async function startServer() {
               const lines = text.split('\n');
               for (const line of lines) {
                 const trimmed = line.trim();
+                if (trimmed.startsWith('[time]')) {
+                  symbolTiming = trimmed.replace('[time]', '').trim();
+                }
                 if (trimmed.startsWith('ERROR:')) {
                   symbolLastError = trimmed;
                   backtestLastError = trimmed;
@@ -646,9 +651,19 @@ async function startServer() {
           proc.on('exit', (code) => {
             activeBacktestProcess = null;
             if (code === 0) {
-              backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 8/8 matrix' });
+              backtestResults.push({
+                symbol: sym,
+                status: 'OK',
+                message: 'Completed 8/8 matrix',
+                timing: symbolTiming
+              });
             } else {
-              backtestResults.push({ symbol: sym, status: 'FAILED', message: symbolLastError || `Exited with code ${code}` });
+              backtestResults.push({
+                symbol: sym,
+                status: 'FAILED',
+                message: symbolLastError || `Exited with code ${code}`,
+                timing: symbolTiming
+              });
             }
             resolve();
           });

@@ -25,7 +25,8 @@ import {
   Copy,
   Check,
   Table,
-  Database
+  Database,
+  Clock
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -72,6 +73,13 @@ interface StorageInfo {
   market_data_mb: number;
   reports_mb: number;
   largest_files?: Array<{ name: string; size_mb: number; type: string }>;
+}
+
+interface RunResultItem {
+  symbol: string;
+  status: 'OK' | 'FAILED';
+  message: string;
+  timing?: string;
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
@@ -137,7 +145,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   // Execution & Status
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
-  const [runResults, setRunResults] = useState<Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string }>>([]);
+  const [runResults, setRunResults] = useState<RunResultItem[]>([]);
 
   // Copy for AI State
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
@@ -770,7 +778,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* Per-Symbol Results Box (Wrapped Error Output) */}
+      {/* Per-Symbol Results Box (Wrapped Error Output + Expandable Phase Timers) */}
       {runResults.length > 0 && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -782,15 +790,28 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               Dismiss
             </button>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 pt-1">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 pt-1">
             {runResults.map((r, i) => (
-              <div key={i} className={`p-3 rounded-xl border flex flex-col sm:flex-row sm:items-start justify-between gap-2 text-xs font-mono ${
+              <div key={i} className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 text-xs font-mono ${
                 r.status === 'OK'
                   ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
                   : 'bg-rose-500/10 border-rose-500/30 text-rose-600'
               }`}>
-                <span className="font-bold shrink-0">{r.symbol}</span>
-                <span className="text-[11px] break-words whitespace-pre-wrap flex-1">{r.status}: {r.message}</span>
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-black dark:text-white">{r.symbol}</span>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                    r.status === 'OK' ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' : 'bg-rose-500/20 text-rose-600'
+                  }`}>
+                    {r.status}
+                  </span>
+                </div>
+                <div className="text-[11px] break-words whitespace-pre-wrap">{r.message}</div>
+                {r.timing && (
+                  <div className="pt-1.5 mt-0.5 border-t border-slate-200 dark:border-[#1a2030] text-[10px] text-slate-600 dark:text-slate-400 break-words flex items-start gap-1">
+                    <Clock className="w-3 h-3 text-blue-500 shrink-0 mt-0.5" />
+                    <span>{r.timing}</span>
+                  </div>
+                )}
               </div>
             ))}
           </div>

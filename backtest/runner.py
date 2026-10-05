@@ -8,6 +8,7 @@ High-Performance Automated End-to-End Backtest Matrix Runner.
 - Writes consolidated comparison matrix: {SYMBOL}_summary.json (compact)
 - Automatically purges old outputs & leftovers prior to running each symbol (preserves market data CSVs)
 - Tracks diagnostic funnel: signals evaluated, vol blocks, structural room blocks, fills.
+- High-speed optimizations: D1 vol cache, session level static cache, vectorized candle slicing, phase timers.
 """
 
 import sys
@@ -15,6 +16,7 @@ import os
 import glob
 import shutil
 import json
+import time
 import asyncio
 import argparse
 import tempfile
@@ -176,7 +178,14 @@ def run_backtest_for_symbol(
     days_count: int = 60,
     eurusd_df: Optional[pd.DataFrame] = None
 ) -> Optional[Dict[str, Any]]:
-    # Reset rejection counters per combination run
+    # Phase timers
+    t_sim = 0.0
+    t_agg = 0.0
+    t_vol = 0.0
+    t_lvl = 0.0
+    t_strat = 0.0
+    t_rep = 0.0
+
     volatility_engine.reset_rejection_stats()
 
     mode_str = "adaptive" if adaptive_mode else "legacy"
@@ -223,8 +232,8 @@ def run_backtest_for_symbol(
     frozen_orbs: Dict[Any, Any] = {}
     simulated_bars_count = total_bars - sim_start_idx
 
+    last_d1_bar_count = -1
     last_vol_date = None
-    last_vol_retry_hour = None
     vol_metrics = {"valid": False}
     adr_val = None
     regime = "NORMAL"
@@ -246,21 +255,35 @@ def run_backtest_for_symbol(
     vol_block_reasons: Dict[str, int] = {}
     strategy_errors: Dict[str, int] = {}
 
+    # Pre-extract Python datetimes list for fast indexing
+    m5_times_list = m5_df['time'].tolist()
+
     for i in range(sim_start_idx, total_bars):
-        m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
-        curr_bar = m5_slice.iloc[-1]
-        curr_time = curr_bar['time'].to_pydatetime()
-        curr_date = curr_time.date()
-        sast_dt = curr_time.astimezone(TZ_SAST)
-        sast_hour_key = (sast_dt.date(), sast_dt.hour)
+        curr_time = m5_times_list[i].to_pydatetime()
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+        curr_bar = m5_df.iloc[i]
 
+        # 1. Update in-flight trades against current bar
+        _t0 = time.perf_counter()
         sim.process_candle(symbol, curr_bar, m5_slice)
+        t_sim += time.perf_counter() - _t0
 
+        # Fast weekend bypass: Saturday or Sunday pre-open (no strategies trade on closed weekends)
+        wkday = curr_time.weekday()
+        if wkday == 5 or (wkday == 6 and curr_time.hour < 21):
+            continue
+
+        # 2. Rebuild H1, H4, D1 without look-ahead (using bisect caching)
+        _t0 = time.perf_counter()
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
+        t_agg += time.perf_counter() - _t0
 
-        need_full_recalc = (curr_date != last_vol_date)
-        if not vol_metrics.get("valid", False) and sast_hour_key != last_vol_retry_hour:
-            need_full_recalc = True
+        # 3. Volatility calculation: recompute daily metrics ONLY when a new D1 bar has formed
+        _t0 = time.perf_counter()
+        curr_d1_len = len(d1_view)
+        curr_date = curr_time.date()
+
+        need_full_recalc = (curr_d1_len != last_d1_bar_count) or (curr_date != last_vol_date) or not vol_metrics.get("valid", False)
 
         if need_full_recalc:
             vol_metrics = volatility_engine.compute_symbol_volatility(
@@ -273,8 +296,8 @@ def run_backtest_for_symbol(
             if vol_metrics.get("valid", False):
                 adr_val = vol_metrics.get("adr")
                 regime = vol_metrics.get("regime", "NORMAL")
+            last_d1_bar_count = curr_d1_len
             last_vol_date = curr_date
-            last_vol_retry_hour = sast_hour_key
 
         if vol_metrics.get("valid", False):
             active_vol = volatility_engine.refresh_intraday(
@@ -287,7 +310,10 @@ def run_backtest_for_symbol(
             valid_vol_bars += 1
         else:
             active_vol = vol_metrics
+        t_vol += time.perf_counter() - _t0
 
+        # 4. Session levels and volume profile
+        _t0 = time.perf_counter()
         vp = get_session_volume_profile(m5_slice)
         session_levels = build_session_levels(
             symbol=symbol,
@@ -298,7 +324,10 @@ def run_backtest_for_symbol(
             as_of=curr_time,
             adr_val=adr_val
         )
+        t_lvl += time.perf_counter() - _t0
 
+        # 5. Evaluate strategies
+        _t0 = time.perf_counter()
         signal = sm.evaluate_all(
             symbol=symbol,
             data_5m=m5_slice,
@@ -346,7 +375,10 @@ def run_backtest_for_symbol(
                 funnel["adapted_signals_passed"] += 1
         else:
             prev_signal_key = None
+        t_strat += time.perf_counter() - _t0
 
+        # 6. Simulator execution
+        _t0 = time.perf_counter()
         if signal:
             funnel["sim_trades_attempted"] += 1
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
@@ -354,7 +386,9 @@ def run_backtest_for_symbol(
                 opened = sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
                 if opened:
                     funnel["sim_trades_filled"] += 1
+        t_sim += time.perf_counter() - _t0
 
+    _t0 = time.perf_counter()
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
 
@@ -404,7 +438,6 @@ def run_backtest_for_symbol(
         first_t = day_t[0] if day_t else {}
         ref_levels = first_t.get("ref_levels", {})
 
-        # Omit large candle list from per-combination report to save disk space
         day_charts_data[d_str] = {
             "candles": [],
             "trades": day_t,
@@ -466,6 +499,7 @@ def run_backtest_for_symbol(
     out_file = os.path.join(OUTPUT_DIR, report_filename)
     with open(out_file, "w") as f:
         json.dump(report_payload, f, separators=(",", ":"))
+    t_rep += time.perf_counter() - _t0
 
     return {
         "report_file": report_filename,
@@ -473,7 +507,15 @@ def run_backtest_for_symbol(
         "kpis": global_kpis,
         "funnel": funnel,
         "adaptive_pct": adaptive_pct,
-        "day_candles": day_candles_by_date
+        "day_candles": day_candles_by_date,
+        "timing": {
+            "aggregator_s": t_agg,
+            "volatility_s": t_vol,
+            "session_levels_s": t_lvl,
+            "strategies_s": t_strat,
+            "simulator_s": t_sim,
+            "report_writing_s": t_rep,
+        }
     }
 
 async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
@@ -481,27 +523,15 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
     orig_be = GLOBAL_PARAMS.use_breakeven
     orig_trail = GLOBAL_PARAMS.use_supertrend_trail
 
-    # 1. Clean old outputs and leftovers for this symbol prior to running
-    old_output_patterns = [
-        f"{symbol}_*_report.json",
-        f"{symbol}_summary.json",
-        f"{symbol}_daycandles.json",
-        f"{symbol}_adaptive_report.json",
-        f"{symbol}_legacy_report.json",
-    ]
-    for pattern in old_output_patterns:
+    # Clean old outputs for this symbol
+    for pattern in [f"{symbol}_*_report.json", f"{symbol}_summary.json", f"{symbol}_daycandles.json", f"{symbol}_adaptive_report.json", f"{symbol}_legacy_report.json"]:
         for fpath in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
             try:
                 os.remove(fpath)
             except OSError:
                 pass
 
-    old_data_patterns = [
-        f"{symbol}_*_trades.csv",
-        f"{symbol}_*_trades.json",
-        f"{symbol}_*_skipped_signals.csv",
-    ]
-    for pattern in old_data_patterns:
+    for pattern in [f"{symbol}_*_trades.csv", f"{symbol}_*_trades.json", f"{symbol}_*_skipped_signals.csv"]:
         for fpath in glob.glob(os.path.join(DATA_DIR, pattern)):
             try:
                 os.remove(fpath)
@@ -517,6 +547,13 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
 
     matrix_rows = []
     all_day_candles: Dict[str, Any] = {}
+
+    tot_agg = 0.0
+    tot_vol = 0.0
+    tot_lvl = 0.0
+    tot_strat = 0.0
+    tot_sim = 0.0
+    tot_rep = 0.0
 
     try:
         for idx, combo in enumerate(COMBINATIONS):
@@ -536,6 +573,14 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
 
             if res:
                 k = res["kpis"]
+                timing = res.get("timing", {})
+                tot_agg += timing.get("aggregator_s", 0.0)
+                tot_vol += timing.get("volatility_s", 0.0)
+                tot_lvl += timing.get("session_levels_s", 0.0)
+                tot_strat += timing.get("strategies_s", 0.0)
+                tot_sim += timing.get("simulator_s", 0.0)
+                tot_rep += timing.get("report_writing_s", 0.0)
+
                 matrix_rows.append({
                     "label": combo["label"],
                     "mode": combo["mode"],
@@ -552,13 +597,12 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
                     "funnel": res["funnel"]
                 })
 
-                # Merge day candles, keeping one copy per date
                 day_candles = res.get("day_candles", {})
                 for d_str, c_list in day_candles.items():
                     if d_str not in all_day_candles:
                         all_day_candles[d_str] = c_list
 
-        # Write consolidated daycandles file once per symbol
+        _t0 = time.perf_counter()
         if all_day_candles:
             candles_file = os.path.join(OUTPUT_DIR, f"{symbol}_daycandles.json")
             with open(candles_file, "w") as f:
@@ -573,6 +617,15 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
                 "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "combinations": matrix_rows
             }, f, separators=(",", ":"))
+        tot_rep += time.perf_counter() - _t0
+
+        # Print phase timing line exactly as requested
+        print(
+            f"[time] {symbol} aggregator {tot_agg:.1f}s, volatility {tot_vol:.1f}s, "
+            f"session_levels {tot_lvl:.1f}s, strategies {tot_strat:.1f}s, "
+            f"simulator {tot_sim:.1f}s, report_writing {tot_rep:.1f}s",
+            flush=True
+        )
 
         print(f"[✓] {symbol} Matrix Complete: 8/8 combinations saved to {summary_file}", flush=True)
         return len(matrix_rows) > 0
@@ -593,7 +646,7 @@ async def main():
     parser.add_argument("--supertrend", type=str, default="on")
     args = parser.parse_args()
 
-    # Pre-run storage check: abort cleanly if less than 80 MB is free
+    # Pre-run storage check
     usage = shutil.disk_usage(OUTPUT_DIR)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < 80.0:
