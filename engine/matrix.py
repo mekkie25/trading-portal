@@ -1560,6 +1560,8 @@ class MatrixEngineMaster:
         # PROPOSED: Read-only periodic status logging timer
         self._last_status_log_time: float = 0.0
         self._last_risk_block_reason: str = "None"
+        # PROPOSED (Gap 3b): one-shot tracker for risk profile changes.
+        self._last_profile_seen: Optional[str] = None
 
     async def start(self) -> None:
         log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Edition)...")
@@ -1772,9 +1774,19 @@ class MatrixEngineMaster:
                     if local_pid not in broker_pids:
                         self.risk_mgr.open_positions.pop(local_pid, None)
 
-                await self.ctrader.sync_deals_from_ctrader()
+                               await self.ctrader.sync_deals_from_ctrader()
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
+
+                # PROPOSED (Gap 3b): one-shot log when the active profile changes.
+                # Fires once per change, not every scan.
+                current_profile = self.risk_mgr.persistent_risk.active_profile_name
+                if current_profile != self._last_profile_seen:
+                    self._last_profile_seen = current_profile
+                    if current_profile:
+                        log.info(f"[RISK] profile={current_profile} loaded from bot_config.json")
+                    else:
+                        log.info("[RISK] profile=None (Legacy) loaded from bot_config.json")
 
                 last_signal: Optional[Any] = None
 
@@ -1949,16 +1961,32 @@ class MatrixEngineMaster:
                     "losingTrades": losses,
                     "openPositions": open_positions_telemetry
                 })
-                # PROPOSED: Periodic read-only status log every 5 minutes (300 seconds)
+                                # PROPOSED (Gap 3a + 3b): Periodic status log with profile, min R:R,
+                # chosen risk %, and daily allowance remaining. Fires once every 5 minutes.
                 if (time.time() - self._last_status_log_time) >= 300.0:
                     self._last_status_log_time = time.time()
                     b_state = self.risk_mgr.persistent_risk
                     breaker_str = "TRIGGERED" if b_state.breaker_triggered else "CLEAR"
                     master_str = "ARMED" if self.risk_mgr.master_execution else "HALTED"
                     block_msg = b_state.last_trigger_reason or "None"
+                    profile_str = b_state.active_profile_name or "None (Legacy)"
+                    min_rr_str = f"{GLOBAL_PARAMS.min_rr:.2f}"
+                    try:
+                        snap = b_state.get_sizing_snapshot(
+                            current_equity=equity,
+                            account_currency=self.ctrader.account_currency,
+                        )
+                        chosen_str = f"{snap['chosen_pct']:.2f}%"
+                        daily_left_str = f"{snap['daily_left']:.2f} {snap['currency']}"
+                    except Exception as e:
+                        chosen_str = "n/a"
+                        daily_left_str = "n/a"
+                        log.warning(f"[BOT_STATUS] snapshot failed: {e}")
                     log.info(
                         f"[BOT_STATUS] Master: {master_str} | Breaker: {breaker_str} (Scope: {b_state.active_trip_scope}) | "
+                        f"Profile: {profile_str} | MinRR: {min_rr_str} | Risk%: {chosen_str} | "
                         f"Trades: {b_state.trades_taken_today}/{b_state.max_daily_trades} | "
+                        f"DailyLeft: {daily_left_str} | "
                         f"Currency: {self.ctrader.account_currency or 'UNKNOWN'} | Equity: ${equity:.2f} | "
                         f"Last Block: {block_msg}"
                     )
