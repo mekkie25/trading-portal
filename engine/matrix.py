@@ -57,7 +57,7 @@ except ImportError:
 
 from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
-from risk.risk_manager import RiskManager
+from risk.risk_manager import RiskManager, RISK_PROFILES
 
 # PROPOSED: Support shared DATA_DIR persistent storage volume
 DATA_DIR = os.getenv("DATA_DIR", "").strip() or PROJECT_ROOT
@@ -1068,7 +1068,12 @@ class InstitutionalRiskEngine:
         GLOBAL_PARAMS.min_rr = float(cfg.get("minRr", GLOBAL_PARAMS.min_rr))
         self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", getattr(self, 'risk_per_trade_pct', GLOBAL_PARAMS.base_risk_per_trade_pct)))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
-        if "maxDailyTrades" in cfg:
+                # PROPOSED: Only let the UI's maxDailyTrades override when NO profile is active.
+        # When a valid profile is selected, RiskManager owns the daily trade cap
+        # (Steady=2, Balanced=3, Aggressive=4, Max Growth=4).
+        prof_name = cfg.get("riskProfile")
+        profile_is_active = prof_name in RISK_PROFILES
+        if not profile_is_active and "maxDailyTrades" in cfg:
             self.max_daily_trades = int(cfg["maxDailyTrades"])
         self.daily_goal_target = float(cfg.get("dailyGoalTarget", self.daily_goal_target))
         self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline or 10.0))

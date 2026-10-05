@@ -97,3 +97,63 @@ def test_ai_multiplier_clamped_to_1_or_below():
     # Even if AI outputs 1.5x, safe clamp ensures it cannot raise risk above 1.0x
     risk_pct = rm.combined_risk_pct(current_equity=1000.0, dow_mult=1.0, ai_factor=1.5, account_currency="USD")
     assert risk_pct == 1.5  # Exactly 1.5% base band risk, not 2.25%
+
+def test_profile_steady_caps_daily_trades_even_with_higher_bot_config(tmp_path, monkeypatch):
+    """
+    PROPOSED (Gap 5): InstitutionalRiskEngine.sync_ui_config must NOT let
+    bot_config's maxDailyTrades override the profile's cap. With Steady (2 trades)
+    selected and bot_config saying 4, the engine must keep 2.
+    """
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+
+    # Redirect the runtime state file so the test doesn't touch the real repo.
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Steady",
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+
+    # read_ui_config() resolves CONFIG_FILE at call time, so patch the module-level name.
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+
+    assert engine.max_daily_trades == 2, (
+        f"Expected Steady profile cap (2) but got {engine.max_daily_trades}. "
+        "bot_config.json's maxDailyTrades=4 leaked through."
+    )
+
+
+def test_profile_unset_respects_bot_config_daily_trades(tmp_path, monkeypatch):
+    """
+    PROPOSED (Gap 5) regression guard: with riskProfile null, the old behaviour
+    must hold — bot_config's maxDailyTrades is applied verbatim.
+    """
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": None,
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+
+    assert engine.max_daily_trades == 4, (
+        f"Expected legacy behaviour (4) but got {engine.max_daily_trades}. "
+        "riskProfile=null must leave bot_config's maxDailyTrades in effect."
+    )
