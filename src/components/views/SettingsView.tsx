@@ -350,6 +350,60 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               })}
             </div>
           </div>
+          
+                    {/* PROPOSED: Risk Profile Selector */}
+          <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] space-y-3">
+            <div>
+              <span className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                <Shield className="w-3.5 h-3.5 text-blue-600" /> Risk Profile (Account Size Band)
+              </span>
+              <p className="text-[11px] text-slate-500 mt-0.5">
+                Pick how aggressively the bot sizes trades. Risk % shrinks automatically as the account grows.
+                Leave on <strong>None (Legacy)</strong> to use the old fixed <code>riskPerTradePct</code>.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5">
+              {[
+                { key: null,          title: 'None (Legacy)', sub: 'Use fixed riskPerTradePct. No profile.' },
+                { key: 'Steady',      title: 'Steady',        sub: 'Lowest risk. 5% → 1% as account grows.' },
+                { key: 'Balanced',    title: 'Balanced',      sub: 'Middle ground. 10% → 2% as account grows.' },
+                { key: 'Aggressive',  title: 'Aggressive',    sub: 'Higher risk. 30% → 3% as account grows.' },
+                { key: 'Max Growth',  title: 'Max Growth',    sub: 'Flip small accounts. 35% → 4% as account grows.' },
+              ].map((opt) => {
+                const isSelected = (localBotSettings.riskProfile ?? null) === opt.key;
+                return (
+                  <button
+                    key={String(opt.key)}
+                    type="button"
+                    onClick={() =>
+                      setLocalBotSettings({
+                        ...localBotSettings,
+                        riskProfile: opt.key as BotSettings['riskProfile'],
+                      })
+                    }
+                    className={`text-left p-3 rounded-xl border-2 transition-all cursor-pointer ${
+                      isSelected
+                        ? 'border-blue-500 bg-blue-500/10'
+                        : 'border-slate-200 dark:border-[#212838] bg-white dark:bg-[#151922] hover:border-slate-300 dark:hover:border-slate-600'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className={`text-xs font-bold ${
+                        isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-slate-900 dark:text-white'
+                      }`}>
+                        {opt.title}
+                      </span>
+                      <span className={`w-3 h-3 rounded-full border-2 ${
+                        isSelected ? 'border-blue-500 bg-blue-500' : 'border-slate-300 dark:border-slate-600'
+                      }`} />
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-snug">{opt.sub}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           {/* Min R:R Input */}
           <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">

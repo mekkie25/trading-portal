@@ -53,6 +53,8 @@ export interface TopMetrics {
 
 export type RiskProfileName = 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth';
 
+export type RiskProfileName = 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth';
+
 export interface BotSettings {
   masterExecution: boolean;
   riskPerTradePct: number;

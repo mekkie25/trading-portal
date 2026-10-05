@@ -19,7 +19,7 @@ interface BotGatewayConfig {
   maxDailyTrades: number;
   trailingStopActive: boolean;
   autoBreakevenPips: number;
-  currency: string;
+    currency: string;
   updatedAt: string;
   version: number;
   strategyModes?: Record<string, string>;
