@@ -151,7 +151,7 @@ let riskState: RiskState = {
   currentDailyLossUsd: 0,
   currentWeeklyLossUsd: 0,
   currentMonthlyLossUsd: 0,
-  breakerTriggered: boolean(false),
+  breakerTriggered: false,
   activeTripScope: 'NONE',
   lastTriggerReason: undefined,
 };
