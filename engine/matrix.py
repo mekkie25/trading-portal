@@ -1536,12 +1536,18 @@ class MatrixEngineMaster:
                         if pid and pid in self.risk_mgr.open_positions:
                             pos = self.risk_mgr.open_positions[pid]
                             log.info(f"Manual close command received for Position #{pid} ({pos['symbol']})")
-                            await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100))
-                            self.risk_mgr.open_positions.pop(pid, None)
-                    except Exception:
-                        pass
+                            # PROPOSED: Check confirmation from broker before popping position
+                            closed = await self.ctrader.close_position(int(pid), pos.get("volume_cents", 100))
+                            if closed:
+                                self.risk_mgr.open_positions.pop(pid, None)
+                                log.info(f"Position #{pid} successfully closed on broker and removed from supervision.")
+                            else:
+                                log.error(f"Broker rejected close for Position #{pid}. Retaining under active supervision.")
+                    except Exception as e:
+                        log.exception(f"Error processing manual close command: {e}")
                 await asyncio.sleep(1.0)
-            except Exception:
+            except Exception as e:
+                log.exception(f"Unexpected error in _manual_close_listener_loop: {e}")
                 await asyncio.sleep(3.0)
 
     async def _position_supervisor_loop(self) -> None:
