@@ -3,13 +3,17 @@ backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 - Auto-runs all 8 parameter combinations per symbol:
   (adaptive vs legacy) x (breakeven on vs off) x (supertrend on vs off).
-- Writes per-combination reports: {SYMBOL}_{mode}_be{on|off}_trail{on|off}_report.json
-- Writes consolidated comparison matrix: {SYMBOL}_summary.json
+- Writes per-combination reports: {SYMBOL}_{mode}_be{on|off}_trail{on|off}_report.json (compact, candles omitted)
+- Writes consolidated day candles once per symbol: {SYMBOL}_daycandles.json (compact)
+- Writes consolidated comparison matrix: {SYMBOL}_summary.json (compact)
+- Automatically purges old outputs & leftovers prior to running each symbol (preserves market data CSVs)
 - Tracks diagnostic funnel: signals evaluated, vol blocks, structural room blocks, fills.
 """
 
 import sys
 import os
+import glob
+import shutil
 import json
 import asyncio
 import argparse
@@ -386,18 +390,23 @@ def run_backtest_for_symbol(
     trading_dates = sorted(df_trades["display_date"].unique().tolist()) if not df_trades.empty else []
 
     day_charts_data = {}
+    day_candles_by_date = {}
+
     for d_str in trading_dates:
         sub_m5 = m5_df[m5_df["date_sast_str"] == d_str]
         candles_list = [
             {"time": int(r["dt"].timestamp()), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
             for _, r in sub_m5.iterrows()
         ]
+        day_candles_by_date[d_str] = candles_list
+
         day_t = df_trades[df_trades["display_date"] == d_str].to_dict("records")
         first_t = day_t[0] if day_t else {}
         ref_levels = first_t.get("ref_levels", {})
 
+        # Omit large candle list from per-combination report to save disk space
         day_charts_data[d_str] = {
-            "candles": candles_list,
+            "candles": [],
             "trades": day_t,
             "levels": {
                 "asia_high": ref_levels.get("asia_high"),
@@ -456,14 +465,15 @@ def run_backtest_for_symbol(
     report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
     out_file = os.path.join(OUTPUT_DIR, report_filename)
     with open(out_file, "w") as f:
-        json.dump(report_payload, f, indent=2)
+        json.dump(report_payload, f, separators=(",", ":"))
 
     return {
         "report_file": report_filename,
         "payload": report_payload,
         "kpis": global_kpis,
         "funnel": funnel,
-        "adaptive_pct": adaptive_pct
+        "adaptive_pct": adaptive_pct,
+        "day_candles": day_candles_by_date
     }
 
 async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
@@ -471,7 +481,42 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
     orig_be = GLOBAL_PARAMS.use_breakeven
     orig_trail = GLOBAL_PARAMS.use_supertrend_trail
 
+    # 1. Clean old outputs and leftovers for this symbol prior to running
+    old_output_patterns = [
+        f"{symbol}_*_report.json",
+        f"{symbol}_summary.json",
+        f"{symbol}_daycandles.json",
+        f"{symbol}_adaptive_report.json",
+        f"{symbol}_legacy_report.json",
+    ]
+    for pattern in old_output_patterns:
+        for fpath in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+
+    old_data_patterns = [
+        f"{symbol}_*_trades.csv",
+        f"{symbol}_*_trades.json",
+        f"{symbol}_*_skipped_signals.csv",
+    ]
+    for pattern in old_data_patterns:
+        for fpath in glob.glob(os.path.join(DATA_DIR, pattern)):
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+
+    report_html = os.path.join(DATA_DIR, "report.html")
+    if os.path.exists(report_html):
+        try:
+            os.remove(report_html)
+        except OSError:
+            pass
+
     matrix_rows = []
+    all_day_candles: Dict[str, Any] = {}
 
     try:
         for idx, combo in enumerate(COMBINATIONS):
@@ -507,6 +552,18 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
                     "funnel": res["funnel"]
                 })
 
+                # Merge day candles, keeping one copy per date
+                day_candles = res.get("day_candles", {})
+                for d_str, c_list in day_candles.items():
+                    if d_str not in all_day_candles:
+                        all_day_candles[d_str] = c_list
+
+        # Write consolidated daycandles file once per symbol
+        if all_day_candles:
+            candles_file = os.path.join(OUTPUT_DIR, f"{symbol}_daycandles.json")
+            with open(candles_file, "w") as f:
+                json.dump(all_day_candles, f, separators=(",", ":"))
+
         summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
         with open(summary_file, "w") as f:
             json.dump({
@@ -515,7 +572,7 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
                 "target_rr": GLOBAL_PARAMS.target_rr,
                 "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "combinations": matrix_rows
-            }, f, indent=2)
+            }, f, separators=(",", ":"))
 
         print(f"[✓] {symbol} Matrix Complete: 8/8 combinations saved to {summary_file}", flush=True)
         return len(matrix_rows) > 0
@@ -535,6 +592,13 @@ async def main():
     parser.add_argument("--breakeven", type=str, default="off")
     parser.add_argument("--supertrend", type=str, default="on")
     args = parser.parse_args()
+
+    # Pre-run storage check: abort cleanly if less than 80 MB is free
+    usage = shutil.disk_usage(OUTPUT_DIR)
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb < 80.0:
+        print(f"ERROR: Low disk space on storage volume ({int(free_mb)} MB free). Clear old reports from the Storage panel.", flush=True)
+        sys.exit(1)
 
     GLOBAL_PARAMS.target_rr = args.rr
 

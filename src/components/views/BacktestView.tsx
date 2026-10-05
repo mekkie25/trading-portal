@@ -24,7 +24,8 @@ import {
   Square,
   Copy,
   Check,
-  Table
+  Table,
+  Database
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -62,6 +63,15 @@ interface SymbolSummaryPayload {
   target_rr: number;
   generated_at: string;
   combinations: SummaryCombination[];
+}
+
+interface StorageInfo {
+  total_mb: number;
+  used_mb: number;
+  free_mb: number;
+  market_data_mb: number;
+  reports_mb: number;
+  largest_files?: Array<{ name: string; size_mb: number; type: string }>;
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
@@ -120,6 +130,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [testDays, setTestDays] = useState<number>(60);
   const [testRr, setTestRr] = useState<number>(1.0);
 
+  // Storage Stats
+  const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
+  const [isCleaning, setIsCleaning] = useState<boolean>(false);
+
   // Execution & Status
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
@@ -146,7 +160,24 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
 
-  // 1. Initial status poll
+  // 1. Storage Info Fetcher
+  const fetchStorageInfo = useCallback(async () => {
+    try {
+      const res = await fetch('/api/backtest/storage');
+      if (res.ok) {
+        const json = await res.json();
+        if (json.data) {
+          setStorageInfo(json.data);
+        }
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    fetchStorageInfo();
+  }, [fetchStorageInfo]);
+
+  // 2. Initial status poll
   useEffect(() => {
     const checkInitialStatus = async () => {
       try {
@@ -166,7 +197,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     checkInitialStatus();
   }, []);
 
-  // 2. Fetch list of reports
+  // 3. Fetch list of reports
   const fetchReportList = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/reports');
@@ -186,7 +217,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchReportList();
   }, [fetchReportList]);
 
-  // 3. Load summary payload for current pair
+  // 4. Load summary payload for current pair
   const fetchSummaryData = useCallback(async (sym: string) => {
     try {
       const res = await fetch(`/api/backtest/summary/${sym}`);
@@ -207,7 +238,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchSummaryData(testSymbol);
   }, [testSymbol, fetchSummaryData]);
 
-  // 4. Fetch selected individual report JSON
+  // 5. Fetch selected individual report JSON
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
@@ -229,7 +260,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     loadReport();
   }, [selectedFile]);
 
-  // 5. Polling while running
+  // 6. Polling while running
   useEffect(() => {
     if (!isRunning) return;
 
@@ -248,6 +279,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             setIsRunning(false);
             await fetchReportList();
             await fetchSummaryData(testSymbol);
+            await fetchStorageInfo();
           }
         }
       } catch (err) {
@@ -256,9 +288,41 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [isRunning, fetchReportList, fetchSummaryData, testSymbol]);
+  }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, testSymbol]);
 
-  // 6. Trigger Run
+  // 7. Cleanup Action
+  const handleCleanup = async (scope: 'all_reports' | 'symbol') => {
+    const sym = testSymbol;
+    const confirmMsg = scope === 'all_reports'
+      ? 'Clear ALL backtest reports, summaries, and day candles? (Market data CSVs will NOT be deleted)'
+      : `Clear all backtest reports and summaries for ${sym}? (Market data CSVs will NOT be deleted)`;
+
+    if (!window.confirm(confirmMsg)) return;
+
+    setIsCleaning(true);
+    try {
+      const res = await fetch('/api/backtest/storage/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope, symbol: sym }),
+      });
+      if (res.ok) {
+        await fetchStorageInfo();
+        await fetchReportList();
+        await fetchSummaryData(testSymbol);
+        if (scope === 'all_reports' || (scope === 'symbol' && selectedFile.startsWith(`${sym}_`))) {
+          setSelectedFile('');
+          setReportData(null);
+        }
+      }
+    } catch (err) {
+      console.warn('Storage cleanup error:', err);
+    } finally {
+      setIsCleaning(false);
+    }
+  };
+
+  // 8. Trigger Run
   const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
@@ -292,10 +356,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       await fetch('/api/backtest/stop', { method: 'POST' });
       setIsRunning(false);
       setProgressText('Backtest cancelled.');
+      await fetchStorageInfo();
     } catch {}
   };
 
-  // 7. Copy for AI Builder
+  // 9. Copy for AI Builder
   const handleCopyForAI = async () => {
     const lines: string[] = [];
 
@@ -374,7 +439,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
-  // 8. Candlestick Chart Rendering
+  // 10. Candlestick Chart Rendering
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
 
@@ -645,7 +710,67 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Per-Symbol Results Box */}
+      {/* STORAGE STRIP */}
+      {storageInfo && (
+        <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 flex-wrap">
+              <Database className="w-4 h-4 text-blue-500 shrink-0" />
+              <span className="font-bold text-black dark:text-white">Storage Volume:</span>
+              <span className="font-mono text-slate-600 dark:text-slate-300">
+                {storageInfo.used_mb} MB used / {storageInfo.free_mb} MB free (Total: {storageInfo.total_mb} MB)
+              </span>
+              <span className="text-slate-400 hidden sm:inline">|</span>
+              <span className="font-mono text-[11px] text-slate-500">
+                Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> • Market Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong>
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={isCleaning || isRunning}
+                onClick={() => handleCleanup('symbol')}
+                className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] dark:hover:bg-[#1c2130] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors"
+              >
+                <Trash2 className="w-3 h-3 text-amber-500" />
+                <span>Clear {testSymbol} reports</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={isCleaning || isRunning}
+                onClick={() => handleCleanup('all_reports')}
+                className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 dark:text-rose-400 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors"
+              >
+                <Trash2 className="w-3 h-3 text-rose-500" />
+                <span>Clear all reports</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Volume progress bar (turns red when used capacity exceeds 85%) */}
+          {(() => {
+            const usedPct = storageInfo.total_mb > 0 
+              ? Math.min(100, Math.round((storageInfo.used_mb / storageInfo.total_mb) * 100)) 
+              : 0;
+            const isHighUsage = usedPct >= 85;
+
+            return (
+              <div className="w-full bg-slate-100 dark:bg-[#08090d] rounded-full h-2 overflow-hidden border border-slate-200 dark:border-[#1a2030]">
+                <div 
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    isHighUsage ? 'bg-rose-500' : 'bg-blue-600'
+                  }`} 
+                  style={{ width: `${usedPct}%` }}
+                />
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* Per-Symbol Results Box (Wrapped Error Output) */}
       {runResults.length > 0 && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -659,13 +784,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 pt-1">
             {runResults.map((r, i) => (
-              <div key={i} className={`p-2.5 rounded-xl border flex items-center justify-between text-xs font-mono ${
+              <div key={i} className={`p-3 rounded-xl border flex flex-col sm:flex-row sm:items-start justify-between gap-2 text-xs font-mono ${
                 r.status === 'OK'
                   ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
                   : 'bg-rose-500/10 border-rose-500/30 text-rose-600'
               }`}>
-                <span className="font-bold">{r.symbol}</span>
-                <span className="text-[11px] truncate max-w-[170px]" title={r.message}>{r.status}: {r.message}</span>
+                <span className="font-bold shrink-0">{r.symbol}</span>
+                <span className="text-[11px] break-words whitespace-pre-wrap flex-1">{r.status}: {r.message}</span>
               </div>
             ))}
           </div>
@@ -1219,7 +1344,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           </div>
 
           <div 
-            ref={chartContainerRef}
+            ref={chartContainerRef} 
             className="w-full h-[480px] rounded-2xl bg-white dark:bg-[#07090e] border border-slate-300 dark:border-[#1a2030] overflow-hidden"
           />
 

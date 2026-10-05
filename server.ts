@@ -88,6 +88,9 @@ const storageBase = (process.env.BACKTEST_STORAGE_DIR || '').trim();
 const BACKTEST_OUTPUT_DIR = storageBase
   ? path.join(storageBase, 'output')
   : path.join(process.cwd(), 'backtest', 'output');
+const BACKTEST_DATA_DIR = storageBase
+  ? path.join(storageBase, 'data')
+  : path.join(process.cwd(), 'backtest', 'data');
 
 let backtestRunning = false;
 let backtestProgress = '';
@@ -366,6 +369,24 @@ async function startServer() {
         return res.status(404).json({ status: 'error', message: 'Report not found' });
       }
       const data = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+
+      // If day_data candles are omitted, re-insert them from shared {SYMBOL}_daycandles.json
+      if (data && data.day_data && data.symbol) {
+        const daycandlesPath = path.resolve(BACKTEST_OUTPUT_DIR, `${data.symbol}_daycandles.json`);
+        if (fs.existsSync(daycandlesPath)) {
+          try {
+            const dayCandles = JSON.parse(fs.readFileSync(daycandlesPath, 'utf8'));
+            for (const [dateKey, dayObj] of Object.entries<any>(data.day_data)) {
+              if ((!dayObj.candles || dayObj.candles.length === 0) && dayCandles[dateKey]) {
+                dayObj.candles = dayCandles[dateKey];
+              }
+            }
+          } catch (e) {
+            console.warn(`Could not load shared daycandles for ${data.symbol}:`, e);
+          }
+        }
+      }
+
       res.status(200).json({ status: 'success', data });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
@@ -394,6 +415,164 @@ async function startServer() {
     backtestProgress = 'Backtest canceled by user.';
     backtestLastError = null;
     res.status(200).json({ status: 'success', message: 'Backtest stopped.' });
+  });
+
+  app.get('/api/backtest/storage', (_req, res) => {
+    try {
+      const volPath = storageBase || process.cwd();
+      let total_mb = 0;
+      let free_mb = 0;
+      let used_mb = 0;
+
+      try {
+        const stats = fs.statfsSync(volPath);
+        total_mb = Math.round((stats.bsize * stats.blocks) / (1024 * 1024));
+        free_mb = Math.round((stats.bsize * stats.bfree) / (1024 * 1024));
+        used_mb = total_mb - free_mb;
+      } catch (e) {
+        console.warn('Could not read statfs:', e);
+      }
+
+      let market_data_bytes = 0;
+      const allFiles: Array<{ name: string; path: string; size_mb: number; type: string }> = [];
+
+      if (fs.existsSync(BACKTEST_DATA_DIR)) {
+        const dataFiles = fs.readdirSync(BACKTEST_DATA_DIR);
+        for (const f of dataFiles) {
+          const fPath = path.join(BACKTEST_DATA_DIR, f);
+          try {
+            const stat = fs.statSync(fPath);
+            if (stat.isFile()) {
+              if (f.endsWith('.csv')) {
+                market_data_bytes += stat.size;
+              }
+              allFiles.push({
+                name: f,
+                path: fPath,
+                size_mb: Number((stat.size / (1024 * 1024)).toFixed(2)),
+                type: f.endsWith('.csv') ? 'market_data' : 'data_other'
+              });
+            }
+          } catch {}
+        }
+      }
+
+      let reports_bytes = 0;
+      if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
+        const outputFiles = fs.readdirSync(BACKTEST_OUTPUT_DIR);
+        for (const f of outputFiles) {
+          const fPath = path.join(BACKTEST_OUTPUT_DIR, f);
+          try {
+            const stat = fs.statSync(fPath);
+            if (stat.isFile()) {
+              reports_bytes += stat.size;
+              allFiles.push({
+                name: f,
+                path: fPath,
+                size_mb: Number((stat.size / (1024 * 1024)).toFixed(2)),
+                type: 'report'
+              });
+            }
+          } catch {}
+        }
+      }
+
+      allFiles.sort((a, b) => b.size_mb - a.size_mb);
+      const largest_files = allFiles.slice(0, 20);
+
+      const market_data_mb = Number((market_data_bytes / (1024 * 1024)).toFixed(2));
+      const reports_mb = Number((reports_bytes / (1024 * 1024)).toFixed(2));
+
+      res.status(200).json({
+        status: 'success',
+        data: {
+          total_mb,
+          used_mb,
+          free_mb,
+          market_data_mb,
+          reports_mb,
+          largest_files
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.post('/api/backtest/storage/cleanup', (req, res) => {
+    try {
+      const scope = req.body?.scope || 'all_reports';
+      const targetSym = (req.body?.symbol || '').toUpperCase().trim();
+      let deletedCount = 0;
+
+      // 1. Delete matching report/summary/daycandles files from BACKTEST_OUTPUT_DIR
+      if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
+        const files = fs.readdirSync(BACKTEST_OUTPUT_DIR);
+        for (const f of files) {
+          if (!f.endsWith('.json')) continue;
+
+          let shouldDelete = false;
+          if (scope === 'all_reports') {
+            shouldDelete = true;
+          } else if (scope === 'symbol' && targetSym) {
+            if (f.startsWith(`${targetSym}_`)) {
+              shouldDelete = true;
+            }
+          }
+
+          if (shouldDelete) {
+            try {
+              fs.unlinkSync(path.join(BACKTEST_OUTPUT_DIR, f));
+              deletedCount++;
+            } catch {}
+          }
+        }
+      }
+
+      // 2. Delete matching leftover trades/skips from BACKTEST_DATA_DIR (protecting market data CSVs)
+      if (fs.existsSync(BACKTEST_DATA_DIR)) {
+        const files = fs.readdirSync(BACKTEST_DATA_DIR);
+        for (const f of files) {
+          // Never delete market data files
+          if (f.endsWith('_M5.csv') || f.endsWith('_H1.csv') || f.endsWith('_H4.csv') || f.endsWith('_D1.csv')) {
+            continue;
+          }
+
+          const isLeftover = (
+            f.includes('_trades.csv') ||
+            f.includes('_trades.json') ||
+            f.includes('_skipped_signals.csv') ||
+            f === 'report.html'
+          );
+
+          if (isLeftover) {
+            let shouldDelete = false;
+            if (scope === 'all_reports') {
+              shouldDelete = true;
+            } else if (scope === 'symbol' && targetSym) {
+              if (f.startsWith(`${targetSym}_`)) {
+                shouldDelete = true;
+              }
+            }
+
+            if (shouldDelete) {
+              try {
+                fs.unlinkSync(path.join(BACKTEST_DATA_DIR, f));
+                deletedCount++;
+              } catch {}
+            }
+          }
+        }
+      }
+
+      res.status(200).json({
+        status: 'success',
+        message: `Cleanup completed. Deleted ${deletedCount} file(s).`,
+        deletedCount
+      });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
   });
 
   app.post('/api/backtest/run', (req, res) => {
@@ -458,10 +637,10 @@ async function startServer() {
           proc.stderr.on('data', (data) => {
             const errText = data.toString().trim();
             console.error(`[Backtest Error]: ${errText}`);
-            if (!symbolLastError && errText.includes('Traceback')) {
-              symbolLastError = `ERROR in ${sym}: Python execution crashed.`;
-              backtestLastError = symbolLastError;
-            }
+            const lines = errText.split('\n').map((l: string) => l.trim()).filter(Boolean);
+            const lastLine = lines.length > 0 ? lines[lines.length - 1] : 'Python execution crashed.';
+            symbolLastError = `ERROR in ${sym}: ${lastLine}`;
+            backtestLastError = symbolLastError;
           });
 
           proc.on('exit', (code) => {
