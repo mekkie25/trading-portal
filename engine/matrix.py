@@ -1062,19 +1062,33 @@ class InstitutionalRiskEngine:
         cfg = read_ui_config()
         if not cfg:
             return
+
+        # PROPOSED (Gaps 3 & 5): Read the active risk profile once so downstream reads agree.
+        prof_name = cfg.get("riskProfile")
+        profile_is_active = prof_name in RISK_PROFILES
+
         self.master_execution = cfg.get("masterExecution", self.master_execution)
         self.dry_run = cfg.get("dryRun", self.dry_run)
         GLOBAL_PARAMS.adaptive_mode = bool(cfg.get("adaptiveMode", GLOBAL_PARAMS.adaptive_mode))
-        GLOBAL_PARAMS.min_rr = float(cfg.get("minRr", GLOBAL_PARAMS.min_rr))
+
+        # PROPOSED (Gap 3): Effective min R:R = higher of UI minRr and profile floor.
+        # Floors: Steady 1.0, Balanced 1.5, Aggressive 2.0, Max Growth 2.0.
+        ui_min_rr = float(cfg.get("minRr", GLOBAL_PARAMS.min_rr))
+        if profile_is_active:
+            profile_floor = float(RISK_PROFILES[prof_name]["min_rr_floor"])
+            GLOBAL_PARAMS.min_rr = max(ui_min_rr, profile_floor)
+        else:
+            GLOBAL_PARAMS.min_rr = ui_min_rr
+
         self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", getattr(self, 'risk_per_trade_pct', GLOBAL_PARAMS.base_risk_per_trade_pct)))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
-                # PROPOSED: Only let the UI's maxDailyTrades override when NO profile is active.
+
+        # PROPOSED (Gap 5): Only let the UI's maxDailyTrades override when NO profile is active.
         # When a valid profile is selected, RiskManager owns the daily trade cap
         # (Steady=2, Balanced=3, Aggressive=4, Max Growth=4).
-        prof_name = cfg.get("riskProfile")
-        profile_is_active = prof_name in RISK_PROFILES
         if not profile_is_active and "maxDailyTrades" in cfg:
             self.max_daily_trades = int(cfg["maxDailyTrades"])
+
         self.daily_goal_target = float(cfg.get("dailyGoalTarget", self.daily_goal_target))
         self.weekly_deposit_baseline = float(cfg.get("weeklyDepositBaseline", self.weekly_deposit_baseline or 10.0))
         self.weekly_goal_target = float(cfg.get("weeklyGoalTarget", self.weekly_goal_target or 20.0))

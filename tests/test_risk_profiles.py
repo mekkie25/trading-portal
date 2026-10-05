@@ -157,3 +157,124 @@ def test_profile_unset_respects_bot_config_daily_trades(tmp_path, monkeypatch):
         f"Expected legacy behaviour (4) but got {engine.max_daily_trades}. "
         "riskProfile=null must leave bot_config's maxDailyTrades in effect."
     )
+
+def test_profile_steady_caps_daily_trades_even_with_higher_bot_config(tmp_path, monkeypatch):
+    """Gap 5: profile Steady (2 trades) must win over bot_config's 4."""
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Steady",
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+    assert engine.max_daily_trades == 2
+
+
+def test_profile_unset_respects_bot_config_daily_trades(tmp_path, monkeypatch):
+    """Gap 5 regression: profile null keeps bot_config's 4."""
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": None,
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+    assert engine.max_daily_trades == 4
+
+
+def test_min_rr_floor_steady_raises_ui_value(tmp_path, monkeypatch):
+    """Gap 3: Steady floor 1.0 beats UI 0.5."""
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+    from core.session_config import GLOBAL_PARAMS
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Steady",
+        "minRr": 0.5,
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+    assert abs(GLOBAL_PARAMS.min_rr - 1.0) < 1e-9
+
+
+def test_min_rr_floor_aggressive_raises_ui_value(tmp_path, monkeypatch):
+    """Gap 3: Aggressive floor 2.0 beats UI 1.5."""
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+    from core.session_config import GLOBAL_PARAMS
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Aggressive",
+        "minRr": 1.5,
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+    assert abs(GLOBAL_PARAMS.min_rr - 2.0) < 1e-9
+
+
+def test_min_rr_ui_higher_than_floor_wins(tmp_path, monkeypatch):
+    """Gap 3: UI 3.0 beats Aggressive floor 2.0; profile null keeps UI value."""
+    import json
+    import engine.matrix as matrix_mod
+    import risk.risk_manager as rm_mod
+    from core.session_config import GLOBAL_PARAMS
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Aggressive",
+        "minRr": 3.0,
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+    monkeypatch.setattr(matrix_mod, "CONFIG_FILE", str(cfg_path))
+
+    engine = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine.sync_ui_config()
+    assert abs(GLOBAL_PARAMS.min_rr - 3.0) < 1e-9
+
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": None,
+        "minRr": 0.7,
+        "maxDailyTrades": 4,
+    }), encoding="utf-8")
+
+    engine2 = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
+    engine2.sync_ui_config()
+    assert abs(GLOBAL_PARAMS.min_rr - 0.7) < 1e-9
