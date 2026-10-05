@@ -41,6 +41,7 @@ interface SymbolSummaryPayload {
   days: number;
   target_rr: number;
   generated_at: string;
+  total_seconds?: number;
   combinations: SummaryCombination[];
 }
 
@@ -327,11 +328,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             doc.text(str, pageWidth / 2, pageHeight - 8, { align: 'center' });
           };
 
-          // COVER PAGE
+          // PAGE 1: COVER PAGE
           doc.setFillColor(15, 23, 42);
           doc.rect(0, 0, pageWidth, pageHeight, 'F');
           doc.setTextColor(255, 255, 255);
-          doc.setFontSize(26);
+          doc.setFontSize(28);
           doc.text('NEXUS MATRIX', 20, 50);
           doc.setFontSize(16);
           doc.setTextColor(59, 130, 246);
@@ -342,21 +343,22 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           doc.text(`Run Date: ${exp.generated_at.slice(0, 10)}`, 20, 80);
           doc.text(`Window Duration: ${exp.days} Days`, 20, 87);
           doc.text(`Risk-to-Reward Target: 1:${exp.target_rr}`, 20, 94);
-          doc.text(`Whitelist Coverage: 7 Multi-Asset Instruments`, 20, 101);
+          doc.text(`Total Run Time: ${exp.total_run_seconds || 0}s`, 20, 101);
+          doc.text(`Whitelist Coverage: 7 Multi-Asset Instruments`, 20, 108);
 
           doc.setFillColor(30, 41, 59);
-          doc.roundedRect(20, 120, pageWidth - 40, 50, 4, 4, 'F');
+          doc.roundedRect(20, 125, pageWidth - 40, 50, 4, 4, 'F');
           doc.setTextColor(248, 250, 252);
           doc.setFontSize(11);
-          doc.text('HOW TO READ THIS REPORT:', 26, 130);
+          doc.text('AUDIT METHODOLOGY & CONVENTIONS:', 26, 135);
           doc.setFontSize(9);
           doc.setTextColor(148, 163, 184);
-          doc.text('1. Evaluates 8 combinations per asset across Adaptive/Legacy, Breakeven, and SuperTrend trail.', 26, 138);
-          doc.text('2. Identifies the statistically superior setup per asset based on Profit Factor and trade volume.', 26, 145);
-          doc.text('3. Rules require at least 30 executions before drawing statistical confidence.', 26, 152);
-          doc.text('4. Detailed suggestions rank recommended parameter and schedule adjustments by estimated dollar impact.', 26, 159);
+          doc.text('1. Tests 8 combinations per asset across Adaptive/Legacy, Breakeven, and SuperTrend trail.', 26, 143);
+          doc.text('2. Every rule in the suggestion engine strictly requires at least 30 trades before firing.', 26, 150);
+          doc.text('3. Identifies the statistically superior setup per asset ranked by estimated dollar impact.', 26, 157);
+          doc.text('4. Zero look-ahead bias: higher timeframe candles are reconstructed bar-by-bar at time T.', 26, 164);
 
-          // OVERVIEW PAGE
+          // PAGE 2: PORTFOLIO OVERVIEW & P&L BAR CHART
           doc.addPage();
           addHeaderFooter('Portfolio Overview');
           doc.setFontSize(16);
@@ -378,6 +380,40 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             bodyStyles: { fontSize: 8 }
           });
 
+          let chartY = (doc as any).lastAutoTable.finalY + 12;
+          doc.setFontSize(12);
+          doc.setTextColor(15, 23, 42);
+          doc.text('Net Realized P&L by Instrument ($)', 14, chartY);
+
+          // Draw vector P&L bar chart with jsPDF primitives
+          const validPairs = (exp.pairs || []).filter((p: any) => p.status === 'OK');
+          const maxPnl = Math.max(50, ...validPairs.map((p: any) => Math.abs(p.best_combination?.net_pnl || 0)));
+          const barBaseY = chartY + 10;
+          const barHeight = 6;
+          const maxBarWidth = 70;
+
+          validPairs.forEach((p: any, idx: number) => {
+            const currentBarY = barBaseY + (idx * 10);
+            const pnl = p.best_combination?.net_pnl || 0;
+            const w = Math.min(maxBarWidth, (Math.abs(pnl) / maxPnl) * maxBarWidth);
+
+            doc.setFontSize(8);
+            doc.setTextColor(51, 65, 85);
+            doc.text(p.symbol, 14, currentBarY + 5);
+
+            if (pnl >= 0) {
+              doc.setFillColor(16, 185, 129);
+              doc.rect(40, currentBarY, Math.max(1, w), barHeight, 'F');
+              doc.setTextColor(16, 185, 129);
+              doc.text(`+$${formatNum(pnl)}`, 42 + w, currentBarY + 5);
+            } else {
+              doc.setFillColor(239, 68, 68);
+              doc.rect(40, currentBarY, Math.max(1, w), barHeight, 'F');
+              doc.setTextColor(239, 68, 68);
+              doc.text(`-$${formatNum(Math.abs(pnl))}`, 42 + w, currentBarY + 5);
+            }
+          });
+
           // ONE PAGE PER PAIR
           for (const p of (exp.pairs || [])) {
             if (p.status !== 'OK') continue;
@@ -385,7 +421,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             addHeaderFooter(`${p.symbol} Deep Dive`);
             doc.setFontSize(14);
             doc.setTextColor(15, 23, 42);
-            doc.text(`${p.symbol} - 8-Combination Matrix Performance`, 14, 22);
+            doc.text(`${p.symbol} - 8-Combination Matrix Performance (${p.seconds_taken || 0}s)`, 14, 22);
 
             const bLabel = p.best_combination?.label || '';
             const comboRows = (p.combinations || []).map((c: any) => [
@@ -410,7 +446,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
             if (stratRows.length > 0) {
               doc.setFontSize(10);
-              doc.text(`Performance by Strategy (${bLabel})`, 14, currentY);
+              doc.setTextColor(15, 23, 42);
+              doc.text(`Strategy Breakdown (${bLabel})`, 14, currentY);
               autoTable(doc, {
                 startY: currentY + 3,
                 head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L']],
@@ -422,25 +459,101 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               currentY = (doc as any).lastAutoTable.finalY + 8;
             }
 
-            const tips = p.best_combination?.improvement_tips || [];
-            if (tips.length > 0) {
+            // Skipped signals display
+            const skipMap = p.best_combination?.skipped_summary || {};
+            const skipEntries = Object.entries(skipMap);
+            if (skipEntries.length > 0) {
+              doc.setFontSize(8);
+              doc.setTextColor(100, 116, 139);
+              const skipStr = skipEntries.map(([r, c]) => `${r}: ${c}`).join(' | ');
+              doc.text(`Skipped Signals: ${skipStr}`, 14, currentY);
+              currentY += 6;
+            }
+
+            // Rule-based suggestions for this pair
+            const ruleSuggestions = p.best_combination?.rule_suggestions || [];
+            if (ruleSuggestions.length > 0) {
               doc.setFontSize(10);
               doc.setTextColor(37, 99, 235);
-              doc.text('Key Actionable Suggestions:', 14, currentY);
+              doc.text('Actionable Rule Suggestions (Impact Ranked):', 14, currentY);
               doc.setFontSize(8);
               doc.setTextColor(51, 65, 85);
-              tips.slice(0, 4).forEach((t: any, i: number) => {
-                doc.text(`• [${t.severity}] ${t.title}: ${t.action}`, 16, currentY + 5 + (i * 5));
+              ruleSuggestions.slice(0, 5).forEach((t: any, i: number) => {
+                doc.text(`• [+$${t.impact}] ${t.text}`, 16, currentY + 5 + (i * 5));
               });
             }
           }
+
+          // FINAL TOP-10 SUGGESTIONS & WHAT TO TEST NEXT PAGE
+          doc.addPage();
+          addHeaderFooter('Strategic Recommendations');
+          doc.setFontSize(16);
+          doc.setTextColor(15, 23, 42);
+          doc.text('Portfolio Strategic Optimization (Top 10 Actions)', 14, 22);
+
+          const portSuggestions = exp.portfolio_suggestions || [];
+          const suggRows = portSuggestions.map((s: any, idx: number) => [
+            `#${idx + 1}`, `+$${formatNum(s.impact)}`, s.type, s.text
+          ]);
+
+          if (suggRows.length > 0) {
+            autoTable(doc, {
+              startY: 28,
+              head: [['Rank', 'Est. Impact', 'Category', 'Recommended Action (Requires >= 30 Trades)']],
+              body: suggRows,
+              theme: 'striped',
+              headStyles: { fillColor: [37, 99, 235], fontSize: 8 },
+              bodyStyles: { fontSize: 8 },
+              columnStyles: { 0: { cellWidth: 14 }, 1: { cellWidth: 24, fontStyle: 'bold' }, 2: { cellWidth: 32 } }
+            });
+          }
+
+          let nextTestY = (doc as any).lastAutoTable ? (doc as any).lastAutoTable.finalY + 12 : 30;
+          doc.setFontSize(12);
+          doc.setTextColor(15, 23, 42);
+          doc.text('What to Test Next (Prioritized Actions):', 14, nextTestY);
+
+          const whatToTest = exp.what_to_test_next || [];
+          doc.setFontSize(9);
+          doc.setTextColor(71, 85, 105);
+          whatToTest.forEach((item: string, i: number) => {
+            doc.text(`${i + 1}. ${item}`, 16, nextTestY + 7 + (i * 6));
+          });
+
+          // AUDIT GLOSSARY PAGE
+          doc.addPage();
+          addHeaderFooter('Glossary & Definitions');
+          doc.setFontSize(16);
+          doc.setTextColor(15, 23, 42);
+          doc.text('Audit Glossary & Methodological Definitions', 14, 22);
+
+          const glossaryItems = [
+            ['Profit Factor (PF)', 'Gross realized winning profits divided by gross realized losing losses. A PF above 1.30 represents a robust institutional statistical edge; below 1.00 represents a losing system.'],
+            ['Expectancy (R)', 'The expected return in units of initial risk (R) per trade: (Win Rate × Avg Win R) - (Loss Rate × Avg Loss R). Positive expectancy is mandatory for profitability.'],
+            ['Maximum Drawdown (Max DD)', 'The maximum peak-to-trough equity decline incurred during the simulation period, measured in currency ($).'],
+            ['Average Daily Range (ADR)', 'A rolling 90-day smoothed daily price range used by the Volatility Engine to dynamically size stop losses and profit targets according to current market regime.'],
+            ['Adaptive vs Legacy Mode', 'Adaptive mode recalculates stop distances and target expansions dynamically based on market volatility; Legacy mode uses static fixed-point stop loss bands.'],
+            ['Breakeven Supervisor (BE)', 'A protective trailing rule that moves the stop loss directly to the entry price once price travels 80% toward the Take Profit target, locking in a risk-free trade.'],
+            ['SuperTrend Trailing', 'An active trend-following exit that trails open positions along the 10-period, 1.6-multiplier SuperTrend line until an opposite-direction flip occurs.'],
+            ['Inconclusive Sample (<30)', 'Any combination or strategy generating fewer than 30 trade executions is flagged as INCONCLUSIVE due to lack of statistical significance.']
+          ];
+
+          autoTable(doc, {
+            startY: 28,
+            head: [['Metric / Concept', 'Quantitative Definition & Operational Role']],
+            body: glossaryItems,
+            theme: 'grid',
+            headStyles: { fillColor: [15, 23, 42], fontSize: 8 },
+            bodyStyles: { fontSize: 8 },
+            columnStyles: { 0: { cellWidth: 45, fontStyle: 'bold' } }
+          });
 
           if (typeof doc.putTotalPages === 'function') doc.putTotalPages(totalPagesExp);
           doc.save(`Nexus_Matrix_Audit_Report_${exp.generated_at.slice(0, 10)}.pdf`);
           jsPdfLoaded = true;
         }
       } catch (importErr) {
-        console.warn('jsPDF dynamic import skipped, falling back to browser print engine:', importErr);
+        console.warn('jsPDF dynamic import error:', importErr);
       }
 
       if (!jsPdfLoaded) {
@@ -462,7 +575,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             <style>body{font-family:sans-serif;padding:30px;color:#0f172a;} table{width:100%;border-collapse:collapse;margin:20px 0;font-size:11px;} th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;} th{background:#f1f5f9;}</style>
             </head><body>
             <h1>NEXUS MATRIX - AUDITED BACKTEST REPORT</h1>
-            <p>Run Date: ${exp.generated_at.slice(0, 10)} | Window: ${exp.days} Days | Target: 1:${exp.target_rr}</p>
+            <p>Run Date: ${exp.generated_at.slice(0, 10)} | Window: ${exp.days} Days | Target: 1:${exp.target_rr} | Total Run Time: ${exp.total_run_seconds || 0}s</p>
             <h2>Portfolio Overview</h2>
             <table><thead><tr><th>Asset</th><th>Best Combination</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>Net P&L</th></tr></thead><tbody>${overviewHtml}</tbody></table>
             <script>window.onload = function() { window.print(); };</script>

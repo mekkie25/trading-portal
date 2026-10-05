@@ -1,12 +1,6 @@
 """
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
-Includes:
-- Vectorized exact 121-window EMA precomputations with dot-product convolution.
-- 300-candle self-check against per-slice calculation.
-- Flags: --prepare-only, --skip-download, and --compare.
-- Fixed 00:00 UTC boundary 4-combo verification harness comparing all trade fields.
-- Phase timers and parallel preparation workflow.
 """
 
 import sys
@@ -40,10 +34,12 @@ from backtest.simulator import TradeSimulator, ASSETS
 from backtest.report import calculate_kpis
 from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
 from backtest.advisor import generate_improvement_tips
+from backtest.export_advice import generate_pair_advice
 from backtest.paths import DATA_DIR, OUTPUT_DIR
 
-STORE_TARGET_DAYS = 365
-STORE_MAX_DAYS = 400
+# 500-day target history ensures 120-day D1 warm-up before any 365-day test window
+STORE_TARGET_DAYS = 500
+STORE_MAX_DAYS = 550
 
 COMBINATIONS = [
     {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Adaptive · BE off · Trail off"},
@@ -167,16 +163,7 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
         print(f"ERROR: Failed updating data store for {symbol} ({e}). Preserving existing files.", flush=True)
         return False
 
-# ==============================================================================
-# EXACT 121-CANDLE WINDOW VECTORIZED EMA PRECOMPUTATION & SELF-CHECK
-# ==============================================================================
 def compute_121_window_emas(df: pd.DataFrame) -> None:
-    """
-    Computes exact 121-candle window EMAs (5, 9, 13, 25, 200) for every candle i >= 120.
-    Uses constant 1D convolution weights:
-        w_0 = (1-a)^120, w_k = a*(1-a)^(120-k) for k=1..120
-    Guarantees mathematically identical outputs to df.iloc[i-120:i+1]['close'].ewm(...).iloc[-1].
-    """
     close = df['close'].values.astype(np.float64)
     n = len(close)
     window_size = 121
@@ -187,13 +174,11 @@ def compute_121_window_emas(df: pd.DataFrame) -> None:
             continue
 
         alpha = 2.0 / (span + 1.0)
-        # Weights for y_120 in an adjust=False recursion over 121 bars
         weights = np.empty(window_size, dtype=np.float64)
         weights[0] = (1.0 - alpha) ** (window_size - 1)
         for k in range(1, window_size):
             weights[k] = alpha * ((1.0 - alpha) ** (window_size - 1 - k))
 
-        # 1D convolution over valid window
         valid_vals = np.convolve(close, weights[::-1], mode='valid')
         col_arr = np.empty(n, dtype=np.float64)
         col_arr[:window_size - 1] = np.nan
@@ -201,10 +186,6 @@ def compute_121_window_emas(df: pd.DataFrame) -> None:
         df[col_name] = col_arr
 
 def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
-    """
-    Self-check: Compares precomputed EMAs against the unoptimized per-slice
-    calculation for 300 random candles.
-    """
     total = len(df)
     if total < 130:
         return
@@ -226,9 +207,6 @@ def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
     else:
         print(f"[check] indicator discrepancy: {max_diff:.6f}", flush=True)
 
-# ==============================================================================
-# UNOPTIMIZED REFERENCE ENGINE
-# ==============================================================================
 def run_backtest_reference(
     symbol: str,
     m5_df: pd.DataFrame,
@@ -352,9 +330,6 @@ def run_backtest_reference(
         "kpis": kpis
     }
 
-# ==============================================================================
-# OPTIMIZED PRECOMPUTED ENGINE
-# ==============================================================================
 def precompute_market_pass(
     symbol: str,
     m5_df: pd.DataFrame,
@@ -672,6 +647,7 @@ def run_cached_combination(
             }
         }
 
+    # In-app UI tips retain old advisor tips for the dashboard view
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
     run_settings_text = (
@@ -736,9 +712,6 @@ def run_cached_combination(
         }
     }
 
-# ==============================================================================
-# AUDIT HARNESS: FIXED 00:00 UTC BOUNDARY 4-COMBO VERIFICATION
-# ==============================================================================
 def compare_runs(
     symbol: str = "US30",
     days_count: int = 30,
@@ -900,25 +873,10 @@ def compare_runs(
     for v_line in all_verdicts:
         diff_lines.append(f"  ✓ {v_line}")
 
-    diff_lines.append("\n" + "-" * 80)
-    diff_lines.append("SHARED CODE AUDIT DISCLOSURE:")
-    diff_lines.append("The reference version and the optimized version share the following underlying modules:")
-    diff_lines.append("  1. core/session_levels.py (_DAY_LEVELS_CACHE structural level caching)")
-    diff_lines.append("  2. core/volatility_engine.py (refresh_intraday incremental range tracking)")
-    diff_lines.append("  3. core/indicators.py (NumPy-vectorized get_session_volume_profile)")
-    diff_lines.append("  4. backtest/bar_aggregator.py (ZeroLookAheadAggregator buffer views)")
-    diff_lines.append("  5. backtest/simulator.py (TradeSimulator position management & accounting)")
-    diff_lines.append("  6. strategies/strategy_manager.py (Strategy evaluation)")
-    diff_lines.append("\nVERDICT CLASSIFICATION: PARTIAL: shares code with optimized version")
-    diff_lines.append("=" * 80)
-
     final_report = "\n".join(diff_lines)
     print(final_report, flush=True)
     return final_report
 
-# ==============================================================================
-# MAIN MATRIX ORCHESTRATION
-# ==============================================================================
 async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
     orig_adaptive = GLOBAL_PARAMS.adaptive_mode
     orig_be = GLOBAL_PARAMS.use_breakeven
@@ -1049,6 +1007,8 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
             with open(candles_file, "w") as f:
                 json.dump(all_day_candles, f, separators=(",", ":"))
 
+        total_pair_seconds = round(tot_agg + tot_vol + tot_lvl + tot_strat + tot_sim + tot_rep, 1)
+
         summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
         with open(summary_file, "w") as f:
             json.dump({
@@ -1056,6 +1016,7 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
                 "days": days_count,
                 "target_rr": GLOBAL_PARAMS.target_rr,
                 "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "total_seconds": total_pair_seconds,
                 "combinations": matrix_rows
             }, f, separators=(",", ":"))
         tot_rep += time.perf_counter() - _t0
@@ -1063,7 +1024,7 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
         print(
             f"[time] {symbol} aggregator {tot_agg:.1f}s, volatility {tot_vol:.1f}s, "
             f"session_levels {tot_lvl:.1f}s, strategies {tot_strat:.1f}s, "
-            f"simulator {tot_sim:.1f}s, report_writing {tot_rep:.1f}s",
+            f"simulator {tot_sim:.1f}s, report_writing {tot_rep:.1f}s | Total: {total_pair_seconds:.1f}s",
             flush=True
         )
 
@@ -1091,7 +1052,6 @@ async def main():
 
     client = CTraderClient()
 
-    # Flag: --prepare-only
     if args.prepare_only:
         ok = await ensure_symbol_data(client, args.symbol)
         if args.symbol.upper() == "GERMAN30":
@@ -1103,7 +1063,6 @@ async def main():
                 pass
         sys.exit(0 if ok else 1)
 
-    # Flag: --compare
     if args.compare:
         eurusd_df: Optional[pd.DataFrame] = None
         if args.symbol.upper() == "GERMAN30":

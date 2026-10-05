@@ -215,16 +215,194 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   trades: [],
 };
 
+// Pure TypeScript implementation of the export_advice rule-based engine (>= 30 trades strictly)
+function computeRuleBasedPairAdvice(pairPayload: any): Array<{ text: string; impact: number; type: string }> {
+  const suggestions: Array<{ text: string; impact: number; type: string }> = [];
+  const combos: any[] = pairPayload.combinations || [];
+  const best = pairPayload.best_combination || {};
+  const symbol = pairPayload.symbol;
+  const totalTrades = best.total_trades || 0;
+
+  // Rule 8: Unviable pair across all combinations (requires >= 30 trades on valid combos)
+  const validCombos30 = combos.filter(c => (c.total_trades || 0) >= 30);
+  if (validCombos30.length >= 4 && validCombos30.every(c => (c.profit_factor || 0) < 1.0)) {
+    const totalLoss = validCombos30.reduce((acc, c) => acc + (c.net_pnl < 0 ? Math.abs(c.net_pnl) : 0), 0);
+    const avgLoss = totalLoss / validCombos30.length;
+    suggestions.push({
+      text: `Do not trade ${symbol} with current strategies: produced Profit Factor below 1.0 across all tested combinations.`,
+      impact: Number(avgLoss.toFixed(2)),
+      type: 'PAIR_VIABILITY'
+    });
+  }
+
+  if (totalTrades < 30) return suggestions;
+
+  // Rule 1: Strategy PF < 1.0 with net loss (>= 30 trades)
+  const stratKpis = best.strategy_kpis || {};
+  Object.entries<any>(stratKpis).forEach(([sName, s]) => {
+    const count = s.count || 0;
+    const pf = s.profit_factor || 0;
+    const net = s.net_pnl || 0;
+    if (count >= 30 && pf < 1.0 && net < 0) {
+      suggestions.push({
+        text: `Disable or retune ${sName} on ${symbol}: produced PF ${pf.toFixed(2)} with a net loss of -$${Math.abs(net).toFixed(2)}.`,
+        impact: Number(Math.abs(net).toFixed(2)),
+        type: 'STRATEGY_RETUNE'
+      });
+    }
+  });
+
+  // Rule 2: Strategy PF >= 1.3 with net profit (>= 30 trades)
+  Object.entries<any>(stratKpis).forEach(([sName, s]) => {
+    const count = s.count || 0;
+    const pf = s.profit_factor || 0;
+    const net = s.net_pnl || 0;
+    if (count >= 30 && pf >= 1.3 && net > 0) {
+      suggestions.push({
+        text: `Keep ${sName} on ${symbol} as core edge and consider increasing risk allocation: strong PF ${pf.toFixed(2)} netting +$${net.toFixed(2)}.`,
+        impact: Number((net * 0.5).toFixed(2)),
+        type: 'STRATEGY_EXPAND'
+      });
+    }
+  });
+
+  // Rule 3: Weekday with negative expectancy (>= 30 trades)
+  const dowKpis = best.dow_kpis || {};
+  Object.entries<any>(dowKpis).forEach(([dow, d]) => {
+    const count = d.count || 0;
+    const exp = d.expectancy || 0;
+    const net = d.net_pnl || 0;
+    if (count >= 30 && (exp < 0 || net < 0)) {
+      suggestions.push({
+        text: `Avoid entries on ${dow}s for ${symbol}: negative expectancy (${exp.toFixed(2)}R) producing -$${Math.abs(net).toFixed(2)}.`,
+        impact: Number(Math.abs(net).toFixed(2)),
+        type: 'DAY_FILTER'
+      });
+    }
+  });
+
+  // Rule 4: Adaptive vs Legacy comparison (gap >= 0.20, >= 30 trades each)
+  const adpCombos = combos.filter(c => c.mode === 'adaptive' && (c.total_trades || 0) >= 30);
+  const legCombos = combos.filter(c => c.mode === 'legacy' && (c.total_trades || 0) >= 30);
+  if (adpCombos.length > 0 && legCombos.length > 0) {
+    const bestAdp = adpCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, adpCombos[0]);
+    const bestLeg = legCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, legCombos[0]);
+    const gap = bestAdp.profit_factor - bestLeg.profit_factor;
+    if (Math.abs(gap) >= 0.20) {
+      const diffPnl = Math.abs((bestAdp.net_pnl || 0) - (bestLeg.net_pnl || 0));
+      if (gap > 0) {
+        suggestions.push({
+          text: `Prefer Adaptive Mode over Legacy for ${symbol}: delivers higher PF (${bestAdp.profit_factor.toFixed(2)} vs ${bestLeg.profit_factor.toFixed(2)}) with a +$${diffPnl.toFixed(2)} profit advantage.`,
+          impact: Number(diffPnl.toFixed(2)),
+          type: 'MODE_SELECTION'
+        });
+      } else {
+        suggestions.push({
+          text: `Prefer Legacy Mode over Adaptive for ${symbol}: delivers higher PF (${bestLeg.profit_factor.toFixed(2)} vs ${bestAdp.profit_factor.toFixed(2)}) with a +$${diffPnl.toFixed(2)} profit advantage.`,
+          impact: Number(diffPnl.toFixed(2)),
+          type: 'MODE_SELECTION'
+        });
+      }
+    }
+  }
+
+  // Rule 5: BE and Trail recommendation (>= 30 trades)
+  const beOffCombos = combos.filter(c => c.be === 'off' && (c.total_trades || 0) >= 30);
+  const beOnCombos = combos.filter(c => c.be === 'on' && (c.total_trades || 0) >= 30);
+  if (beOffCombos.length > 0 && beOnCombos.length > 0) {
+    const bestBeOff = beOffCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, beOffCombos[0]);
+    const bestBeOn = beOnCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, beOnCombos[0]);
+
+    let trailIdentical = true;
+    for (const c1 of combos) {
+      if (c1.trail === 'off') {
+        const match = combos.find(c2 => c2.mode === c1.mode && c2.be === c1.be && c2.trail === 'on');
+        if (match && (match.total_trades !== c1.total_trades || match.net_pnl !== c1.net_pnl)) {
+          trailIdentical = false;
+          break;
+        }
+      }
+    }
+
+    if (trailIdentical) {
+      suggestions.push({
+        text: `Trail on and Trail off produce identical results on ${symbol} because target or stop boundaries are hit before the trail can engage.`,
+        impact: 5.0,
+        type: 'TRAIL_ANALYSIS'
+      });
+    }
+
+    if (Math.abs(bestBeOn.profit_factor - bestBeOff.profit_factor) >= 0.15) {
+      const rec = bestBeOn.profit_factor > bestBeOff.profit_factor ? 'Breakeven On' : 'Breakeven Off';
+      const better = rec === 'Breakeven On' ? bestBeOn : bestBeOff;
+      const worse = rec === 'Breakeven On' ? bestBeOff : bestBeOn;
+      suggestions.push({
+        text: `Recommend ${rec} for ${symbol}: better profit factor (${better.profit_factor.toFixed(2)} vs ${worse.profit_factor.toFixed(2)}) and lower drawdown (-$${better.max_drawdown.toFixed(2)}).`,
+        impact: Number(Math.abs(better.net_pnl - worse.net_pnl).toFixed(2)),
+        type: 'BE_TUNING'
+      });
+    }
+  }
+
+  // Rule 6: Skip reasons > 30% of total skips (>= 30 total skips)
+  const skipSummary = best.skipped_summary || {};
+  const totalSkips = Object.values<number>(skipSummary).reduce((a, b) => a + (typeof b === 'number' ? b : 0), 0);
+  if (totalSkips >= 30) {
+    Object.entries<number>(skipSummary).forEach(([reason, count]) => {
+      const pct = (count / totalSkips) * 100;
+      if (pct >= 30.0) {
+        suggestions.push({
+          text: `Test looser limits for '${reason}' on ${symbol}: accounts for ${count} of ${totalSkips} skipped setups (${pct.toFixed(0)}% of all skips).`,
+          impact: 35.0,
+          type: 'SKIP_TUNING'
+        });
+      }
+    });
+  }
+
+  // Rule 7: Adaptive coverage below 90% (>= 30 trades)
+  const adpCov = best.adaptive_effective_pct ?? 100;
+  if (adpCov < 90.0) {
+    suggestions.push({
+      text: `Adaptive results for ${symbol} include unadapted bars (${adpCov.toFixed(1)}% coverage); extend stored history to 500 days for full warmup.`,
+      impact: 25.0,
+      type: 'DATA_WARMUP'
+    });
+  }
+
+  suggestions.sort((a, b) => b.impact - a.impact);
+  return suggestions;
+}
+
+function computePortfolioNextTests(allSuggestions: Array<{ text: string; impact: number; type: string }>): string[] {
+  const tests: string[] = [];
+  const retunes = allSuggestions.filter(s => s.type === 'STRATEGY_RETUNE');
+  if (retunes.length > 0) tests.push(`Retest matrix with underperforming strategies disabled (${retunes[0].text.split(':')[0]}).`);
+  const days = allSuggestions.filter(s => s.type === 'DAY_FILTER');
+  if (days.length > 0) tests.push(`Implement weekday schedule filter based on negative expectancy days (${days[0].text.split(':')[0]}).`);
+  const bes = allSuggestions.filter(s => s.type === 'BE_TUNING');
+  if (bes.length > 0) tests.push(`Lock in the optimal Breakeven setting identified per asset.`);
+  const skips = allSuggestions.filter(s => s.type === 'SKIP_TUNING');
+  if (skips.length > 0) tests.push(`Test loosening dominant trade skip filters to evaluate expanded opportunity flow.`);
+  tests.push(`Test expanding target R:R from 1.0 to 1.5 on pairs demonstrating profit factor above 1.3.`);
+  return tests.slice(0, 5);
+}
+
 function generateExportDataPayload(): any {
   const result: any = {
     generated_at: new Date().toISOString(),
     days: 60,
     target_rr: 1.0,
+    total_run_seconds: 0.0,
     combinations_rollup: {},
-    pairs: []
+    pairs: [],
+    portfolio_suggestions: [],
+    what_to_test_next: []
   };
 
   const allSummaryCombos: Record<string, { trades: number; pnl: number; win_count: number }> = {};
+  let totalTime = 0.0;
+  const allPortfolioSuggestions: Array<{ text: string; impact: number; type: string }> = [];
 
   for (const sym of WHITELIST_ASSETS) {
     const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
@@ -241,6 +419,9 @@ function generateExportDataPayload(): any {
       const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
       result.days = summary.days || result.days;
       result.target_rr = summary.target_rr || result.target_rr;
+      const pairSeconds = summary.total_seconds || 0.0;
+      totalTime += pairSeconds;
+
       const combos: any[] = summary.combinations || [];
 
       combos.forEach(c => {
@@ -252,7 +433,6 @@ function generateExportDataPayload(): any {
         allSummaryCombos[c.label].win_count += Math.round(((c.win_rate || 0) / 100) * (c.total_trades || 0));
       });
 
-      // Select best combination: highest PF with trades >= 30, else highest trades
       let bestCombo: any = null;
       const qualifying = combos.filter(c => (c.total_trades || 0) >= 30);
       if (qualifying.length > 0) {
@@ -272,6 +452,7 @@ function generateExportDataPayload(): any {
       const pairPayload: any = {
         symbol: sym,
         status: "OK",
+        seconds_taken: pairSeconds,
         combinations: combos,
         best_combination: {
           ...(bestCombo || {}),
@@ -279,10 +460,13 @@ function generateExportDataPayload(): any {
           dow_kpis: bestReportDetail.dow_kpis || {},
           skipped_summary: bestReportDetail.skipped_summary || {},
           warnings: bestReportDetail.warnings || [],
-          adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100,
-          improvement_tips: bestReportDetail.improvement_tips || []
+          adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100
         }
       };
+
+      const suggestions = computeRuleBasedPairAdvice(pairPayload);
+      pairPayload.best_combination.rule_suggestions = suggestions;
+      allPortfolioSuggestions.push(...suggestions);
 
       result.pairs.push(pairPayload);
     } catch (e: any) {
@@ -290,7 +474,11 @@ function generateExportDataPayload(): any {
     }
   }
 
-  // Cross-pair rollup per combination
+  allPortfolioSuggestions.sort((a, b) => b.impact - a.impact);
+  result.portfolio_suggestions = allPortfolioSuggestions.slice(0, 10);
+  result.what_to_test_next = computePortfolioNextTests(allPortfolioSuggestions);
+  result.total_run_seconds = Number(totalTime.toFixed(1));
+
   const rollup: Record<string, any> = {};
   Object.entries(allSummaryCombos).forEach(([label, s]) => {
     rollup[label] = {
@@ -304,11 +492,14 @@ function generateExportDataPayload(): any {
   return result;
 }
 
-function formatExportTxt(data: any): string {
+function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; minDowTrades?: number } = {}): string {
+  const maxSugg = options.maxSuggestionsPerPair ?? 999;
+  const minDow = options.minDowTrades ?? 0;
+
   const lines: string[] = [];
   lines.push(`LEGEND: [TR]=Trades | [WR]=WinRate% | [EXP]=Expectancy(R) | [PF]=ProfitFactor | [DD]=MaxDrawdown | [PNL]=NetRealized$ | [COV]=AdaptiveCover%`);
-  lines.push(`RUN: Date: ${data.generated_at.slice(0, 10)} | Days: ${data.days} | Target R:R: 1:${data.target_rr}`);
-  lines.push(`RULES: Trades < 30 tagged as INCONCLUSIVE | All numbers rounded to 2 decimals\n`);
+  lines.push(`RUN: Date: ${data.generated_at.slice(0, 10)} | Days: ${data.days} | Target R:R: 1:${data.target_rr} | Total Run Time: ${data.total_run_seconds}s`);
+  lines.push(`RULES: Trades < 30 tagged as INCONCLUSIVE | Suggestions require >= 30 trades\n`);
 
   lines.push(`=== CROSS-PAIR ROLLUP PER COMBINATION ===`);
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
@@ -318,7 +509,7 @@ function formatExportTxt(data: any): string {
 
   for (const p of data.pairs || []) {
     lines.push(`================================================================================`);
-    lines.push(`ASSET: ${p.symbol} (${p.status})`);
+    lines.push(`ASSET: ${p.symbol} (${p.status}) | Run Time: ${p.seconds_taken || 0}s`);
     if (p.status !== "OK") {
       lines.push(`STATUS: ${p.error || 'Not tested'}\n`);
       continue;
@@ -339,24 +530,54 @@ function formatExportTxt(data: any): string {
 
     lines.push(`Performance by Day of Week:`);
     Object.entries(b.dow_kpis || {}).forEach(([dow, s]: any) => {
-      lines.push(`  ${dow.padEnd(12)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | EXP: ${s.expectancy.toFixed(2)}R | PNL: $${s.net_pnl.toFixed(2)}`);
+      if ((s.count || 0) >= minDow) {
+        lines.push(`  ${dow.padEnd(12)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | EXP: ${s.expectancy.toFixed(2)}R | PNL: $${s.net_pnl.toFixed(2)}`);
+      }
     });
+
+    const skipSummary = b.skipped_summary || {};
+    const skipEntries = Object.entries(skipSummary);
+    if (skipEntries.length > 0) {
+      lines.push(`Skipped Signals Summary:`);
+      const skipParts = skipEntries.map(([reason, cnt]) => `${reason}: ${cnt}`);
+      lines.push(`  ${skipParts.join(', ')}`);
+    }
 
     if (b.warnings && b.warnings.length > 0) {
       lines.push(`Warnings: ${b.warnings.join(' | ')}`);
     }
 
-    const tips = b.improvement_tips || [];
-    if (tips.length > 0) {
-      lines.push(`Suggestions:`);
-      tips.slice(0, 5).forEach((t: any) => {
-        lines.push(`  • [${t.severity}] ${t.title}: ${t.action}`);
+    const suggestions: any[] = b.rule_suggestions || [];
+    if (suggestions.length > 0) {
+      lines.push(`Actionable Suggestions (Impact Ranked):`);
+      suggestions.slice(0, maxSugg).forEach((s: any) => {
+        lines.push(`  • [+$${s.impact}] ${s.text}`);
       });
     }
     lines.push(``);
   }
 
+  if (data.what_to_test_next && data.what_to_test_next.length > 0) {
+    lines.push(`================================================================================`);
+    lines.push(`WHAT TO TEST NEXT:`);
+    data.what_to_test_next.forEach((item: string, idx: number) => {
+      lines.push(`  ${idx + 1}. ${item}`);
+    });
+    lines.push(`================================================================================\n`);
+  }
+
   return lines.join('\n');
+}
+
+function formatExportTxtWithLengthRule(data: any): string {
+  let text = renderTxtContent(data);
+  if (text.length <= 15000) return text;
+
+  text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 0 });
+  if (text.length <= 15000) return text;
+
+  text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 30 });
+  return text;
 }
 
 async function startServer() {
@@ -398,7 +619,6 @@ async function startServer() {
     }
   });
 
-  // BACKTEST EXPORT APIS
   app.get('/api/backtest/export-data', (_req, res) => {
     try {
       const data = generateExportDataPayload();
@@ -411,7 +631,7 @@ async function startServer() {
   app.get('/api/backtest/export.txt', (_req, res) => {
     try {
       const data = generateExportDataPayload();
-      const txt = formatExportTxt(data);
+      const txt = formatExportTxtWithLengthRule(data);
       const dateStr = new Date().toISOString().slice(0, 10);
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.txt"`);
@@ -627,7 +847,6 @@ async function startServer() {
     }
   });
 
-  // RUN ALL WITH PARALLEL WORKERS & PREPARE-ONLY STAGE
   app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) {
       return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
@@ -648,7 +867,6 @@ async function startServer() {
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
 
     async function executeMatrix() {
-      // 1. Preparation Phase (Sequential download)
       if (requestedSymbol === 'ALL') {
         for (let idx = 0; idx < symbolsQueue.length; idx++) {
           if (!backtestRunning) return;
@@ -665,7 +883,6 @@ async function startServer() {
         }
       }
 
-      // 2. Parallel Execution Phase
       const maxWorkers = Math.min(4, os.cpus().length || 2);
       let activeIndex = 0;
       let completedCount = 0;

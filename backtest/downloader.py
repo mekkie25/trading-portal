@@ -1,7 +1,7 @@
 """
 backtest/downloader.py
 Automated historical candle downloader using your existing cTrader connection.
-Pulls rolling 365 days of 5-Minute (M5) candles in safe 10-day chunks, then automatically
+Pulls rolling 500 days of 5-Minute (M5) candles in safe 10-day chunks, then automatically
 synthesizes H1, H4, and D1 history from M5 so no extra broker API calls are needed.
 """
 
@@ -12,7 +12,6 @@ import asyncio
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
-# Ensure parent directory is in path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -20,7 +19,6 @@ if PROJECT_ROOT not in sys.path:
 from engine.matrix import ConfigManager, CTraderClient, CTraderTrendbarPeriod
 from backtest.paths import DATA_DIR
 
-# Target whitelist assets
 WHITELIST_SYMBOLS = ["GOLD", "US30", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"]
 
 async def fetch_chunked_bars(
@@ -30,10 +28,6 @@ async def fetch_chunked_bars(
     start_dt: datetime,
     end_dt: datetime
 ) -> pd.DataFrame:
-    """
-    Downloads trendbars in safe 10-day chunks (under 3,000 M5 bars per request)
-    to strictly respect the Spotware 5,000-bar limit.
-    """
     sid = client.resolve_symbol_id(symbol_name)
     if not sid:
         print(f"[-] Could not resolve broker symbol ID for {symbol_name}", flush=True)
@@ -79,7 +73,6 @@ async def fetch_chunked_bars(
                     "volume": b.get("volume", 1)
                 })
 
-        # Pacing rate limiter: 4 req/sec to prevent disconnects
         await asyncio.sleep(0.25)
         current_start = current_end
 
@@ -93,10 +86,6 @@ async def fetch_chunked_bars(
     return df
 
 def build_higher_timeframes_from_m5(m5_df: pd.DataFrame, symbol: str) -> None:
-    """
-    Synthesizes H1, H4, and D1 CSVs directly from M5 candles.
-    Eliminates unnecessary broker API requests and guarantees 100% price consistency.
-    """
     if m5_df.empty:
         return
 
@@ -134,7 +123,7 @@ def build_higher_timeframes_from_m5(m5_df: pd.DataFrame, symbol: str) -> None:
     )
     print(f"    [+] Automatically synthesized H1, H4, and D1 for {symbol} from M5 data.", flush=True)
 
-async def run_downloader(days_back: int = 365):
+async def run_downloader(days_back: int = 500):
     client = CTraderClient()
     print("=" * 65, flush=True)
     print("1. CONNECTING TO BROKER VIA CTRADER OPEN API", flush=True)
@@ -170,4 +159,4 @@ async def run_downloader(days_back: int = 365):
             pass
 
 if __name__ == "__main__":
-    asyncio.run(run_downloader(days_back=365))
+    asyncio.run(run_downloader(days_back=500))
