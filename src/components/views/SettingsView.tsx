@@ -1,33 +1,33 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { 
-  Settings as SettingsIcon, 
-  Moon, 
-  Sun, 
-  Wifi, 
-  CheckCircle2, 
-  FileSpreadsheet, 
-  Bot, 
-  RefreshCw, 
-  Database, 
-  Terminal, 
-  ShieldCheck, 
-  Zap, 
-  Sliders, 
-  Shield, 
-  TrendingUp, 
-  Sparkles, 
-  Power, 
-  PowerOff, 
+import {
+  Settings as SettingsIcon,
+  Moon,
+  Sun,
+  Wifi,
+  CheckCircle2,
+  FileSpreadsheet,
+  Bot,
+  RefreshCw,
+  Database,
+  Terminal,
+  ShieldCheck,
+  Zap,
+  Sliders,
+  Shield,
+  TrendingUp,
+  Sparkles,
+  Power,
+  PowerOff,
   Palette,
   Target,
   Layers
 } from 'lucide-react';
-import { 
-  ThemeMode, 
-  BrokerConfig, 
-  GoogleSheetsConfig, 
-  BotSettings, 
+import {
+  ThemeMode,
+  BrokerConfig,
+  GoogleSheetsConfig,
+  BotSettings,
   TopMetrics,
   SiteBrandingConfig
 } from '../../types';
@@ -46,6 +46,8 @@ interface SettingsViewProps {
   onUpdateBranding: (branding: SiteBrandingConfig) => void;
   botActive: boolean;
   onToggleBotActive: () => void;
+  // PROPOSED (Fix 3a): parent owns the POST and returns success/failure.
+  onSaveBotSettings?: (settings: BotSettings) => Promise<boolean> | boolean;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -62,6 +64,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateBranding,
   botActive,
   onToggleBotActive,
+  onSaveBotSettings,
 }) => {
   const [localBroker, setLocalBroker] = useState<BrokerConfig>(brokerConfig);
   const [localSheets, setLocalSheets] = useState<GoogleSheetsConfig>(sheetsConfig);
@@ -99,18 +102,38 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }, 600);
   };
 
+  // PROPOSED (Fix 3a): delegate saving to the parent so App.tsx state and the
+  // server stay in sync. Direct POST is kept ONLY as a fallback.
   const handleSaveEngineSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    try {
-      await fetch('/api/bot/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(localBotSettings),
-      });
+    setEngineSaved(false);
+
+    let success = false;
+
+    if (onSaveBotSettings) {
+      try {
+        const res = await onSaveBotSettings(localBotSettings);
+        success = res !== false;
+      } catch {
+        success = false;
+      }
+    } else {
+      // Fallback path: parent handler not supplied. Only this branch POSTs.
+      try {
+        const res = await fetch('/api/bot/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(localBotSettings),
+        });
+        success = res.ok;
+      } catch {
+        success = false;
+      }
+    }
+
+    if (success) {
       setEngineSaved(true);
       setTimeout(() => setEngineSaved(false), 3000);
-    } catch (err) {
-      console.error('Failed to save engine settings:', err);
     }
   };
 
@@ -152,8 +175,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-6xl mx-auto">
-      {/* View Header */}
-      <motion.div 
+      <motion.div
         initial={{ opacity: 0, y: 15 }}
         animate={{ opacity: 1, y: 0 }}
         className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200 dark:border-[#212838]"
@@ -178,8 +200,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         )}
       </motion.div>
 
-      {/* 1. Master Kill Switch */}
-      <motion.section 
+      <motion.section
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
@@ -230,8 +251,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       </motion.section>
 
-      {/* 2. Quant Engine & Profit Objectives */}
-      <motion.section 
+      <motion.section
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
@@ -262,7 +282,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <form onSubmit={handleSaveEngineSettings} className="space-y-5 text-xs">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-            {/* Adaptive Mode Toggle */}
             <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
               <div>
                 <span className="font-bold text-slate-900 dark:text-white">Adaptive Volatility Engine (ADR)</span>
@@ -279,7 +298,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </label>
             </div>
 
-            {/* Stop on Daily Goal Toggle */}
             <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
               <div>
                 <span className="font-bold text-slate-900 dark:text-white">Auto-Halt on Daily Goal Reached</span>
@@ -296,62 +314,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </label>
             </div>
           </div>
-          
-                    {/* PROPOSED: Risk Profile Selector */}
-          <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] space-y-3">
-            <div>
-              <span className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-                <Shield className="w-3.5 h-3.5 text-blue-600" /> Risk Profile (Account Size Band)
-              </span>
-              <p className="text-[11px] text-slate-500 mt-0.5">
-                Pick how aggressively the bot sizes trades. Risk % shrinks automatically as the account grows.
-                Leave on <strong>None (Legacy)</strong> to use the old fixed <code>riskPerTradePct</code>.
-              </p>
-            </div>
 
-            <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5">
-              {[
-                { key: null,          title: 'None (Legacy)', sub: 'Use fixed riskPerTradePct. No profile.' },
-                { key: 'Steady',      title: 'Steady',        sub: 'Lowest risk. 5% → 1% as account grows.' },
-                { key: 'Balanced',    title: 'Balanced',      sub: 'Middle ground. 10% → 2% as account grows.' },
-                { key: 'Aggressive',  title: 'Aggressive',    sub: 'Higher risk. 30% → 3% as account grows.' },
-                { key: 'Max Growth',  title: 'Max Growth',    sub: 'Flip small accounts. 35% → 4% as account grows.' },
-              ].map((opt) => {
-                const isSelected = (localBotSettings.riskProfile ?? null) === opt.key;
-                return (
-                  <button
-                    key={String(opt.key)}
-                    type="button"
-                    onClick={() =>
-                      setLocalBotSettings({
-                        ...localBotSettings,
-                        riskProfile: opt.key as BotSettings['riskProfile'],
-                      })
-                    }
-                    className={`text-left p-3 rounded-xl border-2 transition-all cursor-pointer ${
-                      isSelected
-                        ? 'border-blue-500 bg-blue-500/10'
-                        : 'border-slate-200 dark:border-[#212838] bg-white dark:bg-[#151922] hover:border-slate-300 dark:hover:border-slate-600'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className={`text-xs font-bold ${
-                        isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-slate-900 dark:text-white'
-                      }`}>
-                        {opt.title}
-                      </span>
-                      <span className={`w-3 h-3 rounded-full border-2 ${
-                        isSelected ? 'border-blue-500 bg-blue-500' : 'border-slate-300 dark:border-slate-600'
-                      }`} />
-                    </div>
-                    <p className="text-[10px] text-slate-500 leading-snug">{opt.sub}</p>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-          
-                    {/* PROPOSED: Risk Profile Selector */}
+          {/* PROPOSED: Risk Profile Selector (single copy) */}
           <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] space-y-3">
             <div>
               <span className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
@@ -405,7 +369,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Min R:R Input */}
           <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
             <div>
               <span className="font-bold text-slate-900 dark:text-white">Minimum Target R:R Filter (1 : R)</span>
@@ -425,7 +388,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Profit Goal Display & Inputs */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
             <div className="space-y-1.5">
               <label className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1">
@@ -481,8 +443,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </form>
       </motion.section>
 
-      {/* 3. Site Branding */}
-      <motion.section 
+      <motion.section
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
@@ -550,8 +511,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </form>
       </motion.section>
 
-      {/* 4. Appearance & Theme */}
-      <motion.section 
+      <motion.section
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
@@ -575,8 +535,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               type="button"
               onClick={() => onToggleTheme('dark')}
               className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                isDark 
-                  ? 'bg-blue-600 text-white shadow-sm' 
+                isDark
+                  ? 'bg-blue-600 text-white shadow-sm'
                   : 'text-slate-700 hover:text-slate-900 dark:text-slate-400'
               }`}
             >
@@ -587,8 +547,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               type="button"
               onClick={() => onToggleTheme('light')}
               className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                !isDark 
-                  ? 'bg-blue-600 text-white shadow-sm' 
+                !isDark
+                  ? 'bg-blue-600 text-white shadow-sm'
                   : 'text-slate-700 hover:text-slate-900 dark:text-slate-400'
               }`}
             >
@@ -599,8 +559,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       </motion.section>
 
-      {/* 5. Real Broker Connection */}
-      <motion.section 
+      <motion.section
         initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true }}
@@ -615,8 +574,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
                 Broker Connection & Gateway
                 <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full ${
-                  localBroker.connected 
-                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' 
+                  localBroker.connected
+                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30'
                     : 'bg-rose-500/15 text-rose-600'
                 }`}>
                   {localBroker.connected ? `CONNECTED (${localBroker.lastPingMs}ms)` : 'DISCONNECTED'}

@@ -115,8 +115,6 @@ export default function App() {
     });
   });
 
-  // PROPOSED (Gap 2): default USD loss caps of 0 so a fresh install lets the
-  // active profile's percentage caps act as the source of truth.
   const [limits, setLimits] = useState<AdvancedLimits>(() => {
     return safeStorage.getItem('portal_limits', {
       ...INITIAL_ADVANCED_LIMITS,
@@ -143,6 +141,42 @@ export default function App() {
     currentBalance: 14.62,
     unrealizedPnL: 0.0,
   });
+
+  // PROPOSED (Fix 3a): load server config once on mount so the client cannot
+  // diverge from bot_config.json. Server is source of truth for riskProfile,
+  // minRr, maxDailyTrades, etc. Offline / API failure keeps localStorage values.
+  useEffect(() => {
+    const loadServerConfig = async () => {
+      try {
+        const res = await fetch('/api/bot/config');
+        if (!res.ok) return;
+        const json = await res.json();
+        const serverCfg: Partial<BotSettings> | undefined = json?.data;
+        if (!serverCfg) return;
+
+        setBotSettings(prev => {
+          const merged: BotSettings = {
+            ...prev,
+            ...serverCfg,
+            strategyModes: {
+              ...(prev.strategyModes || {}),
+              ...((serverCfg as any).strategyModes || {}),
+            },
+            // Only adopt the server's riskProfile if it is present. If the
+            // server has never seen a profile, we keep whatever was local.
+            riskProfile: (serverCfg as any).riskProfile !== undefined
+              ? (serverCfg as any).riskProfile
+              : prev.riskProfile,
+          };
+          safeStorage.setItem('portal_bot_settings', merged);
+          return merged;
+        });
+      } catch {
+        // Offline: keep localStorage-based state.
+      }
+    };
+    loadServerConfig();
+  }, []);
 
   const fetchJournalTrades = useCallback(async () => {
     try {
@@ -200,16 +234,30 @@ export default function App() {
     return () => clearInterval(interval);
   }, [syncBrokerTelemetry, fetchJournalTrades]);
 
-  const handleSaveBotSettings = async (newSettings: BotSettings) => {
+  // PROPOSED (Fix 3a): single source of truth for saving bot settings.
+  // Updates state, localStorage, and POSTs once. Returns true on success.
+  const handleSaveBotSettings = async (newSettings: BotSettings): Promise<boolean> => {
     setBotSettings(newSettings);
     safeStorage.setItem('portal_bot_settings', newSettings);
+
+    // PROPOSED: omit riskProfile entirely if it is undefined so the server
+    // keeps whatever it already has. Only send riskProfile: null when the user
+    // deliberately chose "None (Legacy)".
+    const payload: any = { ...newSettings };
+    if (payload.riskProfile === undefined) {
+      delete payload.riskProfile;
+    }
+
     try {
-      await fetch('/api/bot/config', {
+      const res = await fetch('/api/bot/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newSettings),
+        body: JSON.stringify(payload),
       });
-    } catch {}
+      return res.ok;
+    } catch {
+      return false;
+    }
   };
 
   const handleUpdateLimits = async (newLimits: AdvancedLimits) => {
@@ -355,6 +403,7 @@ export default function App() {
               onUpdateBranding={(b) => setBranding(b)}
               botActive={botSettings.masterExecution && !limits.breakerTriggered}
               onToggleBotActive={() => handleSaveBotSettings({ ...botSettings, masterExecution: !botSettings.masterExecution })}
+              onSaveBotSettings={handleSaveBotSettings}
             />
           )}
         </main>
