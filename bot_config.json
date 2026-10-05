@@ -1,0 +1,17 @@
+{
+  "masterExecution": true,
+  "riskPerTradePct": 1.0,
+  "minRr": 1.0,
+  "adaptiveMode": false,
+  "stopOnDailyGoalReached": false,
+  "dailyGoalTarget": 5.0,
+  "weeklyGoalTarget": 20.0,
+  "monthlyGoalTarget": 50.0,
+  "weeklyDepositBaseline": 10.0,
+  "maxDailyTrades": 4,
+  "trailingStopActive": true,
+  "autoBreakevenPips": 15,
+  "currency": "USD",
+  "riskProfile": null,
+  "strategyModes": {}
+}

@@ -1176,7 +1176,7 @@ class InstitutionalRiskEngine:
 
         return True, "Spread optimal", spread
 
-    def calculate_smart_lot_size(
+            def calculate_smart_lot_size(
         self,
         current_equity: float,
         sl_distance: float,
@@ -1192,8 +1192,15 @@ class InstitutionalRiskEngine:
 
         equity = current_equity if current_equity > 0 else 10.0
 
+        # Delegate sizing % entirely through unified RiskManager.
+        # PROPOSED: Pass account_currency so profile ZAR bands convert correctly.
         _, dow_mult, _ = MarketSessionManager.get_day_of_week_policy()
-        final_risk_pct = self.persistent_risk.combined_risk_pct(current_equity=equity, dow_mult=dow_mult, ai_factor=ai_quality_factor)
+        final_risk_pct = self.persistent_risk.combined_risk_pct(
+            current_equity=equity,
+            dow_mult=dow_mult,
+            ai_factor=ai_quality_factor,
+            account_currency=account_currency,
+        )
         risk_cash = equity * (final_risk_pct / 100.0)
 
         cfg = ConfigManager.ASSETS.get(symbol)
@@ -1207,11 +1214,20 @@ class InstitutionalRiskEngine:
         pip_value_per_lot = (pip_size * contract_size) * fx_rate_to_account
         risk_per_lot = pips_at_risk * pip_value_per_lot
 
+        # Min-lot risk ceiling check (cannot exceed tolerance * risk_cash)
+        # PROPOSED: log symbol + reason so the UI/logs can show which instrument
+        # was skipped for minimum-lot reasons.
         min_lot_ok, min_lot_msg = self.persistent_risk.validate_min_lot_risk(min_lots, risk_per_lot, risk_cash)
         if not min_lot_ok:
+            log.warning(
+                f"SIZING SKIP on {symbol}: {min_lot_msg} "
+                f"(risk_cash=${risk_cash:.4f}, equity=${equity:.2f}, currency={account_currency})"
+            )
+            self.persistent_risk.last_trigger_reason = f"Min-lot skip on {symbol}: {min_lot_msg}"
             return 0.0
 
         raw_lots = risk_cash / (risk_per_lot + 1e-9)
+        # Broker step quantisation (round before floor to eliminate precision errors)
         stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
         final_lots = round(max(min(stepped_lots, max_lots), min_lots), 4)
         return final_lots
@@ -1393,6 +1409,12 @@ class CloudExecutionEngine:
 
         quote, bid, ask = await self.ctrader.get_live_quote(symbol)
 
+        if not is_ok:
+            log.warning(f"ORDER BLOCKED BY RISK GATE: {reason}")
+            # PROPOSED: Capture last risk block reason for status reporting
+            self.risk.persistent_risk.last_trigger_reason = reason
+            return False
+
         def quote_lookup(pair: str) -> Optional[Tuple[float, float, float]]:
             sid = self.ctrader.resolve_symbol_id(pair, use_fx_aliases=True)
             if not sid or sid not in self.ctrader.live_quotes:
@@ -1520,6 +1542,9 @@ class MatrixEngineMaster:
         self.execution_engine: Optional[CloudExecutionEngine] = None
         self.volume_profiles: Dict[str, VolumeProfileNode] = {}
         self.frozen_opening_ranges: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # PROPOSED: Read-only periodic status logging timer
+        self._last_status_log_time: float = 0.0
+        self._last_risk_block_reason: str = "None"
 
     async def start(self) -> None:
         log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Edition)...")
@@ -1909,6 +1934,20 @@ class MatrixEngineMaster:
                     "losingTrades": losses,
                     "openPositions": open_positions_telemetry
                 })
+                # PROPOSED: Periodic read-only status log every 5 minutes (300 seconds)
+                if (time.time() - self._last_status_log_time) >= 300.0:
+                    self._last_status_log_time = time.time()
+                    b_state = self.risk_mgr.persistent_risk
+                    breaker_str = "TRIGGERED" if b_state.breaker_triggered else "CLEAR"
+                    master_str = "ARMED" if self.risk_mgr.master_execution else "HALTED"
+                    block_msg = b_state.last_trigger_reason or "None"
+                    log.info(
+                        f"[BOT_STATUS] Master: {master_str} | Breaker: {breaker_str} (Scope: {b_state.active_trip_scope}) | "
+                        f"Trades: {b_state.trades_taken_today}/{b_state.max_daily_trades} | "
+                        f"Currency: {self.ctrader.account_currency or 'UNKNOWN'} | Equity: ${equity:.2f} | "
+                        f"Last Block: {block_msg}"
+                    )
+                    
                 print(f"[MATRIX_TELEMETRY] {telem_msg}", flush=True)
                 write_telemetry(balance, equity, regime_status, active_setup_str, verdict_str, open_positions_telemetry)
 

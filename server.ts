@@ -81,11 +81,17 @@ interface BrokerTelemetry {
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
 
-const BOT_CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
-const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
-const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
-const CLOSE_COMMAND_FILE = path.join(process.cwd(), 'close_command.json');
-const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(process.cwd(), 'risk_state.json');
+// PROPOSED: Support unified DATA_DIR persistent storage volume
+const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
+if (!fs.existsSync(DATA_DIR)) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+}
+
+const BOT_CONFIG_FILE = path.join(DATA_DIR, 'bot_config.json');
+const TRADES_DB_FILE = path.join(DATA_DIR, 'trades_db.json');
+const CANDLES_CACHE_FILE = path.join(DATA_DIR, 'candles_cache.json');
+const CLOSE_COMMAND_FILE = path.join(DATA_DIR, 'close_command.json');
+const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(DATA_DIR, 'risk_state.json');
 
 const storageBase = (process.env.BACKTEST_STORAGE_DIR || '').trim();
 const BACKTEST_OUTPUT_DIR = storageBase
@@ -131,19 +137,22 @@ let riskLimits: RiskLimitsConfig = {
 
 if (fs.existsSync(BOT_CONFIG_FILE)) {
   try {
-    const saved = JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8'));
-    activeBotConfig = { ...activeBotConfig, ...saved };
-    if (saved.maxDailyLoss !== undefined || saved.maxDailyLossUsd !== undefined) {
-      riskLimits.maxDailyLossUsd = saved.maxDailyLoss ?? saved.maxDailyLossUsd;
-    }
-    if (saved.maxWeeklyLoss !== undefined || saved.maxWeeklyLossUsd !== undefined) {
-      riskLimits.maxWeeklyLossUsd = saved.maxWeeklyLoss ?? saved.maxWeeklyLossUsd;
-    }
-    if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) {
-      riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
+    const content = fs.readFileSync(BOT_CONFIG_FILE, 'utf8').trim();
+    if (content) {
+      const saved = JSON.parse(content);
+      activeBotConfig = { ...activeBotConfig, ...saved };
+      if (saved.maxDailyLoss !== undefined || saved.maxDailyLossUsd !== undefined) {
+        riskLimits.maxDailyLossUsd = saved.maxDailyLoss ?? saved.maxDailyLossUsd;
+      }
+      if (saved.maxWeeklyLoss !== undefined || saved.maxWeeklyLossUsd !== undefined) {
+        riskLimits.maxWeeklyLossUsd = saved.maxWeeklyLoss ?? saved.maxWeeklyLossUsd;
+      }
+      if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) {
+        riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
+      }
     }
   } catch (e) {
-    console.error('Failed to load bot_config.json on startup:', e);
+    console.error('CRITICAL: Failed to load bot_config.json on startup:', e);
   }
 }
 
@@ -156,11 +165,14 @@ let riskState: RiskState = {
   lastTriggerReason: undefined,
 };
 
+// PROPOSED: Atomic writes and loud error logging
 function saveTradesToDisk(tradesList: any[]) {
   try {
-    fs.writeFileSync(TRADES_DB_FILE, JSON.stringify(tradesList, null, 2));
+    const tempPath = path.join(DATA_DIR, `.tmp_trades_${Date.now()}.json`);
+    fs.writeFileSync(tempPath, JSON.stringify(tradesList, null, 2), 'utf8');
+    fs.renameSync(tempPath, TRADES_DB_FILE);
   } catch (e) {
-    console.error('Failed to save trades to disk:', e);
+    console.error('CRITICAL: Failed to save trades to disk atomically:', e);
   }
 }
 
@@ -171,12 +183,23 @@ function loadTradesFromDisk(): any[] {
       if (content) {
         const parsed = JSON.parse(content);
         if (Array.isArray(parsed)) return parsed;
+        console.error('CRITICAL: trades_db.json is not an array. Refusing to overwrite.');
       }
     }
   } catch (e) {
-    console.error('Failed to load trades from disk:', e);
+    console.error('CRITICAL: Failed to read or parse trades_db.json:', e);
   }
   return [];
+}
+
+function saveBotConfigAtomically(cfg: any) {
+  try {
+    const tempPath = path.join(DATA_DIR, `.tmp_bot_config_${Date.now()}.json`);
+    fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), 'utf8');
+    fs.renameSync(tempPath, BOT_CONFIG_FILE);
+  } catch (e) {
+    console.error('CRITICAL: Failed to write bot_config.json atomically:', e);
+  }
 }
 
 function recomputeRiskState() {
@@ -622,15 +645,12 @@ function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; 
 }
 
 function formatExportTxtWithLengthRule(data: any): string {
-  // Pass 1: Full content
   let text = renderTxtContent(data);
   if (text.length <= 15000) return text;
 
-  // Pass 2: Shorten to top 3 suggestions per pair
   text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 0 });
   if (text.length <= 15000) return text;
 
-  // Pass 3: Drop weekday rows with fewer than 30 trades
   text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 30 });
   return text;
 }
@@ -1063,7 +1083,7 @@ async function startServer() {
     try {
       const config = req.body;
       activeBotConfig = { ...activeBotConfig, ...config, updatedAt: new Date().toISOString() };
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(activeBotConfig, null, 2));
+      saveBotConfigAtomically(activeBotConfig);
       res.json({ status: 'success', config: activeBotConfig });
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error?.message });
@@ -1091,7 +1111,7 @@ async function startServer() {
         activeBotConfig.masterExecution = true;
       }
 
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify({ ...activeBotConfig, ...riskLimits, limitsConfirmedAt: new Date().toISOString() }, null, 2));
+      saveBotConfigAtomically({ ...activeBotConfig, ...riskLimits, limitsConfirmedAt: new Date().toISOString() });
       res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error?.message });

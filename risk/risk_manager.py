@@ -1,17 +1,18 @@
 """
 trading-portal/risk/risk_manager.py
 Institutional Unified Risk Engine with Real-Time Multi-Period Drawdown Throttling & Cashflow Adjustments.
-Single Source of Truth for risk evaluation, micro-account tier sizing, and circuit breakers.
+Single Source of Truth for risk evaluation, risk profiles, micro-account tier sizing, and circuit breakers.
 """
 
 import os
 import json
 import logging
 import math
+import tempfile
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta, time as dtime
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 
 try:
     from config.strategy_params import GLOBAL_PARAMS
@@ -24,7 +25,47 @@ except ImportError:
 log = logging.getLogger("RiskManager")
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", os.path.join(PROJECT_ROOT, "risk_state.json"))
+
+# Support unified DATA_DIR persistent storage volume
+DATA_DIR = os.getenv("DATA_DIR", "").strip() or PROJECT_ROOT
+os.makedirs(DATA_DIR, exist_ok=True)
+RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", os.path.join(DATA_DIR, "risk_state.json"))
+
+
+# ==============================================================================
+# PROPOSED: INSTITUTIONAL RISK PROFILES SPECIFICATION
+# ==============================================================================
+# Bands in ZAR: <500, 500-2k, 2k-10k, 10k-50k, >50k
+RISK_PROFILES: Dict[str, Dict[str, Any]] = {
+    "Steady": {
+        "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
+        "risk_pct_by_band": [5.0, 3.0, 2.0, 1.5, 1.0],
+        "daily_loss_stop_pct": 5.0,
+        "min_rr_floor": 1.0,
+        "max_daily_trades": 2,
+    },
+    "Balanced": {
+        "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
+        "risk_pct_by_band": [10.0, 6.0, 4.0, 3.0, 2.0],
+        "daily_loss_stop_pct": 15.0,
+        "min_rr_floor": 1.5,
+        "max_daily_trades": 3,
+    },
+    "Aggressive": {
+        "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
+        "risk_pct_by_band": [30.0, 15.0, 8.0, 5.0, 3.0],
+        "daily_loss_stop_pct": 30.0,
+        "min_rr_floor": 2.0,
+        "max_daily_trades": 4,
+    },
+    "Max Growth": {
+        "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
+        "risk_pct_by_band": [35.0, 25.0, 12.0, 6.0, 4.0],  # PROPOSED: 35% cap under R500
+        "daily_loss_stop_pct": 50.0,
+        "min_rr_floor": 2.0,
+        "max_daily_trades": 4,
+    },
+}
 
 
 def get_sast_session_date() -> str:
@@ -36,12 +77,35 @@ def get_sast_session_date() -> str:
     return now_sast.strftime("%Y-%m-%d")
 
 
+def convert_equity_to_zar(current_equity: float, account_currency: Optional[str] = "USD", usd_zar_rate: Optional[float] = None) -> float:
+    """
+    PROPOSED: Converts equity into ZAR equivalent for profile account-size bands.
+    Uses provided live usd_zar_rate, or fallback rate of 18.0 if unquoted.
+    """
+    curr = (account_currency or "USD").upper()
+    if curr == "ZAR":
+        return current_equity
+
+    rate = usd_zar_rate if (usd_zar_rate is not None and usd_zar_rate > 0) else 18.0
+    if curr == "USD":
+        return current_equity * rate
+    elif curr == "EUR":
+        return current_equity * 1.10 * rate
+    elif curr == "GBP":
+        return current_equity * 1.30 * rate
+    return current_equity * rate
+
+
 class RiskManager:
     def __init__(self, config_file: str = "bot_config.json", state_file: str = RISK_STATE_FILE):
-        self.config_file = config_file if os.path.isabs(config_file) else os.path.join(PROJECT_ROOT, config_file)
+        self.config_file = config_file if os.path.isabs(config_file) else os.path.join(DATA_DIR, config_file)
         self.state_file = state_file
 
-        # UI & Spec Synced Controls (with bulletproof getattr fallbacks)
+        # Active Profile state (None = Default Legacy Behavior)
+        self.active_profile_name: Optional[str] = None
+        self.active_profile: Optional[Dict[str, Any]] = None
+
+        # UI & Spec Synced Controls
         self.master_execution: bool = True
         self.dry_run: bool = False
         self.risk_per_trade_pct: float = getattr(GLOBAL_PARAMS, 'base_risk_per_trade_pct', 1.0)
@@ -50,6 +114,7 @@ class RiskManager:
         self.max_daily_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_daily_loss_pct', 5.0)
         self.max_weekly_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_weekly_loss_pct', 10.0)
         self.max_monthly_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_monthly_loss_pct', 15.0)
+        self.min_rr_floor: float = getattr(GLOBAL_PARAMS, 'min_rr', 1.0)
 
         # USD Drawdown Limits default to 0.0 (Unset -> Percentage limits act as active fallback)
         self.max_daily_loss_usd: float = getattr(GLOBAL_PARAMS, 'max_daily_loss_usd', 0.0)
@@ -76,9 +141,10 @@ class RiskManager:
         self.starting_week_equity: float = 0.0
         self.starting_month_equity: float = 0.0
 
-        # Cashflow Ledger (Distinguishes trade PnL from deposits/withdrawals)
+        # Cashflow & Profit Ledger
         self.last_known_balance: float = 0.0
         self.expected_balance: float = 0.0
+        self.today_closed_profit: float = 0.0  # Tracks today's closed winnings for house money
 
         self.trades_taken_today: int = 0
         self.consecutive_losses: int = 0
@@ -91,20 +157,34 @@ class RiskManager:
         self.load_persistent_state()
 
     def sync_ui_config(self) -> None:
-        """Pulls authoritative settings from bot_config.json."""
+        """Pulls authoritative settings from bot_config.json with safe JSON parsing."""
         if not os.path.exists(self.config_file):
             return
         try:
-            with open(self.config_file, "r") as f:
-                cfg = json.load(f)
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return
+                cfg = json.loads(content)
 
             self.master_execution = cfg.get("masterExecution", self.master_execution)
             self.dry_run = cfg.get("dryRun", self.dry_run)
             self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", self.risk_per_trade_pct))
             self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
 
-            if "maxDailyTrades" in cfg:
-                self.max_daily_trades = int(cfg["maxDailyTrades"])
+            # PROPOSED: Read active risk profile (Steady, Balanced, Aggressive, Max Growth)
+            prof_name = cfg.get("riskProfile")
+            if prof_name in RISK_PROFILES:
+                self.active_profile_name = prof_name
+                self.active_profile = RISK_PROFILES[prof_name]
+                self.max_daily_trades = self.active_profile["max_daily_trades"]
+                self.max_daily_loss_pct = self.active_profile["daily_loss_stop_pct"]
+                self.min_rr_floor = self.active_profile["min_rr_floor"]
+            else:
+                self.active_profile_name = None
+                self.active_profile = None
+                if "maxDailyTrades" in cfg:
+                    self.max_daily_trades = int(cfg["maxDailyTrades"])
 
             # USD limits take precedence if > 0.0; otherwise 0.0 enables percentage fallback
             if "maxDailyLossUsd" in cfg:
@@ -143,8 +223,11 @@ class RiskManager:
         if not os.path.exists(self.state_file):
             return
         try:
-            with open(self.state_file, "r") as f:
-                st = json.load(f)
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return
+                st = json.loads(content)
 
             self.consecutive_losses = st.get("consecutive_losses", 0)
             self.current_week_str = st.get("current_week_str", self.current_week_str)
@@ -160,6 +243,7 @@ class RiskManager:
             self.active_trip_scope = st.get("active_trip_scope", "NONE")
             self.last_known_balance = st.get("last_known_balance", 0.0)
             self.expected_balance = st.get("expected_balance", self.last_known_balance)
+            self.today_closed_profit = st.get("today_closed_profit", 0.0)
 
             saved_day = st.get("current_day_str")
             now_day = get_sast_session_date()
@@ -173,6 +257,7 @@ class RiskManager:
                 self.current_day_str = now_day
                 self.trades_taken_today = 0
                 self.current_daily_loss = 0.0
+                self.today_closed_profit = 0.0
                 if self.active_trip_scope == 'DAY':
                     self.breaker_triggered = False
                     self.active_trip_scope = 'NONE'
@@ -195,7 +280,7 @@ class RiskManager:
         self.save_persistent_state()
 
     def save_persistent_state(self):
-        """Persists authoritative risk state strictly to risk_state.json."""
+        """Persists authoritative risk state atomically using a temporary file and atomic replace."""
         try:
             st = {
                 "current_day_str": self.current_day_str,
@@ -211,6 +296,7 @@ class RiskManager:
                 "starting_month_equity": self.starting_month_equity,
                 "last_known_balance": self.last_known_balance,
                 "expected_balance": self.expected_balance,
+                "today_closed_profit": self.today_closed_profit,
                 "last_seen_currency": self.last_seen_currency,
                 "currency_tripped_at": self.currency_tripped_at,
                 "breaker_triggered": self.breaker_triggered,
@@ -219,10 +305,14 @@ class RiskManager:
                 "last_trigger_reason": self.last_trigger_reason,
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
-            with open(self.state_file, "w") as f:
+            dirname = os.path.dirname(self.state_file)
+            os.makedirs(dirname, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=dirname, prefix="tmp_risk_state_", suffix=".json")
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(st, f, indent=2)
+            os.replace(tmp_path, self.state_file)
         except Exception as e:
-            log.error(f"Failed to persist risk state: {e}")
+            log.error(f"Failed to persist risk state atomically: {e}")
 
     def check_rollovers(self, current_equity: float, current_balance: float = 0.0):
         """
@@ -260,6 +350,7 @@ class RiskManager:
             self.current_day_str = now_day
             self.trades_taken_today = 0
             self.current_daily_loss = 0.0
+            self.today_closed_profit = 0.0
             if current_equity > 0:
                 self.starting_day_equity = current_equity
             if self.active_trip_scope == 'DAY':
@@ -320,58 +411,128 @@ class RiskManager:
             log.warning(f"LOSS RECORDED (-${abs(pnl):.2f}). Consecutive loss streak: {self.consecutive_losses}")
         elif pnl > 0:
             self.consecutive_losses = 0
+            self.today_closed_profit += pnl  # PROPOSED: Accumulate today's closed winnings for house money
             log.info(f"WIN RECORDED (+${pnl:.2f}). Consecutive loss streak reset.")
         self.save_persistent_state()
 
-    def combined_risk_pct(self, current_equity: float, dow_mult: float = 1.0, ai_factor: float = 1.0) -> float:
-        """
-        Single Authority for Risk Percentage Sizing:
-        - Micro-account mode tiers (<$60 at 25%, $60-$200 at 12.5%, $200-$1000 at 5%, >$1000 at 1%).
-        - Bypasses 2.0% cap under micro-account mode.
-        - Clamps UI risk to max_risk_per_trade_pct when micro mode is False.
-        - Multiplies streak reduction (0.5x on 3+ losses), DOW multiplier, and AI factor.
-        - Floored at min_risk_multiplier_floor (25% of base risk).
-        """
-        micro_mode = getattr(GLOBAL_PARAMS, 'micro_account_mode', False)
-        if micro_mode:
-            # Micro-account tiers bypass the 2.0% max_risk_per_trade_pct ceiling
-            if current_equity < 60.0:
-                base_risk = getattr(GLOBAL_PARAMS, 'micro_account_risk_pct', 25.0)
-            elif 60.0 <= current_equity < 200.0:
-                base_risk = 12.5
-            elif 200.0 <= current_equity < 1000.0:
-                base_risk = 5.0
-            else:
-                base_risk = 1.0
-        else:
-            base_risk = self.risk_per_trade_pct
-            max_ceiling = getattr(GLOBAL_PARAMS, 'max_risk_per_trade_pct', 2.0)
-            if base_risk > max_ceiling:
-                log.warning(
-                    f"UI Risk ({base_risk}%) exceeds safety ceiling ({max_ceiling}%). "
-                    f"Clamping base risk to {max_ceiling}%."
-                )
-                base_risk = max_ceiling
+    def _get_profile_band_risk_pct(self, profile: Dict[str, Any], zar_equity: float) -> float:
+        """Helper returning the profile's risk percentage for the current ZAR equity band."""
+        bands = profile["bands_zar"]
+        risks = profile["risk_pct_by_band"]
 
-        loss_threshold = getattr(GLOBAL_PARAMS, 'consecutive_loss_threshold', 3)
-        streak_mult = 0.5 if self.consecutive_losses >= loss_threshold else 1.0
-        raw_mult = streak_mult * dow_mult * ai_factor
-        mult_floor = getattr(GLOBAL_PARAMS, 'min_risk_multiplier_floor', 0.25)
-        final_mult = max(raw_mult, mult_floor)
-        return base_risk * final_mult
+        if zar_equity < bands[0]:
+            return risks[0]
+        elif bands[0] <= zar_equity < bands[1]:
+            return risks[1]
+        elif bands[1] <= zar_equity < bands[2]:
+            return risks[2]
+        elif bands[2] <= zar_equity < bands[3]:
+            return risks[3]
+        else:
+            return risks[4]
+
+    def combined_risk_pct(
+        self,
+        current_equity: float,
+        dow_mult: float = 1.0,
+        ai_factor: float = 1.0,
+        account_currency: Optional[str] = "USD",
+        usd_zar_rate: Optional[float] = None
+    ) -> float:
+        """
+        PROPOSED: Dynamic Sizing Engine with Selectable Risk Profiles:
+        - If NO profile set: Preserves exact current/legacy behavior.
+        - If profile set:
+          * Converts equity to ZAR equivalent via convert_equity_to_zar.
+          * Sets base risk % from the profile band.
+          * Halves risk after 2 consecutive losses.
+          * AI multiplier is clamped to <= 1.0 (can only veto/lower, never raise).
+          * House money: Extra risk cash may only use up to 50% of today's closed profit.
+          * Single trade cash risk is capped by the remaining daily loss allowance.
+        """
+        # =====================================================================
+        # 1. DEFAULT BEHAVIOR (When no profile is selected)
+        # =====================================================================
+        if self.active_profile is None:
+            micro_mode = getattr(GLOBAL_PARAMS, 'micro_account_mode', False)
+            if micro_mode:
+                if current_equity < 60.0:
+                    base_risk = getattr(GLOBAL_PARAMS, 'micro_account_risk_pct', 25.0)
+                elif 60.0 <= current_equity < 200.0:
+                    base_risk = 12.5
+                elif 200.0 <= current_equity < 1000.0:
+                    base_risk = 5.0
+                else:
+                    base_risk = 1.0
+            else:
+                base_risk = self.risk_per_trade_pct
+                max_ceiling = getattr(GLOBAL_PARAMS, 'max_risk_per_trade_pct', 2.0)
+                if base_risk > max_ceiling:
+                    base_risk = max_ceiling
+
+            loss_threshold = getattr(GLOBAL_PARAMS, 'consecutive_loss_threshold', 3)
+            streak_mult = 0.5 if self.consecutive_losses >= loss_threshold else 1.0
+            raw_mult = streak_mult * dow_mult * ai_factor
+            mult_floor = getattr(GLOBAL_PARAMS, 'min_risk_multiplier_floor', 0.25)
+            final_mult = max(raw_mult, mult_floor)
+            return base_risk * final_mult
+
+        # =====================================================================
+        # 2. SELECTABLE PROFILE BEHAVIOR (Steady, Balanced, Aggressive, Max Growth)
+        # =====================================================================
+        zar_equity = convert_equity_to_zar(current_equity, account_currency, usd_zar_rate)
+        profile_band_risk = self._get_profile_band_risk_pct(self.active_profile, zar_equity)
+
+        # Streak penalty: Halve after 2 consecutive losses
+        streak_mult = 0.5 if self.consecutive_losses >= 2 else 1.0
+
+        # AI Overseer Safety: Clamp to <= 1.0 (veto or lower only, never raise)
+        safe_ai_factor = min(1.0, max(0.5, ai_factor))
+
+        base_multiplier = streak_mult * dow_mult * safe_ai_factor
+        effective_profile_risk = profile_band_risk * max(0.25, base_multiplier)
+
+        # Calculate nominal risk in cash
+        nominal_risk_cash = current_equity * (effective_profile_risk / 100.0)
+
+        # House money bonus: Extra risk may use up to 50% of today's closed profit (never starting capital)
+        if self.today_closed_profit > 0:
+            house_money_allowance = 0.50 * self.today_closed_profit
+            # Cap house money additions so risk never exceeds the profile's tier cap
+            max_cash_cap = current_equity * (profile_band_risk / 100.0)
+            nominal_risk_cash = min(max_cash_cap, nominal_risk_cash + house_money_allowance)
+
+        # Circuit Breaker Safety: Single trade risk cannot exceed remaining daily allowance
+        max_daily_usd = self.max_daily_loss_usd if self.max_daily_loss_usd > 0 else (
+            self.starting_day_equity * (self.active_profile["daily_loss_stop_pct"] / 100.0)
+        )
+        daily_dd_usd = max(0.0, self.starting_day_equity - current_equity) if self.starting_day_equity > 0 else self.current_daily_loss
+        remaining_daily_cash = max(0.0, max_daily_usd - daily_dd_usd)
+
+        if remaining_daily_cash > 0:
+            final_risk_cash = min(nominal_risk_cash, remaining_daily_cash)
+        else:
+            final_risk_cash = 0.0
+
+        final_pct = (final_risk_cash / current_equity) * 100.0 if current_equity > 0 else 0.0
+        return max(0.0, final_pct)
 
     def validate_min_lot_risk(self, min_lots: float, risk_per_lot: float, risk_cash: float) -> Tuple[bool, str]:
         """
-        Rejects trade if broker minimum lot risk exceeds 1.5x allowable cash risk.
-        Protects small accounts from over-leveraging when structural stops are wide.
+        Rejects trade if broker minimum lot risk exceeds allowable cash risk.
+        In Aggressive / Max Growth on tiny accounts, allows a small tolerance (1.5x) for high-conviction entries.
         """
         min_lot_cash_risk = min_lots * risk_per_lot
-        tolerance = getattr(GLOBAL_PARAMS, 'min_lot_risk_tolerance', 1.5)
+        if self.active_profile_name in ("Aggressive", "Max Growth"):
+            tolerance = 1.5
+        else:
+            tolerance = getattr(GLOBAL_PARAMS, 'min_lot_risk_tolerance', 1.2)
+
         allowed_max = tolerance * risk_cash
         if min_lot_cash_risk > allowed_max:
             msg = (
                 f"Min-Lot Risk Rejection: Minimum trade size ({min_lots:.2f} lots) "
-                f"risks ${min_lot_cash_risk:.2f}, exceeding 1.5x allowable risk budget (${allowed_max:.2f})."
+                f"risks ${min_lot_cash_risk:.2f}, exceeding allowed budget (${allowed_max:.2f})."
             )
             log.warning(msg)
             return False, msg
@@ -391,21 +552,23 @@ class RiskManager:
         if self.trades_taken_today >= self.max_daily_trades:
             return False, f"Daily trade limit reached ({self.trades_taken_today}/{self.max_daily_trades})"
 
-        # 1. Daily Drawdown Evaluation (USD limit prioritized over % limit)
+        # Daily Drawdown Evaluation
+        daily_loss_pct = self.active_profile["daily_loss_stop_pct"] if self.active_profile else self.max_daily_loss_pct
         daily_dd_usd = max(0.0, self.starting_day_equity - current_equity) if self.starting_day_equity > 0 else self.current_daily_loss
-        max_daily_usd = self.max_daily_loss_usd if self.max_daily_loss_usd > 0 else (self.starting_day_equity * (self.max_daily_loss_pct / 100.0))
+        max_daily_usd = self.max_daily_loss_usd if self.max_daily_loss_usd > 0 else (self.starting_day_equity * (daily_loss_pct / 100.0))
+
         if daily_dd_usd >= max_daily_usd and max_daily_usd > 0:
             self._trip_breaker('DAY', f"Daily Drawdown Ceiling breached (-${daily_dd_usd:.2f} >= ${max_daily_usd:.2f})")
             return False, self.last_trigger_reason
 
-        # 2. Weekly Drawdown Evaluation
+        # Weekly Drawdown Evaluation
         weekly_dd_usd = max(0.0, self.starting_week_equity - current_equity) if self.starting_week_equity > 0 else self.current_weekly_loss
         max_weekly_usd = self.max_weekly_loss_usd if self.max_weekly_loss_usd > 0 else (self.starting_week_equity * (self.max_weekly_loss_pct / 100.0))
         if weekly_dd_usd >= max_weekly_usd and max_weekly_usd > 0:
             self._trip_breaker('WEEK', f"Weekly Drawdown Ceiling breached (-${weekly_dd_usd:.2f} >= ${max_weekly_usd:.2f})")
             return False, self.last_trigger_reason
 
-        # 3. Monthly Drawdown Evaluation
+        # Monthly Drawdown Evaluation
         monthly_dd_usd = max(0.0, self.starting_month_equity - current_equity) if self.starting_month_equity > 0 else self.current_monthly_loss
         max_monthly_usd = self.max_monthly_loss_usd if self.max_monthly_loss_usd > 0 else (self.starting_month_equity * (self.max_monthly_loss_pct / 100.0))
         if monthly_dd_usd >= max_monthly_usd and max_monthly_usd > 0:
