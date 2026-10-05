@@ -1,11 +1,10 @@
 """
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
-- Single shared precompute pass per pair for indicators, volatility, session levels, and raw signals.
-- 8 combination runs read from precomputed signal cache using deep-copy before adaptation.
-- Process candle only called when open positions or pending evaluations exist.
-- Progress prints for precompute (20%, 40%...) and combos (1/8 done, 2/8 done...).
-- Guaranteed zero look-ahead bias and exact baseline numerical parity.
+Includes:
+- run_backtest_reference: The pristine, unoptimized reference implementation (exact per-candle loop, zero look-ahead).
+- run_cached_combination: The high-speed cached implementation.
+- compare_runs: Side-by-side trade-by-trade verification harness pinpointing the exact first 5 divergent trades.
 """
 
 import sys
@@ -164,6 +163,154 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
         print(f"ERROR: Failed updating data store for {symbol} ({e}). Preserving existing files.", flush=True)
         return False
 
+# ==============================================================================
+# ORIGINAL UNOPTIMIZED REFERENCE IMPLEMENTATION (PERMANENT BASELINE)
+# ==============================================================================
+def run_backtest_reference(
+    symbol: str = "US30",
+    adaptive_mode: bool = True,
+    use_be: bool = False,
+    use_trail: bool = False,
+    days_count: int = 60,
+    balance: float = 1000.0,
+    risk_pct: float = 1.0,
+    eurusd_df: Optional[pd.DataFrame] = None
+) -> Dict[str, Any]:
+    """
+    Pristine reference backtester without any caching or skipping.
+    Evaluates every single candle, processes every candle in simulator,
+    and runs full recomputation at every step.
+    """
+    volatility_engine.reset_rejection_stats()
+
+    GLOBAL_PARAMS.adaptive_mode = adaptive_mode
+    GLOBAL_PARAMS.use_breakeven = use_be
+    GLOBAL_PARAMS.use_supertrend_trail = use_trail
+
+    m5_df = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}_M5.csv"))
+    h1_df = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}_H1.csv"))
+    h4_df = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}_H4.csv"))
+    d1_df = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}_D1.csv"))
+
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    total_bars = len(m5_df)
+
+    last_bar_time = m5_df['time'].iloc[-1]
+    window_cutoff = last_bar_time - timedelta(days=days_count)
+
+    matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
+
+    aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
+    sm = StrategyManager()
+    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct, eurusd_df=eurusd_df)
+
+    frozen_orbs: Dict[Any, Any] = {}
+    last_vol_date = None
+    last_vol_retry_hour = None
+    vol_metrics = {"valid": False}
+    adr_val = None
+    regime = "NORMAL"
+
+    for i in range(sim_start_idx, total_bars):
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
+        curr_bar = m5_slice.iloc[-1]
+        curr_time = curr_bar['time'].to_pydatetime()
+        curr_date = curr_time.date()
+        sast_dt = curr_time.astimezone(TZ_SAST)
+        sast_hour_key = (sast_dt.date(), sast_dt.hour)
+
+        # 1. Update in-flight trades against every single candle
+        sim.process_candle(symbol, curr_bar, m5_slice)
+
+        # 2. Rebuild H1, H4, D1 without look-ahead
+        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
+
+        # 3. Volatility calculation
+        need_full_recalc = (curr_date != last_vol_date)
+        if not vol_metrics.get("valid", False) and sast_hour_key != last_vol_retry_hour:
+            need_full_recalc = True
+
+        if need_full_recalc:
+            vol_metrics = volatility_engine.compute_symbol_volatility(
+                d1_df=d1_view,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                symbol=symbol,
+                as_of=curr_time
+            )
+            if vol_metrics.get("valid", False):
+                adr_val = vol_metrics.get("adr")
+                regime = vol_metrics.get("regime", "NORMAL")
+            last_vol_date = curr_date
+            last_vol_retry_hour = sast_hour_key
+
+        if vol_metrics.get("valid", False):
+            active_vol = volatility_engine.refresh_intraday(
+                vol_metrics=vol_metrics,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                d1_view=d1_view,
+                as_of=curr_time
+            )
+        else:
+            active_vol = vol_metrics
+
+        # 4. Session levels and volume profile
+        vp = get_session_volume_profile(m5_slice)
+        session_levels = build_session_levels(
+            symbol=symbol,
+            m5_df=m5_slice,
+            d1_df=d1_view,
+            vp_node=vp,
+            frozen_orbs=frozen_orbs,
+            as_of=curr_time,
+            adr_val=adr_val
+        )
+
+        # 5. Evaluate all strategies on every single candle
+        signal = sm.evaluate_all(
+            symbol=symbol,
+            data_5m=m5_slice,
+            data_h4=h4_view,
+            data_d1=d1_view,
+            session_levels=session_levels,
+            data_h1=h1_view
+        )
+
+        if signal and adaptive_mode:
+            if active_vol.get("valid", False):
+                adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+                if adapted:
+                    spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+                    sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                    tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                    vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+                        active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                    )
+                    signal = adapted if vol_ok else None
+                else:
+                    signal = None
+            else:
+                signal = None
+
+        if signal:
+            has_open = any(p["symbol"] == symbol for p in sim.open_positions)
+            if not has_open:
+                sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
+
+    if len(m5_df) > 0 and len(sim.open_positions) > 0:
+        sim.close_all(symbol, m5_df.iloc[-1])
+
+    kpis = calculate_kpis(sim.completed_trades)
+    return {
+        "trades": sim.completed_trades,
+        "kpis": kpis
+    }
+
+# ==============================================================================
+# OPTIMIZED PRECOMPUTED IMPLEMENTATION
+# ==============================================================================
 def precompute_market_pass(
     symbol: str,
     m5_df: pd.DataFrame,
@@ -173,10 +320,6 @@ def precompute_market_pass(
     sim_start_idx: int,
     total_bars: int
 ) -> Dict[str, Any]:
-    """
-    Pass 1: Computes all indicators, volatility, session levels, and raw strategy signals once.
-    Results are cached only for candles where a raw signal was produced.
-    """
     t_agg = 0.0
     t_vol = 0.0
     t_lvl = 0.0
@@ -194,7 +337,6 @@ def precompute_market_pass(
 
     valid_vol_bars = 0
     cached_signals_by_index: Dict[int, Dict[str, Any]] = {}
-    day_candles_by_date: Dict[str, List[Dict[str, Any]]] = {}
 
     m5_times_list = m5_df['time'].tolist()
     total_sim_bars = max(1, total_bars - sim_start_idx)
@@ -205,7 +347,6 @@ def precompute_market_pass(
         curr_bar = m5_df.iloc[i]
         m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
 
-        # Progress reporting during precompute pass
         current_pct = int(((i - sim_start_idx) / total_sim_bars) * 100)
         if current_pct >= next_progress_pct:
             print(f"[*] {symbol} precompute {next_progress_pct}% ...", flush=True)
@@ -216,12 +357,10 @@ def precompute_market_pass(
         if wkday == 5 or (wkday == 6 and curr_time.hour < 21):
             continue
 
-        # 1. Higher-timeframe aggregation
         _t0 = time.perf_counter()
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
         t_agg += time.perf_counter() - _t0
 
-        # 2. Volatility calculation
         _t0 = time.perf_counter()
         curr_d1_len = len(d1_view)
         curr_date = curr_time.date()
@@ -255,7 +394,6 @@ def precompute_market_pass(
             active_vol = vol_metrics
         t_vol += time.perf_counter() - _t0
 
-        # 3. Session levels and volume profile
         _t0 = time.perf_counter()
         vp = get_session_volume_profile(m5_slice)
         session_levels = build_session_levels(
@@ -269,7 +407,6 @@ def precompute_market_pass(
         )
         t_lvl += time.perf_counter() - _t0
 
-        # 4. Strategy evaluation
         _t0 = time.perf_counter()
         raw_signal = sm.evaluate_all(
             symbol=symbol,
@@ -282,7 +419,6 @@ def precompute_market_pass(
         t_strat += time.perf_counter() - _t0
 
         if raw_signal is not None:
-            # Store only when a raw signal exists (no 121-candle slice stored)
             cached_signals_by_index[i] = {
                 "raw_signal": raw_signal,
                 "active_vol": active_vol,
@@ -321,10 +457,6 @@ def run_cached_combination(
     risk_pct: float = 1.0,
     eurusd_df: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
-    """
-    Executes a single combination by reading from the precomputed signal cache.
-    Deep-copies each cached signal before adapt_signal to prevent side-effects.
-    """
     t_vol = 0.0
     t_strat = 0.0
     t_sim = 0.0
@@ -364,19 +496,16 @@ def run_cached_combination(
         curr_bar = m5_df.iloc[i]
         curr_time = m5_times_list[i].to_pydatetime()
 
-        # Update in-flight trades only when positions or pending SL evaluations exist
         _t0 = time.perf_counter()
         if sim.open_positions or sim.pending_sl_evaluations:
             m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
             sim.process_candle(symbol, curr_bar, m5_slice)
         t_sim += time.perf_counter() - _t0
 
-        # If no raw signal was found on this candle during precompute, move to next candle
         if i not in cached_signals:
             continue
 
         item = cached_signals[i]
-        # Deep-copy cached raw signal before adaptation (adapt_signal edits in-place)
         signal = copy.deepcopy(item["raw_signal"])
         active_vol = item["active_vol"]
         session_levels = item["session_levels"]
@@ -420,7 +549,6 @@ def run_cached_combination(
             funnel["adapted_signals_passed"] += 1
         t_vol += time.perf_counter() - _t0
 
-        # Simulator order opening
         _t0 = time.perf_counter()
         if signal:
             funnel["sim_trades_attempted"] += 1
@@ -431,7 +559,6 @@ def run_cached_combination(
                     funnel["sim_trades_filled"] += 1
         t_sim += time.perf_counter() - _t0
 
-    # Close any positions still open at end of data
     _t0 = time.perf_counter()
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
@@ -484,7 +611,6 @@ def run_cached_combination(
         first_t = day_t[0] if day_t else {}
         ref_levels = first_t.get("ref_levels", {})
 
-        # Omit candles list from per-combination report to save disk space
         day_charts_data[d_str] = {
             "candles": [],
             "trades": day_t,
@@ -551,6 +677,7 @@ def run_cached_combination(
     return {
         "report_file": report_filename,
         "payload": report_payload,
+        "trades": all_trades,
         "kpis": global_kpis,
         "funnel": funnel,
         "adaptive_pct": adaptive_pct,
@@ -563,12 +690,157 @@ def run_cached_combination(
         }
     }
 
+# ==============================================================================
+# AUDIT HARNESS: RUNS BOTH VERSIONS & COMPARES FIRST 5 DIVERGENT TRADES
+# ==============================================================================
+def compare_runs(
+    symbol: str = "US30",
+    days_count: int = 60,
+    adaptive_mode: bool = True,
+    use_be: bool = False,
+    use_trail: bool = False,
+    eurusd_df: Optional[pd.DataFrame] = None
+) -> str:
+    """
+    Runs the reference unoptimized engine and the fast precomputed engine side-by-side.
+    Returns a detailed diff of the first 5 divergent trades.
+    """
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        return f"ERROR: Missing market data files for {symbol} in {DATA_DIR}."
+
+    m5_df = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    total_bars = len(m5_df)
+
+    last_bar_time = m5_df['time'].iloc[-1]
+    window_cutoff = last_bar_time - timedelta(days=days_count)
+    matching = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching[0]) if matching else max(120, total_bars - 1)
+
+    # 1. Run reference version
+    t0 = time.perf_counter()
+    ref_res = run_backtest_reference(
+        symbol=symbol,
+        adaptive_mode=adaptive_mode,
+        use_be=use_be,
+        use_trail=use_trail,
+        days_count=days_count,
+        eurusd_df=eurusd_df
+    )
+    t_ref = time.perf_counter() - t0
+    ref_trades = ref_res["trades"]
+    ref_kpis = ref_res["kpis"]
+
+    # 2. Run fast precomputed version
+    t0 = time.perf_counter()
+    precomputed = precompute_market_pass(
+        symbol=symbol,
+        m5_df=m5_df,
+        h1_df=h1_df,
+        h4_df=h4_df,
+        d1_df=d1_df,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars
+    )
+    combo = {
+        "mode": "adaptive" if adaptive_mode else "legacy",
+        "adaptive_mode": adaptive_mode,
+        "be": "on" if use_be else "off",
+        "use_be": use_be,
+        "trail": "on" if use_trail else "off",
+        "use_trail": use_trail
+    }
+    fast_res = run_cached_combination(
+        symbol=symbol,
+        m5_df=m5_df,
+        precomputed=precomputed,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars,
+        combo=combo,
+        days_count=days_count,
+        window_start_str=m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC'),
+        window_end_str=last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC'),
+        history_days_before_window=0.0,
+        eurusd_df=eurusd_df
+    )
+    t_fast = time.perf_counter() - t0
+    fast_trades = fast_res["trades"]
+    fast_kpis = fast_res["kpis"]
+
+    # 3. Compare trades
+    diff_lines = []
+    diff_lines.append("=" * 80)
+    diff_lines.append(f"VERIFICATION VS ORIGINAL REFERENCE ({symbol} · {days_count} Days · Mode: {'Adaptive' if adaptive_mode else 'Legacy'} · BE: {'ON' if use_be else 'OFF'} · Trail: {'ON' if use_trail else 'OFF'})")
+    diff_lines.append("=" * 80)
+    diff_lines.append(f"• Reference Version : {len(ref_trades)} trades | Net P&L: ${ref_kpis['net_pnl']} | WR: {ref_kpis['win_rate']}% | Time: {t_ref:.2f}s")
+    diff_lines.append(f"• Optimized Version : {len(fast_trades)} trades | Net P&L: ${fast_kpis['net_pnl']} | WR: {fast_kpis['win_rate']}% | Time: {t_fast:.2f}s")
+    diff_lines.append(f"• Trade Count Match : {'YES' if len(ref_trades) == len(fast_trades) else 'NO'}")
+    diff_lines.append("-" * 80)
+
+    divergent_count = 0
+    max_compare = max(len(ref_trades), len(fast_trades))
+
+    for idx in range(max_compare):
+        if idx >= len(ref_trades):
+            divergent_count += 1
+            if divergent_count <= 5:
+                diff_lines.append(f"\n[Trade #{idx + 1} EXTRA IN OPTIMIZED]")
+                diff_lines.append(f"  Optimized: {fast_trades[idx]['signal_time_utc']} {fast_trades[idx]['direction']} {fast_trades[idx]['strategy']} Entry: {fast_trades[idx]['entry_price']}")
+            continue
+        if idx >= len(fast_trades):
+            divergent_count += 1
+            if divergent_count <= 5:
+                diff_lines.append(f"\n[Trade #{idx + 1} MISSING IN OPTIMIZED]")
+                diff_lines.append(f"  Reference: {ref_trades[idx]['signal_time_utc']} {ref_trades[idx]['direction']} {ref_trades[idx]['strategy']} Entry: {ref_trades[idx]['entry_price']}")
+            continue
+
+        r = ref_trades[idx]
+        f = fast_trades[idx]
+
+        # Stage diff detection
+        diff_stage = None
+        if r['signal_time_utc'] != f['signal_time_utc'] or r['direction'] != f['direction'] or r['strategy'] != f['strategy']:
+            diff_stage = "SIGNAL"
+        elif abs(r['entry_price'] - f['entry_price']) > 1e-4:
+            diff_stage = "ENTRY_FILL"
+        elif abs(r['sl'] - f['sl']) > 1e-4 or abs(r['tp'] - f['tp']) > 1e-4:
+            diff_stage = "ADAPTED_SL_TP"
+        elif r['exit_time'] != f['exit_time'] or abs(r['exit_price'] - f['exit_price']) > 1e-4 or r['exit_reason'] != f['exit_reason']:
+            diff_stage = "EXIT"
+
+        if diff_stage is not None:
+            divergent_count += 1
+            if divergent_count <= 5:
+                diff_lines.append(f"\n[Trade #{idx + 1} DIVERGENCE FIRST AT: {diff_stage}]")
+                diff_lines.append(f"• Reference : Entry: {r['signal_time_utc']} | {r['direction']} {r['strategy']} @ {r['entry_price']} | SL: {r['sl']} | TP: {r['tp']}")
+                diff_lines.append(f"              Exit : {r['exit_time']} @ {r['exit_price']} ({r['exit_reason']}) | Net: ${r['money_pnl']} ({r['result']})")
+                diff_lines.append(f"• Optimized : Entry: {f['signal_time_utc']} | {f['direction']} {f['strategy']} @ {f['entry_price']} | SL: {f['sl']} | TP: {f['tp']}")
+                diff_lines.append(f"              Exit : {f['exit_time']} @ {f['exit_price']} ({f['exit_reason']}) | Net: ${f['money_pnl']} ({f['result']})")
+
+    if divergent_count == 0:
+        diff_lines.append("\n[VERDICT: 100% IDENTICAL RESULTS] Zero divergences across all evaluated trades.")
+    else:
+        diff_lines.append(f"\n[TOTAL DIVERGENT TRADES: {divergent_count} of {max_compare}]")
+
+    diff_lines.append("=" * 80)
+    return "\n".join(diff_lines)
+
+# ==============================================================================
+# MAIN MATRIX ORCHESTRATION
+# ==============================================================================
 async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
     orig_adaptive = GLOBAL_PARAMS.adaptive_mode
     orig_be = GLOBAL_PARAMS.use_breakeven
     orig_trail = GLOBAL_PARAMS.use_supertrend_trail
 
-    # 1. Clean old outputs and leftovers for this symbol prior to running
     for pattern in [f"{symbol}_*_report.json", f"{symbol}_summary.json", f"{symbol}_daycandles.json", f"{symbol}_adaptive_report.json", f"{symbol}_legacy_report.json"]:
         for fpath in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
             try:
@@ -620,7 +892,6 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
     window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
     history_days_before_window = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
 
-    # --- PASS 1: SHARED PRECOMPUTE PASS (Runs once per pair) ---
     print(f"[*] {symbol}: Running shared precompute pass across {total_bars - sim_start_idx:,} candles...", flush=True)
     precomputed = precompute_market_pass(
         symbol=symbol,
@@ -643,7 +914,6 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
     tot_sim = 0.0
     tot_rep = 0.0
 
-    # --- PASS 2: 8 COMBINATION RUNS (Replay cached signals) ---
     try:
         for idx, combo in enumerate(COMBINATIONS):
             res = run_cached_combination(
@@ -731,7 +1001,19 @@ async def main():
     parser.add_argument("--adaptive", action="store_true", default=True)
     parser.add_argument("--breakeven", type=str, default="off")
     parser.add_argument("--supertrend", type=str, default="on")
+    parser.add_argument("--compare", action="store_true", default=False, help="Run comparison vs reference engine")
     args = parser.parse_args()
+
+    if args.compare:
+        res_text = compare_runs(
+            symbol=args.symbol,
+            days_count=args.days,
+            adaptive_mode=args.adaptive,
+            use_be=(args.breakeven.lower() == "on"),
+            use_trail=(args.supertrend.lower() == "on")
+        )
+        print(res_text)
+        return
 
     usage = shutil.disk_usage(OUTPUT_DIR)
     free_mb = usage.free / (1024 * 1024)

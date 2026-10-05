@@ -370,7 +370,6 @@ async function startServer() {
       }
       const data = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
 
-      // If day_data candles are omitted, re-insert them from shared {SYMBOL}_daycandles.json
       if (data && data.day_data && data.symbol) {
         const daycandlesPath = path.resolve(BACKTEST_OUTPUT_DIR, `${data.symbol}_daycandles.json`);
         if (fs.existsSync(daycandlesPath)) {
@@ -505,7 +504,6 @@ async function startServer() {
       const targetSym = (req.body?.symbol || '').toUpperCase().trim();
       let deletedCount = 0;
 
-      // 1. Delete matching report/summary/daycandles files from BACKTEST_OUTPUT_DIR
       if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
         const files = fs.readdirSync(BACKTEST_OUTPUT_DIR);
         for (const f of files) {
@@ -529,11 +527,9 @@ async function startServer() {
         }
       }
 
-      // 2. Delete matching leftover trades/skips from BACKTEST_DATA_DIR (protecting market data CSVs)
       if (fs.existsSync(BACKTEST_DATA_DIR)) {
         const files = fs.readdirSync(BACKTEST_DATA_DIR);
         for (const f of files) {
-          // Never delete market data files
           if (f.endsWith('_M5.csv') || f.endsWith('_H1.csv') || f.endsWith('_H4.csv') || f.endsWith('_D1.csv')) {
             continue;
           }
@@ -569,6 +565,50 @@ async function startServer() {
         status: 'success',
         message: `Cleanup completed. Deleted ${deletedCount} file(s).`,
         deletedCount
+      });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // COMPARE ENDPOINT: Runs verification harness vs unoptimized reference engine
+  app.post('/api/backtest/compare', async (req, res) => {
+    try {
+      const symbol = String(req.body?.symbol || 'US30').toUpperCase();
+      const days = parseInt(req.body?.days || '60', 10);
+      const mode = req.body?.mode || 'adaptive';
+      const be = req.body?.be || 'off';
+      const trail = req.body?.trail || 'off';
+
+      const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+      const args = [
+        'backtest/runner.py',
+        '--symbol', symbol,
+        '--days', String(days),
+        '--compare',
+        '--breakeven', be,
+        '--supertrend', trail
+      ];
+      if (mode === 'legacy') {
+        args.push('--adaptive=False');
+      }
+
+      const proc = spawn(pythonCmd, args, {
+        env: { ...process.env, PYTHONPATH: process.cwd() }
+      });
+
+      let output = '';
+      let errorOutput = '';
+
+      proc.stdout.on('data', (d) => { output += d.toString(); });
+      proc.stderr.on('data', (d) => { errorOutput += d.toString(); });
+
+      proc.on('exit', (code) => {
+        if (code === 0) {
+          res.status(200).json({ status: 'success', diff: output.trim() });
+        } else {
+          res.status(500).json({ status: 'error', message: errorOutput || output || `Exited with code ${code}` });
+        }
       });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });

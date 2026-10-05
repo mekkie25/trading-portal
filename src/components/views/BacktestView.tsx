@@ -18,15 +18,16 @@ import {
   AlertTriangle, 
   Lightbulb, 
   Trash2, 
-  RotateCcw,
-  Sparkles,
-  Layers,
-  Square,
-  Copy,
-  Check,
-  Table,
-  Database,
-  Clock
+  RotateCcw, 
+  Sparkles, 
+  Layers, 
+  Square, 
+  Copy, 
+  Check, 
+  Table, 
+  Database, 
+  Clock, 
+  ShieldCheck 
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -96,16 +97,13 @@ function formatPriceBySymbol(price: any, symbol?: string): string {
   const num = parseFloat(price);
   if (isNaN(num)) return '--';
   const sym = (symbol || '').toUpperCase();
-  if (sym.includes('EURUSD') || sym.includes('GBPUSD')) {
-    return num.toFixed(5);
-  }
-  if (sym.includes('USDJPY')) {
-    return num.toFixed(3);
-  }
+  if (sym.includes('EURUSD') || sym.includes('GBPUSD')) return num.toFixed(5);
+  if (sym.includes('USDJPY')) return num.toFixed(3);
   return num.toFixed(2);
 }
 
 function prettifyReportName(filename: string): string {
+  if (!filename) return 'Report';
   if (filename.includes('_summary.json')) {
     const sym = filename.replace('_summary.json', '');
     return `${sym} · 8-Combination Summary Matrix`;
@@ -133,25 +131,25 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
-  // Runner Controls
   const [testSymbol, setTestSymbol] = useState<string>('US30');
   const [testDays, setTestDays] = useState<number>(60);
   const [testRr, setTestRr] = useState<number>(1.0);
 
-  // Storage Stats
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
 
-  // Execution & Status
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
   const [runResults, setRunResults] = useState<RunResultItem[]>([]);
 
-  // Copy for AI State
+  // Verification vs Original Reference State
+  const [isVerifying, setIsVerifying] = useState<boolean>(false);
+  const [verifyResult, setVerifyResult] = useState<string | null>(null);
+  const [verifyCopyStatus, setVerifyCopyStatus] = useState<'idle' | 'copied'>('idle');
+
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
   const [fallbackCopyText, setFallbackCopyText] = useState<string>('');
 
-  // Table Filters
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
   const [tipFilter, setTipFilter] = useState<string>('ALL');
@@ -168,15 +166,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartApiRef = useRef<IChartApi | null>(null);
 
-  // 1. Storage Info Fetcher
   const fetchStorageInfo = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/storage');
       if (res.ok) {
         const json = await res.json();
-        if (json.data) {
-          setStorageInfo(json.data);
-        }
+        if (json.data) setStorageInfo(json.data);
       }
     } catch {}
   }, []);
@@ -185,7 +180,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchStorageInfo();
   }, [fetchStorageInfo]);
 
-  // 2. Initial status poll
   useEffect(() => {
     const checkInitialStatus = async () => {
       try {
@@ -205,7 +199,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     checkInitialStatus();
   }, []);
 
-  // 3. Fetch list of reports
   const fetchReportList = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/reports');
@@ -225,15 +218,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchReportList();
   }, [fetchReportList]);
 
-  // 4. Load summary payload for current pair
   const fetchSummaryData = useCallback(async (sym: string) => {
     try {
       const res = await fetch(`/api/backtest/summary/${sym}`);
       if (res.ok) {
         const json = await res.json();
-        if (json.data) {
-          setSummaryData(json.data);
-        }
+        if (json.data) setSummaryData(json.data);
       } else {
         setSummaryData(null);
       }
@@ -246,7 +236,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     fetchSummaryData(testSymbol);
   }, [testSymbol, fetchSummaryData]);
 
-  // 5. Fetch selected individual report JSON
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
@@ -268,7 +257,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     loadReport();
   }, [selectedFile]);
 
-  // 6. Polling while running
   useEffect(() => {
     if (!isRunning) return;
 
@@ -277,9 +265,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         const res = await fetch('/api/backtest/status');
         if (res.ok) {
           const json = await res.json();
-          if (json.progress) {
-            setProgressText(json.progress);
-          }
+          if (json.progress) setProgressText(json.progress);
           if (Array.isArray(json.results) && json.results.length > 0) {
             setRunResults(json.results);
           }
@@ -298,7 +284,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, testSymbol]);
 
-  // 7. Cleanup Action
   const handleCleanup = async (scope: 'all_reports' | 'symbol') => {
     const sym = testSymbol;
     const confirmMsg = scope === 'all_reports'
@@ -330,7 +315,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     }
   };
 
-  // 8. Trigger Run
   const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
@@ -341,11 +325,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          symbol: targetSym, 
-          days: testDays, 
-          rr: testRr
-        }),
+        body: JSON.stringify({ symbol: targetSym, days: testDays, rr: testRr }),
       });
 
       if (!res.ok) {
@@ -368,14 +348,50 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
-  // 9. Copy for AI Builder
+  const handleVerifyVsOriginal = async () => {
+    setIsVerifying(true);
+    setVerifyResult(null);
+    try {
+      const res = await fetch('/api/backtest/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: testSymbol,
+          days: 60,
+          mode: 'adaptive',
+          be: 'off',
+          trail: 'off'
+        })
+      });
+      const json = await res.json();
+      if (res.ok && json.diff) {
+        setVerifyResult(json.diff);
+      } else {
+        setVerifyResult(json.message || 'Verification failed to run.');
+      }
+    } catch (err: any) {
+      setVerifyResult(`Network error running verification: ${err?.message}`);
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  const handleCopyVerifyResult = async () => {
+    if (!verifyResult) return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(verifyResult);
+        setVerifyCopyStatus('copied');
+        setTimeout(() => setVerifyCopyStatus('idle'), 2000);
+      }
+    } catch {}
+  };
+
   const handleCopyForAI = async () => {
     const lines: string[] = [];
-
     lines.push(`# BACKTEST REPORT FOR AI REVIEW`);
     lines.push(`Pair: ${testSymbol} | Days: ${testDays} | Target R:R: ${testRr}`);
-    lines.push(`Generated: ${new Date().toUTCString()}`);
-    lines.push(``);
+    lines.push(`Generated: ${new Date().toUTCString()}\n`);
     lines.push(`## All 8 Parameter Combinations Matrix`);
 
     if (summaryData && summaryData.combinations && summaryData.combinations.length > 0) {
@@ -387,42 +403,24 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           `| ${c.label} | ${c.total_trades} | ${formatNum(c.win_rate)}% | ${formatNum(c.expectancy)}R | ${formatNum(c.profit_factor)} | $${formatNum(c.max_drawdown)} | $${formatNum(c.net_pnl)} | ${formatNum(c.adaptive_effective_pct)}% | ${f.raw_signals_fired} | ${f.vol_filters_blocked} | ${f.sim_trades_filled} |`
         );
       });
-    } else {
-      lines.push(`*(No summary combinations loaded yet)*`);
     }
 
-    lines.push(``);
-    lines.push(`## Active Selected Report Details (${selectedFile || 'None'})`);
-
+    lines.push(`\n## Active Selected Report Details (${selectedFile || 'None'})`);
     if (reportData) {
       const g = reportData.global_kpis;
       lines.push(`- Total Trades: ${g?.count ?? 0}`);
       lines.push(`- Win Rate: ${formatNum(g?.win_rate)}%`);
       lines.push(`- Net P&L: $${formatNum(g?.net_pnl)}`);
       lines.push(`- Run Settings: ${(reportData as any).run_settings || 'N/A'}`);
-      
-      const reportWarnings = (reportData as any).warnings || [];
-      lines.push(`- Warnings: ${reportWarnings.length > 0 ? reportWarnings.join(' | ') : 'None'}`);
-
-      const skipped = (reportData as any).skipped_summary || {};
-      lines.push(`- Skipped Reasons: ${JSON.stringify(skipped)}`);
-
-      const funnelData = (reportData as any).funnel || {};
-      lines.push(`- Funnel Metrics: ${JSON.stringify(funnelData)}`);
-    } else {
-      lines.push(`*(No individual report selected)*`);
     }
 
-    lines.push(``);
-    lines.push(`QUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
-
+    lines.push(`\nQUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
     const fullText = lines.join('\n');
 
     try {
-      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+      if (navigator?.clipboard?.writeText) {
         await navigator.clipboard.writeText(fullText);
         setCopyStatus('copied');
-        setFallbackCopyText('');
         setTimeout(() => setCopyStatus('idle'), 2000);
       } else {
         setFallbackCopyText(fullText);
@@ -447,10 +445,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   };
 
-  // 10. Candlestick Chart Rendering
   useEffect(() => {
     if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
-
     const container = chartContainerRef.current;
     container.innerHTML = '';
 
@@ -469,76 +465,42 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         vertLines: { color: isLight ? '#f1f5f9' : '#141a26' },
         horzLines: { color: isLight ? '#f1f5f9' : '#141a26' },
       },
-      timeScale: {
-        timeVisible: true,
-        secondsVisible: false,
-        borderColor: isLight ? '#cbd5e1' : '#212838',
-      },
-      rightPriceScale: {
-        borderColor: isLight ? '#cbd5e1' : '#212838',
-      },
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: isLight ? '#cbd5e1' : '#212838' },
+      rightPriceScale: { borderColor: isLight ? '#cbd5e1' : '#212838' },
     });
-
     chartApiRef.current = chart;
 
     const candleSeries = chart.addCandlestickSeries({
-      upColor: '#10b981',
-      downColor: '#ef4444',
-      borderUpColor: '#10b981',
-      borderDownColor: '#ef4444',
-      wickUpColor: '#10b981',
-      wickDownColor: '#ef4444',
+      upColor: '#10b981', downColor: '#ef4444',
+      borderUpColor: '#10b981', borderDownColor: '#ef4444',
+      wickUpColor: '#10b981', wickDownColor: '#ef4444',
     });
 
-    const formattedCandles = dayData.candles.map((c) => ({
+    candleSeries.setData(dayData.candles.map((c) => ({
       time: c.time as UTCTimestamp,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-    }));
-    candleSeries.setData(formattedCandles);
+      open: c.open, high: c.high, low: c.low, close: c.close,
+    })));
 
     const lvls = dayData.levels || {};
-    if (lvls.asia_high) {
-      candleSeries.createPriceLine({ price: lvls.asia_high, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'ASIA HIGH' });
-    }
-    if (lvls.asia_low) {
-      candleSeries.createPriceLine({ price: lvls.asia_low, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'ASIA LOW' });
-    }
-    if (lvls.daily_eq) {
-      candleSeries.createPriceLine({ price: lvls.daily_eq, color: '#f59e0b', lineWidth: 2, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'DAILY EQ' });
-    }
-    if (lvls.pdh) {
-      candleSeries.createPriceLine({ price: lvls.pdh, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'PDH' });
-    }
-    if (lvls.pdl) {
-      candleSeries.createPriceLine({ price: lvls.pdl, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'PDL' });
-    }
+    if (lvls.asia_high) candleSeries.createPriceLine({ price: lvls.asia_high, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'ASIA HIGH' });
+    if (lvls.asia_low) candleSeries.createPriceLine({ price: lvls.asia_low, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'ASIA LOW' });
+    if (lvls.daily_eq) candleSeries.createPriceLine({ price: lvls.daily_eq, color: '#f59e0b', lineWidth: 2, lineStyle: LineStyle.Dashed, title: 'DAILY EQ' });
+    if (lvls.pdh) candleSeries.createPriceLine({ price: lvls.pdh, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'PDH' });
+    if (lvls.pdl) candleSeries.createPriceLine({ price: lvls.pdl, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'PDL' });
 
     if (dayData.trades && dayData.trades.length > 0) {
-      const markers: any[] = [];
-      dayData.trades.forEach((t) => {
-        const openEpoch = Math.floor(new Date(t.signal_time_utc).getTime() / 1000);
-        markers.push({
-          time: openEpoch as UTCTimestamp,
-          position: t.direction === 'BUY' ? 'belowBar' : 'aboveBar',
-          color: t.direction === 'BUY' ? '#10b981' : '#ef4444',
-          shape: t.direction === 'BUY' ? 'arrowUp' : 'arrowDown',
-          text: `${t.direction} (${t.strategy})`,
-        });
-      });
-      markers.sort((a, b) => (a.time as number) - (b.time as number));
+      const markers = dayData.trades.map((t) => ({
+        time: Math.floor(new Date(t.signal_time_utc).getTime() / 1000) as UTCTimestamp,
+        position: (t.direction === 'BUY' ? 'belowBar' : 'aboveBar') as any,
+        color: t.direction === 'BUY' ? '#10b981' : '#ef4444',
+        shape: (t.direction === 'BUY' ? 'arrowUp' : 'arrowDown') as any,
+        text: `${t.direction} (${t.strategy})`,
+      })).sort((a, b) => (a.time as number) - (b.time as number));
       candleSeries.setMarkers(markers);
     }
 
-    const handleResize = () => {
-      if (chart && container) {
-        chart.applyOptions({ width: container.clientWidth });
-      }
-    };
+    const handleResize = () => { if (chart && container) chart.applyOptions({ width: container.clientWidth }); };
     window.addEventListener('resize', handleResize);
-
     return () => {
       window.removeEventListener('resize', handleResize);
       chart.remove();
@@ -547,30 +509,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   }, [activeSubTab, reportData, selectedDay, themeMode]);
 
   const kpis: BacktestKPIs = reportData?.global_kpis || {
-    count: 0,
-    win_rate: 0,
-    avg_r: 0,
-    expectancy: 0,
-    profit_factor: 0,
-    max_dd_money: 0,
-    avg_duration: 0,
-    best_r: 0,
-    worst_r: 0,
-    net_pnl: 0,
-    is_inconclusive: true,
+    count: 0, win_rate: 0, avg_r: 0, expectancy: 0, profit_factor: 0,
+    max_dd_money: 0, avg_duration: 0, best_r: 0, worst_r: 0, net_pnl: 0, is_inconclusive: true,
   };
 
   const filteredTrades = (reportData?.all_trades || []).filter((tr) => {
-    const matchStrat = strategyFilter === 'ALL' || tr.strategy === strategyFilter;
-    const matchOutcome = outcomeFilter === 'ALL' || tr.result === outcomeFilter;
-    return matchStrat && matchOutcome;
+    return (strategyFilter === 'ALL' || tr.strategy === strategyFilter) &&
+           (outcomeFilter === 'ALL' || tr.result === outcomeFilter);
   });
 
   const rawTips: ImprovementTip[] = reportData?.improvement_tips || [];
   const activeTips = rawTips.filter((tip) => {
-    const isDismissed = dismissedTipIds.includes(tip.id);
-    const matchFilter = tipFilter === 'ALL' || tip.strategy === tipFilter || tip.category === tipFilter;
-    return !isDismissed && matchFilter;
+    return !dismissedTipIds.includes(tip.id) &&
+           (tipFilter === 'ALL' || tip.strategy === tipFilter || tip.category === tipFilter);
   });
 
   const skippedDetail = (reportData as any)?.skipped_detail || {};
@@ -603,7 +554,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           </p>
         </div>
 
-        {/* Action Controls */}
+        {/* Action Controls & Verification Button */}
         <div className="flex flex-wrap items-center gap-2.5">
           <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1.5 rounded-xl border border-slate-300 dark:border-[#1a2030]">
             <select
@@ -612,9 +563,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               disabled={isRunning}
               className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
             >
-              {WHITELIST_ASSETS.map((sym) => (
-                <option key={sym} value={sym}>{sym}</option>
-              ))}
+              {WHITELIST_ASSETS.map((sym) => (<option key={sym} value={sym}>{sym}</option>))}
             </select>
 
             <select
@@ -633,9 +582,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <span className="text-[10px] font-bold text-slate-500">R:R</span>
               <input
                 type="number"
-                step="0.1"
-                min="0.5"
-                max="5.0"
+                step="0.1" min="0.5" max="5.0"
                 value={testRr}
                 onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)}
                 disabled={isRunning}
@@ -653,12 +600,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   <Play className="w-3.5 h-3.5" />
                   <span>Run {testSymbol}</span>
                 </button>
-
                 <button
                   type="button"
                   onClick={() => handleRunBacktest('ALL')}
                   className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white"
-                  title="Runs 8-combination matrix across all whitelist pairs"
                 >
                   <Layers className="w-3.5 h-3.5" />
                   <span>Run All</span>
@@ -678,29 +623,23 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
           <div className="h-6 w-px bg-slate-300 dark:border-[#1a2030] hidden sm:block" />
 
-          {/* Report Viewer & Copy for AI */}
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-bold text-slate-500">Report:</span>
-            <select
-              value={selectedFile}
-              onChange={(e) => setSelectedFile(e.target.value)}
-              disabled={isRunning}
-              className="px-3 py-2 rounded-xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer max-w-xs truncate"
+          {/* Verification Tool Button */}
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              disabled={isVerifying || isRunning}
+              onClick={handleVerifyVsOriginal}
+              className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors"
+              title="Runs reference original per-candle engine against optimized version and reports trade differences"
             >
-              {reportFiles.length === 0 ? (
-                <option value="">No reports found</option>
-              ) : (
-                reportFiles.map((f) => (
-                  <option key={f} value={f}>{prettifyReportName(f)}</option>
-                ))
-              )}
-            </select>
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>{isVerifying ? 'Verifying...' : 'Verify vs original (60 days)'}</span>
+            </button>
 
             <button
               type="button"
               onClick={handleCopyForAI}
               className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors shrink-0"
-              title="Copy markdown summary of all combinations and funnel for AI review"
             >
               {copyStatus === 'copied' ? (
                 <>
@@ -717,6 +656,42 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           </div>
         </div>
       </motion.div>
+
+      {/* VERIFY VS ORIGINAL DIFF RESULT BOX */}
+      {verifyResult && (
+        <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3 animate-in fade-in">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-purple-500" />
+              <span className="text-xs font-bold text-black dark:text-white">Verification Difference Report (60 Days vs Reference Original)</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleCopyVerifyResult}
+                className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs"
+              >
+                {verifyCopyStatus === 'copied' ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{verifyCopyStatus === 'copied' ? 'Copied' : 'Copy Verification Result'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setVerifyResult(null)}
+                className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer ml-1"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+          <textarea
+            readOnly
+            value={verifyResult}
+            rows={14}
+            onFocus={(e) => e.target.select()}
+            className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none leading-relaxed"
+          />
+        </div>
+      )}
 
       {/* STORAGE STRIP */}
       {storageInfo && (
@@ -757,7 +732,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
-          {/* Volume progress bar (turns red when used capacity exceeds 85%) */}
           {(() => {
             const usedPct = storageInfo.total_mb > 0 
               ? Math.min(100, Math.round((storageInfo.used_mb / storageInfo.total_mb) * 100)) 
@@ -778,7 +752,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* Per-Symbol Results Box (Wrapped Error Output + Expandable Phase Timers) */}
+      {/* Per-Symbol Results Box */}
       {runResults.length > 0 && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -936,8 +910,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         <div className="p-4 rounded-2xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] space-y-2 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <span className="font-bold text-slate-500">Active Report:</span>
-              <span className="font-mono font-bold text-black dark:text-white">{prettifyReportName(selectedFile)}</span>
+              <span className="font-bold text-slate-500">Report File:</span>
+              <select
+                value={selectedFile}
+                onChange={(e) => setSelectedFile(e.target.value)}
+                disabled={isRunning}
+                className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer max-w-sm truncate"
+              >
+                {reportFiles.map((f) => (<option key={f} value={f}>{prettifyReportName(f)}</option>))}
+              </select>
               <span className="font-mono text-blue-600 dark:text-blue-400">
                 (Adaptive Coverage: {(reportData as any).adaptive_effective_pct ?? 100}%)
               </span>
@@ -950,7 +931,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             )}
           </div>
 
-          {/* Signal Generation Funnel */}
           {funnel && (
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-2 border-t border-slate-200 dark:border-[#1a2030] text-center font-mono">
               <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
@@ -1083,7 +1063,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
-          {/* Strategy Performance */}
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
             <h3 className="text-sm font-bold text-black dark:text-white mb-3">Performance by Strategy</h3>
             <div className="overflow-x-auto">
@@ -1132,7 +1111,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
-          {/* Weekday Performance */}
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
             <h3 className="text-sm font-bold text-black dark:text-white mb-3">Performance by Day of Week</h3>
             <div className="overflow-x-auto">
@@ -1179,7 +1157,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             </div>
           </div>
 
-          {/* Skipped Detail */}
           {skippedDetail && (skippedDetail.by_reason || Object.keys(skippedDetail).length > 0) && (
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-4">
               <h3 className="text-sm font-bold text-black dark:text-white">Skipped Signals Summary</h3>
@@ -1237,9 +1214,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white cursor-pointer"
               >
                 <option value="ALL">All Tips</option>
-                {Array.from(new Set(rawTips.map((t) => t.strategy))).map((s) => (
-                  <option key={s} value={s}>{s}</option>
-                ))}
+                {Array.from(new Set(rawTips.map((t) => t.strategy))).map((s) => (<option key={s} value={s}>{s}</option>))}
               </select>
             </div>
 
@@ -1266,9 +1241,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <div className="text-sm font-bold text-black dark:text-white">
                 No tip rules triggered (sample too small or no pattern above thresholds)
               </div>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                No active recommendations pending.
-              </p>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1280,22 +1252,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   <div
                     key={tip.id}
                     className={`p-5 rounded-2xl border bg-white dark:bg-[#0f1118] shadow-xs flex flex-col justify-between space-y-4 ${
-                      isHigh
-                        ? 'border-rose-500/30 dark:border-rose-500/30'
-                        : isMed
-                        ? 'border-amber-500/30 dark:border-amber-500/30'
-                        : 'border-blue-500/30 dark:border-blue-500/30'
+                      isHigh ? 'border-rose-500/30' : isMed ? 'border-amber-500/30' : 'border-blue-500/30'
                     }`}
                   >
                     <div>
                       <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-[#1a2030]">
                         <div className="flex items-center gap-2">
                           <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
-                            isHigh
-                              ? 'bg-rose-500/15 text-rose-600 border border-rose-500/30'
-                              : isMed
-                              ? 'bg-amber-500/15 text-amber-600 border border-amber-500/30'
-                              : 'bg-blue-500/15 text-blue-600 border border-blue-500/30'
+                            isHigh ? 'bg-rose-500/15 text-rose-600 border border-rose-500/30' : isMed ? 'bg-amber-500/15 text-amber-600 border border-amber-500/30' : 'bg-blue-500/15 text-blue-600 border border-blue-500/30'
                           }`}>
                             {tip.severity} PRIORITY
                           </span>
@@ -1303,32 +1267,22 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                             {tip.strategy}
                           </span>
                         </div>
-
                         <button
                           type="button"
                           onClick={() => handleDismissTip(tip.id)}
                           className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-500/10 transition-colors cursor-pointer"
-                          title="Dismiss this tip"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
-
-                      <h4 className="text-sm font-bold text-black dark:text-white mt-3">
-                        {tip.title}
-                      </h4>
-                      <p className="text-xs text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
-                        {tip.description}
-                      </p>
+                      <h4 className="text-sm font-bold text-black dark:text-white mt-3">{tip.title}</h4>
+                      <p className="text-xs text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">{tip.description}</p>
                     </div>
-
                     <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] text-xs">
                       <div className="font-bold text-blue-600 dark:text-blue-400 text-[11px] mb-1 flex items-center gap-1.5">
                         <Lightbulb className="w-3.5 h-3.5" /> Recommended Tweak:
                       </div>
-                      <div className="text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed">
-                        {tip.action}
-                      </div>
+                      <div className="text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed">{tip.action}</div>
                     </div>
                   </div>
                 );
@@ -1349,12 +1303,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 onChange={(e) => setSelectedDay(e.target.value)}
                 className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
               >
-                {(reportData?.trading_dates || []).map((d) => (
-                  <option key={d} value={d}>{d}</option>
-                ))}
+                {(reportData?.trading_dates || []).map((d) => (<option key={d} value={d}>{d}</option>))}
               </select>
             </div>
-
             <div className="flex items-center gap-3 text-[11px] font-mono text-slate-500">
               <span className="flex items-center gap-1"><span className="w-2 h-0.5 bg-blue-500 inline-block" /> Asia H/L</span>
               <span className="flex items-center gap-1"><span className="w-2 h-0.5 bg-amber-500 inline-block" /> Daily EQ</span>
@@ -1391,18 +1342,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                   {(reportData?.day_data?.[selectedDay]?.trades || []).map((t: any, idx: number) => (
                     <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
                       <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {t.direction}
-                      </td>
+                      <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>{t.direction}</td>
                       <td className="py-2.5 px-3">{t.lots}</td>
                       <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
                       <td className="py-2.5 px-3">{formatPriceBySymbol(t.exit_price, t.symbol)}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {t.r_multiple}R
-                      </td>
-                      <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        ${t.money_pnl}
-                      </td>
+                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{t.r_multiple}R</td>
+                      <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${t.money_pnl}</td>
                       <td className="py-2.5 px-3 text-slate-400">{t.exit_reason}</td>
                     </tr>
                   ))}
@@ -1425,9 +1370,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white cursor-pointer"
               >
                 <option value="ALL">All Strategies</option>
-                {Object.keys(reportData?.strategy_kpis || {}).map((s) => (
-                  <option key={s} value={s}>{s}</option>
-                ))}
+                {Object.keys(reportData?.strategy_kpis || {}).map((s) => (<option key={s} value={s}>{s}</option>))}
               </select>
 
               <label className="font-bold text-slate-500">Outcome:</label>
@@ -1442,7 +1385,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 <option value="BREAKEVEN">Breakeven Only</option>
               </select>
             </div>
-
             <span className="font-mono text-slate-500 text-xs">Showing {filteredTrades.length} trades</span>
           </div>
 
@@ -1470,26 +1412,18 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                     <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
                       <td className="py-2.5 px-3 text-slate-400">{t.date_sast || t.date}</td>
                       <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {t.direction}
-                      </td>
+                      <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>{t.direction}</td>
                       <td className="py-2.5 px-3">{t.lots}</td>
                       <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
                       <td className="py-2.5 px-3 text-rose-500">{formatPriceBySymbol(t.sl, t.symbol)}</td>
                       <td className="py-2.5 px-3 text-emerald-500">{formatPriceBySymbol(t.tp, t.symbol)}</td>
                       <td className="py-2.5 px-3 text-slate-400">{t.exit_time}</td>
                       <td className="py-2.5 px-3 text-slate-400">{t.exit_reason}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {t.r_multiple}R
-                      </td>
-                      <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        ${t.money_pnl}
-                      </td>
+                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{t.r_multiple}R</td>
+                      <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${t.money_pnl}</td>
                       <td className="py-2.5 px-3 text-center">
                         <span className={`text-[9px] px-2 py-0.5 rounded font-mono font-bold ${
-                          t.result === 'WIN' 
-                            ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30' 
-                            : 'bg-rose-500/15 text-rose-500 border border-rose-500/30'
+                          t.result === 'WIN' ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30' : 'bg-rose-500/15 text-rose-500 border border-rose-500/30'
                         }`}>
                           {t.result}
                         </span>
