@@ -20,7 +20,8 @@ import {
   Power, 
   PowerOff, 
   Palette,
-  Target
+  Target,
+  Layers
 } from 'lucide-react';
 import { 
   ThemeMode, 
@@ -296,7 +297,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Min R:R Input (No R:R slider!) */}
+          {/* Min R:R Input */}
           <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-center justify-between">
             <div>
               <span className="font-bold text-slate-900 dark:text-white">Minimum Target R:R Filter (1 : R)</span>

@@ -3,7 +3,8 @@ import { motion } from 'motion/react';
 import { createChart, IChartApi, ColorType, LineStyle, UTCTimestamp } from 'lightweight-charts';
 import { 
   Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw, 
-  Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer 
+  Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer,
+  FileText
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -293,7 +294,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     } finally { setIsVerifying(false); }
   };
 
-  // Safe client-side PDF export with dynamic library loader & fallback
   const handleExportPDF = async () => {
     setIsExportingPdf(true);
     try {
@@ -443,7 +443,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         console.warn('jsPDF dynamic import skipped, falling back to browser print engine:', importErr);
       }
 
-      // Native fallback if jsPDF is not yet compiled into client bundle
       if (!jsPdfLoaded) {
         const printWindow = window.open('', '_blank');
         if (printWindow) {
