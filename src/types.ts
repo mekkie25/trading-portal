@@ -51,6 +51,8 @@ export interface TopMetrics {
   unrealizedPnL: number;
 }
 
+export type RiskProfileName = 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth';
+
 export interface BotSettings {
   masterExecution: boolean;
   riskPerTradePct: number;
@@ -68,6 +70,9 @@ export interface BotSettings {
   weeklyGoalTarget?: number;
   monthlyGoalTarget?: number;
   weeklyDepositBaseline?: number;
+
+  // PROPOSED: Selectable risk profile. null = legacy fixed-risk behaviour.
+  riskProfile?: RiskProfileName | null;
 }
 
 export interface TradeRecord {

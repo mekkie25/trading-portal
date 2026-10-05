@@ -24,6 +24,8 @@ interface BotGatewayConfig {
   version: number;
   strategyModes?: Record<string, string>;
   limitsConfirmedAt?: string;
+  // PROPOSED: Selectable risk profile. null = legacy fixed-risk behaviour.
+  riskProfile?: 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth' | null;
 }
 
 interface RiskLimitsConfig {
