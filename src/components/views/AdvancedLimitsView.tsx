@@ -11,7 +11,8 @@ import {
   Target,
   Shield
 } from 'lucide-react';
-import { AdvancedLimits, ThemeMode } from '../../types';
+import { AdvancedLimits, ThemeMode, RiskProfileName } from '../../types';
+import { formatCurrency } from '../../utils/currency';
 
 interface AdvancedLimitsViewProps {
   limits: AdvancedLimits;
@@ -19,7 +20,21 @@ interface AdvancedLimitsViewProps {
   currentEquity: number;
   themeMode?: ThemeMode;
   onHaltBot?: (halted: boolean) => void;
+  // PROPOSED (Fix 2b): active risk profile from App state. Display-only.
+  riskProfile?: RiskProfileName | null;
+  // Optional: currency to format the derived ceilings with. Falls back to USD.
+  brokerCurrency?: string;
 }
+
+// PROPOSED: must match RISK_PROFILES in risk/risk_manager.py
+// Display-only. No decision code may read these numbers. If the Python
+// profiles change, this map must be updated in the same commit.
+const PROFILE_LIMITS: Record<string, { daily: number; weekly: number; monthly: number }> = {
+  'Steady':     { daily:  5, weekly: 10, monthly: 15 },
+  'Balanced':   { daily: 15, weekly: 25, monthly: 40 },
+  'Aggressive': { daily: 30, weekly: 50, monthly: 70 },
+  'Max Growth': { daily: 50, weekly: 70, monthly: 85 },
+};
 
 export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
   limits,
@@ -27,6 +42,8 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
   currentEquity,
   themeMode = 'dark',
   onHaltBot,
+  riskProfile = null,
+  brokerCurrency = 'USD',
 }) => {
   const [formLimits, setFormLimits] = useState<AdvancedLimits>(limits);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -55,17 +72,43 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
     }
   };
 
-  const maxDaily = formLimits.maxDailyLossUsd || 10;
+  // PROPOSED (Fix 2b): when a profile is active and the toggle is on,
+  // show the profile's real ceilings. Otherwise today's behaviour.
+  const profileActive = Boolean(riskProfile && PROFILE_LIMITS[riskProfile]);
+  const switchOn = formLimits.useProfileDrawdownPct !== false;
+  const useProfileView = profileActive && switchOn;
+
+  let maxDaily: number;
+  let maxWeekly: number;
+  let maxMonthly: number;
+  let dailyPctLabel: string | null = null;
+  let weeklyPctLabel: string | null = null;
+  let monthlyPctLabel: string | null = null;
+
+  if (useProfileView && riskProfile) {
+    const pl = PROFILE_LIMITS[riskProfile];
+    maxDaily = Number(((currentEquity || 0) * pl.daily / 100).toFixed(2));
+    maxWeekly = Number(((currentEquity || 0) * pl.weekly / 100).toFixed(2));
+    maxMonthly = Number(((currentEquity || 0) * pl.monthly / 100).toFixed(2));
+    dailyPctLabel = `${pl.daily}%`;
+    weeklyPctLabel = `${pl.weekly}%`;
+    monthlyPctLabel = `${pl.monthly}%`;
+  } else {
+    maxDaily = formLimits.maxDailyLossUsd ?? 0;
+    maxWeekly = formLimits.maxWeeklyLossUsd ?? 0;
+    maxMonthly = formLimits.maxMonthlyLossUsd ?? 0;
+  }
+
   const currentDaily = formLimits.currentDailyLossUsd || 0;
   const dailyPct = maxDaily > 0 ? Math.min(100, Math.round((currentDaily / maxDaily) * 100)) : 0;
 
-  const maxWeekly = formLimits.maxWeeklyLossUsd || 25;
   const currentWeekly = formLimits.currentWeeklyLossUsd || 0;
   const weeklyPct = maxWeekly > 0 ? Math.min(100, Math.round((currentWeekly / maxWeekly) * 100)) : 0;
 
-  const maxMonthly = formLimits.maxMonthlyLossUsd || 50;
   const currentMonthly = formLimits.currentMonthlyLossUsd || 0;
   const monthlyPct = maxMonthly > 0 ? Math.min(100, Math.round((currentMonthly / maxMonthly) * 100)) : 0;
+
+  const fmt = (v: number) => formatCurrency(v, brokerCurrency);
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
@@ -97,6 +140,16 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
         )}
       </motion.div>
 
+      {/* PROPOSED (Fix 2b): explain what the cards are showing when the profile is active. */}
+      {useProfileView && riskProfile && (
+        <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 text-xs text-slate-700 dark:text-slate-300">
+          <strong className="text-blue-600 dark:text-blue-400">Showing {riskProfile} profile caps</strong>
+          {' '}— daily {PROFILE_LIMITS[riskProfile].daily}%, weekly {PROFILE_LIMITS[riskProfile].weekly}%,
+          {' '}monthly {PROFILE_LIMITS[riskProfile].monthly}% of current equity
+          ({fmt(currentEquity)}). Turn the switch below off to use your own USD ceilings instead.
+        </div>
+      )}
+
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -109,12 +162,19 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
                 <Clock className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Daily Loss Ceiling
               </span>
               <span className="font-mono text-xs font-bold text-slate-900 dark:text-white">
-                ${currentDaily.toFixed(2)} / ${maxDaily.toFixed(2)}
+                {dailyPctLabel
+                  ? `${dailyPctLabel} (${fmt(maxDaily)})`
+                  : `${fmt(currentDaily)} / ${fmt(maxDaily)}`}
               </span>
             </div>
             <div className="w-full bg-slate-100 dark:bg-[#0d1017] rounded-full h-3 mt-3 overflow-hidden border border-slate-200 dark:border-[#212838] p-0.5">
               <div className="h-full rounded-full bg-blue-600 transition-all duration-500" style={{ width: `${dailyPct}%` }} />
             </div>
+            {dailyPctLabel && (
+              <p className="text-[10px] text-slate-500 mt-2 font-mono">
+                Cap: {fmt(maxDaily)} · Used: {fmt(currentDaily)} ({dailyPct}%)
+              </p>
+            )}
           </div>
           <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#212838] flex items-center justify-between text-xs">
             <span className="text-slate-500">Action:</span>
@@ -129,12 +189,19 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
                 <Calendar className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Weekly Loss Ceiling
               </span>
               <span className="font-mono text-xs font-bold text-slate-900 dark:text-white">
-                ${currentWeekly.toFixed(2)} / ${maxWeekly.toFixed(2)}
+                {weeklyPctLabel
+                  ? `${weeklyPctLabel} (${fmt(maxWeekly)})`
+                  : `${fmt(currentWeekly)} / ${fmt(maxWeekly)}`}
               </span>
             </div>
             <div className="w-full bg-slate-100 dark:bg-[#0d1017] rounded-full h-3 mt-3 overflow-hidden border border-slate-200 dark:border-[#212838] p-0.5">
               <div className="h-full rounded-full bg-indigo-600 transition-all duration-500" style={{ width: `${weeklyPct}%` }} />
             </div>
+            {weeklyPctLabel && (
+              <p className="text-[10px] text-slate-500 mt-2 font-mono">
+                Cap: {fmt(maxWeekly)} · Used: {fmt(currentWeekly)} ({weeklyPct}%)
+              </p>
+            )}
           </div>
           <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#212838] flex items-center justify-between text-xs">
             <span className="text-slate-500">Action:</span>
@@ -149,12 +216,19 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
                 <Layers className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Monthly Loss Ceiling
               </span>
               <span className="font-mono text-xs font-bold text-slate-900 dark:text-white">
-                ${currentMonthly.toFixed(2)} / ${maxMonthly.toFixed(2)}
+                {monthlyPctLabel
+                  ? `${monthlyPctLabel} (${fmt(maxMonthly)})`
+                  : `${fmt(currentMonthly)} / ${fmt(maxMonthly)}`}
               </span>
             </div>
             <div className="w-full bg-slate-100 dark:bg-[#0d1017] rounded-full h-3 mt-3 overflow-hidden border border-slate-200 dark:border-[#212838] p-0.5">
               <div className="h-full rounded-full bg-emerald-600 transition-all duration-500" style={{ width: `${monthlyPct}%` }} />
             </div>
+            {monthlyPctLabel && (
+              <p className="text-[10px] text-slate-500 mt-2 font-mono">
+                Cap: {fmt(maxMonthly)} · Used: {fmt(currentMonthly)} ({monthlyPct}%)
+              </p>
+            )}
           </div>
           <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#212838] flex items-center justify-between text-xs">
             <span className="text-slate-500">Action:</span>
@@ -192,7 +266,6 @@ export const AdvancedLimitsView: React.FC<AdvancedLimitsViewProps> = ({
           )}
         </div>
 
-        {/* PROPOSED (Gap 2): switch between profile % and USD ceilings when a profile is active */}
         <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#0d1017] border border-slate-200 dark:border-[#212838] flex items-start justify-between gap-4">
           <div className="flex items-start gap-3">
             <div className="p-2 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 shrink-0">

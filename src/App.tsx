@@ -358,13 +358,15 @@ export default function App() {
             />
           )}
 
-          {currentTab === 'limits' && (
+         {currentTab === 'limits' && (
             <AdvancedLimitsView
               limits={limits}
               onUpdateLimits={handleUpdateLimits}
               currentEquity={metrics.currentEquity}
               themeMode={themeMode}
               onHaltBot={(halted) => handleSaveBotSettings({ ...botSettings, masterExecution: !halted })}
+              riskProfile={botSettings.riskProfile ?? null}
+              brokerCurrency={brokerConfig.currency || 'USD'}
             />
           )}
 
