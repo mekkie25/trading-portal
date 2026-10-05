@@ -14,10 +14,29 @@ import {
   Trash2,
   Database,
   ArrowUpRight,
-  ArrowDownRight
+  ArrowDownRight,
+  ArrowUpDown,
+  Calendar
 } from 'lucide-react';
 import { TradeRecord, GoogleSheetsConfig, BrokerConfig, ThemeMode } from '../../types';
 import { formatCurrency } from '../../utils/currency';
+
+type SortMode = 'date_desc' | 'date_asc' | 'pnl_desc' | 'pnl_asc';
+
+const MONTH_LABELS: Array<{ key: string; label: string }> = [
+  { key: '01', label: 'Jan' },
+  { key: '02', label: 'Feb' },
+  { key: '03', label: 'Mar' },
+  { key: '04', label: 'Apr' },
+  { key: '05', label: 'May' },
+  { key: '06', label: 'Jun' },
+  { key: '07', label: 'Jul' },
+  { key: '08', label: 'Aug' },
+  { key: '09', label: 'Sep' },
+  { key: '10', label: 'Oct' },
+  { key: '11', label: 'Nov' },
+  { key: '12', label: 'Dec' },
+];
 
 interface TradeJournalViewProps {
   trades: TradeRecord[];
@@ -41,6 +60,9 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [assetFilter, setAssetFilter] = useState('ALL');
   const [statusFilter, setStatusFilter] = useState('ALL');
+  const [sortMode, setSortMode] = useState<SortMode>('date_desc');
+  const [yearFilter, setYearFilter] = useState<string>('all');
+  const [monthFilter, setMonthFilter] = useState<string>('all');
   const [isSyncingSheets, setIsSyncingSheets] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -55,8 +77,18 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
   const [newClosePrice, setNewClosePrice] = useState(46250.00);
   const [newPnL, setNewPnL] = useState(130.00);
 
+  // Distinct years present in the journal, sorted newest first.
+  const availableYears = useMemo(() => {
+    const years = new Set<string>();
+    trades.forEach((t) => {
+      const dt = (t.closeTime || t.openTime || '').slice(0, 4);
+      if (/^\d{4}$/.test(dt)) years.add(dt);
+    });
+    return Array.from(years).sort().reverse();
+  }, [trades]);
+
   const filteredTrades = useMemo(() => {
-    return trades.filter((tr) => {
+    let list = trades.filter((tr) => {
       const matchSearch =
         tr.ticket.toLowerCase().includes(searchQuery.toLowerCase()) ||
         tr.asset.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -65,7 +97,30 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
       const matchStatus = statusFilter === 'ALL' || tr.status === statusFilter;
       return matchSearch && matchAsset && matchStatus;
     });
-  }, [trades, searchQuery, assetFilter, statusFilter]);
+
+    // Year / month filter
+    if (yearFilter !== 'all' || monthFilter !== 'all') {
+      list = list.filter((tr) => {
+        const dt = tr.closeTime || tr.openTime || '';
+        const y = dt.slice(0, 4);
+        const m = dt.slice(5, 7);
+        if (yearFilter !== 'all' && y !== yearFilter) return false;
+        if (monthFilter !== 'all' && m !== monthFilter) return false;
+        return true;
+      });
+    }
+
+    // Sort
+    list = [...list].sort((a, b) => {
+      if (sortMode === 'date_desc') return (b.closeTime || '').localeCompare(a.closeTime || '');
+      if (sortMode === 'date_asc') return (a.closeTime || '').localeCompare(b.closeTime || '');
+      if (sortMode === 'pnl_desc') return (b.pnl || 0) - (a.pnl || 0);
+      if (sortMode === 'pnl_asc') return (a.pnl || 0) - (b.pnl || 0);
+      return 0;
+    });
+
+    return list;
+  }, [trades, searchQuery, assetFilter, statusFilter, yearFilter, monthFilter, sortMode]);
 
   const stats = useMemo(() => {
     const totalCount = filteredTrades.length;
@@ -202,7 +257,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
   };
 
   return (
-    <div className="h-full overflow-y-auto p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
+    <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
       {syncNotice && (
         <div className="p-4 rounded-xl bg-blue-600 text-white shadow-lg flex items-center gap-2.5 text-xs font-semibold animate-in fade-in border border-blue-400">
           <CheckCircle2 className="w-4 h-4 text-emerald-300 shrink-0" />
@@ -314,7 +369,72 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
         </div>
       </motion.div>
 
-      {/* Filter and Search Bar */}
+      {/* Period + Sort Bar */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider flex items-center gap-1">
+            <Calendar className="w-3 h-3" /> Year
+          </span>
+          <button
+            type="button"
+            onClick={() => setYearFilter('all')}
+            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold font-mono transition-colors cursor-pointer border ${
+              yearFilter === 'all'
+                ? 'bg-blue-600 text-white border-blue-600'
+                : 'bg-white dark:bg-[#08090d] text-slate-600 dark:text-slate-300 border-slate-300 dark:border-[#1a2030] hover:border-slate-400'
+            }`}
+          >
+            All
+          </button>
+          {availableYears.map((y) => (
+            <button
+              key={y}
+              type="button"
+              onClick={() => setYearFilter(y)}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold font-mono transition-colors cursor-pointer border ${
+                yearFilter === y
+                  ? 'bg-blue-600 text-white border-blue-600'
+                  : 'bg-white dark:bg-[#08090d] text-slate-600 dark:text-slate-300 border-slate-300 dark:border-[#1a2030] hover:border-slate-400'
+              }`}
+            >
+              {y}
+            </button>
+          ))}
+          {availableYears.length === 0 && (
+            <span className="text-[11px] text-slate-500 italic">No trades yet</span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <select
+            value={monthFilter}
+            onChange={(e) => setMonthFilter(e.target.value)}
+            className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold text-black dark:text-slate-200 focus:outline-none focus:border-blue-500 cursor-pointer"
+          >
+            <option value="all">All Months</option>
+            {MONTH_LABELS.map((m) => (
+              <option key={m.key} value={m.key}>{m.label}</option>
+            ))}
+          </select>
+
+          <select
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value as SortMode)}
+            className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold text-black dark:text-slate-200 focus:outline-none focus:border-blue-500 cursor-pointer"
+          >
+            <option value="date_desc">Newest first</option>
+            <option value="date_asc">Oldest first</option>
+            <option value="pnl_desc">P&L: high → low</option>
+            <option value="pnl_asc">P&L: low → high</option>
+          </select>
+        </div>
+      </motion.div>
+
+      {/* Search / Asset / Status Bar */}
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -378,7 +498,13 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-[#141a26]">
-              {filteredTrades.map((trade) => {
+              {filteredTrades.length === 0 ? (
+                <tr>
+                  <td colSpan={9} className="py-10 text-center text-xs text-slate-500 font-mono">
+                    No trades match the current filters.
+                  </td>
+                </tr>
+              ) : filteredTrades.map((trade) => {
                 const isWin = trade.status === 'WIN';
                 const isLoss = trade.status === 'LOSS';
                 return (
@@ -433,7 +559,6 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                         {trade.status}
                       </span>
                     </td>
-                    {/* Individual Delete Action */}
                     <td className="py-3.5 px-4 text-right">
                       {onDeleteTrade && (
                         <button
