@@ -8,6 +8,7 @@ Quantitative Indicator and Institutional Market Profile Library.
 - SuperTrend Indicator (ATR 10, Factor 1.6 / 1.25)
 - CVD Absorption Proxy Engine
 - Candlestick anatomy validators (True Engulfing, Rejection Wick)
+Optimized with pure NumPy vectorization for high-throughput backtesting.
 """
 
 import pandas as pd
@@ -38,17 +39,28 @@ def calculate_emas(data: pd.DataFrame, column: str = 'close') -> pd.DataFrame:
 
 def calculate_session_vwap(df: pd.DataFrame, session_mask: pd.Series = None) -> pd.Series:
     """Calculates true Session VWAP reset at session boundaries."""
-    typical_price = (df['high'] + df['low'] + df['close']) / 3.0
-    vol = df['tick_volume'] if 'tick_volume' in df.columns else df.get('volume', pd.Series(1, index=df.index))
-    vol = vol.replace(0, 1)
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    typical_price = (high + low + close) / 3.0
+
+    if 'tick_volume' in df.columns:
+        vol = df['tick_volume'].values.astype(float)
+    elif 'volume' in df.columns:
+        vol = df['volume'].values.astype(float)
+    else:
+        vol = np.ones(len(df), dtype=float)
+    vol = np.where(vol == 0, 1.0, vol)
 
     if session_mask is not None:
-        typical_price = typical_price.where(session_mask, 0)
-        vol = vol.where(session_mask, 0)
+        mask = session_mask.values
+        typical_price = np.where(mask, typical_price, 0.0)
+        vol = np.where(mask, vol, 0.0)
 
-    cum_vol = vol.cumsum()
-    cum_pv = (typical_price * vol).cumsum()
-    return cum_pv / (cum_vol + 1e-10)
+    cum_vol = np.cumsum(vol)
+    cum_pv = np.cumsum(typical_price * vol)
+    vwap_vals = cum_pv / (cum_vol + 1e-10)
+    return pd.Series(vwap_vals, index=df.index)
 
 def calculate_anchored_vwap(df: pd.DataFrame, anchor_index: int) -> pd.Series:
     """Anchors VWAP to a specific bar index (e.g. Start of Week, NFP bar, ATH)."""
@@ -56,13 +68,22 @@ def calculate_anchored_vwap(df: pd.DataFrame, anchor_index: int) -> pd.Series:
     if anchor_index >= len(df) or anchor_index < 0:
         return calculate_session_vwap(df)
 
-    sub_df = df.iloc[anchor_index:].copy()
-    typical_price = (sub_df['high'] + sub_df['low'] + sub_df['close']) / 3.0
-    vol = sub_df['tick_volume'] if 'tick_volume' in sub_df.columns else sub_df.get('volume', pd.Series(1, index=sub_df.index))
-    vol = vol.replace(0, 1)
+    sub_df = df.iloc[anchor_index:]
+    high = sub_df['high'].values
+    low = sub_df['low'].values
+    close = sub_df['close'].values
+    typical_price = (high + low + close) / 3.0
 
-    cum_vol = vol.cumsum()
-    cum_pv = (typical_price * vol).cumsum()
+    if 'tick_volume' in sub_df.columns:
+        vol = sub_df['tick_volume'].values.astype(float)
+    elif 'volume' in sub_df.columns:
+        vol = sub_df['volume'].values.astype(float)
+    else:
+        vol = np.ones(len(sub_df), dtype=float)
+    vol = np.where(vol == 0, 1.0, vol)
+
+    cum_vol = np.cumsum(vol)
+    cum_pv = np.cumsum(typical_price * vol)
     sub_vwap = cum_pv / (cum_vol + 1e-10)
     vwap.iloc[anchor_index:] = sub_vwap
     vwap.iloc[:anchor_index] = np.nan
@@ -76,21 +97,33 @@ def get_session_volume_profile(df: pd.DataFrame, bins: int = 50, value_area_pct:
     """
     Calculates POC, VAH, and VAL using the institutional 75% Value Area expansion
     algorithm moving outward from POC (Spec Section 2: '75% value area boundary').
+    Optimized with C-level NumPy array vectorization.
     """
     if value_area_pct is None:
         value_area_pct = GLOBAL_PARAMS.value_area_pct
 
-    if df.empty or len(df) < 5:
+    n_rows = len(df)
+    if df.empty or n_rows < 5:
         return {'poc': 0.0, 'vah': 0.0, 'val': 0.0, 'total_volume': 0.0}
 
-    price_min = float(df['low'].min())
-    price_max = float(df['high'].max())
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+
+    price_min = float(np.min(low))
+    price_max = float(np.max(high))
     if price_min == price_max:
         return {'poc': price_min, 'vah': price_max, 'val': price_min, 'total_volume': 0.0}
 
-    prices = (df['high'] + df['low'] + df['close']) / 3.0
-    vol = df['tick_volume'] if 'tick_volume' in df.columns else df.get('volume', pd.Series(1, index=df.index))
-    vol = vol.replace(0, 1)
+    prices = (high + low + close) / 3.0
+
+    if 'tick_volume' in df.columns:
+        vol = df['tick_volume'].values.astype(float)
+    elif 'volume' in df.columns:
+        vol = df['volume'].values.astype(float)
+    else:
+        vol = np.ones(n_rows, dtype=float)
+    vol = np.where(vol == 0, 1.0, vol)
 
     hist, bin_edges = np.histogram(prices, bins=bins, weights=vol)
     total_volume = float(np.sum(hist))
@@ -207,35 +240,46 @@ def calculate_cvd_absorption_proxy(df: pd.DataFrame, lookback: int = 10) -> Dict
     if df.empty or len(df) < lookback:
         return {'absorption_detected': False, 'delta_direction': 'NEUTRAL', 'absorption_score': 0.0}
 
-    recent = df.tail(lookback).copy()
-    vol = recent['tick_volume'] if 'tick_volume' in recent.columns else recent.get('volume', pd.Series(1, index=recent.index))
-    c_range = recent['high'] - recent['low']
-    c_range = c_range.replace(0, 1e-5)
+    recent = df.tail(lookback)
+    vol = recent['tick_volume'].values if 'tick_volume' in recent.columns else (recent['volume'].values if 'volume' in recent.columns else np.ones(lookback))
+    vol = np.where(vol == 0, 1.0, vol)
 
-    bar_bias = ((recent['close'] - recent['low']) / c_range - 0.5) * 2.0
+    high = recent['high'].values
+    low = recent['low'].values
+    close = recent['close'].values
+    open_p = recent['open'].values
+
+    c_range = high - low
+    c_range = np.where(c_range == 0, 1e-5, c_range)
+
+    bar_bias = ((close - low) / c_range - 0.5) * 2.0
     signed_vol = vol * bar_bias
-    cum_delta = signed_vol.cumsum()
+    cum_delta = np.sum(signed_vol)
 
-    last_vol = vol.iloc[-1]
-    avg_vol = vol.iloc[:-1].mean()
-    last_range = c_range.iloc[-1]
-    avg_range = c_range.iloc[:-1].mean()
+    last_vol = vol[-1]
+    avg_vol = np.mean(vol[:-1])
+    last_range = c_range[-1]
+    avg_range = np.mean(c_range[:-1])
 
     volume_spike = last_vol > (avg_vol * 1.35)
     effort_vs_result = (last_vol / avg_vol) > (last_range / avg_range)
 
-    last_bar = recent.iloc[-1]
+    last_close = close[-1]
+    last_open = open_p[-1]
+    last_low = low[-1]
+    last_high = high[-1]
+
     is_rejection_candle = (
-        (last_bar['close'] > last_bar['open'] and (last_bar['open'] - last_bar['low']) > (last_range * 0.4)) or
-        (last_bar['close'] < last_bar['open'] and (last_bar['high'] - last_bar['open']) > (last_range * 0.4))
+        (last_close > last_open and (last_open - last_low) > (last_range * 0.4)) or
+        (last_close < last_open and (last_high - last_open) > (last_range * 0.4))
     )
 
     absorption = bool(volume_spike and effort_vs_result and is_rejection_candle)
-    direction = 'BULLISH_ABSORPTION' if last_bar['close'] > last_bar['open'] else 'BEARISH_ABSORPTION'
+    direction = 'BULLISH_ABSORPTION' if last_close > last_open else 'BEARISH_ABSORPTION'
 
     return {
         'absorption_detected': absorption,
-        'delta_direction': direction if absorption else ('POSITIVE' if cum_delta.iloc[-1] > 0 else 'NEGATIVE'),
+        'delta_direction': direction if absorption else ('POSITIVE' if cum_delta > 0 else 'NEGATIVE'),
         'absorption_score': round(float(last_vol / (avg_vol + 1e-5)), 2)
     }
 

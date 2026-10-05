@@ -2,12 +2,17 @@
 core/session_levels.py
 Single Source of Truth for Session Levels (PDH/PDL, Pivots, Asia H/L, Frozen ORB, Weekly Open).
 Shared identically by both the live Matrix engine and the historical backtester.
+Optimized with day-level and session-level caching for constant structural levels.
 """
 
 import pandas as pd
 from datetime import datetime, timezone
 from typing import Dict, Tuple, Any, Optional
 from core.session_config import MarketSessionManager
+
+# Global day-level cache for constant structural levels: (symbol, date_str) -> dict
+_DAY_LEVELS_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
 
 def compute_frozen_opening_range(
     symbol: str,
@@ -38,7 +43,11 @@ def compute_frozen_opening_range(
         h, l = float(m5_df['high'].tail(12).max()), float(m5_df['low'].tail(12).min())
         return h, l, True, h, l, True
 
-    m5_df_time = pd.to_datetime(m5_df['time'], utc=True)
+    if not pd.api.types.is_datetime64_any_dtype(m5_df['time']):
+        m5_df_time = pd.to_datetime(m5_df['time'], utc=True)
+    else:
+        m5_df_time = m5_df['time']
+
     if in_london:
         t_open_local = times["LONDON"].replace(hour=8, minute=0, second=0, microsecond=0)
         t_open_utc = t_open_local.astimezone(timezone.utc)
@@ -67,6 +76,7 @@ def compute_frozen_opening_range(
     }
     return orb_h, orb_l, True, cracker_h, cracker_l, True
 
+
 def build_session_levels(
     symbol: str,
     m5_df: pd.DataFrame,
@@ -78,58 +88,93 @@ def build_session_levels(
 ) -> Dict[str, Any]:
     """
     Builds the standardized session_levels dictionary required by all strategies.
+    Uses daily structural caching for previous-day levels, pivots, and weekly open.
     """
-    # 1. Previous Day High, Low, Close (PDH / PDL / PDC)
-    if len(d1_df) >= 2:
-        prev_d1 = d1_df.iloc[-2]
-        pdh = float(prev_d1['high'])
-        pdl = float(prev_d1['low'])
-        pdc = float(prev_d1['close'])
-    else:
-        pdh = float(m5_df['high'].max())
-        pdl = float(m5_df['low'].min())
-        pdc = float(m5_df.iloc[-1]['close'])
+    now = as_of if as_of is not None else datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    cache_key = (symbol, today_str)
 
-    daily_pivot = (pdh + pdl + pdc) / 3.0
-    pivot_r1 = (2.0 * daily_pivot) - pdl
-    pivot_s1 = (2.0 * daily_pivot) - pdh
-    pivot_r2 = daily_pivot + (pdh - pdl)
-    pivot_s2 = daily_pivot - (pdh - pdl)
-    daily_eq = (pdh + pdl) / 2.0
+    # 1. Check or populate daily constant levels (PDH, PDL, PDC, Pivots, Weekly Open)
+    cached_day = _DAY_LEVELS_CACHE.get(cache_key)
+
+    if cached_day is None:
+        if len(d1_df) >= 2:
+            prev_d1 = d1_df.iloc[-2]
+            pdh = float(prev_d1['high'])
+            pdl = float(prev_d1['low'])
+            pdc = float(prev_d1['close'])
+        else:
+            pdh = float(m5_df['high'].max())
+            pdl = float(m5_df['low'].min())
+            pdc = float(m5_df.iloc[-1]['close'])
+
+        daily_pivot = (pdh + pdl + pdc) / 3.0
+        pivot_r1 = (2.0 * daily_pivot) - pdl
+        pivot_s1 = (2.0 * daily_pivot) - pdh
+        pivot_r2 = daily_pivot + (pdh - pdl)
+        pivot_s2 = daily_pivot - (pdh - pdl)
+        daily_eq = (pdh + pdl) / 2.0
+
+        # Weekly Open (+3h shift for Sunday 21:00 UTC alignment)
+        weekly_open = float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open'])
+        if not d1_df.empty:
+            d1_times = pd.to_datetime(d1_df['time'], utc=True) if not pd.api.types.is_datetime64_any_dtype(d1_df['time']) else d1_df['time']
+            d1_times_shifted = d1_times + pd.Timedelta(hours=3)
+            curr_week = d1_times_shifted.iloc[-1].isocalendar().week
+            curr_year = d1_times_shifted.iloc[-1].isocalendar().year
+            week_bars = d1_df[(d1_times_shifted.dt.isocalendar().week == curr_week) & (d1_times_shifted.dt.isocalendar().year == curr_year)]
+            if not week_bars.empty:
+                weekly_open = float(week_bars.iloc[0]['open'])
+
+        # Start-of-Week AVWAP Anchor
+        avwap_anchor_idx = 0
+        if not m5_df.empty:
+            m5_times = pd.to_datetime(m5_df['time'], utc=True) if not pd.api.types.is_datetime64_any_dtype(m5_df['time']) else m5_df['time']
+            mon_candles = m5_df[m5_times.dt.weekday == 0]
+            if not mon_candles.empty:
+                avwap_anchor_idx = int(m5_df.index.get_loc(mon_candles.index[0]))
+
+        cached_day = {
+            "pdh": pdh,
+            "pdl": pdl,
+            "daily_pivot": daily_pivot,
+            "pivot_r1": pivot_r1,
+            "pivot_s1": pivot_s1,
+            "pivot_r2": pivot_r2,
+            "pivot_s2": pivot_s2,
+            "daily_eq": daily_eq,
+            "weekly_open": weekly_open,
+            "avwap_anchor_index": avwap_anchor_idx,
+            "asia_high": None,
+            "asia_low": None
+        }
+        _DAY_LEVELS_CACHE[cache_key] = cached_day
 
     # 2. Asian Range (01:00 to 06:00 SAST / 23:00 to 04:00 UTC)
-    m5_times = pd.to_datetime(m5_df['time'], utc=True)
-    asia_candles = m5_df[(m5_times.dt.hour >= 23) | (m5_times.dt.hour < 4)]
-    if not asia_candles.empty:
-        asia_high = float(asia_candles['high'].max())
-        asia_low = float(asia_candles['low'].min())
+    # Once time >= 04:00 UTC, the Asia session is finished and values are frozen for the day
+    if cached_day["asia_high"] is not None and cached_day["asia_low"] is not None:
+        asia_high = cached_day["asia_high"]
+        asia_low = cached_day["asia_low"]
     else:
-        asia_high = float(m5_df['high'].tail(36).max())
-        asia_low = float(m5_df['low'].tail(36).min())
+        m5_times = pd.to_datetime(m5_df['time'], utc=True) if not pd.api.types.is_datetime64_any_dtype(m5_df['time']) else m5_df['time']
+        asia_candles = m5_df[(m5_times.dt.hour >= 23) | (m5_times.dt.hour < 4)]
+        if not asia_candles.empty:
+            asia_high = float(asia_candles['high'].max())
+            asia_low = float(asia_candles['low'].min())
+        else:
+            asia_high = float(m5_df['high'].tail(36).max())
+            asia_low = float(m5_df['low'].tail(36).min())
 
-    # 3. Weekly Open (+3h shift so Sunday night 21:00 UTC groups into Monday's ISO week)
-    weekly_open = float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open'])
-    if not d1_df.empty:
-        d1_times_shifted = pd.to_datetime(d1_df['time'], utc=True) + pd.Timedelta(hours=3)
-        curr_week = d1_times_shifted.iloc[-1].isocalendar().week
-        curr_year = d1_times_shifted.iloc[-1].isocalendar().year
-        week_bars = d1_df[(d1_times_shifted.dt.isocalendar().week == curr_week) & (d1_times_shifted.dt.isocalendar().year == curr_year)]
-        if not week_bars.empty:
-            weekly_open = float(week_bars.iloc[0]['open'])
+        if now.hour >= 4 and now.hour < 23:
+            cached_day["asia_high"] = asia_high
+            cached_day["asia_low"] = asia_low
 
-    # 4. AVWAP Anchor Index (Start of Week)
-    avwap_anchor_idx = 0
-    if not m5_df.empty:
-        mon_candles = m5_df[m5_times.dt.weekday == 0]
-        if not mon_candles.empty:
-            avwap_anchor_idx = int(m5_df.index.get_loc(mon_candles.index[0]))
-
-    # 5. Opening Range (15M & 5M Cracker)
+    # 3. Opening Range (15M & 5M Cracker)
     orb_h, orb_l, orb_est, cracker_h, cracker_l, cracker_est = compute_frozen_opening_range(
         symbol, m5_df, frozen_orbs, as_of=as_of
     )
 
-    # 6. Extract Volume Profile properties
+    # 4. Extract Volume Profile properties
     poc = getattr(vp_node, 'poc_price', getattr(vp_node, 'poc', 0.0))
     vah = getattr(vp_node, 'value_area_high', getattr(vp_node, 'vah', 0.0))
     val = getattr(vp_node, 'value_area_low', getattr(vp_node, 'val', 0.0))
@@ -137,24 +182,24 @@ def build_session_levels(
     return {
         "asia_high": asia_high,
         "asia_low": asia_low,
-        "daily_eq": daily_eq,
-        "pdh": pdh,
-        "pdl": pdl,
-        "daily_pivot": daily_pivot,
-        "pivot_r1": pivot_r1,
-        "pivot_s1": pivot_s1,
-        "pivot_r2": pivot_r2,
-        "pivot_s2": pivot_s2,
+        "daily_eq": cached_day["daily_eq"],
+        "pdh": cached_day["pdh"],
+        "pdl": cached_day["pdl"],
+        "daily_pivot": cached_day["daily_pivot"],
+        "pivot_r1": cached_day["pivot_r1"],
+        "pivot_s1": cached_day["pivot_s1"],
+        "pivot_r2": cached_day["pivot_r2"],
+        "pivot_s2": cached_day["pivot_s2"],
         "orb_high": orb_h,
         "orb_low": orb_l,
         "orb_established": orb_est,
         "cracker_orb_high": cracker_h,
         "cracker_orb_low": cracker_l,
         "cracker_orb_established": cracker_est,
-        "weekly_open": weekly_open,
+        "weekly_open": cached_day["weekly_open"],
         "d1_open": float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open']),
         "adr": adr_val,
-        "avwap_anchor_index": avwap_anchor_idx,
+        "avwap_anchor_index": cached_day["avwap_anchor_index"],
         "poc": poc,
         "vah": vah,
         "val": val,
