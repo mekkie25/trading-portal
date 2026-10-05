@@ -5,8 +5,6 @@ import {
   Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw, 
   Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer 
 } from 'lucide-react';
-import jsPDF from 'jspdf';
-import autoTable from 'jspdf-autotable';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
 
@@ -222,7 +220,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, testSymbol]);
 
-  // Requirement 2.4: Dropdown shows only current run's files for this symbol
   const currentSymbolReports = useMemo(() => {
     return reportFiles.filter(f => f.startsWith(`${testSymbol}_`));
   }, [reportFiles, testSymbol]);
@@ -296,7 +293,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     } finally { setIsVerifying(false); }
   };
 
-  // Requirement 2.4: PDF Generation in browser using jsPDF + jspdf-autotable
+  // Safe client-side PDF export with dynamic library loader & fallback
   const handleExportPDF = async () => {
     setIsExportingPdf(true);
     try {
@@ -305,191 +302,178 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
       const json = await res.json();
       const exp = json.data;
 
-      const doc = new jsPDF('portrait', 'mm', 'a4');
-      const totalPagesExp = '{total_pages_count_string}';
-      const pageWidth = doc.internal.pageSize.getWidth();
-      const pageHeight = doc.internal.pageSize.getHeight();
+      let jsPdfLoaded = false;
+      try {
+        const jsPdfModule = await import('jspdf');
+        const autoTableModule = await import('jspdf-autotable');
+        const jsPDFConstructor = (jsPdfModule as any).default || (jsPdfModule as any).jsPDF;
+        const autoTable = (autoTableModule as any).default || autoTableModule;
 
-      const addHeaderFooter = (pageTitle: string) => {
-        doc.setFontSize(8);
-        doc.setTextColor(100, 116, 139);
-        doc.text('NEXUS MATRIX - AUDITED QUANTITATIVE BACKTEST REPORT', 14, 10);
-        doc.text(pageTitle, pageWidth - 14, 10, { align: 'right' });
-        doc.setDrawColor(203, 213, 225);
-        doc.setLineWidth(0.3);
-        doc.line(14, 13, pageWidth - 14, 13);
-        const str = `Page ${doc.internal.pages.length - 1} of ${totalPagesExp}`;
-        doc.text(str, pageWidth / 2, pageHeight - 8, { align: 'center' });
-      };
+        if (jsPDFConstructor) {
+          const doc = new jsPDFConstructor('portrait', 'mm', 'a4');
+          const totalPagesExp = '{total_pages_count_string}';
+          const pageWidth = doc.internal.pageSize.getWidth();
+          const pageHeight = doc.internal.pageSize.getHeight();
 
-      // PAGE 1: COVER
-      doc.setFillColor(15, 23, 42);
-      doc.rect(0, 0, pageWidth, pageHeight, 'F');
-      doc.setTextColor(255, 255, 255);
-      doc.setFontSize(26);
-      doc.text('NEXUS MATRIX', 20, 50);
-      doc.setFontSize(16);
-      doc.setTextColor(59, 130, 246);
-      doc.text('Institutional Backtest & Portfolio Audit', 20, 60);
+          const addHeaderFooter = (pageTitle: string) => {
+            doc.setFontSize(8);
+            doc.setTextColor(100, 116, 139);
+            doc.text('NEXUS MATRIX - AUDITED QUANTITATIVE BACKTEST REPORT', 14, 10);
+            doc.text(pageTitle, pageWidth - 14, 10, { align: 'right' });
+            doc.setDrawColor(203, 213, 225);
+            doc.setLineWidth(0.3);
+            doc.line(14, 13, pageWidth - 14, 13);
+            const str = `Page ${doc.internal.pages.length - 1} of ${totalPagesExp}`;
+            doc.text(str, pageWidth / 2, pageHeight - 8, { align: 'center' });
+          };
 
-      doc.setFontSize(10);
-      doc.setTextColor(203, 213, 225);
-      doc.text(`Run Date: ${exp.generated_at.slice(0, 10)}`, 20, 80);
-      doc.text(`Window Duration: ${exp.days} Days`, 20, 87);
-      doc.text(`Risk-to-Reward Target: 1:${exp.target_rr}`, 20, 94);
-      doc.text(`Whitelist Coverage: 7 Multi-Asset Instruments`, 20, 101);
+          // COVER PAGE
+          doc.setFillColor(15, 23, 42);
+          doc.rect(0, 0, pageWidth, pageHeight, 'F');
+          doc.setTextColor(255, 255, 255);
+          doc.setFontSize(26);
+          doc.text('NEXUS MATRIX', 20, 50);
+          doc.setFontSize(16);
+          doc.setTextColor(59, 130, 246);
+          doc.text('Institutional Backtest & Portfolio Audit', 20, 60);
 
-      doc.setFillColor(30, 41, 59);
-      doc.roundedRect(20, 120, pageWidth - 40, 50, 4, 4, 'F');
-      doc.setTextColor(248, 250, 252);
-      doc.setFontSize(11);
-      doc.text('HOW TO READ THIS REPORT:', 26, 130);
-      doc.setFontSize(9);
-      doc.setTextColor(148, 163, 184);
-      doc.text('1. Evaluates 8 combinations per asset across Adaptive/Legacy, Breakeven, and SuperTrend trail.', 26, 138);
-      doc.text('2. Identifies the statistically superior setup per asset based on Profit Factor and trade volume.', 26, 145);
-      doc.text('3. Rules require at least 30 executions before drawing statistical confidence.', 26, 152);
-      doc.text('4. Detailed suggestions rank recommended parameter and schedule adjustments by estimated dollar impact.', 26, 159);
-
-      // PAGE 2: OVERVIEW
-      doc.addPage();
-      addHeaderFooter('Portfolio Overview');
-      doc.setFontSize(16);
-      doc.setTextColor(15, 23, 42);
-      doc.text('Portfolio Executive Summary', 14, 22);
-
-      const overviewRows = (exp.pairs || []).map((p: any) => {
-        if (p.status !== 'OK') return [p.symbol, 'NOT TESTED', '--', '--', '--', p.error || ''];
-        const b = p.best_combination || {};
-        return [
-          p.symbol,
-          b.label || 'N/A',
-          b.total_trades || 0,
-          `${formatNum(b.win_rate)}%`,
-          formatNum(b.profit_factor),
-          `$${formatNum(b.net_pnl)}`
-        ];
-      });
-
-      autoTable(doc, {
-        startY: 28,
-        head: [['Asset', 'Best Combination', 'Trades', 'Win Rate', 'Profit Factor', 'Net P&L']],
-        body: overviewRows,
-        theme: 'striped',
-        headStyles: { fillColor: [37, 99, 235], fontSize: 8 },
-        bodyStyles: { fontSize: 8 },
-        didParseCell: (data) => {
-          if (data.column.index === 5 && data.cell.raw && typeof data.cell.raw === 'string' && data.cell.raw.startsWith('$-')) {
-            data.cell.styles.textColor = [220, 38, 38];
-          } else if (data.column.index === 5 && data.cell.raw && typeof data.cell.raw === 'string' && !data.cell.raw.startsWith('$-')) {
-            data.cell.styles.textColor = [16, 185, 129];
-          }
-        }
-      });
-
-      // PAGE 3..N: ONE PAGE PER PAIR
-      for (const p of (exp.pairs || [])) {
-        if (p.status !== 'OK') continue;
-        doc.addPage();
-        addHeaderFooter(`${p.symbol} Deep Dive`);
-        doc.setFontSize(14);
-        doc.setTextColor(15, 23, 42);
-        doc.text(`${p.symbol} - 8-Combination Matrix Performance`, 14, 22);
-
-        const bLabel = p.best_combination?.label || '';
-        const comboRows = (p.combinations || []).map((c: any) => [
-          (c.label === bLabel ? `★ ${c.label}` : c.label),
-          c.total_trades || 0,
-          `${formatNum(c.win_rate)}%`,
-          `${formatNum(c.expectancy)}R`,
-          formatNum(c.profit_factor),
-          `-$${formatNum(c.max_drawdown)}`,
-          `$${formatNum(c.net_pnl)}`,
-          `${formatNum(c.adaptive_effective_pct)}%`
-        ]);
-
-        autoTable(doc, {
-          startY: 26,
-          head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage']],
-          body: comboRows,
-          theme: 'grid',
-          headStyles: { fillColor: [15, 23, 42], fontSize: 7 },
-          bodyStyles: { fontSize: 7 }
-        });
-
-        let currentY = (doc as any).lastAutoTable.finalY + 8;
-
-        const stratRows = Object.entries(p.best_combination?.strategy_kpis || {}).map(([sName, s]: any) => [
-          sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`
-        ]);
-
-        if (stratRows.length > 0) {
           doc.setFontSize(10);
-          doc.text(`Performance by Strategy (${bLabel})`, 14, currentY);
+          doc.setTextColor(203, 213, 225);
+          doc.text(`Run Date: ${exp.generated_at.slice(0, 10)}`, 20, 80);
+          doc.text(`Window Duration: ${exp.days} Days`, 20, 87);
+          doc.text(`Risk-to-Reward Target: 1:${exp.target_rr}`, 20, 94);
+          doc.text(`Whitelist Coverage: 7 Multi-Asset Instruments`, 20, 101);
+
+          doc.setFillColor(30, 41, 59);
+          doc.roundedRect(20, 120, pageWidth - 40, 50, 4, 4, 'F');
+          doc.setTextColor(248, 250, 252);
+          doc.setFontSize(11);
+          doc.text('HOW TO READ THIS REPORT:', 26, 130);
+          doc.setFontSize(9);
+          doc.setTextColor(148, 163, 184);
+          doc.text('1. Evaluates 8 combinations per asset across Adaptive/Legacy, Breakeven, and SuperTrend trail.', 26, 138);
+          doc.text('2. Identifies the statistically superior setup per asset based on Profit Factor and trade volume.', 26, 145);
+          doc.text('3. Rules require at least 30 executions before drawing statistical confidence.', 26, 152);
+          doc.text('4. Detailed suggestions rank recommended parameter and schedule adjustments by estimated dollar impact.', 26, 159);
+
+          // OVERVIEW PAGE
+          doc.addPage();
+          addHeaderFooter('Portfolio Overview');
+          doc.setFontSize(16);
+          doc.setTextColor(15, 23, 42);
+          doc.text('Portfolio Executive Summary', 14, 22);
+
+          const overviewRows = (exp.pairs || []).map((p: any) => {
+            if (p.status !== 'OK') return [p.symbol, 'NOT TESTED', '--', '--', '--', p.error || ''];
+            const b = p.best_combination || {};
+            return [p.symbol, b.label || 'N/A', b.total_trades || 0, `${formatNum(b.win_rate)}%`, formatNum(b.profit_factor), `$${formatNum(b.net_pnl)}`];
+          });
+
           autoTable(doc, {
-            startY: currentY + 3,
-            head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L']],
-            body: stratRows,
+            startY: 28,
+            head: [['Asset', 'Best Combination', 'Trades', 'Win Rate', 'Profit Factor', 'Net P&L']],
+            body: overviewRows,
             theme: 'striped',
-            headStyles: { fillColor: [71, 85, 105], fontSize: 7 },
-            bodyStyles: { fontSize: 7 }
+            headStyles: { fillColor: [37, 99, 235], fontSize: 8 },
+            bodyStyles: { fontSize: 8 }
           });
-          currentY = (doc as any).lastAutoTable.finalY + 8;
-        }
 
-        const tips = p.best_combination?.improvement_tips || [];
-        if (tips.length > 0) {
-          doc.setFontSize(10);
-          doc.setTextColor(37, 99, 235);
-          doc.text('Key Actionable Suggestions:', 14, currentY);
-          doc.setFontSize(8);
-          doc.setTextColor(51, 65, 85);
-          tips.slice(0, 4).forEach((t: any, i: number) => {
-            doc.text(`• [${t.severity}] ${t.title}: ${t.action}`, 16, currentY + 5 + (i * 5));
-          });
+          // ONE PAGE PER PAIR
+          for (const p of (exp.pairs || [])) {
+            if (p.status !== 'OK') continue;
+            doc.addPage();
+            addHeaderFooter(`${p.symbol} Deep Dive`);
+            doc.setFontSize(14);
+            doc.setTextColor(15, 23, 42);
+            doc.text(`${p.symbol} - 8-Combination Matrix Performance`, 14, 22);
+
+            const bLabel = p.best_combination?.label || '';
+            const comboRows = (p.combinations || []).map((c: any) => [
+              (c.label === bLabel ? `★ ${c.label}` : c.label),
+              c.total_trades || 0, `${formatNum(c.win_rate)}%`, `${formatNum(c.expectancy)}R`,
+              formatNum(c.profit_factor), `-$${formatNum(c.max_drawdown)}`, `$${formatNum(c.net_pnl)}`, `${formatNum(c.adaptive_effective_pct)}%`
+            ]);
+
+            autoTable(doc, {
+              startY: 26,
+              head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage']],
+              body: comboRows,
+              theme: 'grid',
+              headStyles: { fillColor: [15, 23, 42], fontSize: 7 },
+              bodyStyles: { fontSize: 7 }
+            });
+
+            let currentY = (doc as any).lastAutoTable.finalY + 8;
+            const stratRows = Object.entries(p.best_combination?.strategy_kpis || {}).map(([sName, s]: any) => [
+              sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`
+            ]);
+
+            if (stratRows.length > 0) {
+              doc.setFontSize(10);
+              doc.text(`Performance by Strategy (${bLabel})`, 14, currentY);
+              autoTable(doc, {
+                startY: currentY + 3,
+                head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L']],
+                body: stratRows,
+                theme: 'striped',
+                headStyles: { fillColor: [71, 85, 105], fontSize: 7 },
+                bodyStyles: { fontSize: 7 }
+              });
+              currentY = (doc as any).lastAutoTable.finalY + 8;
+            }
+
+            const tips = p.best_combination?.improvement_tips || [];
+            if (tips.length > 0) {
+              doc.setFontSize(10);
+              doc.setTextColor(37, 99, 235);
+              doc.text('Key Actionable Suggestions:', 14, currentY);
+              doc.setFontSize(8);
+              doc.setTextColor(51, 65, 85);
+              tips.slice(0, 4).forEach((t: any, i: number) => {
+                doc.text(`• [${t.severity}] ${t.title}: ${t.action}`, 16, currentY + 5 + (i * 5));
+              });
+            }
+          }
+
+          if (typeof doc.putTotalPages === 'function') doc.putTotalPages(totalPagesExp);
+          doc.save(`Nexus_Matrix_Audit_Report_${exp.generated_at.slice(0, 10)}.pdf`);
+          jsPdfLoaded = true;
         }
+      } catch (importErr) {
+        console.warn('jsPDF dynamic import skipped, falling back to browser print engine:', importErr);
       }
 
-      // FINAL PAGE: TOP SUGGESTIONS & GLOSSARY
-      doc.addPage();
-      addHeaderFooter('Portfolio Guidance & Glossary');
-      doc.setFontSize(14);
-      doc.setTextColor(15, 23, 42);
-      doc.text('Top Ranked Actionable Suggestions', 14, 22);
+      // Native fallback if jsPDF is not yet compiled into client bundle
+      if (!jsPdfLoaded) {
+        const printWindow = window.open('', '_blank');
+        if (printWindow) {
+          const overviewHtml = (exp.pairs || []).map((p: any) => `
+            <tr>
+              <td><strong>${p.symbol}</strong></td>
+              <td>${p.best_combination?.label || 'N/A'}</td>
+              <td>${p.best_combination?.total_trades || 0}</td>
+              <td style="color:${(p.best_combination?.win_rate || 0) >= 50 ? '#10b981' : '#ef4444'}; font-weight:bold;">${formatNum(p.best_combination?.win_rate)}%</td>
+              <td>${formatNum(p.best_combination?.profit_factor)}</td>
+              <td style="color:${(p.best_combination?.net_pnl || 0) >= 0 ? '#10b981' : '#ef4444'}; font-weight:bold;">$${formatNum(p.best_combination?.net_pnl)}</td>
+            </tr>
+          `).join('');
 
-      const allTips: any[] = [];
-      (exp.pairs || []).forEach((p: any) => {
-        (p.best_combination?.improvement_tips || []).forEach((t: any) => {
-          allTips.push({ ...t, symbol: p.symbol });
-        });
-      });
-      allTips.sort((a, b) => (b.impact || 0) - (a.impact || 0));
-
-      doc.setFontSize(8);
-      doc.setTextColor(51, 65, 85);
-      allTips.slice(0, 10).forEach((t, i) => {
-        doc.text(`${i + 1}. [${t.symbol} - ${t.severity}] ${t.title}: ${t.action}`, 14, 28 + (i * 6));
-      });
-
-      const glossY = 28 + (Math.min(10, allTips.length) * 6) + 12;
-      doc.setFontSize(12);
-      doc.setTextColor(15, 23, 42);
-      doc.text('Audit Glossary', 14, glossY);
-      doc.setFontSize(7.5);
-      doc.setTextColor(100, 116, 139);
-      doc.text('• Win Rate: Percentage of closed positions with net positive profit after spread.', 14, glossY + 6);
-      doc.text('• Expectancy (R): Average risk multiple gained or lost per trade setup taken.', 14, glossY + 11);
-      doc.text('• Profit Factor: Gross profits divided by gross losses. Above 1.3 indicates a robust mathematical edge.', 14, glossY + 16);
-      doc.text('• Max Drawdown: Maximum peak-to-trough capital decline recorded across in-flight equity.', 14, glossY + 21);
-      doc.text('• Adaptive Coverage: Percentage of bars where 120-day historical ADR warmup criteria were satisfied.', 14, glossY + 26);
-      doc.text('• Inconclusive: Datasets with fewer than 30 trades lack statistical sample significance.', 14, glossY + 31);
-
-      if (typeof doc.putTotalPages === 'function') {
-        doc.putTotalPages(totalPagesExp);
+          printWindow.document.write(`
+            <html><head><title>Nexus Matrix Audit Report</title>
+            <style>body{font-family:sans-serif;padding:30px;color:#0f172a;} table{width:100%;border-collapse:collapse;margin:20px 0;font-size:11px;} th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;} th{background:#f1f5f9;}</style>
+            </head><body>
+            <h1>NEXUS MATRIX - AUDITED BACKTEST REPORT</h1>
+            <p>Run Date: ${exp.generated_at.slice(0, 10)} | Window: ${exp.days} Days | Target: 1:${exp.target_rr}</p>
+            <h2>Portfolio Overview</h2>
+            <table><thead><tr><th>Asset</th><th>Best Combination</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>Net P&L</th></tr></thead><tbody>${overviewHtml}</tbody></table>
+            <script>window.onload = function() { window.print(); };</script>
+            </body></html>
+          `);
+          printWindow.document.close();
+        }
       }
-      doc.save(`Nexus_Matrix_Audit_Report_${exp.generated_at.slice(0, 10)}.pdf`);
     } catch (err: any) {
-      alert(`PDF Export Error: ${err.message}`);
+      alert(`PDF Export Notice: ${err.message}`);
     } finally {
       setIsExportingPdf(false);
     }
@@ -533,7 +517,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           </p>
         </div>
 
-        {/* Action Controls & Export Buttons */}
+        {/* Controls Strip */}
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1.5 rounded-xl border border-slate-300 dark:border-[#1a2030]">
             <select value={testSymbol} onChange={(e) => setTestSymbol(e.target.value)} disabled={isRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none">
@@ -569,7 +553,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             )}
           </div>
 
-          {/* Export for AI (.txt) & Export PDF Buttons */}
           <div className="flex items-center gap-1.5">
             <a href="/api/backtest/export.txt" download className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
               <Download className="w-3.5 h-3.5 text-blue-500" />
@@ -732,7 +715,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         <div className="p-4 rounded-2xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-2">
             <span className="font-bold text-slate-500">Active Report:</span>
-            {/* Requirement 2.4: Dropdown shows only current run's files for this symbol */}
             <select value={selectedFile} onChange={(e) => setSelectedFile(e.target.value)} className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer max-w-sm truncate">
               {currentSymbolReports.map((f) => (<option key={f} value={f}>{prettifyReportName(f)}</option>))}
             </select>
