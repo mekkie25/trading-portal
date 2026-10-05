@@ -1774,7 +1774,7 @@ class MatrixEngineMaster:
                     if local_pid not in broker_pids:
                         self.risk_mgr.open_positions.pop(local_pid, None)
 
-                               await self.ctrader.sync_deals_from_ctrader()
+                await self.ctrader.sync_deals_from_ctrader()
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
 
