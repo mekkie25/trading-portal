@@ -243,6 +243,11 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   trades: [],
 };
 
+// PROPOSED: crash-loop tracking for the auto-restarted Python bot.
+// Cleared only when a full cluster of restarts ages out of the 2-minute window.
+let botRestartTimestamps: number[] = [];
+let botCrashLoopWarned = false;
+
 function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> {
   const suggestions: Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> = [];
   const combos: any[] = pairPayload.combinations || [];
@@ -1124,35 +1129,97 @@ async function startServer() {
     res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
   });
 
-  function launchPythonBot() {
+    function launchPythonBot() {
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
     const bot = spawn(pythonCmd, ['engine/matrix.py'], {
       env: { ...process.env, PYTHONPATH: process.cwd() },
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
+    // Per-launch state (fresh on every launch).
+    let restartScheduled = false;
+    let stdoutBuffer = '';
+    let stderrBuffer = '';
+
+    const scheduleRestart = (reason: string) => {
+      if (restartScheduled) return;
+      restartScheduled = true;
+
+      const now = Date.now();
+      botRestartTimestamps.push(now);
+      botRestartTimestamps = botRestartTimestamps.filter(t => now - t <= 120000);
+      const count = botRestartTimestamps.length;
+
+      // PROPOSED: cluster reset. If after pruning only this launch remains,
+      // any previous crash cluster has aged out, so allow a fresh warning.
+      if (count <= 1) {
+        botCrashLoopWarned = false;
+      }
+
+      if (!botCrashLoopWarned && count > 5) {
+        botCrashLoopWarned = true;
+        console.error(`[BOT] CRASH LOOP — ${count} restarts within 2 minutes. Still restarting.`);
+      }
+
+      console.log(`[BOT] Restarting in 5s (${reason}).`);
+      setTimeout(() => {
+        launchPythonBot();
+      }, 5000);
+    };
+
     bot.stdout.on('data', chunk => {
-      const line = chunk.toString().trim();
-      if (line.includes('[MATRIX_TELEMETRY]')) {
-        try {
-          const telem = JSON.parse(line.split('[MATRIX_TELEMETRY]')[1].trim());
-          activeBrokerTelemetry.balance = telem.balance;
-          activeBrokerTelemetry.equity = telem.equity;
-          if (telem.currency) activeBrokerTelemetry.currency = telem.currency;
-          if (telem.netProfit !== undefined) activeBrokerTelemetry.netProfit = telem.netProfit;
-          if (telem.winRate !== undefined) activeBrokerTelemetry.winRate = telem.winRate;
-          if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
-          if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
-          if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
-          if (Array.isArray(telem.openPositions)) activeBrokerTelemetry.openPositions = telem.openPositions;
-          activeBrokerTelemetry.connected = true;
-          activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-        } catch {}
+      stdoutBuffer += chunk.toString();
+      const lines = stdoutBuffer.split('\n');
+      // Keep the last element: it may be a partial line.
+      stdoutBuffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        if (line.includes('[MATRIX_TELEMETRY]')) {
+          try {
+            const telem = JSON.parse(line.split('[MATRIX_TELEMETRY]')[1].trim());
+            activeBrokerTelemetry.balance = telem.balance;
+            activeBrokerTelemetry.equity = telem.equity;
+            if (telem.currency) activeBrokerTelemetry.currency = telem.currency;
+            if (telem.netProfit !== undefined) activeBrokerTelemetry.netProfit = telem.netProfit;
+            if (telem.winRate !== undefined) activeBrokerTelemetry.winRate = telem.winRate;
+            if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
+            if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
+            if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
+            if (Array.isArray(telem.openPositions)) activeBrokerTelemetry.openPositions = telem.openPositions;
+            activeBrokerTelemetry.connected = true;
+            activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
+          } catch {}
+          // Telemetry is deliberately not logged to console.
+          continue;
+        }
+
+        console.log(`[BOT] ${line}`);
       }
     });
 
-    bot.on('exit', () => {
-      setTimeout(launchPythonBot, 5000);
+    bot.stderr.on('data', chunk => {
+      stderrBuffer += chunk.toString();
+      const lines = stderrBuffer.split('\n');
+      stderrBuffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        if (!line) continue;
+        console.error(`[BOT:ERR] ${line}`);
+      }
+    });
+
+    bot.on('error', err => {
+      console.error(`[BOT] spawn error: ${err.message}`);
+      scheduleRestart(`spawn error: ${err.message}`);
+    });
+
+    bot.on('exit', (code, signal) => {
+      console.log(`[BOT] exited code=${code} signal=${signal ?? 'null'}`);
+      scheduleRestart(`exit code=${code} signal=${signal ?? 'null'}`);
     });
   }
 
