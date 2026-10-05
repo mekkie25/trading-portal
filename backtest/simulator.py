@@ -7,15 +7,7 @@ Replicates the exact single-order live position management of engine/matrix.py:
 - SuperTrend 5M trailing exit gated by GLOBAL_PARAMS.use_supertrend_trail
 - Daily trade cap tracked per SAST calendar date (max_daily_trades)
 - Minimum-lot risk tolerance check matching live bot
-- Skip logging and skip_summary() method returning by_reason, by_strategy, by_hour_sast
-- date_sast recorded on every trade record alongside date
-- USD account currency scaling (USDJPY divided by price, GERMAN30 converted via EURUSD history)
-- Fix false post-stop recovery by ignoring creation candle
-- Deadline-based EOD close (first candle >= 21:00 SAST)
-- close_all(symbol, last_candle) method for END_OF_DATA
-- Conservative collision rule (SL hit first if same candle touches both SL and TP)
-- Half spread charged on entry AND half spread charged on exit
-- Classification by R: WIN if r_multiple > 0.1, LOSS if r_multiple < -0.1, else BREAKEVEN
+- Skip logging with candle_skips and unique_setups (strategy, direction, day)
 """
 
 import sys
@@ -34,7 +26,6 @@ from core.session_config import TZ_SAST, GLOBAL_PARAMS
 from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 
-# Whitelist asset specifications
 ASSETS = {
     "GOLD": {"pip_size": 0.01, "contract_size": 100.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
     "US30": {"pip_size": 1.0, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 2.50},
@@ -85,29 +76,49 @@ class TradeSimulator:
         return None
 
     def skip_summary(self) -> Dict[str, Any]:
-        by_reason: Dict[str, int] = {}
+        by_reason_candles: Dict[str, int] = {}
+        by_reason_setups: Dict[str, set] = {}
         by_strategy: Dict[str, int] = {}
         by_hour_sast: Dict[int, int] = {}
+
         for s in self.skipped:
             reason = s.get("reason", "UNKNOWN")
             strat = s.get("strategy", "UNKNOWN")
+            direction = s.get("direction", "UNKNOWN")
+            day = s.get("date_sast", s.get("time", "")[:10])
             h = s.get("hour_sast", 0)
-            by_reason[reason] = by_reason.get(reason, 0) + 1
+
+            by_reason_candles[reason] = by_reason_candles.get(reason, 0) + 1
+            if reason not in by_reason_setups:
+                by_reason_setups[reason] = set()
+            by_reason_setups[reason].add((strat, direction, day))
+
             by_strategy[strat] = by_strategy.get(strat, 0) + 1
             by_hour_sast[h] = by_hour_sast.get(h, 0) + 1
 
-        res = dict(by_reason)
-        res["by_reason"] = by_reason
-        res["by_strategy"] = by_strategy
-        res["by_hour_sast"] = by_hour_sast
-        return res
+        by_reason_detail: Dict[str, Dict[str, int]] = {}
+        for r, c_cnt in by_reason_candles.items():
+            by_reason_detail[r] = {
+                "candle_skips": c_cnt,
+                "unique_setups": len(by_reason_setups.get(r, set()))
+            }
 
-    def _record_skip(self, current_time: datetime, symbol: str, strategy: str, reason: str) -> bool:
-        sast_hour = current_time.astimezone(TZ_SAST).hour
+        return {
+            "by_reason": by_reason_detail,
+            "by_strategy": by_strategy,
+            "by_hour_sast": by_hour_sast
+        }
+
+    def _record_skip(self, current_time: datetime, symbol: str, strategy: str, reason: str, direction: str = "UNKNOWN") -> bool:
+        sast_time = current_time.astimezone(TZ_SAST)
+        sast_date_str = sast_time.strftime("%Y-%m-%d")
+        sast_hour = sast_time.hour
         self.skipped.append({
             "time": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "date_sast": sast_date_str,
             "symbol": symbol,
             "strategy": strategy,
+            "direction": direction,
             "reason": reason,
             "hour_sast": sast_hour
         })
@@ -122,18 +133,18 @@ class TradeSimulator:
         sl_dist = abs(entry_price - sl)
 
         if sl_dist <= 0:
-            return self._record_skip(current_time, symbol, strategy, "INVALID_SL_DIST")
+            return self._record_skip(current_time, symbol, strategy, "INVALID_SL_DIST", direction)
 
         sast_time = current_time.astimezone(TZ_SAST)
         sast_date_str = sast_time.strftime("%Y-%m-%d")
         current_daily_count = self.daily_trade_counts.get(sast_date_str, 0)
         max_daily = getattr(GLOBAL_PARAMS, 'max_daily_trades', 2)
         if current_daily_count >= max_daily:
-            return self._record_skip(current_time, symbol, strategy, "DAILY_CAP")
+            return self._record_skip(current_time, symbol, strategy, "DAILY_CAP", direction)
 
         fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
         if fixed_tp is None:
-            return self._record_skip(current_time, symbol, strategy, "NO_ROOM")
+            return self._record_skip(current_time, symbol, strategy, "NO_ROOM", direction)
 
         cfg = ASSETS.get(symbol, {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.0001})
         contract_size = cfg["contract_size"]
@@ -147,7 +158,7 @@ class TradeSimulator:
         elif symbol == "GERMAN30":
             rate = self._get_eurusd_rate_at_or_before(current_time)
             if rate is None or rate <= 0:
-                return self._record_skip(current_time, symbol, strategy, "UNSUPPORTED_SYMBOL_NO_FX")
+                return self._record_skip(current_time, symbol, strategy, "UNSUPPORTED_SYMBOL_NO_FX", direction)
             fx_rate = rate
         else:
             fx_rate = 1.0
@@ -165,7 +176,7 @@ class TradeSimulator:
         if raw_lots < min_lots:
             min_lot_cash_risk = min_lots * risk_per_lot
             if min_lot_cash_risk > (tolerance * risk_cash):
-                return self._record_skip(current_time, symbol, strategy, "MIN_LOT_TOO_RISKY")
+                return self._record_skip(current_time, symbol, strategy, "MIN_LOT_TOO_RISKY", direction)
             total_lots = min_lots
         else:
             stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
@@ -208,7 +219,7 @@ class TradeSimulator:
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
         self.open_positions.append(position)
         return True
-    
+
     def process_candle(self, symbol: str, candle: pd.Series, m5_slice: pd.DataFrame):
         c_high = float(candle['high'])
         c_low = float(candle['low'])

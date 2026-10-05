@@ -685,7 +685,7 @@ def run_cached_combination(
         "trading_dates": trading_dates,
         "day_data": day_charts_data,
         "all_trades": all_trades,
-        "skipped_summary": full_skip_summary.get("by_reason", full_skip_summary),
+        "skipped_summary": full_skip_summary.get("by_reason", {}),
         "skipped_detail": full_skip_summary,
         "improvement_tips": improvement_tips
     }
