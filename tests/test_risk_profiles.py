@@ -278,3 +278,104 @@ def test_min_rr_ui_higher_than_floor_wins(tmp_path, monkeypatch):
     engine2 = matrix_mod.InstitutionalRiskEngine(config_file=str(cfg_path))
     engine2.sync_ui_config()
     assert abs(GLOBAL_PARAMS.min_rr - 0.7) < 1e-9
+
+def test_profile_steady_scales_weekly_monthly(tmp_path, monkeypatch):
+    """Gap 1: Steady profile sets weekly=10, monthly=15."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Steady",
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_weekly_loss_pct == 10.0
+    assert rm.max_monthly_loss_pct == 15.0
+
+
+def test_profile_max_growth_scales_weekly_monthly(tmp_path, monkeypatch):
+    """Gap 1: Max Growth sets weekly=70, monthly=85."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Max Growth",
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_weekly_loss_pct == 70.0
+    assert rm.max_monthly_loss_pct == 85.0
+
+
+def test_profile_balanced_and_aggressive_scales_weekly_monthly(tmp_path, monkeypatch):
+    """Gap 1: Balanced=25/40, Aggressive=50/70."""
+    import json
+    import risk.risk_manager as rm_mod
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Balanced",
+    }), encoding="utf-8")
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_weekly_loss_pct == 25.0
+    assert rm.max_monthly_loss_pct == 40.0
+
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": "Aggressive",
+    }), encoding="utf-8")
+    rm2 = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm2.max_weekly_loss_pct == 50.0
+    assert rm2.max_monthly_loss_pct == 70.0
+
+
+def test_profile_unset_keeps_global_weekly_monthly(tmp_path, monkeypatch):
+    """Gap 1 regression: profile null keeps GLOBAL_PARAMS weekly=10, monthly=15."""
+    import json
+    import risk.risk_manager as rm_mod
+    from core.session_config import GLOBAL_PARAMS
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+    cfg_path.write_text(json.dumps({
+        "masterExecution": True,
+        "riskProfile": None,
+    }), encoding="utf-8")
+
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_weekly_loss_pct == GLOBAL_PARAMS.max_weekly_loss_pct
+    assert rm.max_monthly_loss_pct == GLOBAL_PARAMS.max_monthly_loss_pct
+
+
+def test_profile_switch_resets_weekly_monthly(tmp_path, monkeypatch):
+    """Gap 1: switching Steady -> null restores legacy defaults."""
+    import json
+    import risk.risk_manager as rm_mod
+    from core.session_config import GLOBAL_PARAMS
+
+    monkeypatch.setattr(rm_mod.RiskManager, "save_persistent_state", lambda self: None)
+
+    cfg_path = tmp_path / "bot_config.json"
+
+    # First, Steady active
+    cfg_path.write_text(json.dumps({"riskProfile": "Steady"}), encoding="utf-8")
+    rm = rm_mod.RiskManager(config_file=str(cfg_path), state_file=str(tmp_path / "state.json"))
+    assert rm.max_weekly_loss_pct == 10.0
+
+    # Now flip to null
+    cfg_path.write_text(json.dumps({"riskProfile": None}), encoding="utf-8")
+    rm.sync_ui_config()
+    assert rm.max_weekly_loss_pct == GLOBAL_PARAMS.max_weekly_loss_pct
+    assert rm.max_monthly_loss_pct == GLOBAL_PARAMS.max_monthly_loss_pct

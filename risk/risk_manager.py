@@ -36,11 +36,15 @@ RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", os.path.join(DATA_DIR, "risk_stat
 # PROPOSED: INSTITUTIONAL RISK PROFILES SPECIFICATION
 # ==============================================================================
 # Bands in ZAR: <500, 500-2k, 2k-10k, 10k-50k, >50k
+# PROPOSED (Gap 1): weekly_loss_stop_pct and monthly_loss_stop_pct per profile
+#   so the weekly breaker cannot trip before the daily stop makes sense.
 RISK_PROFILES: Dict[str, Dict[str, Any]] = {
     "Steady": {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
         "risk_pct_by_band": [5.0, 3.0, 2.0, 1.5, 1.0],
         "daily_loss_stop_pct": 5.0,
+        "weekly_loss_stop_pct": 10.0,
+        "monthly_loss_stop_pct": 15.0,
         "min_rr_floor": 1.0,
         "max_daily_trades": 2,
     },
@@ -48,6 +52,8 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
         "risk_pct_by_band": [10.0, 6.0, 4.0, 3.0, 2.0],
         "daily_loss_stop_pct": 15.0,
+        "weekly_loss_stop_pct": 25.0,
+        "monthly_loss_stop_pct": 40.0,
         "min_rr_floor": 1.5,
         "max_daily_trades": 3,
     },
@@ -55,6 +61,8 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
         "risk_pct_by_band": [30.0, 15.0, 8.0, 5.0, 3.0],
         "daily_loss_stop_pct": 30.0,
+        "weekly_loss_stop_pct": 50.0,
+        "monthly_loss_stop_pct": 70.0,
         "min_rr_floor": 2.0,
         "max_daily_trades": 4,
     },
@@ -62,6 +70,8 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "bands_zar": [500.0, 2000.0, 10000.0, 50000.0],
         "risk_pct_by_band": [35.0, 25.0, 12.0, 6.0, 4.0],  # PROPOSED: 35% cap under R500
         "daily_loss_stop_pct": 50.0,
+        "weekly_loss_stop_pct": 70.0,
+        "monthly_loss_stop_pct": 85.0,
         "min_rr_floor": 2.0,
         "max_daily_trades": 4,
     },
@@ -180,9 +190,16 @@ class RiskManager:
                 self.max_daily_trades = self.active_profile["max_daily_trades"]
                 self.max_daily_loss_pct = self.active_profile["daily_loss_stop_pct"]
                 self.min_rr_floor = self.active_profile["min_rr_floor"]
+                # PROPOSED (Gap 1): profile-scaled weekly/monthly caps
+                self.max_weekly_loss_pct = self.active_profile["weekly_loss_stop_pct"]
+                self.max_monthly_loss_pct = self.active_profile["monthly_loss_stop_pct"]
             else:
                 self.active_profile_name = None
                 self.active_profile = None
+                # PROPOSED (Gap 1): restore legacy GLOBAL_PARAMS values when profile is unset
+                self.max_daily_loss_pct = getattr(GLOBAL_PARAMS, 'max_daily_loss_pct', 5.0)
+                self.max_weekly_loss_pct = getattr(GLOBAL_PARAMS, 'max_weekly_loss_pct', 10.0)
+                self.max_monthly_loss_pct = getattr(GLOBAL_PARAMS, 'max_monthly_loss_pct', 15.0)
                 if "maxDailyTrades" in cfg:
                     self.max_daily_trades = int(cfg["maxDailyTrades"])
 
@@ -503,7 +520,6 @@ class RiskManager:
             nominal_risk_cash = min(max_cash_cap, nominal_risk_cash + house_money_allowance)
 
         # Circuit Breaker Safety: Single trade risk cannot exceed remaining daily allowance
-                # Circuit Breaker Safety: Single trade risk cannot exceed remaining daily allowance
         # PROPOSED: Fall back to current_equity when starting_day_equity is still 0 (cold start).
         effective_day_start = self.starting_day_equity if self.starting_day_equity > 0 else current_equity
         max_daily_usd = self.max_daily_loss_usd if self.max_daily_loss_usd > 0 else (
@@ -549,7 +565,7 @@ class RiskManager:
         except Exception:
             chosen_pct = 0.0
 
-                # Daily loss budget
+        # Daily loss budget
         # PROPOSED: Fall back to current_equity when starting_day_equity is still 0 (cold start).
         effective_day_start = self.starting_day_equity if self.starting_day_equity > 0 else current_equity
         if self.max_daily_loss_usd > 0:
@@ -561,7 +577,6 @@ class RiskManager:
 
         daily_used = max(0.0, effective_day_start - current_equity)
         daily_left = max(0.0, daily_max - daily_used)
-        
 
         return {
             "profile": profile_label,
@@ -611,6 +626,7 @@ class RiskManager:
             return False, f"Daily trade limit reached ({self.trades_taken_today}/{self.max_daily_trades})"
 
         # Daily Drawdown Evaluation
+        # PROPOSED (Gap 1): profile-scaled daily %, weekly %, monthly % are all set in sync_ui_config.
         daily_loss_pct = self.active_profile["daily_loss_stop_pct"] if self.active_profile else self.max_daily_loss_pct
         daily_dd_usd = max(0.0, self.starting_day_equity - current_equity) if self.starting_day_equity > 0 else self.current_daily_loss
         max_daily_usd = self.max_daily_loss_usd if self.max_daily_loss_usd > 0 else (self.starting_day_equity * (daily_loss_pct / 100.0))
