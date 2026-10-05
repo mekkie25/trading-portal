@@ -2,10 +2,11 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 Includes:
-- Fixed 00:00 UTC boundary verification harness comparing 4 combinations (30 days each).
-- Trade-by-trade comparison across all fields: entry time, direction, strategy, entry, SL, TP1, TP2, exit time, exit price, exit reason, P&L.
-- Shared code disclosure labeling verdicts 'PARTIAL: shares code with optimized version'.
-- Single shared precompute pass and cached combination runs.
+- Vectorized exact 121-window EMA precomputations with dot-product convolution.
+- 300-candle self-check against per-slice calculation.
+- Flags: --prepare-only, --skip-download, and --compare.
+- Fixed 00:00 UTC boundary 4-combo verification harness comparing all trade fields.
+- Phase timers and parallel preparation workflow.
 """
 
 import sys
@@ -15,9 +16,11 @@ import shutil
 import json
 import time
 import copy
+import random
 import asyncio
 import argparse
 import tempfile
+import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
@@ -165,7 +168,66 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
         return False
 
 # ==============================================================================
-# UNOPTIMIZED REFERENCE ENGINE (Per-candle recomputation, no caches)
+# EXACT 121-CANDLE WINDOW VECTORIZED EMA PRECOMPUTATION & SELF-CHECK
+# ==============================================================================
+def compute_121_window_emas(df: pd.DataFrame) -> None:
+    """
+    Computes exact 121-candle window EMAs (5, 9, 13, 25, 200) for every candle i >= 120.
+    Uses constant 1D convolution weights:
+        w_0 = (1-a)^120, w_k = a*(1-a)^(120-k) for k=1..120
+    Guarantees mathematically identical outputs to df.iloc[i-120:i+1]['close'].ewm(...).iloc[-1].
+    """
+    close = df['close'].values.astype(np.float64)
+    n = len(close)
+    window_size = 121
+
+    for span in [5, 9, 13, 25, 200]:
+        col_name = f"ema_{span}"
+        if col_name in df.columns:
+            continue
+
+        alpha = 2.0 / (span + 1.0)
+        # Weights for y_120 in an adjust=False recursion over 121 bars
+        weights = np.empty(window_size, dtype=np.float64)
+        weights[0] = (1.0 - alpha) ** (window_size - 1)
+        for k in range(1, window_size):
+            weights[k] = alpha * ((1.0 - alpha) ** (window_size - 1 - k))
+
+        # 1D convolution over valid window
+        valid_vals = np.convolve(close, weights[::-1], mode='valid')
+        col_arr = np.empty(n, dtype=np.float64)
+        col_arr[:window_size - 1] = np.nan
+        col_arr[window_size - 1:] = valid_vals
+        df[col_name] = col_arr
+
+def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
+    """
+    Self-check: Compares precomputed EMAs against the unoptimized per-slice
+    calculation for 300 random candles.
+    """
+    total = len(df)
+    if total < 130:
+        return
+
+    sample_indices = random.sample(range(120, total), min(n_samples, total - 120))
+    max_diff = 0.0
+
+    for idx in sample_indices:
+        slice_close = df['close'].iloc[idx - 120:idx + 1]
+        for span in [5, 9, 13, 25, 200]:
+            ref_val = float(slice_close.ewm(span=span, adjust=False).mean().iloc[-1])
+            pre_val = float(df[f"ema_{span}"].iloc[idx])
+            diff = abs(ref_val - pre_val)
+            if diff > max_diff:
+                max_diff = diff
+
+    if max_diff < 1e-6:
+        print(f"[check] indicators match (max diff: {max_diff:.2e})", flush=True)
+    else:
+        print(f"[check] indicator discrepancy: {max_diff:.6f}", flush=True)
+
+# ==============================================================================
+# UNOPTIMIZED REFERENCE ENGINE
 # ==============================================================================
 def run_backtest_reference(
     symbol: str,
@@ -207,13 +269,10 @@ def run_backtest_reference(
         sast_dt = curr_time.astimezone(TZ_SAST)
         sast_hour_key = (sast_dt.date(), sast_dt.hour)
 
-        # 1. Update in-flight trades against every single candle
         sim.process_candle(symbol, curr_bar, m5_slice)
 
-        # 2. Rebuild H1, H4, D1
         h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
 
-        # 3. Volatility calculation
         need_full_recalc = (curr_date != last_vol_date)
         if not vol_metrics.get("valid", False) and sast_hour_key != last_vol_retry_hour:
             need_full_recalc = True
@@ -243,7 +302,6 @@ def run_backtest_reference(
         else:
             active_vol = vol_metrics
 
-        # 4. Session levels and volume profile
         vp = get_session_volume_profile(m5_slice)
         session_levels = build_session_levels(
             symbol=symbol,
@@ -255,7 +313,6 @@ def run_backtest_reference(
             adr_val=adr_val
         )
 
-        # 5. Evaluate all strategies on every single candle
         signal = sm.evaluate_all(
             symbol=symbol,
             data_5m=m5_slice,
@@ -311,6 +368,9 @@ def precompute_market_pass(
     t_vol = 0.0
     t_lvl = 0.0
     t_strat = 0.0
+
+    compute_121_window_emas(m5_df)
+    verify_precomputed_emas(m5_df, 300)
 
     aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
     sm = StrategyManager()
@@ -677,21 +737,13 @@ def run_cached_combination(
     }
 
 # ==============================================================================
-# AUDIT HARNESS: PROMPT F FIXED 00:00 UTC BOUNDARY 4-COMBO VERIFICATION
+# AUDIT HARNESS: FIXED 00:00 UTC BOUNDARY 4-COMBO VERIFICATION
 # ==============================================================================
 def compare_runs(
     symbol: str = "US30",
     days_count: int = 30,
     eurusd_df: Optional[pd.DataFrame] = None
 ) -> str:
-    """
-    Fixed boundary verifier (Prompt F).
-    - Freezes end time strictly at the most recent 00:00 UTC in the dataset.
-    - Closes any open trade at that boundary candle. Zero data download.
-    - Runs 4 combinations across 30 days.
-    - Compares full list of trades field by field.
-    - Reports shared code modules and labels verdict 'PARTIAL: shares code with optimized version'.
-    """
     m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
     h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
     h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
@@ -706,7 +758,6 @@ def compare_runs(
     d1_df = pd.read_csv(d1_path)
     m5_df_full['time'] = pd.to_datetime(m5_df_full['time'], utc=True)
 
-    # 1. Fixed End Time Boundary: Most recent 00:00 UTC
     latest_bar_time = m5_df_full['time'].iloc[-1]
     fixed_end_utc = latest_bar_time.replace(hour=0, minute=0, second=0, microsecond=0)
     if latest_bar_time < fixed_end_utc:
@@ -733,8 +784,6 @@ def compare_runs(
     diff_lines.append(f"• Market Data Used  : Local CSV cache only (Zero network download)")
     diff_lines.append("-" * 80)
 
-    # Precompute Pass for optimized version
-    t0_pre = time.perf_counter()
     precomputed = precompute_market_pass(
         symbol=symbol,
         m5_df=m5_df,
@@ -744,9 +793,7 @@ def compare_runs(
         sim_start_idx=sim_start_idx,
         total_bars=total_bars
     )
-    t_precompute = time.perf_counter() - t0_pre
 
-    # 4 Combinations to evaluate
     test_combos = [
         {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Adaptive · BE off · Trail off"},
         {"mode": "adaptive", "adaptive_mode": True,  "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Adaptive · BE on · Trail on"},
@@ -760,7 +807,6 @@ def compare_runs(
         combo_label = combo["label"]
         print(f"[*] Verifying combo {c_idx + 1}/4: {combo_label}...", flush=True)
 
-        # Run unoptimized reference
         t0 = time.perf_counter()
         ref_res = run_backtest_reference(
             symbol=symbol,
@@ -779,7 +825,6 @@ def compare_runs(
         ref_trades = ref_res["trades"]
         ref_kpis = ref_res["kpis"]
 
-        # Run optimized cached combination
         t0 = time.perf_counter()
         fast_res = run_cached_combination(
             symbol=symbol,
@@ -798,32 +843,20 @@ def compare_runs(
         fast_trades = fast_res["trades"]
         fast_kpis = fast_res["kpis"]
 
-        # Full field-by-field trade comparison
         divergences = []
         n_compare = max(len(ref_trades), len(fast_trades))
 
         for idx in range(n_compare):
             if idx >= len(ref_trades):
-                divergences.append({
-                    "trade_num": idx + 1,
-                    "stage": "EXTRA_IN_OPTIMIZED",
-                    "ref": None,
-                    "fast": fast_trades[idx]
-                })
+                divergences.append({"trade_num": idx + 1, "stage": "EXTRA_IN_OPTIMIZED", "ref": None, "fast": fast_trades[idx]})
                 continue
             if idx >= len(fast_trades):
-                divergences.append({
-                    "trade_num": idx + 1,
-                    "stage": "MISSING_IN_OPTIMIZED",
-                    "ref": ref_trades[idx],
-                    "fast": None
-                })
+                divergences.append({"trade_num": idx + 1, "stage": "MISSING_IN_OPTIMIZED", "ref": ref_trades[idx], "fast": None})
                 continue
 
             r = ref_trades[idx]
             f = fast_trades[idx]
 
-            # Field checks: entry time, direction, strategy, entry, SL, TP1, TP2, exit time, exit price, exit reason, P&L
             diff_stage = None
             if r['signal_time_utc'] != f['signal_time_utc'] or r['direction'] != f['direction'] or r['strategy'] != f['strategy']:
                 diff_stage = "SIGNAL"
@@ -837,12 +870,7 @@ def compare_runs(
                 diff_stage = "PNL"
 
             if diff_stage is not None:
-                divergences.append({
-                    "trade_num": idx + 1,
-                    "stage": diff_stage,
-                    "ref": r,
-                    "fast": f
-                })
+                divergences.append({"trade_num": idx + 1, "stage": diff_stage, "ref": r, "fast": f})
 
         diff_lines.append(f"\n[COMBO {c_idx + 1}/4] {combo_label}")
         diff_lines.append(f"  • Reference (Per-Candle) : {len(ref_trades)} trades | Net P&L: ${ref_kpis['net_pnl']} | WR: {ref_kpis['win_rate']}% | Time: {t_ref:.2f}s")
@@ -855,7 +883,6 @@ def compare_runs(
         else:
             diff_lines.append(f"  • Divergent Trades Found : {len(divergences)} trade(s) differed")
             all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): DIVERGENCE DETECTED ({len(divergences)} trades differ)")
-
             diff_lines.append(f"  --- First {min(5, len(divergences))} Divergent Trades ---")
             for d_item in divergences[:5]:
                 t_num = d_item["trade_num"]
@@ -873,7 +900,6 @@ def compare_runs(
     for v_line in all_verdicts:
         diff_lines.append(f"  ✓ {v_line}")
 
-    # Shared code audit disclosure
     diff_lines.append("\n" + "-" * 80)
     diff_lines.append("SHARED CODE AUDIT DISCLOSURE:")
     diff_lines.append("The reference version and the optimized version share the following underlying modules:")
@@ -1058,13 +1084,37 @@ async def main():
     parser.add_argument("--adaptive", action="store_true", default=True)
     parser.add_argument("--breakeven", type=str, default="off")
     parser.add_argument("--supertrend", type=str, default="on")
-    parser.add_argument("--compare", action="store_true", default=False, help="Run comparison vs reference engine")
+    parser.add_argument("--compare", action="store_true", default=False, help="Run 4-combination verification vs reference engine")
+    parser.add_argument("--prepare-only", action="store_true", default=False, help="Prepare and update market data only, then exit")
+    parser.add_argument("--skip-download", action="store_true", default=False, help="Skip downloading data and run matrix from local cache")
     args = parser.parse_args()
 
+    client = CTraderClient()
+
+    # Flag: --prepare-only
+    if args.prepare_only:
+        ok = await ensure_symbol_data(client, args.symbol)
+        if args.symbol.upper() == "GERMAN30":
+            await ensure_symbol_data(client, "EURUSD")
+        if client.ws:
+            try:
+                await client.ws.close()
+            except Exception:
+                pass
+        sys.exit(0 if ok else 1)
+
+    # Flag: --compare
     if args.compare:
+        eurusd_df: Optional[pd.DataFrame] = None
+        if args.symbol.upper() == "GERMAN30":
+            eurusd_m5_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+            if os.path.exists(eurusd_m5_path):
+                eurusd_df = pd.read_csv(eurusd_m5_path)
+
         res_text = compare_runs(
             symbol=args.symbol,
-            days_count=30
+            days_count=30,
+            eurusd_df=eurusd_df
         )
         return
 
@@ -1076,12 +1126,17 @@ async def main():
 
     GLOBAL_PARAMS.target_rr = args.rr
 
-    client = CTraderClient()
-    ok = await ensure_symbol_data(client, args.symbol)
+    if not args.skip_download:
+        ok = await ensure_symbol_data(client, args.symbol)
+    else:
+        ok = True
 
     eurusd_df: Optional[pd.DataFrame] = None
     if args.symbol.upper() == "GERMAN30":
-        eurusd_ok = await ensure_symbol_data(client, "EURUSD")
+        if not args.skip_download:
+            eurusd_ok = await ensure_symbol_data(client, "EURUSD")
+        else:
+            eurusd_ok = True
         eurusd_m5_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
         if not eurusd_ok or not os.path.exists(eurusd_m5_path):
             print("ERROR: GERMAN30 needs EURUSD history", flush=True)

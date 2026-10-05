@@ -3,9 +3,8 @@ trading-portal/strategies/ema_9_25_cross_trail.py
 Dynamic 9 EMA / 25 EMA Crossover with Pullback Confirmation (Spec Setup 4).
 - Overall Bias aligned with 200 EMA
 - Fast 9 EMA crosses 25 EMA
-- Strict Retest Entry: Pullback to 9 or 25 EMA that HOLDS (Does not enter on cross candle itself)
-- Stop Loss below 25 EMA or recent swing extreme
-- Dynamic Exit: Position supervisor closes order when candle closes across 9 EMA
+- Strict Retest Entry: Pullback to 9 or 25 EMA that HOLDS
+- Reads precomputed EMAs from DataFrame columns if present, avoiding redundant calculations.
 """
 
 import pandas as pd
@@ -19,14 +18,19 @@ class EMACrossTrail:
             diagnostics["reason"] = "Insufficient 5M candle history"
             return None
 
-        close = data_5m['close']
-        ema_9 = close.ewm(span=9, adjust=False).mean()
-        ema_25 = close.ewm(span=25, adjust=False).mean()
-        ema_200 = close.ewm(span=200, adjust=False).mean()
+        # Fast path: Read precomputed EMAs if available, otherwise compute via ewm
+        if 'ema_9' in data_5m.columns and 'ema_25' in data_5m.columns and 'ema_200' in data_5m.columns:
+            ema_9 = data_5m['ema_9']
+            ema_25 = data_5m['ema_25']
+            ema_200 = data_5m['ema_200']
+        else:
+            close = data_5m['close']
+            ema_9 = close.ewm(span=9, adjust=False).mean()
+            ema_25 = close.ewm(span=25, adjust=False).mean()
+            ema_200 = close.ewm(span=200, adjust=False).mean()
 
         current_200 = ema_200.iloc[-1]
 
-        # Scan last 6 bars for the cross event
         recent = data_5m.tail(7)
         bullish_cross_idx = -1
         bearish_cross_idx = -1
@@ -42,7 +46,7 @@ class EMACrossTrail:
         curr_bar = data_5m.iloc[-1]
         prev_bar = data_5m.iloc[-2]
 
-        # BULLISH RETEST ENTRY (Cross happened 1-4 bars ago, price pulled back to 9/25 and held)
+        # BULLISH RETEST ENTRY
         if bullish_cross_idx != -1 and bullish_cross_idx < (len(recent) - 1):
             if curr_bar['close'] > current_200:
                 tested_support = (prev_bar['low'] <= ema_9.iloc[-2]) or (prev_bar['low'] <= ema_25.iloc[-2])

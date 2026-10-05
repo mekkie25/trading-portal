@@ -5,9 +5,8 @@ Mechanical 513 Strategy Crossover (Spec Setup 7).
 - Trigger: 5 EMA crosses 13 EMA (Fast cross on current bar)
 - Structural Filter: Price at/above Daily Flip Level (Previous Day Close / Daily Equilibrium)
 - Trend Benchmark: Aligned above 200 EMA for longs, below 200 EMA for shorts
-- Confirmation: Candle close held beyond 13 EMA (Not entering mid-candle)
-- Stop Loss: Placed below recent swing low or 13 EMA
-- Target: 1:1.5 to 1:2 R:R
+- Confirmation: Candle close held beyond 13 EMA
+- Reads precomputed EMAs from DataFrame columns if present, avoiding redundant calculations.
 """
 
 import pandas as pd
@@ -21,19 +20,22 @@ class Strategy513:
             diagnostics["reason"] = "Insufficient 5M candles"
             return None
 
-        close = data_5m['close']
-        ema_5 = close.ewm(span=5, adjust=False).mean()
-        ema_13 = close.ewm(span=13, adjust=False).mean()
-        ema_200 = close.ewm(span=200, adjust=False).mean()
+        # Fast path: Read precomputed EMAs if available, otherwise compute via ewm
+        if 'ema_5' in data_5m.columns and 'ema_13' in data_5m.columns and 'ema_200' in data_5m.columns:
+            ema_5 = data_5m['ema_5']
+            ema_13 = data_5m['ema_13']
+            ema_200 = data_5m['ema_200']
+        else:
+            close = data_5m['close']
+            ema_5 = close.ewm(span=5, adjust=False).mean()
+            ema_13 = close.ewm(span=13, adjust=False).mean()
+            ema_200 = close.ewm(span=200, adjust=False).mean()
 
         c_curr = data_5m.iloc[-1]
-        c_prev = data_5m.iloc[-2]
         current_200 = ema_200.iloc[-1]
 
-        # Daily Flip Level: Pre-session Close or Daily Equilibrium (Spec Sec 2 & 4)
         daily_flip = session_levels.get('daily_eq', session_levels.get('daily_pivot', current_200)) if session_levels else current_200
 
-        # Fast 5/13 Crossover test
         bullish_cross = ema_5.iloc[-2] <= ema_13.iloc[-2] and ema_5.iloc[-1] > ema_13.iloc[-1]
         bearish_cross = ema_5.iloc[-2] >= ema_13.iloc[-2] and ema_5.iloc[-1] < ema_13.iloc[-1]
 

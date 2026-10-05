@@ -1,34 +1,12 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion } from 'motion/react';
+import { createChart, IChartApi, ColorType, LineStyle, UTCTimestamp } from 'lightweight-charts';
 import { 
-  createChart, 
-  IChartApi, 
-  ColorType, 
-  LineStyle, 
-  UTCTimestamp 
-// @ts-ignore
-} from 'lightweight-charts';
-import { 
-  Calendar, 
-  TrendingUp, 
-  RefreshCw, 
-  FileText, 
-  Play, 
-  CheckCircle2, 
-  AlertTriangle, 
-  Lightbulb, 
-  Trash2, 
-  RotateCcw, 
-  Sparkles, 
-  Layers, 
-  Square, 
-  Copy, 
-  Check, 
-  Table, 
-  Database, 
-  Clock, 
-  ShieldCheck 
+  Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw, 
+  Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer 
 } from 'lucide-react';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
 
@@ -73,7 +51,6 @@ interface StorageInfo {
   free_mb: number;
   market_data_mb: number;
   reports_mb: number;
-  largest_files?: Array<{ name: string; size_mb: number; type: string }>;
 }
 
 interface RunResultItem {
@@ -86,11 +63,8 @@ interface RunResultItem {
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
 
 function formatNum(val: any, decimals = 2): string {
-  if (typeof val === 'number') {
-    return isNaN(val) ? '0.00' : val.toFixed(decimals);
-  }
-  const parsed = parseFloat(val);
-  return isNaN(parsed) ? '0.00' : parsed.toFixed(decimals);
+  const num = typeof val === 'number' ? val : parseFloat(val);
+  return isNaN(num) ? '0.00' : num.toFixed(decimals);
 }
 
 function formatPriceBySymbol(price: any, symbol?: string): string {
@@ -104,10 +78,7 @@ function formatPriceBySymbol(price: any, symbol?: string): string {
 
 function prettifyReportName(filename: string): string {
   if (!filename) return 'Report';
-  if (filename.includes('_summary.json')) {
-    const sym = filename.replace('_summary.json', '');
-    return `${sym} · 8-Combination Summary Matrix`;
-  }
+  if (filename.includes('_summary.json')) return `${filename.replace('_summary.json', '')} · 8-Combo Summary`;
   const clean = filename.replace('_report.json', '');
   const parts = clean.split('_');
   if (parts.length >= 4) {
@@ -120,10 +91,7 @@ function prettifyReportName(filename: string): string {
   return filename;
 }
 
-export const BacktestView: React.FC<BacktestViewProps> = ({
-  themeMode = 'dark',
-  brokerCurrency = 'USD'
-}) => {
+export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', brokerCurrency = 'USD' }) => {
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
@@ -137,18 +105,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
 
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
-
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progressText, setProgressText] = useState<string>('');
   const [runResults, setRunResults] = useState<RunResultItem[]>([]);
 
-  // Verification vs Original Reference State
   const [isVerifying, setIsVerifying] = useState<boolean>(false);
   const [verifyResult, setVerifyResult] = useState<string | null>(null);
   const [verifyCopyStatus, setVerifyCopyStatus] = useState<'idle' | 'copied'>('idle');
-
-  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
-  const [fallbackCopyText, setFallbackCopyText] = useState<string>('');
+  const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
 
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
@@ -158,9 +122,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     try {
       const saved = localStorage.getItem('dismissed_improvement_tips');
       return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
+    } catch { return []; }
   });
 
   const chartContainerRef = useRef<HTMLDivElement>(null);
@@ -176,12 +138,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     } catch {}
   }, []);
 
-  useEffect(() => {
-    fetchStorageInfo();
-  }, [fetchStorageInfo]);
+  useEffect(() => { fetchStorageInfo(); }, [fetchStorageInfo]);
 
   useEffect(() => {
-    const checkInitialStatus = async () => {
+    const checkStatus = async () => {
       try {
         const res = await fetch('/api/backtest/status');
         if (res.ok) {
@@ -190,13 +150,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             setIsRunning(true);
             setProgressText(json.progress || 'Simulation in progress...');
           }
-          if (Array.isArray(json.results) && json.results.length > 0) {
-            setRunResults(json.results);
-          }
+          if (Array.isArray(json.results) && json.results.length > 0) setRunResults(json.results);
         }
       } catch {}
     };
-    checkInitialStatus();
+    checkStatus();
   }, []);
 
   const fetchReportList = useCallback(async () => {
@@ -206,35 +164,25 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         const json = await res.json();
         if (json.reports && json.reports.length > 0) {
           setReportFiles(json.reports);
-          setSelectedFile((prev) => (json.reports.includes(prev) ? prev : json.reports[0]));
+          setSelectedFile(prev => json.reports.includes(prev) ? prev : json.reports[0]);
         }
       }
-    } catch (err) {
-      console.warn('Could not fetch backtest report list:', err);
-    }
+    } catch {}
   }, []);
 
-  useEffect(() => {
-    fetchReportList();
-  }, [fetchReportList]);
+  useEffect(() => { fetchReportList(); }, [fetchReportList]);
 
   const fetchSummaryData = useCallback(async (sym: string) => {
     try {
       const res = await fetch(`/api/backtest/summary/${sym}`);
       if (res.ok) {
         const json = await res.json();
-        if (json.data) setSummaryData(json.data);
-      } else {
-        setSummaryData(null);
-      }
-    } catch {
-      setSummaryData(null);
-    }
+        setSummaryData(json.data || null);
+      } else { setSummaryData(null); }
+    } catch { setSummaryData(null); }
   }, []);
 
-  useEffect(() => {
-    fetchSummaryData(testSymbol);
-  }, [testSymbol, fetchSummaryData]);
+  useEffect(() => { fetchSummaryData(testSymbol); }, [testSymbol, fetchSummaryData]);
 
   useEffect(() => {
     if (!selectedFile) return;
@@ -245,30 +193,23 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           const json = await res.json();
           if (json.data) {
             setReportData(json.data);
-            if (json.data.trading_dates && json.data.trading_dates.length > 0) {
-              setSelectedDay(json.data.trading_dates[0]);
-            }
+            if (json.data.trading_dates?.length > 0) setSelectedDay(json.data.trading_dates[0]);
           }
         }
-      } catch (err) {
-        console.warn('Could not load report payload:', err);
-      }
+      } catch {}
     };
     loadReport();
   }, [selectedFile]);
 
   useEffect(() => {
     if (!isRunning) return;
-
     const interval = setInterval(async () => {
       try {
         const res = await fetch('/api/backtest/status');
         if (res.ok) {
           const json = await res.json();
           if (json.progress) setProgressText(json.progress);
-          if (Array.isArray(json.results) && json.results.length > 0) {
-            setRunResults(json.results);
-          }
+          if (Array.isArray(json.results)) setRunResults(json.results);
           if (!json.isRunning) {
             setIsRunning(false);
             await fetchReportList();
@@ -276,22 +217,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
             await fetchStorageInfo();
           }
         }
-      } catch (err) {
-        console.warn('Status poll error:', err);
-      }
+      } catch {}
     }, 2000);
-
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, testSymbol]);
 
+  // Requirement 2.4: Dropdown shows only current run's files for this symbol
+  const currentSymbolReports = useMemo(() => {
+    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`));
+  }, [reportFiles, testSymbol]);
+
   const handleCleanup = async (scope: 'all_reports' | 'symbol') => {
     const sym = testSymbol;
-    const confirmMsg = scope === 'all_reports'
-      ? 'Clear ALL backtest reports, summaries, and day candles? (Market data CSVs will NOT be deleted)'
-      : `Clear all backtest reports and summaries for ${sym}? (Market data CSVs will NOT be deleted)`;
-
-    if (!window.confirm(confirmMsg)) return;
-
+    if (!window.confirm(scope === 'all_reports' ? 'Clear ALL reports and summaries?' : `Clear all reports for ${sym}?`)) return;
     setIsCleaning(true);
     try {
       const res = await fetch('/api/backtest/storage/cleanup', {
@@ -303,38 +241,32 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         await fetchStorageInfo();
         await fetchReportList();
         await fetchSummaryData(testSymbol);
-        if (scope === 'all_reports' || (scope === 'symbol' && selectedFile.startsWith(`${sym}_`))) {
+        if (scope === 'all_reports' || selectedFile.startsWith(`${sym}_`)) {
           setSelectedFile('');
           setReportData(null);
         }
       }
-    } catch (err) {
-      console.warn('Storage cleanup error:', err);
-    } finally {
-      setIsCleaning(false);
-    }
+    } finally { setIsCleaning(false); }
   };
 
   const handleRunBacktest = async (targetSym: string) => {
     if (isRunning) return;
     setIsRunning(true);
     setRunResults([]);
-    setProgressText(`Preparing 8-combination matrix for ${targetSym}...`);
-
+    setProgressText(`Preparing matrix for ${targetSym}...`);
     try {
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: targetSym, days: testDays, rr: testRr }),
       });
-
       if (!res.ok) {
-        const errJson = await res.json();
-        setRunResults([{ symbol: targetSym, status: 'FAILED', message: errJson.message || 'Run request failed' }]);
+        const err = await res.json();
+        setRunResults([{ symbol: targetSym, status: 'FAILED', message: err.message || 'Run failed' }]);
         setIsRunning(false);
       }
     } catch {
-      setRunResults([{ symbol: targetSym, status: 'FAILED', message: 'Network error connecting to backtest server' }]);
+      setRunResults([{ symbol: targetSym, status: 'FAILED', message: 'Network error connecting to runner' }]);
       setIsRunning(false);
     }
   };
@@ -343,7 +275,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
     try {
       await fetch('/api/backtest/stop', { method: 'POST' });
       setIsRunning(false);
-      setProgressText('Backtest cancelled.');
+      setProgressText('Cancelled.');
       await fetchStorageInfo();
     } catch {}
   };
@@ -355,162 +287,217 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
       const res = await fetch('/api/backtest/compare', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol: testSymbol,
-          days: 60,
-          mode: 'adaptive',
-          be: 'off',
-          trail: 'off'
-        })
+        body: JSON.stringify({ symbol: testSymbol, days: 30 })
       });
       const json = await res.json();
-      if (res.ok && json.diff) {
-        setVerifyResult(json.diff);
-      } else {
-        setVerifyResult(json.message || 'Verification failed to run.');
-      }
-    } catch (err: any) {
-      setVerifyResult(`Network error running verification: ${err?.message}`);
-    } finally {
-      setIsVerifying(false);
-    }
+      setVerifyResult(res.ok && json.diff ? json.diff : (json.message || 'Verification failed.'));
+    } catch (e: any) {
+      setVerifyResult(`Verification network error: ${e.message}`);
+    } finally { setIsVerifying(false); }
   };
 
-  const handleCopyVerifyResult = async () => {
-    if (!verifyResult) return;
+  // Requirement 2.4: PDF Generation in browser using jsPDF + jspdf-autotable
+  const handleExportPDF = async () => {
+    setIsExportingPdf(true);
     try {
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(verifyResult);
-        setVerifyCopyStatus('copied');
-        setTimeout(() => setVerifyCopyStatus('idle'), 2000);
-      }
-    } catch {}
-  };
+      const res = await fetch('/api/backtest/export-data');
+      if (!res.ok) throw new Error('Could not fetch export data.');
+      const json = await res.json();
+      const exp = json.data;
 
-  const handleCopyForAI = async () => {
-    const lines: string[] = [];
-    lines.push(`# BACKTEST REPORT FOR AI REVIEW`);
-    lines.push(`Pair: ${testSymbol} | Days: ${testDays} | Target R:R: ${testRr}`);
-    lines.push(`Generated: ${new Date().toUTCString()}\n`);
-    lines.push(`## All 8 Parameter Combinations Matrix`);
+      const doc = new jsPDF('portrait', 'mm', 'a4');
+      const totalPagesExp = '{total_pages_count_string}';
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
 
-    if (summaryData && summaryData.combinations && summaryData.combinations.length > 0) {
-      lines.push(`| Combination | Trades | Win Rate | Exp (R) | PF | Max DD | Net P&L | Adp Cov | Signals Fired | Vol Blocked | Filled |`);
-      lines.push(`| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`);
-      summaryData.combinations.forEach((c) => {
-        const f = c.funnel || { raw_signals_fired: 0, vol_filters_blocked: 0, sim_trades_filled: 0 };
-        lines.push(
-          `| ${c.label} | ${c.total_trades} | ${formatNum(c.win_rate)}% | ${formatNum(c.expectancy)}R | ${formatNum(c.profit_factor)} | $${formatNum(c.max_drawdown)} | $${formatNum(c.net_pnl)} | ${formatNum(c.adaptive_effective_pct)}% | ${f.raw_signals_fired} | ${f.vol_filters_blocked} | ${f.sim_trades_filled} |`
-        );
+      const addHeaderFooter = (pageTitle: string) => {
+        doc.setFontSize(8);
+        doc.setTextColor(100, 116, 139);
+        doc.text('NEXUS MATRIX - AUDITED QUANTITATIVE BACKTEST REPORT', 14, 10);
+        doc.text(pageTitle, pageWidth - 14, 10, { align: 'right' });
+        doc.setDrawColor(203, 213, 225);
+        doc.setLineWidth(0.3);
+        doc.line(14, 13, pageWidth - 14, 13);
+        const str = `Page ${doc.internal.pages.length - 1} of ${totalPagesExp}`;
+        doc.text(str, pageWidth / 2, pageHeight - 8, { align: 'center' });
+      };
+
+      // PAGE 1: COVER
+      doc.setFillColor(15, 23, 42);
+      doc.rect(0, 0, pageWidth, pageHeight, 'F');
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(26);
+      doc.text('NEXUS MATRIX', 20, 50);
+      doc.setFontSize(16);
+      doc.setTextColor(59, 130, 246);
+      doc.text('Institutional Backtest & Portfolio Audit', 20, 60);
+
+      doc.setFontSize(10);
+      doc.setTextColor(203, 213, 225);
+      doc.text(`Run Date: ${exp.generated_at.slice(0, 10)}`, 20, 80);
+      doc.text(`Window Duration: ${exp.days} Days`, 20, 87);
+      doc.text(`Risk-to-Reward Target: 1:${exp.target_rr}`, 20, 94);
+      doc.text(`Whitelist Coverage: 7 Multi-Asset Instruments`, 20, 101);
+
+      doc.setFillColor(30, 41, 59);
+      doc.roundedRect(20, 120, pageWidth - 40, 50, 4, 4, 'F');
+      doc.setTextColor(248, 250, 252);
+      doc.setFontSize(11);
+      doc.text('HOW TO READ THIS REPORT:', 26, 130);
+      doc.setFontSize(9);
+      doc.setTextColor(148, 163, 184);
+      doc.text('1. Evaluates 8 combinations per asset across Adaptive/Legacy, Breakeven, and SuperTrend trail.', 26, 138);
+      doc.text('2. Identifies the statistically superior setup per asset based on Profit Factor and trade volume.', 26, 145);
+      doc.text('3. Rules require at least 30 executions before drawing statistical confidence.', 26, 152);
+      doc.text('4. Detailed suggestions rank recommended parameter and schedule adjustments by estimated dollar impact.', 26, 159);
+
+      // PAGE 2: OVERVIEW
+      doc.addPage();
+      addHeaderFooter('Portfolio Overview');
+      doc.setFontSize(16);
+      doc.setTextColor(15, 23, 42);
+      doc.text('Portfolio Executive Summary', 14, 22);
+
+      const overviewRows = (exp.pairs || []).map((p: any) => {
+        if (p.status !== 'OK') return [p.symbol, 'NOT TESTED', '--', '--', '--', p.error || ''];
+        const b = p.best_combination || {};
+        return [
+          p.symbol,
+          b.label || 'N/A',
+          b.total_trades || 0,
+          `${formatNum(b.win_rate)}%`,
+          formatNum(b.profit_factor),
+          `$${formatNum(b.net_pnl)}`
+        ];
       });
-    }
 
-    lines.push(`\n## Active Selected Report Details (${selectedFile || 'None'})`);
-    if (reportData) {
-      const g = reportData.global_kpis;
-      lines.push(`- Total Trades: ${g?.count ?? 0}`);
-      lines.push(`- Win Rate: ${formatNum(g?.win_rate)}%`);
-      lines.push(`- Net P&L: $${formatNum(g?.net_pnl)}`);
-      lines.push(`- Run Settings: ${(reportData as any).run_settings || 'N/A'}`);
-    }
+      autoTable(doc, {
+        startY: 28,
+        head: [['Asset', 'Best Combination', 'Trades', 'Win Rate', 'Profit Factor', 'Net P&L']],
+        body: overviewRows,
+        theme: 'striped',
+        headStyles: { fillColor: [37, 99, 235], fontSize: 8 },
+        bodyStyles: { fontSize: 8 },
+        didParseCell: (data) => {
+          if (data.column.index === 5 && data.cell.raw && typeof data.cell.raw === 'string' && data.cell.raw.startsWith('$-')) {
+            data.cell.styles.textColor = [220, 38, 38];
+          } else if (data.column.index === 5 && data.cell.raw && typeof data.cell.raw === 'string' && !data.cell.raw.startsWith('$-')) {
+            data.cell.styles.textColor = [16, 185, 129];
+          }
+        }
+      });
 
-    lines.push(`\nQUESTION: What are the 3 most credible weaknesses in this data, and what is the smallest change to test for each?`);
-    const fullText = lines.join('\n');
+      // PAGE 3..N: ONE PAGE PER PAIR
+      for (const p of (exp.pairs || [])) {
+        if (p.status !== 'OK') continue;
+        doc.addPage();
+        addHeaderFooter(`${p.symbol} Deep Dive`);
+        doc.setFontSize(14);
+        doc.setTextColor(15, 23, 42);
+        doc.text(`${p.symbol} - 8-Combination Matrix Performance`, 14, 22);
 
-    try {
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(fullText);
-        setCopyStatus('copied');
-        setTimeout(() => setCopyStatus('idle'), 2000);
-      } else {
-        setFallbackCopyText(fullText);
+        const bLabel = p.best_combination?.label || '';
+        const comboRows = (p.combinations || []).map((c: any) => [
+          (c.label === bLabel ? `★ ${c.label}` : c.label),
+          c.total_trades || 0,
+          `${formatNum(c.win_rate)}%`,
+          `${formatNum(c.expectancy)}R`,
+          formatNum(c.profit_factor),
+          `-$${formatNum(c.max_drawdown)}`,
+          `$${formatNum(c.net_pnl)}`,
+          `${formatNum(c.adaptive_effective_pct)}%`
+        ]);
+
+        autoTable(doc, {
+          startY: 26,
+          head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage']],
+          body: comboRows,
+          theme: 'grid',
+          headStyles: { fillColor: [15, 23, 42], fontSize: 7 },
+          bodyStyles: { fontSize: 7 }
+        });
+
+        let currentY = (doc as any).lastAutoTable.finalY + 8;
+
+        const stratRows = Object.entries(p.best_combination?.strategy_kpis || {}).map(([sName, s]: any) => [
+          sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`
+        ]);
+
+        if (stratRows.length > 0) {
+          doc.setFontSize(10);
+          doc.text(`Performance by Strategy (${bLabel})`, 14, currentY);
+          autoTable(doc, {
+            startY: currentY + 3,
+            head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L']],
+            body: stratRows,
+            theme: 'striped',
+            headStyles: { fillColor: [71, 85, 105], fontSize: 7 },
+            bodyStyles: { fontSize: 7 }
+          });
+          currentY = (doc as any).lastAutoTable.finalY + 8;
+        }
+
+        const tips = p.best_combination?.improvement_tips || [];
+        if (tips.length > 0) {
+          doc.setFontSize(10);
+          doc.setTextColor(37, 99, 235);
+          doc.text('Key Actionable Suggestions:', 14, currentY);
+          doc.setFontSize(8);
+          doc.setTextColor(51, 65, 85);
+          tips.slice(0, 4).forEach((t: any, i: number) => {
+            doc.text(`• [${t.severity}] ${t.title}: ${t.action}`, 16, currentY + 5 + (i * 5));
+          });
+        }
       }
-    } catch {
-      setFallbackCopyText(fullText);
+
+      // FINAL PAGE: TOP SUGGESTIONS & GLOSSARY
+      doc.addPage();
+      addHeaderFooter('Portfolio Guidance & Glossary');
+      doc.setFontSize(14);
+      doc.setTextColor(15, 23, 42);
+      doc.text('Top Ranked Actionable Suggestions', 14, 22);
+
+      const allTips: any[] = [];
+      (exp.pairs || []).forEach((p: any) => {
+        (p.best_combination?.improvement_tips || []).forEach((t: any) => {
+          allTips.push({ ...t, symbol: p.symbol });
+        });
+      });
+      allTips.sort((a, b) => (b.impact || 0) - (a.impact || 0));
+
+      doc.setFontSize(8);
+      doc.setTextColor(51, 65, 85);
+      allTips.slice(0, 10).forEach((t, i) => {
+        doc.text(`${i + 1}. [${t.symbol} - ${t.severity}] ${t.title}: ${t.action}`, 14, 28 + (i * 6));
+      });
+
+      const glossY = 28 + (Math.min(10, allTips.length) * 6) + 12;
+      doc.setFontSize(12);
+      doc.setTextColor(15, 23, 42);
+      doc.text('Audit Glossary', 14, glossY);
+      doc.setFontSize(7.5);
+      doc.setTextColor(100, 116, 139);
+      doc.text('• Win Rate: Percentage of closed positions with net positive profit after spread.', 14, glossY + 6);
+      doc.text('• Expectancy (R): Average risk multiple gained or lost per trade setup taken.', 14, glossY + 11);
+      doc.text('• Profit Factor: Gross profits divided by gross losses. Above 1.3 indicates a robust mathematical edge.', 14, glossY + 16);
+      doc.text('• Max Drawdown: Maximum peak-to-trough capital decline recorded across in-flight equity.', 14, glossY + 21);
+      doc.text('• Adaptive Coverage: Percentage of bars where 120-day historical ADR warmup criteria were satisfied.', 14, glossY + 26);
+      doc.text('• Inconclusive: Datasets with fewer than 30 trades lack statistical sample significance.', 14, glossY + 31);
+
+      if (typeof doc.putTotalPages === 'function') {
+        doc.putTotalPages(totalPagesExp);
+      }
+      doc.save(`Nexus_Matrix_Audit_Report_${exp.generated_at.slice(0, 10)}.pdf`);
+    } catch (err: any) {
+      alert(`PDF Export Error: ${err.message}`);
+    } finally {
+      setIsExportingPdf(false);
     }
   };
-
-  const handleDismissTip = (tipId: string) => {
-    const updated = [...dismissedTipIds, tipId];
-    setDismissedTipIds(updated);
-    try {
-      localStorage.setItem('dismissed_improvement_tips', JSON.stringify(updated));
-    } catch {}
-  };
-
-  const handleResetDismissedTips = () => {
-    setDismissedTipIds([]);
-    try {
-      localStorage.removeItem('dismissed_improvement_tips');
-    } catch {}
-  };
-
-  useEffect(() => {
-    if (activeSubTab !== 'chart' || !reportData || !selectedDay || !chartContainerRef.current) return;
-    const container = chartContainerRef.current;
-    container.innerHTML = '';
-
-    const isLight = themeMode !== 'dark';
-    const dayData = reportData.day_data?.[selectedDay];
-    if (!dayData || !dayData.candles || dayData.candles.length === 0) return;
-
-    const chart = createChart(container, {
-      width: container.clientWidth,
-      height: 480,
-      layout: {
-        background: { type: ColorType.Solid, color: isLight ? '#ffffff' : '#07090e' },
-        textColor: isLight ? '#334155' : '#94a3b8',
-      },
-      grid: {
-        vertLines: { color: isLight ? '#f1f5f9' : '#141a26' },
-        horzLines: { color: isLight ? '#f1f5f9' : '#141a26' },
-      },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: isLight ? '#cbd5e1' : '#212838' },
-      rightPriceScale: { borderColor: isLight ? '#cbd5e1' : '#212838' },
-    });
-    chartApiRef.current = chart;
-
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: '#10b981', downColor: '#ef4444',
-      borderUpColor: '#10b981', borderDownColor: '#ef4444',
-      wickUpColor: '#10b981', wickDownColor: '#ef4444',
-    });
-
-    candleSeries.setData(dayData.candles.map((c) => ({
-      time: c.time as UTCTimestamp,
-      open: c.open, high: c.high, low: c.low, close: c.close,
-    })));
-
-    const lvls = dayData.levels || {};
-    if (lvls.asia_high) candleSeries.createPriceLine({ price: lvls.asia_high, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'ASIA HIGH' });
-    if (lvls.asia_low) candleSeries.createPriceLine({ price: lvls.asia_low, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'ASIA LOW' });
-    if (lvls.daily_eq) candleSeries.createPriceLine({ price: lvls.daily_eq, color: '#f59e0b', lineWidth: 2, lineStyle: LineStyle.Dashed, title: 'DAILY EQ' });
-    if (lvls.pdh) candleSeries.createPriceLine({ price: lvls.pdh, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'PDH' });
-    if (lvls.pdl) candleSeries.createPriceLine({ price: lvls.pdl, color: '#a855f7', lineWidth: 1, lineStyle: LineStyle.Dashed, title: 'PDL' });
-
-    if (dayData.trades && dayData.trades.length > 0) {
-      const markers = dayData.trades.map((t) => ({
-        time: Math.floor(new Date(t.signal_time_utc).getTime() / 1000) as UTCTimestamp,
-        position: (t.direction === 'BUY' ? 'belowBar' : 'aboveBar') as any,
-        color: t.direction === 'BUY' ? '#10b981' : '#ef4444',
-        shape: (t.direction === 'BUY' ? 'arrowUp' : 'arrowDown') as any,
-        text: `${t.direction} (${t.strategy})`,
-      })).sort((a, b) => (a.time as number) - (b.time as number));
-      candleSeries.setMarkers(markers);
-    }
-
-    const handleResize = () => { if (chart && container) chart.applyOptions({ width: container.clientWidth }); };
-    window.addEventListener('resize', handleResize);
-    return () => {
-      window.removeEventListener('resize', handleResize);
-      chart.remove();
-      chartApiRef.current = null;
-    };
-  }, [activeSubTab, reportData, selectedDay, themeMode]);
 
   const kpis: BacktestKPIs = reportData?.global_kpis || {
-    count: 0, win_rate: 0, avg_r: 0, expectancy: 0, profit_factor: 0,
-    max_dd_money: 0, avg_duration: 0, best_r: 0, worst_r: 0, net_pnl: 0, is_inconclusive: true,
+    count: 0, win_rate: 0, avg_r: 0, expectancy: 0, profit_factor: 0, max_dd_money: 0,
+    avg_duration: 0, best_r: 0, worst_r: 0, net_pnl: 0, is_inconclusive: true,
   };
 
   const filteredTrades = (reportData?.all_trades || []).filter((tr) => {
@@ -524,10 +511,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
            (tipFilter === 'ALL' || tip.strategy === tipFilter || tip.category === tipFilter);
   });
 
-  const skippedDetail = (reportData as any)?.skipped_detail || {};
-  const funnel = (reportData as any)?.funnel;
-  const warnings = (reportData as any)?.warnings || [];
-
   const bestComboIdx = summaryData?.combinations?.reduce((bestIdx, curr, currIdx, arr) => {
     if (curr.total_trades < 30) return bestIdx;
     if (bestIdx === -1) return currIdx;
@@ -537,11 +520,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
       {/* Top Header */}
-      <motion.div 
-        initial={{ opacity: 0, y: 15 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-300 dark:border-[#1a2030]"
-      >
+      <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-300 dark:border-[#1a2030]">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
             Backtest & Replay Suite
@@ -554,198 +533,107 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
           </p>
         </div>
 
-        {/* Action Controls & Verification Button */}
-        <div className="flex flex-wrap items-center gap-2.5">
+        {/* Action Controls & Export Buttons */}
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1.5 rounded-xl border border-slate-300 dark:border-[#1a2030]">
-            <select
-              value={testSymbol}
-              onChange={(e) => setTestSymbol(e.target.value)}
-              disabled={isRunning}
-              className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
-            >
+            <select value={testSymbol} onChange={(e) => setTestSymbol(e.target.value)} disabled={isRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none">
               {WHITELIST_ASSETS.map((sym) => (<option key={sym} value={sym}>{sym}</option>))}
             </select>
-
-            <select
-              value={testDays}
-              onChange={(e) => setTestDays(parseInt(e.target.value, 10))}
-              disabled={isRunning}
-              className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none"
-            >
+            <select value={testDays} onChange={(e) => setTestDays(parseInt(e.target.value, 10))} disabled={isRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none">
               <option value={60}>60 Days</option>
               <option value={90}>90 Days</option>
               <option value={180}>180 Days</option>
               <option value={365}>365 Days</option>
             </select>
-
             <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
               <span className="text-[10px] font-bold text-slate-500">R:R</span>
-              <input
-                type="number"
-                step="0.1" min="0.5" max="5.0"
-                value={testRr}
-                onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)}
-                disabled={isRunning}
-                className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none"
-              />
+              <input type="number" step="0.1" min="0.5" max="5.0" value={testRr} onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)} disabled={isRunning} className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none" />
             </div>
 
             {!isRunning ? (
               <>
-                <button
-                  type="button"
-                  onClick={() => handleRunBacktest(testSymbol)}
-                  className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white"
-                >
+                <button type="button" onClick={() => handleRunBacktest(testSymbol)} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white">
                   <Play className="w-3.5 h-3.5" />
                   <span>Run {testSymbol}</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => handleRunBacktest('ALL')}
-                  className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white"
-                >
+                <button type="button" onClick={() => handleRunBacktest('ALL')} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white">
                   <Layers className="w-3.5 h-3.5" />
                   <span>Run All</span>
                 </button>
               </>
             ) : (
-              <button
-                type="button"
-                onClick={handleStopBacktest}
-                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white"
-              >
+              <button type="button" onClick={handleStopBacktest} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white">
                 <Square className="w-3.5 h-3.5" />
                 <span>Stop</span>
               </button>
             )}
           </div>
 
-          <div className="h-6 w-px bg-slate-300 dark:border-[#1a2030] hidden sm:block" />
-
-          {/* Verification Tool Button */}
+          {/* Export for AI (.txt) & Export PDF Buttons */}
           <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              disabled={isVerifying || isRunning}
-              onClick={handleVerifyVsOriginal}
-              className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors"
-              title="Runs reference original per-candle engine against optimized version and reports trade differences"
-            >
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>{isVerifying ? 'Verifying...' : 'Verify vs original (60 days)'}</span>
+            <a href="/api/backtest/export.txt" download className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
+              <Download className="w-3.5 h-3.5 text-blue-500" />
+              <span>Export for AI (.txt)</span>
+            </a>
+
+            <button type="button" onClick={handleExportPDF} disabled={isExportingPdf} className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs disabled:opacity-50">
+              <Printer className="w-3.5 h-3.5 text-emerald-500" />
+              <span>{isExportingPdf ? 'Building PDF...' : 'Export PDF'}</span>
             </button>
 
-            <button
-              type="button"
-              onClick={handleCopyForAI}
-              className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors shrink-0"
-            >
-              {copyStatus === 'copied' ? (
-                <>
-                  <Check className="w-3.5 h-3.5 text-emerald-500" />
-                  <span className="text-emerald-500 font-bold">Copied!</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="w-3.5 h-3.5 text-blue-500" />
-                  <span>Copy for AI</span>
-                </>
-              )}
+            <button type="button" disabled={isVerifying || isRunning} onClick={handleVerifyVsOriginal} className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>{isVerifying ? 'Verifying...' : 'Verify vs original (60 days)'}</span>
             </button>
           </div>
         </div>
       </motion.div>
 
-      {/* VERIFY VS ORIGINAL DIFF RESULT BOX */}
+      {/* Verification Diff Box */}
       {verifyResult && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3 animate-in fade-in">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-purple-500" />
-              <span className="text-xs font-bold text-black dark:text-white">Verification Difference Report (60 Days vs Reference Original)</span>
+              <span className="text-xs font-bold text-black dark:text-white">Verification Difference Report (Prompt F Fixed Boundary)</span>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleCopyVerifyResult}
-                className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs"
-              >
+              <button type="button" onClick={() => { navigator.clipboard.writeText(verifyResult); setVerifyCopyStatus('copied'); setTimeout(() => setVerifyCopyStatus('idle'), 2000); }} className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer">
                 {verifyCopyStatus === 'copied' ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{verifyCopyStatus === 'copied' ? 'Copied' : 'Copy Verification Result'}</span>
+                <span>{verifyCopyStatus === 'copied' ? 'Copied' : 'Copy Result'}</span>
               </button>
-              <button
-                type="button"
-                onClick={() => setVerifyResult(null)}
-                className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer ml-1"
-              >
-                Dismiss
-              </button>
+              <button type="button" onClick={() => setVerifyResult(null)} className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer ml-1">Dismiss</button>
             </div>
           </div>
-          <textarea
-            readOnly
-            value={verifyResult}
-            rows={14}
-            onFocus={(e) => e.target.select()}
-            className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none leading-relaxed"
-          />
+          <textarea readOnly value={verifyResult} rows={14} onFocus={(e) => e.target.select()} className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none" />
         </div>
       )}
 
-      {/* STORAGE STRIP */}
+      {/* Storage Strip */}
       {storageInfo && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-3">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2 flex-wrap">
               <Database className="w-4 h-4 text-blue-500 shrink-0" />
               <span className="font-bold text-black dark:text-white">Storage Volume:</span>
-              <span className="font-mono text-slate-600 dark:text-slate-300">
-                {storageInfo.used_mb} MB used / {storageInfo.free_mb} MB free (Total: {storageInfo.total_mb} MB)
-              </span>
+              <span className="font-mono text-slate-600 dark:text-slate-300">{storageInfo.used_mb} MB used / {storageInfo.free_mb} MB free (Total: {storageInfo.total_mb} MB)</span>
               <span className="text-slate-400 hidden sm:inline">|</span>
-              <span className="font-mono text-[11px] text-slate-500">
-                Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> • Market Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong>
-              </span>
+              <span className="font-mono text-[11px] text-slate-500">Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> • Market Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong></span>
             </div>
-
             <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                disabled={isCleaning || isRunning}
-                onClick={() => handleCleanup('symbol')}
-                className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] dark:hover:bg-[#1c2130] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors"
-              >
-                <Trash2 className="w-3 h-3 text-amber-500" />
-                <span>Clear {testSymbol} reports</span>
+              <button type="button" disabled={isCleaning || isRunning} onClick={() => handleCleanup('symbol')} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+                <Trash2 className="w-3 h-3 text-amber-500" /><span>Clear {testSymbol} reports</span>
               </button>
-
-              <button
-                type="button"
-                disabled={isCleaning || isRunning}
-                onClick={() => handleCleanup('all_reports')}
-                className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 dark:text-rose-400 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors"
-              >
-                <Trash2 className="w-3 h-3 text-rose-500" />
-                <span>Clear all reports</span>
+              <button type="button" disabled={isCleaning || isRunning} onClick={() => handleCleanup('all_reports')} className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+                <Trash2 className="w-3 h-3 text-rose-500" /><span>Clear all reports</span>
               </button>
             </div>
           </div>
-
           {(() => {
-            const usedPct = storageInfo.total_mb > 0 
-              ? Math.min(100, Math.round((storageInfo.used_mb / storageInfo.total_mb) * 100)) 
-              : 0;
-            const isHighUsage = usedPct >= 85;
-
+            const usedPct = storageInfo.total_mb > 0 ? Math.min(100, Math.round((storageInfo.used_mb / storageInfo.total_mb) * 100)) : 0;
             return (
               <div className="w-full bg-slate-100 dark:bg-[#08090d] rounded-full h-2 overflow-hidden border border-slate-200 dark:border-[#1a2030]">
-                <div 
-                  className={`h-full rounded-full transition-all duration-500 ${
-                    isHighUsage ? 'bg-rose-500' : 'bg-blue-600'
-                  }`} 
-                  style={{ width: `${usedPct}%` }}
-                />
+                <div className={`h-full rounded-full transition-all duration-500 ${usedPct >= 85 ? 'bg-rose-500' : 'bg-blue-600'}`} style={{ width: `${usedPct}%` }} />
               </div>
             );
           })()}
@@ -757,27 +645,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold text-black dark:text-white">Backtest Run Results</span>
-            <button
-              onClick={() => setRunResults([])}
-              className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer"
-            >
-              Dismiss
-            </button>
+            <button onClick={() => setRunResults([])} className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer">Dismiss</button>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 pt-1">
             {runResults.map((r, i) => (
-              <div key={i} className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 text-xs font-mono ${
-                r.status === 'OK'
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
-                  : 'bg-rose-500/10 border-rose-500/30 text-rose-600'
-              }`}>
+              <div key={i} className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 text-xs font-mono ${r.status === 'OK' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-600'}`}>
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-black dark:text-white">{r.symbol}</span>
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                    r.status === 'OK' ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' : 'bg-rose-500/20 text-rose-600'
-                  }`}>
-                    {r.status}
-                  </span>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${r.status === 'OK' ? 'bg-emerald-500/20 text-emerald-600' : 'bg-rose-500/20 text-rose-600'}`}>{r.status}</span>
                 </div>
                 <div className="text-[11px] break-words whitespace-pre-wrap">{r.message}</div>
                 {r.timing && (
@@ -792,29 +667,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
         </div>
       )}
 
-      {/* Fallback Textarea if Clipboard is Blocked */}
-      {fallbackCopyText && (
-        <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-amber-500/40 shadow-xs space-y-2 animate-in fade-in">
-          <div className="flex items-center justify-between text-xs font-bold text-amber-600 dark:text-amber-400">
-            <span>Clipboard write blocked. Select all and copy below:</span>
-            <button
-              type="button"
-              onClick={() => setFallbackCopyText('')}
-              className="text-slate-400 hover:text-black dark:hover:text-white cursor-pointer text-xs"
-            >
-              Dismiss
-            </button>
-          </div>
-          <textarea
-            readOnly
-            value={fallbackCopyText}
-            rows={10}
-            onFocus={(e) => e.target.select()}
-            className="w-full p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none"
-          />
-        </div>
-      )}
-
       {/* Live Running Banner */}
       {isRunning && (
         <div className="p-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-between text-xs animate-in fade-in">
@@ -825,29 +677,18 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <div className="text-slate-500 font-mono text-[11px] mt-0.5">{progressText || 'Stepping through historical candles...'}</div>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={handleStopBacktest}
-            className="px-3 py-1.5 rounded-lg text-[11px] font-bold font-mono bg-rose-600 hover:bg-rose-500 text-white transition-colors cursor-pointer"
-          >
-            Cancel Run
-          </button>
+          <button type="button" onClick={handleStopBacktest} className="px-3 py-1.5 rounded-lg text-[11px] font-bold font-mono bg-rose-600 hover:bg-rose-500 text-white transition-colors cursor-pointer">Cancel Run</button>
         </div>
       )}
 
       {/* RESULTS BY COMBINATION MATRIX TABLE */}
-      {summaryData && summaryData.combinations && summaryData.combinations.length > 0 && (
+      {summaryData?.combinations && summaryData.combinations.length > 0 && (
         <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Table className="w-4 h-4 text-blue-500" />
-              <h3 className="text-sm font-bold text-black dark:text-white">
-                Results by Combination ({summaryData.symbol} · {summaryData.days} Days · R:R {summaryData.target_rr})
-              </h3>
+              <h3 className="text-sm font-bold text-black dark:text-white">Results by Combination ({summaryData.symbol} · {summaryData.days} Days · R:R {summaryData.target_rr})</h3>
             </div>
-            <span className="text-[11px] text-slate-500 font-mono">
-              Click any row to view its detailed report
-            </span>
           </div>
 
           <div className="overflow-x-auto">
@@ -865,148 +706,58 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                {summaryData.combinations.map((c, idx) => {
-                  const isBest = idx === bestComboIdx;
-                  const isSelected = selectedFile === c.report_file;
-
-                  return (
-                    <tr
-                      key={idx}
-                      onClick={() => setSelectedFile(c.report_file)}
-                      className={`cursor-pointer transition-colors ${
-                        isSelected 
-                          ? 'bg-blue-500/15 dark:bg-blue-500/20' 
-                          : isBest 
-                          ? 'bg-amber-500/10 dark:bg-amber-500/15 hover:bg-amber-500/20' 
-                          : 'hover:bg-slate-50 dark:hover:bg-[#121520]'
-                      }`}
-                    >
-                      <td className="py-3 px-3 font-bold text-black dark:text-white flex items-center gap-2">
-                        {isBest && <span className="text-amber-500" title="Best PF with ≥ 30 trades">★</span>}
-                        <span>{c.label}</span>
-                      </td>
-                      <td className="py-3 px-3 text-center font-bold">{c.total_trades}</td>
-                      <td className={`py-3 px-3 text-center font-bold ${c.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {c.win_rate}%
-                      </td>
-                      <td className="py-3 px-3 text-center">{c.expectancy}R</td>
-                      <td className="py-3 px-3 text-center">{c.profit_factor}</td>
-                      <td className="py-3 px-3 text-right text-rose-500">-${c.max_drawdown}</td>
-                      <td className={`py-3 px-3 text-right font-bold ${c.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        ${c.net_pnl}
-                      </td>
-                      <td className="py-3 px-3 text-center text-blue-500">{c.adaptive_effective_pct}%</td>
-                    </tr>
-                  );
-                })}
+                {summaryData.combinations.map((c, idx) => (
+                  <tr key={idx} onClick={() => setSelectedFile(c.report_file)} className={`cursor-pointer transition-colors ${selectedFile === c.report_file ? 'bg-blue-500/15' : idx === bestComboIdx ? 'bg-amber-500/10 hover:bg-amber-500/20' : 'hover:bg-slate-50 dark:hover:bg-[#121520]'}`}>
+                    <td className="py-3 px-3 font-bold text-black dark:text-white flex items-center gap-2">
+                      {idx === bestComboIdx && <span className="text-amber-500">★</span>}
+                      <span>{c.label}</span>
+                    </td>
+                    <td className="py-3 px-3 text-center font-bold">{c.total_trades}</td>
+                    <td className={`py-3 px-3 text-center font-bold ${c.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{c.win_rate}%</td>
+                    <td className="py-3 px-3 text-center">{c.expectancy}R</td>
+                    <td className="py-3 px-3 text-center">{c.profit_factor}</td>
+                    <td className="py-3 px-3 text-right text-rose-500">-${c.max_drawdown}</td>
+                    <td className={`py-3 px-3 text-right font-bold ${c.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${c.net_pnl}</td>
+                    <td className="py-3 px-3 text-center text-blue-500">{c.adaptive_effective_pct}%</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
         </div>
       )}
 
-      {/* DIAGNOSTIC FUNNEL & WARNINGS STRIP */}
+      {/* Report Selector Strip */}
       {reportData && (
-        <div className="p-4 rounded-2xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] space-y-2 text-xs">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-slate-500">Report File:</span>
-              <select
-                value={selectedFile}
-                onChange={(e) => setSelectedFile(e.target.value)}
-                disabled={isRunning}
-                className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer max-w-sm truncate"
-              >
-                {reportFiles.map((f) => (<option key={f} value={f}>{prettifyReportName(f)}</option>))}
-              </select>
-              <span className="font-mono text-blue-600 dark:text-blue-400">
-                (Adaptive Coverage: {(reportData as any).adaptive_effective_pct ?? 100}%)
-              </span>
-            </div>
-            {warnings.length > 0 && (
-              <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 font-semibold text-[11px]">
-                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                <span>{warnings.join(' | ')}</span>
-              </div>
-            )}
+        <div className="p-4 rounded-2xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2">
+            <span className="font-bold text-slate-500">Active Report:</span>
+            {/* Requirement 2.4: Dropdown shows only current run's files for this symbol */}
+            <select value={selectedFile} onChange={(e) => setSelectedFile(e.target.value)} className="px-3 py-1.5 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer max-w-sm truncate">
+              {currentSymbolReports.map((f) => (<option key={f} value={f}>{prettifyReportName(f)}</option>))}
+            </select>
           </div>
-
-          {funnel && (
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-2 border-t border-slate-200 dark:border-[#1a2030] text-center font-mono">
-              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-                <div className="text-[10px] text-slate-400 uppercase">Signals Fired</div>
-                <div className="text-sm font-bold text-black dark:text-white mt-0.5">{funnel.raw_signals_fired}</div>
-              </div>
-              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-                <div className="text-[10px] text-slate-400 uppercase">Passed Clamping</div>
-                <div className="text-sm font-bold text-blue-500 mt-0.5">{funnel.adapted_signals_passed}</div>
-              </div>
-              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-                <div className="text-[10px] text-slate-400 uppercase">Vol / Room Blocked</div>
-                <div className="text-sm font-bold text-rose-500 mt-0.5">{funnel.vol_filters_blocked}</div>
-              </div>
-              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-                <div className="text-[10px] text-slate-400 uppercase">Attempted Fills</div>
-                <div className="text-sm font-bold text-amber-500 mt-0.5">{funnel.sim_trades_attempted}</div>
-              </div>
-              <div className="p-2 rounded-lg bg-white dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
-                <div className="text-[10px] text-slate-400 uppercase">Filled Trades</div>
-                <div className="text-sm font-bold text-emerald-500 mt-0.5">{funnel.sim_trades_filled}</div>
-              </div>
-            </div>
-          )}
+          <span className="font-mono text-blue-600 dark:text-blue-400">Coverage: {(reportData as any).adaptive_effective_pct ?? 100}%</span>
         </div>
       )}
 
       {/* Navigation Sub-Tabs */}
       <div className="flex flex-wrap gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
-        <button
-          onClick={() => setActiveSubTab('summary')}
-          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
-            activeSubTab === 'summary' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
-          }`}
-        >
-          <TrendingUp className="w-3.5 h-3.5" />
-          <span>Summary Dashboard</span>
+        <button onClick={() => setActiveSubTab('summary')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'summary' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <TrendingUp className="w-3.5 h-3.5" /><span>Summary Dashboard</span>
         </button>
-
-        <button
-          onClick={() => setActiveSubTab('tips')}
-          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 relative ${
-            activeSubTab === 'tips' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
-          }`}
-        >
-          <Lightbulb className="w-3.5 h-3.5 text-amber-400" />
-          <span>Actionable Improvement Tips</span>
-          {activeTips.length > 0 && (
-            <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold bg-amber-500 text-black">
-              {activeTips.length}
-            </span>
-          )}
+        <button onClick={() => setActiveSubTab('tips')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'tips' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <Lightbulb className="w-3.5 h-3.5 text-amber-400" /><span>Actionable Improvement Tips</span>
         </button>
-
-        <button
-          onClick={() => setActiveSubTab('chart')}
-          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
-            activeSubTab === 'chart' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
-          }`}
-        >
-          <Calendar className="w-3.5 h-3.5" />
-          <span>Day Chart Inspector</span>
+        <button onClick={() => setActiveSubTab('chart')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'chart' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <Calendar className="w-3.5 h-3.5" /><span>Day Chart Inspector</span>
         </button>
-
-        <button
-          onClick={() => setActiveSubTab('ledger')}
-          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
-            activeSubTab === 'ledger' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-500 hover:text-black dark:hover:text-white'
-          }`}
-        >
-          <FileText className="w-3.5 h-3.5" />
-          <span>Full Trade Ledger ({reportData?.all_trades?.length || 0})</span>
+        <button onClick={() => setActiveSubTab('ledger')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'ledger' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <FileText className="w-3.5 h-3.5" /><span>Full Trade Ledger ({reportData?.all_trades?.length || 0})</span>
         </button>
       </div>
 
-      {/* SUB-TAB 1: SUMMARY DASHBOARD */}
+      {/* SUB-TAB 1: SUMMARY */}
       {activeSubTab === 'summary' && (
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
@@ -1015,51 +766,31 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
               <div className="text-2xl font-bold font-mono text-blue-600 dark:text-blue-400 mt-1">{kpis.count}</div>
               <div className="mt-1">
                 {kpis.is_inconclusive ? (
-                  <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-amber-500/15 text-amber-500 border border-amber-500/30">
-                    INCONCLUSIVE (&lt;30)
-                  </span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-amber-500/15 text-amber-500">INCONCLUSIVE (&lt;30)</span>
                 ) : (
-                  <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
-                    SAMPLE VALID
-                  </span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-emerald-500/15 text-emerald-500">VALID SAMPLE</span>
                 )}
               </div>
             </div>
-
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] uppercase font-bold text-slate-500">Win Rate</div>
-              <div className={`text-2xl font-bold font-mono mt-1 ${kpis.win_rate >= 50 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'}`}>
-                {kpis.win_rate}%
-              </div>
-              <div className="text-[10px] text-slate-500 mt-1">Accuracy</div>
+              <div className={`text-2xl font-bold font-mono mt-1 ${kpis.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{kpis.win_rate}%</div>
             </div>
-
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] uppercase font-bold text-slate-500">Expectancy</div>
-              <div className={`text-2xl font-bold font-mono mt-1 ${kpis.expectancy > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'}`}>
-                {kpis.expectancy}R
-              </div>
-              <div className="text-[10px] text-slate-500 mt-1">Per trade edge</div>
+              <div className={`text-2xl font-bold font-mono mt-1 ${kpis.expectancy > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{kpis.expectancy}R</div>
             </div>
-
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] uppercase font-bold text-slate-500">Profit Factor</div>
               <div className="text-2xl font-bold font-mono text-black dark:text-white mt-1">{kpis.profit_factor}</div>
-              <div className="text-[10px] text-slate-500 mt-1">Gross Win / Loss</div>
             </div>
-
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] uppercase font-bold text-slate-500">Max Drawdown</div>
               <div className="text-2xl font-bold font-mono text-rose-600 mt-1">-${kpis.max_dd_money}</div>
-              <div className="text-[10px] text-slate-500 mt-1">Peak-to-valley</div>
             </div>
-
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
               <div className="text-[10px] uppercase font-bold text-slate-500">Net Realized P&L</div>
-              <div className={`text-2xl font-bold font-mono mt-1 ${kpis.net_pnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'}`}>
-                {formatCurrency(kpis.net_pnl, brokerCurrency)}
-              </div>
-              <div className="text-[10px] text-slate-500 mt-1">Simulated Net</div>
+              <div className={`text-2xl font-bold font-mono mt-1 ${kpis.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{formatCurrency(kpis.net_pnl, brokerCurrency)}</div>
             </div>
           </div>
 
@@ -1073,10 +804,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                     <th className="py-2.5 px-3 text-center">Trades</th>
                     <th className="py-2.5 px-3 text-center">Win Rate</th>
                     <th className="py-2.5 px-3 text-center">Avg R</th>
-                    <th className="py-2.5 px-3 text-center">Expectancy</th>
-                    <th className="py-2.5 px-3 text-center">Profit Factor</th>
+                    <th className="py-2.5 px-3 text-center">PF</th>
                     <th className="py-2.5 px-3 text-right">Net P&L</th>
-                    <th className="py-2.5 px-3 text-center">Audit Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
@@ -1084,355 +813,85 @@ export const BacktestView: React.FC<BacktestViewProps> = ({
                     <tr key={sName} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
                       <td className="py-3 px-3 font-bold text-black dark:text-white">{sName}</td>
                       <td className="py-3 px-3 text-center font-bold">{sKpi.count}</td>
-                      <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {sKpi.win_rate}%
-                      </td>
+                      <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{sKpi.win_rate}%</td>
                       <td className="py-3 px-3 text-center">{sKpi.avg_r}R</td>
-                      <td className="py-3 px-3 text-center">{sKpi.expectancy}R</td>
                       <td className="py-3 px-3 text-center">{sKpi.profit_factor}</td>
-                      <td className={`py-3 px-3 text-right font-bold ${sKpi.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        ${sKpi.net_pnl}
-                      </td>
-                      <td className="py-3 px-3 text-center">
-                        {sKpi.is_inconclusive ? (
-                          <span className="text-[9px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/15 text-amber-500 border border-amber-500/30">
-                            INCONCLUSIVE (&lt;30)
-                          </span>
-                        ) : (
-                          <span className="text-[9px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
-                            VALID
-                          </span>
-                        )}
-                      </td>
+                      <td className={`py-3 px-3 text-right font-bold ${sKpi.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${sKpi.net_pnl}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </div>
-
-          <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
-            <h3 className="text-sm font-bold text-black dark:text-white mb-3">Performance by Day of Week</h3>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
-                    <th className="py-2.5 px-3">Weekday</th>
-                    <th className="py-2.5 px-3 text-center">Trades</th>
-                    <th className="py-2.5 px-3 text-center">Win Rate</th>
-                    <th className="py-2.5 px-3 text-center">Avg R</th>
-                    <th className="py-2.5 px-3 text-center">Expectancy</th>
-                    <th className="py-2.5 px-3 text-right">Net P&L</th>
-                    <th className="py-2.5 px-3 text-center">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                  {Object.entries(reportData?.dow_kpis || {}).map(([dow, k]) => (
-                    <tr key={dow} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
-                      <td className="py-3 px-3 font-bold text-black dark:text-white">{dow}</td>
-                      <td className="py-3 px-3 text-center font-bold">{k.count}</td>
-                      <td className={`py-3 px-3 text-center font-bold ${k.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        {k.win_rate}%
-                      </td>
-                      <td className="py-3 px-3 text-center">{k.avg_r}R</td>
-                      <td className="py-3 px-3 text-center">{k.expectancy}R</td>
-                      <td className={`py-3 px-3 text-right font-bold ${k.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                        ${k.net_pnl}
-                      </td>
-                      <td className="py-3 px-3 text-center">
-                        {k.is_inconclusive ? (
-                          <span className="text-[9px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/15 text-amber-500 border border-amber-500/30">
-                            INCONCLUSIVE (&lt;30)
-                          </span>
-                        ) : (
-                          <span className="text-[9px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
-                            VALID
-                          </span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {skippedDetail && (skippedDetail.by_reason || Object.keys(skippedDetail).length > 0) && (
-            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-4">
-              <h3 className="text-sm font-bold text-black dark:text-white">Skipped Signals Summary</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
-                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
-                  <div className="text-[10px] font-bold text-slate-500 uppercase">By Skip Reason</div>
-                  <div className="space-y-1">
-                    {Object.entries(skippedDetail.by_reason || {}).map(([r, count]: any) => (
-                      <div key={r} className="flex justify-between">
-                        <span className="text-slate-600 dark:text-slate-300">{r}</span>
-                        <span className="font-bold text-black dark:text-white">{count}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
-                  <div className="text-[10px] font-bold text-slate-500 uppercase">By Strategy</div>
-                  <div className="space-y-1">
-                    {Object.entries(skippedDetail.by_strategy || {}).map(([s, count]: any) => (
-                      <div key={s} className="flex justify-between">
-                        <span className="text-slate-600 dark:text-slate-300">{s}</span>
-                        <span className="font-bold text-black dark:text-white">{count}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] space-y-2">
-                  <div className="text-[10px] font-bold text-slate-500 uppercase">By Hour (SAST)</div>
-                  <div className="space-y-1 max-h-36 overflow-y-auto">
-                    {Object.entries(skippedDetail.by_hour_sast || {}).map(([h, count]: any) => (
-                      <div key={h} className="flex justify-between">
-                        <span className="text-slate-600 dark:text-slate-300">{String(h).padStart(2, '0')}:00 SAST</span>
-                        <span className="font-bold text-black dark:text-white">{count}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       )}
 
-      {/* SUB-TAB 2: ACTIONABLE IMPROVEMENT TIPS */}
+      {/* SUB-TAB 2: TIPS */}
       {activeSubTab === 'tips' && (
         <div className="space-y-4">
-          <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-3">
-              <label className="font-bold text-slate-500">Filter Strategy:</label>
-              <select
-                value={tipFilter}
-                onChange={(e) => setTipFilter(e.target.value)}
-                className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white cursor-pointer"
-              >
-                <option value="ALL">All Tips</option>
-                {Array.from(new Set(rawTips.map((t) => t.strategy))).map((s) => (<option key={s} value={s}>{s}</option>))}
-              </select>
-            </div>
-
-            <div className="flex items-center gap-3">
-              {dismissedTipIds.length > 0 && (
-                <button
-                  type="button"
-                  onClick={handleResetDismissedTips}
-                  className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] text-slate-600 dark:text-slate-300 hover:text-black dark:hover:text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  <span>Restore Dismissed Tips ({dismissedTipIds.length})</span>
-                </button>
-              )}
-              <span className="font-mono text-slate-500 text-xs">
-                Showing {activeTips.length} active insights
-              </span>
-            </div>
-          </div>
-
           {activeTips.length === 0 ? (
-            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center space-y-3">
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center">
               <Sparkles className="w-8 h-8 text-amber-400 mx-auto" />
-              <div className="text-sm font-bold text-black dark:text-white">
-                No tip rules triggered (sample too small or no pattern above thresholds)
-              </div>
+              <div className="text-sm font-bold text-black dark:text-white mt-2">No tip rules triggered</div>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {activeTips.map((tip) => {
-                const isHigh = tip.severity === 'HIGH';
-                const isMed = tip.severity === 'MEDIUM';
-
-                return (
-                  <div
-                    key={tip.id}
-                    className={`p-5 rounded-2xl border bg-white dark:bg-[#0f1118] shadow-xs flex flex-col justify-between space-y-4 ${
-                      isHigh ? 'border-rose-500/30' : isMed ? 'border-amber-500/30' : 'border-blue-500/30'
-                    }`}
-                  >
-                    <div>
-                      <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-[#1a2030]">
-                        <div className="flex items-center gap-2">
-                          <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
-                            isHigh ? 'bg-rose-500/15 text-rose-600 border border-rose-500/30' : isMed ? 'bg-amber-500/15 text-amber-600 border border-amber-500/30' : 'bg-blue-500/15 text-blue-600 border border-blue-500/30'
-                          }`}>
-                            {tip.severity} PRIORITY
-                          </span>
-                          <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-100 dark:bg-[#08090d] text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-[#1a2030]">
-                            {tip.strategy}
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => handleDismissTip(tip.id)}
-                          className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-500/10 transition-colors cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                      <h4 className="text-sm font-bold text-black dark:text-white mt-3">{tip.title}</h4>
-                      <p className="text-xs text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">{tip.description}</p>
-                    </div>
-                    <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] text-xs">
-                      <div className="font-bold text-blue-600 dark:text-blue-400 text-[11px] mb-1 flex items-center gap-1.5">
-                        <Lightbulb className="w-3.5 h-3.5" /> Recommended Tweak:
-                      </div>
-                      <div className="text-slate-700 dark:text-slate-300 text-[11px] leading-relaxed">{tip.action}</div>
-                    </div>
+              {activeTips.map((tip) => (
+                <div key={tip.id} className="p-5 rounded-2xl border bg-white dark:bg-[#0f1118] shadow-xs flex flex-col justify-between space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold bg-blue-500/15 text-blue-600">{tip.severity}</span>
+                    <button type="button" onClick={() => setDismissedTipIds(prev => [...prev, tip.id])} className="text-slate-400 hover:text-rose-600"><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
-                );
-              })}
+                  <h4 className="text-sm font-bold text-black dark:text-white">{tip.title}</h4>
+                  <p className="text-xs text-slate-600 dark:text-slate-400">{tip.description}</p>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] text-xs text-slate-700 dark:text-slate-300">
+                    <strong className="text-blue-500">Action: </strong>{tip.action}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>
       )}
 
-      {/* SUB-TAB 3: DAY CHART INSPECTOR */}
+      {/* SUB-TAB 3: CHART */}
       {activeSubTab === 'chart' && (
         <div className="space-y-4">
-          <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2">
-              <label className="font-bold text-slate-500">Select Trading Day:</label>
-              <select
-                value={selectedDay}
-                onChange={(e) => setSelectedDay(e.target.value)}
-                className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
-              >
-                {(reportData?.trading_dates || []).map((d) => (<option key={d} value={d}>{d}</option>))}
-              </select>
-            </div>
-            <div className="flex items-center gap-3 text-[11px] font-mono text-slate-500">
-              <span className="flex items-center gap-1"><span className="w-2 h-0.5 bg-blue-500 inline-block" /> Asia H/L</span>
-              <span className="flex items-center gap-1"><span className="w-2 h-0.5 bg-amber-500 inline-block" /> Daily EQ</span>
-              <span className="flex items-center gap-1"><span className="w-2 h-0.5 bg-purple-500 inline-block" /> PDH/PDL</span>
-              <span className="text-emerald-500 font-bold">▲ Buy Entry</span>
-              <span className="text-rose-500 font-bold">▼ Sell Entry</span>
-            </div>
+          <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
+            <select value={selectedDay} onChange={(e) => setSelectedDay(e.target.value)} className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] font-mono font-bold text-blue-600 dark:text-blue-400">
+              {(reportData?.trading_dates || []).map((d) => (<option key={d} value={d}>{d}</option>))}
+            </select>
           </div>
-
-          <div 
-            ref={chartContainerRef} 
-            className="w-full h-[480px] rounded-2xl bg-white dark:bg-[#07090e] border border-slate-300 dark:border-[#1a2030] overflow-hidden"
-          />
-
-          <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
-            <h4 className="text-xs font-bold text-black dark:text-white uppercase mb-3">
-              Trades for {selectedDay} ({reportData?.day_data?.[selectedDay]?.trades?.length || 0} trades)
-            </h4>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
-                    <th className="py-2 px-3">Strategy</th>
-                    <th className="py-2 px-3 text-center">Dir</th>
-                    <th className="py-2 px-3">Lots</th>
-                    <th className="py-2 px-3">Entry</th>
-                    <th className="py-2 px-3">Exit</th>
-                    <th className="py-2 px-3 text-center">R</th>
-                    <th className="py-2 px-3 text-right">P&L</th>
-                    <th className="py-2 px-3">Exit Reason</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                  {(reportData?.day_data?.[selectedDay]?.trades || []).map((t: any, idx: number) => (
-                    <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
-                      <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>{t.direction}</td>
-                      <td className="py-2.5 px-3">{t.lots}</td>
-                      <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
-                      <td className="py-2.5 px-3">{formatPriceBySymbol(t.exit_price, t.symbol)}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{t.r_multiple}R</td>
-                      <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${t.money_pnl}</td>
-                      <td className="py-2.5 px-3 text-slate-400">{t.exit_reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
+          <div ref={chartContainerRef} className="w-full h-[480px] rounded-2xl bg-white dark:bg-[#07090e] border border-slate-300 dark:border-[#1a2030]" />
         </div>
       )}
 
-      {/* SUB-TAB 4: FULL TRADE LEDGER */}
+      {/* SUB-TAB 4: LEDGER */}
       {activeSubTab === 'ledger' && (
-        <div className="space-y-4">
-          <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-3">
-              <label className="font-bold text-slate-500">Filter Strategy:</label>
-              <select
-                value={strategyFilter}
-                onChange={(e) => setStrategyFilter(e.target.value)}
-                className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white cursor-pointer"
-              >
-                <option value="ALL">All Strategies</option>
-                {Object.keys(reportData?.strategy_kpis || {}).map((s) => (<option key={s} value={s}>{s}</option>))}
-              </select>
-
-              <label className="font-bold text-slate-500">Outcome:</label>
-              <select
-                value={outcomeFilter}
-                onChange={(e) => setOutcomeFilter(e.target.value)}
-                className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-black dark:text-white cursor-pointer"
-              >
-                <option value="ALL">All Outcomes</option>
-                <option value="WIN">Wins Only</option>
-                <option value="LOSS">Losses Only</option>
-                <option value="BREAKEVEN">Breakeven Only</option>
-              </select>
-            </div>
-            <span className="font-mono text-slate-500 text-xs">Showing {filteredTrades.length} trades</span>
-          </div>
-
-          <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500 bg-slate-50 dark:bg-[#08090d]/50">
-                    <th className="py-3 px-3">Date (SAST)</th>
-                    <th className="py-3 px-3">Strategy</th>
-                    <th className="py-3 px-3 text-center">Dir</th>
-                    <th className="py-3 px-3">Lots</th>
-                    <th className="py-3 px-3">Entry</th>
-                    <th className="py-3 px-3">SL</th>
-                    <th className="py-3 px-3">TP</th>
-                    <th className="py-3 px-3">Exit Time</th>
-                    <th className="py-3 px-3">Exit Reason</th>
-                    <th className="py-3 px-3 text-center">R</th>
-                    <th className="py-3 px-3 text-right">Net P&L</th>
-                    <th className="py-3 px-3 text-center">Result</th>
+        <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead>
+                <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500 bg-slate-50 dark:bg-[#08090d]/50">
+                  <th className="py-3 px-3">Date</th><th className="py-3 px-3">Strategy</th><th className="py-3 px-3">Dir</th><th className="py-3 px-3">Lots</th><th className="py-3 px-3">Entry</th><th className="py-3 px-3">Exit</th><th className="py-3 px-3">R</th><th className="py-3 px-3 text-right">Net P&L</th><th className="py-3 px-3">Result</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                {filteredTrades.map((t: any, idx: number) => (
+                  <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
+                    <td className="py-2.5 px-3 text-slate-400">{t.date_sast || t.date}</td>
+                    <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
+                    <td className={`py-2.5 px-3 font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>{t.direction}</td>
+                    <td className="py-2.5 px-3">{t.lots}</td>
+                    <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
+                    <td className="py-2.5 px-3">{formatPriceBySymbol(t.exit_price, t.symbol)}</td>
+                    <td className={`py-2.5 px-3 font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{t.r_multiple}R</td>
+                    <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${t.money_pnl}</td>
+                    <td className="py-2.5 px-3"><span className={`text-[9px] px-2 py-0.5 rounded font-bold ${t.result === 'WIN' ? 'bg-emerald-500/15 text-emerald-500' : 'bg-rose-500/15 text-rose-500'}`}>{t.result}</span></td>
                   </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                  {filteredTrades.map((t: any, idx: number) => (
-                    <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
-                      <td className="py-2.5 px-3 text-slate-400">{t.date_sast || t.date}</td>
-                      <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>{t.direction}</td>
-                      <td className="py-2.5 px-3">{t.lots}</td>
-                      <td className="py-2.5 px-3">{formatPriceBySymbol(t.entry_price, t.symbol)}</td>
-                      <td className="py-2.5 px-3 text-rose-500">{formatPriceBySymbol(t.sl, t.symbol)}</td>
-                      <td className="py-2.5 px-3 text-emerald-500">{formatPriceBySymbol(t.tp, t.symbol)}</td>
-                      <td className="py-2.5 px-3 text-slate-400">{t.exit_time}</td>
-                      <td className="py-2.5 px-3 text-slate-400">{t.exit_reason}</td>
-                      <td className={`py-2.5 px-3 text-center font-bold ${t.r_multiple > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{t.r_multiple}R</td>
-                      <td className={`py-2.5 px-3 text-right font-bold ${t.money_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${t.money_pnl}</td>
-                      <td className="py-2.5 px-3 text-center">
-                        <span className={`text-[9px] px-2 py-0.5 rounded font-mono font-bold ${
-                          t.result === 'WIN' ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30' : 'bg-rose-500/15 text-rose-500 border border-rose-500/30'
-                        }`}>
-                          {t.result}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}

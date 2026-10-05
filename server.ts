@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { createServer as createViteServer } from 'vite';
 import { spawn, ChildProcess } from 'child_process';
 
@@ -78,6 +79,8 @@ interface BrokerTelemetry {
   }>;
 }
 
+const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
+
 const BOT_CONFIG_FILE = path.join(process.cwd(), 'bot_config.json');
 const TRADES_DB_FILE = path.join(process.cwd(), 'trades_db.json');
 const CANDLES_CACHE_FILE = path.join(process.cwd(), 'candles_cache.json');
@@ -96,71 +99,8 @@ let backtestRunning = false;
 let backtestProgress = '';
 let backtestLastError: string | null = null;
 let backtestExitCode: number | null = null;
-let activeBacktestProcess: ChildProcess | null = null;
+let activeBacktestProcesses: ChildProcess[] = [];
 let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string }> = [];
-
-const SEED_TRADES = [
-  {
-    id: "deal-26686729",
-    ticket: "#26686729",
-    asset: "EURUSD",
-    strategy: "STRATEGY_513",
-    type: "BUY",
-    lots: 0.02,
-    openPrice: 1.11420,
-    closePrice: 1.11660,
-    pnl: 2.88,
-    openTime: "2026-09-29 15:23:10",
-    closeTime: "2026-09-29 16:02:45",
-    status: "WIN",
-    source: "Fusion cTrader"
-  },
-  {
-    id: "deal-26685480",
-    ticket: "#26685480",
-    asset: "EURUSD",
-    strategy: "STRATEGY_513",
-    type: "BUY",
-    lots: 0.02,
-    openPrice: 1.11420,
-    closePrice: 1.11660,
-    pnl: 1.92,
-    openTime: "2026-09-29 15:05:40",
-    closeTime: "2026-09-29 16:01:30",
-    status: "WIN",
-    source: "Fusion cTrader"
-  },
-  {
-    id: "deal-26668860",
-    ticket: "#26668860",
-    asset: "GBPUSD",
-    strategy: "EMA_9_25_CROSS",
-    type: "BUY",
-    lots: 0.02,
-    openPrice: 1.33520,
-    closePrice: 1.33700,
-    pnl: 0.36,
-    openTime: "2026-09-29 10:51:15",
-    closeTime: "2026-09-29 12:50:32",
-    status: "WIN",
-    source: "Fusion cTrader"
-  },
-  {
-    id: "deal-26667829",
-    ticket: "#26667829",
-    asset: "AUDUSD",
-    strategy: "MANUAL_TRADE",
-    type: "SELL",
-    lots: 0.01,
-    openPrice: 0.68940,
-    closePrice: 0.68994,
-    pnl: -0.54,
-    openTime: "2026-09-29 10:29:00",
-    closeTime: "2026-09-29 12:47:10",
-    status: "LOSS",
-    source: "Fusion cTrader"
-  }
-];
 
 let activeBotConfig: BotGatewayConfig = {
   masterExecution: true,
@@ -178,16 +118,6 @@ let activeBotConfig: BotGatewayConfig = {
   currency: 'USD',
   updatedAt: new Date().toISOString(),
   version: 1,
-  strategyModes: {
-    "EMA_9_25_CROSS": "LIVE",
-    "GRUBBER_KICK": "LIVE",
-    "STRATEGY_513": "LIVE",
-    "ORB_LIQUIDITY_SWEEP": "LIVE",
-    "AVWAP_200EMA_CONTINUATION": "LIVE",
-    "PDH_PDL_FAILED_BREAKOUT": "LIVE",
-    "ORB_CRACKER": "DRY_RUN",
-    "OES_4H_ORDER_BLOCK": "LIVE"
-  }
 };
 
 let riskLimits: RiskLimitsConfig = {
@@ -240,17 +170,13 @@ function loadTradesFromDisk(): any[] {
       const content = fs.readFileSync(TRADES_DB_FILE, 'utf8').trim();
       if (content) {
         const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) {
-          return parsed;
-        }
+        if (Array.isArray(parsed)) return parsed;
       }
     }
   } catch (e) {
     console.error('Failed to load trades from disk:', e);
   }
-
-  saveTradesToDisk(SEED_TRADES);
-  return SEED_TRADES;
+  return [];
 }
 
 function recomputeRiskState() {
@@ -286,8 +212,152 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   lastSyncTime: new Date().toISOString(),
   lastHeartbeat: new Date().toISOString(),
   openPositions: [],
-  trades: SEED_TRADES,
+  trades: [],
 };
+
+function generateExportDataPayload(): any {
+  const result: any = {
+    generated_at: new Date().toISOString(),
+    days: 60,
+    target_rr: 1.0,
+    combinations_rollup: {},
+    pairs: []
+  };
+
+  const allSummaryCombos: Record<string, { trades: number; pnl: number; win_count: number }> = {};
+
+  for (const sym of WHITELIST_ASSETS) {
+    const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
+    if (!fs.existsSync(summaryFile)) {
+      result.pairs.push({
+        symbol: sym,
+        status: "NOT TESTED",
+        error: "No backtest summary generated yet."
+      });
+      continue;
+    }
+
+    try {
+      const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
+      result.days = summary.days || result.days;
+      result.target_rr = summary.target_rr || result.target_rr;
+      const combos: any[] = summary.combinations || [];
+
+      combos.forEach(c => {
+        if (!allSummaryCombos[c.label]) {
+          allSummaryCombos[c.label] = { trades: 0, pnl: 0, win_count: 0 };
+        }
+        allSummaryCombos[c.label].trades += c.total_trades || 0;
+        allSummaryCombos[c.label].pnl += c.net_pnl || 0;
+        allSummaryCombos[c.label].win_count += Math.round(((c.win_rate || 0) / 100) * (c.total_trades || 0));
+      });
+
+      // Select best combination: highest PF with trades >= 30, else highest trades
+      let bestCombo: any = null;
+      const qualifying = combos.filter(c => (c.total_trades || 0) >= 30);
+      if (qualifying.length > 0) {
+        bestCombo = qualifying.reduce((b, curr) => (curr.profit_factor > b.profit_factor ? curr : b), qualifying[0]);
+      } else if (combos.length > 0) {
+        bestCombo = combos.reduce((b, curr) => (curr.total_trades > b.total_trades ? curr : b), combos[0]);
+      }
+
+      let bestReportDetail: any = {};
+      if (bestCombo && bestCombo.report_file) {
+        const reportPath = path.resolve(BACKTEST_OUTPUT_DIR, bestCombo.report_file);
+        if (fs.existsSync(reportPath)) {
+          bestReportDetail = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+        }
+      }
+
+      const pairPayload: any = {
+        symbol: sym,
+        status: "OK",
+        combinations: combos,
+        best_combination: {
+          ...(bestCombo || {}),
+          strategy_kpis: bestReportDetail.strategy_kpis || {},
+          dow_kpis: bestReportDetail.dow_kpis || {},
+          skipped_summary: bestReportDetail.skipped_summary || {},
+          warnings: bestReportDetail.warnings || [],
+          adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100,
+          improvement_tips: bestReportDetail.improvement_tips || []
+        }
+      };
+
+      result.pairs.push(pairPayload);
+    } catch (e: any) {
+      result.pairs.push({ symbol: sym, status: "NOT TESTED", error: e.message });
+    }
+  }
+
+  // Cross-pair rollup per combination
+  const rollup: Record<string, any> = {};
+  Object.entries(allSummaryCombos).forEach(([label, s]) => {
+    rollup[label] = {
+      total_trades: s.trades,
+      total_pnl: Number(s.pnl.toFixed(2)),
+      weighted_win_rate: s.trades > 0 ? Number(((s.win_count / s.trades) * 100).toFixed(1)) : 0
+    };
+  });
+  result.combinations_rollup = rollup;
+
+  return result;
+}
+
+function formatExportTxt(data: any): string {
+  const lines: string[] = [];
+  lines.push(`LEGEND: [TR]=Trades | [WR]=WinRate% | [EXP]=Expectancy(R) | [PF]=ProfitFactor | [DD]=MaxDrawdown | [PNL]=NetRealized$ | [COV]=AdaptiveCover%`);
+  lines.push(`RUN: Date: ${data.generated_at.slice(0, 10)} | Days: ${data.days} | Target R:R: 1:${data.target_rr}`);
+  lines.push(`RULES: Trades < 30 tagged as INCONCLUSIVE | All numbers rounded to 2 decimals\n`);
+
+  lines.push(`=== CROSS-PAIR ROLLUP PER COMBINATION ===`);
+  Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
+    lines.push(`${combo.padEnd(32)} | TR: ${String(r.total_trades).padStart(5)} | WR: ${r.weighted_win_rate.toFixed(1).padStart(5)}% | PNL: $${r.total_pnl.toFixed(2)}`);
+  });
+  lines.push(``);
+
+  for (const p of data.pairs || []) {
+    lines.push(`================================================================================`);
+    lines.push(`ASSET: ${p.symbol} (${p.status})`);
+    if (p.status !== "OK") {
+      lines.push(`STATUS: ${p.error || 'Not tested'}\n`);
+      continue;
+    }
+
+    lines.push(`--- 8 Combinations ---`);
+    for (const c of p.combinations || []) {
+      const incon = (c.total_trades || 0) < 30 ? " [INCONCLUSIVE]" : "";
+      lines.push(`${c.label.padEnd(32)} | TR: ${String(c.total_trades).padStart(4)} | WR: ${c.win_rate.toFixed(1)}% | EXP: ${c.expectancy.toFixed(2)}R | PF: ${c.profit_factor.toFixed(2)} | DD: -$${c.max_drawdown.toFixed(2)} | PNL: $${c.net_pnl.toFixed(2)} | COV: ${c.adaptive_effective_pct.toFixed(0)}%${incon}`);
+    }
+
+    const b = p.best_combination || {};
+    lines.push(`\n--- Best Combination: ${b.label || 'N/A'} ---`);
+    lines.push(`Performance by Strategy:`);
+    Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
+      lines.push(`  ${sName.padEnd(28)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | PF: ${s.profit_factor.toFixed(2)} | PNL: $${s.net_pnl.toFixed(2)}`);
+    });
+
+    lines.push(`Performance by Day of Week:`);
+    Object.entries(b.dow_kpis || {}).forEach(([dow, s]: any) => {
+      lines.push(`  ${dow.padEnd(12)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | EXP: ${s.expectancy.toFixed(2)}R | PNL: $${s.net_pnl.toFixed(2)}`);
+    });
+
+    if (b.warnings && b.warnings.length > 0) {
+      lines.push(`Warnings: ${b.warnings.join(' | ')}`);
+    }
+
+    const tips = b.improvement_tips || [];
+    if (tips.length > 0) {
+      lines.push(`Suggestions:`);
+      tips.slice(0, 5).forEach((t: any) => {
+        lines.push(`  • [${t.severity}] ${t.title}: ${t.action}`);
+      });
+    }
+    lines.push(``);
+  }
+
+  return lines.join('\n');
+}
 
 async function startServer() {
   const app = express();
@@ -299,9 +369,7 @@ async function startServer() {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
-    }
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
   });
 
@@ -330,7 +398,29 @@ async function startServer() {
     }
   });
 
-  // BACKTEST REPORT AND SUMMARY APIS
+  // BACKTEST EXPORT APIS
+  app.get('/api/backtest/export-data', (_req, res) => {
+    try {
+      const data = generateExportDataPayload();
+      res.status(200).json({ status: 'success', data });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.get('/api/backtest/export.txt', (_req, res) => {
+    try {
+      const data = generateExportDataPayload();
+      const txt = formatExportTxt(data);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.txt"`);
+      res.status(200).send(txt);
+    } catch (err: any) {
+      res.status(500).send(`Export error: ${err?.message}`);
+    }
+  });
+
   app.get('/api/backtest/reports', (_req, res) => {
     try {
       if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) {
@@ -393,9 +483,9 @@ async function startServer() {
   });
 
   app.get('/api/backtest/status', (_req, res) => {
-    res.status(200).json({ 
-      status: 'success', 
-      isRunning: backtestRunning, 
+    res.status(200).json({
+      status: 'success',
+      isRunning: backtestRunning,
       progress: backtestProgress,
       lastError: backtestLastError,
       exitCode: backtestExitCode,
@@ -404,12 +494,10 @@ async function startServer() {
   });
 
   app.post('/api/backtest/stop', (_req, res) => {
-    if (activeBacktestProcess) {
-      try {
-        activeBacktestProcess.kill();
-      } catch {}
-      activeBacktestProcess = null;
-    }
+    activeBacktestProcesses.forEach(p => {
+      try { p.kill(); } catch {}
+    });
+    activeBacktestProcesses = [];
     backtestRunning = false;
     backtestProgress = 'Backtest canceled by user.';
     backtestLastError = null;
@@ -419,35 +507,26 @@ async function startServer() {
   app.get('/api/backtest/storage', (_req, res) => {
     try {
       const volPath = storageBase || process.cwd();
-      let total_mb = 0;
-      let free_mb = 0;
-      let used_mb = 0;
-
+      let total_mb = 0, free_mb = 0, used_mb = 0;
       try {
         const stats = fs.statfsSync(volPath);
         total_mb = Math.round((stats.bsize * stats.blocks) / (1024 * 1024));
         free_mb = Math.round((stats.bsize * stats.bfree) / (1024 * 1024));
         used_mb = total_mb - free_mb;
-      } catch (e) {
-        console.warn('Could not read statfs:', e);
-      }
+      } catch (e) {}
 
       let market_data_bytes = 0;
       const allFiles: Array<{ name: string; path: string; size_mb: number; type: string }> = [];
 
       if (fs.existsSync(BACKTEST_DATA_DIR)) {
-        const dataFiles = fs.readdirSync(BACKTEST_DATA_DIR);
-        for (const f of dataFiles) {
+        for (const f of fs.readdirSync(BACKTEST_DATA_DIR)) {
           const fPath = path.join(BACKTEST_DATA_DIR, f);
           try {
             const stat = fs.statSync(fPath);
             if (stat.isFile()) {
-              if (f.endsWith('.csv')) {
-                market_data_bytes += stat.size;
-              }
+              if (f.endsWith('.csv')) market_data_bytes += stat.size;
               allFiles.push({
-                name: f,
-                path: fPath,
+                name: f, path: fPath,
                 size_mb: Number((stat.size / (1024 * 1024)).toFixed(2)),
                 type: f.endsWith('.csv') ? 'market_data' : 'data_other'
               });
@@ -458,16 +537,14 @@ async function startServer() {
 
       let reports_bytes = 0;
       if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
-        const outputFiles = fs.readdirSync(BACKTEST_OUTPUT_DIR);
-        for (const f of outputFiles) {
+        for (const f of fs.readdirSync(BACKTEST_OUTPUT_DIR)) {
           const fPath = path.join(BACKTEST_OUTPUT_DIR, f);
           try {
             const stat = fs.statSync(fPath);
             if (stat.isFile()) {
               reports_bytes += stat.size;
               allFiles.push({
-                name: f,
-                path: fPath,
+                name: f, path: fPath,
                 size_mb: Number((stat.size / (1024 * 1024)).toFixed(2)),
                 type: 'report'
               });
@@ -479,17 +556,12 @@ async function startServer() {
       allFiles.sort((a, b) => b.size_mb - a.size_mb);
       const largest_files = allFiles.slice(0, 20);
 
-      const market_data_mb = Number((market_data_bytes / (1024 * 1024)).toFixed(2));
-      const reports_mb = Number((reports_bytes / (1024 * 1024)).toFixed(2));
-
       res.status(200).json({
         status: 'success',
         data: {
-          total_mb,
-          used_mb,
-          free_mb,
-          market_data_mb,
-          reports_mb,
+          total_mb, used_mb, free_mb,
+          market_data_mb: Number((market_data_bytes / (1024 * 1024)).toFixed(2)),
+          reports_mb: Number((reports_bytes / (1024 * 1024)).toFixed(2)),
           largest_files
         }
       });
@@ -505,116 +577,57 @@ async function startServer() {
       let deletedCount = 0;
 
       if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
-        const files = fs.readdirSync(BACKTEST_OUTPUT_DIR);
-        for (const f of files) {
+        for (const f of fs.readdirSync(BACKTEST_OUTPUT_DIR)) {
           if (!f.endsWith('.json')) continue;
-
-          let shouldDelete = false;
-          if (scope === 'all_reports') {
-            shouldDelete = true;
-          } else if (scope === 'symbol' && targetSym) {
-            if (f.startsWith(`${targetSym}_`)) {
-              shouldDelete = true;
-            }
-          }
-
+          let shouldDelete = (scope === 'all_reports') || (scope === 'symbol' && targetSym && f.startsWith(`${targetSym}_`));
           if (shouldDelete) {
-            try {
-              fs.unlinkSync(path.join(BACKTEST_OUTPUT_DIR, f));
-              deletedCount++;
-            } catch {}
+            try { fs.unlinkSync(path.join(BACKTEST_OUTPUT_DIR, f)); deletedCount++; } catch {}
           }
         }
       }
 
       if (fs.existsSync(BACKTEST_DATA_DIR)) {
-        const files = fs.readdirSync(BACKTEST_DATA_DIR);
-        for (const f of files) {
-          if (f.endsWith('_M5.csv') || f.endsWith('_H1.csv') || f.endsWith('_H4.csv') || f.endsWith('_D1.csv')) {
-            continue;
-          }
-
-          const isLeftover = (
-            f.includes('_trades.csv') ||
-            f.includes('_trades.json') ||
-            f.includes('_skipped_signals.csv') ||
-            f === 'report.html'
-          );
-
+        for (const f of fs.readdirSync(BACKTEST_DATA_DIR)) {
+          if (f.endsWith('_M5.csv') || f.endsWith('_H1.csv') || f.endsWith('_H4.csv') || f.endsWith('_D1.csv')) continue;
+          const isLeftover = f.includes('_trades.csv') || f.includes('_trades.json') || f.includes('_skipped_signals.csv') || f === 'report.html';
           if (isLeftover) {
-            let shouldDelete = false;
-            if (scope === 'all_reports') {
-              shouldDelete = true;
-            } else if (scope === 'symbol' && targetSym) {
-              if (f.startsWith(`${targetSym}_`)) {
-                shouldDelete = true;
-              }
-            }
-
+            let shouldDelete = (scope === 'all_reports') || (scope === 'symbol' && targetSym && f.startsWith(`${targetSym}_`));
             if (shouldDelete) {
-              try {
-                fs.unlinkSync(path.join(BACKTEST_DATA_DIR, f));
-                deletedCount++;
-              } catch {}
+              try { fs.unlinkSync(path.join(BACKTEST_DATA_DIR, f)); deletedCount++; } catch {}
             }
           }
         }
       }
 
-      res.status(200).json({
-        status: 'success',
-        message: `Cleanup completed. Deleted ${deletedCount} file(s).`,
-        deletedCount
-      });
+      res.status(200).json({ status: 'success', message: `Cleanup completed. Deleted ${deletedCount} file(s).`, deletedCount });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
   });
 
-  // COMPARE ENDPOINT: Runs verification harness vs unoptimized reference engine
   app.post('/api/backtest/compare', async (req, res) => {
     try {
       const symbol = String(req.body?.symbol || 'US30').toUpperCase();
-      const days = parseInt(req.body?.days || '60', 10);
-      const mode = req.body?.mode || 'adaptive';
-      const be = req.body?.be || 'off';
-      const trail = req.body?.trail || 'off';
-
       const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-      const args = [
-        'backtest/runner.py',
-        '--symbol', symbol,
-        '--days', String(days),
-        '--compare',
-        '--breakeven', be,
-        '--supertrend', trail
-      ];
-      if (mode === 'legacy') {
-        args.push('--adaptive=False');
-      }
-
-      const proc = spawn(pythonCmd, args, {
+      const proc = spawn(pythonCmd, ['backtest/runner.py', '--symbol', symbol, '--compare'], {
         env: { ...process.env, PYTHONPATH: process.cwd() }
       });
 
       let output = '';
-      let errorOutput = '';
+      let errText = '';
+      proc.stdout.on('data', d => { output += d.toString(); });
+      proc.stderr.on('data', d => { errText += d.toString(); });
 
-      proc.stdout.on('data', (d) => { output += d.toString(); });
-      proc.stderr.on('data', (d) => { errorOutput += d.toString(); });
-
-      proc.on('exit', (code) => {
-        if (code === 0) {
-          res.status(200).json({ status: 'success', diff: output.trim() });
-        } else {
-          res.status(500).json({ status: 'error', message: errorOutput || output || `Exited with code ${code}` });
-        }
+      proc.on('exit', code => {
+        if (code === 0) res.status(200).json({ status: 'success', diff: output.trim() });
+        else res.status(500).json({ status: 'error', message: errText || output || `Exited code ${code}` });
       });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
   });
 
+  // RUN ALL WITH PARALLEL WORKERS & PREPARE-ONLY STAGE
   app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) {
       return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
@@ -625,113 +638,107 @@ async function startServer() {
     const rr = parseFloat(req.body?.rr || 1.0);
 
     backtestResults = [];
+    activeBacktestProcesses = [];
     backtestRunning = true;
-    backtestProgress = `Starting 8-combination parameter matrix...`;
+    backtestProgress = `Initiating backtest matrix...`;
     backtestLastError = null;
     backtestExitCode = null;
 
-    const symbolsQueue = requestedSymbol === 'ALL'
-      ? ['US30', 'GOLD', 'NAS100', 'GERMAN30', 'EURUSD', 'GBPUSD', 'USDJPY']
-      : [requestedSymbol];
-
+    const symbolsQueue = requestedSymbol === 'ALL' ? WHITELIST_ASSETS : [requestedSymbol];
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
 
-    async function runQueue() {
-      for (let i = 0; i < symbolsQueue.length; i++) {
-        if (!backtestRunning) break;
-        const sym = symbolsQueue[i];
-        backtestProgress = `[${i + 1}/${symbolsQueue.length}] Testing 8 combinations on ${sym} (${days} Days)...`;
-        console.log(`[Backtest Matrix Queue]: Starting ${sym}...`);
+    async function executeMatrix() {
+      // 1. Preparation Phase (Sequential download)
+      if (requestedSymbol === 'ALL') {
+        for (let idx = 0; idx < symbolsQueue.length; idx++) {
+          if (!backtestRunning) return;
+          const sym = symbolsQueue[idx];
+          backtestProgress = `[Phase 1/2: Preparing Data ${idx + 1}/${symbolsQueue.length}] ${sym}...`;
 
-        let symbolLastError = '';
-        let symbolTiming = '';
+          await new Promise<void>((resolve) => {
+            const prepProc = spawn(pythonCmd, ['backtest/runner.py', '--symbol', sym, '--prepare-only'], {
+              env: { ...process.env, PYTHONPATH: process.cwd() }
+            });
+            prepProc.on('exit', () => resolve());
+            prepProc.on('error', () => resolve());
+          });
+        }
+      }
 
-        const runnerArgs = [
-          'backtest/runner.py',
-          '--symbol', sym,
-          '--days', String(days),
-          '--rr', String(rr)
-        ];
+      // 2. Parallel Execution Phase
+      const maxWorkers = Math.min(4, os.cpus().length || 2);
+      let activeIndex = 0;
+      let completedCount = 0;
+
+      async function runWorker(sym: string): Promise<void> {
+        let symTiming = '';
+        let symError = '';
+
+        const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days), '--rr', String(rr)];
+        if (requestedSymbol === 'ALL') args.push('--skip-download');
 
         await new Promise<void>((resolve) => {
-          const proc = spawn(pythonCmd, runnerArgs, {
-            env: { ...process.env, PYTHONPATH: process.cwd() }
-          });
-          activeBacktestProcess = proc;
+          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd() } });
+          activeBacktestProcesses.push(proc);
 
-          proc.stdout.on('data', (data) => {
-            const text = data.toString().trim();
-            if (text) {
-              const lines = text.split('\n');
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (trimmed.startsWith('[time]')) {
-                  symbolTiming = trimmed.replace('[time]', '').trim();
-                }
-                if (trimmed.startsWith('ERROR:')) {
-                  symbolLastError = trimmed;
-                  backtestLastError = trimmed;
-                }
-              }
-              const lastLine = lines[lines.length - 1];
-              backtestProgress = `[${i + 1}/${symbolsQueue.length}] ${sym}: ${lastLine}`;
-              console.log(`[Backtest Runner]: ${lastLine}`);
+          proc.stdout.on('data', data => {
+            const lines = data.toString().split('\n');
+            for (const l of lines) {
+              const trimmed = l.trim();
+              if (trimmed.startsWith('[time]')) symTiming = trimmed.replace('[time]', '').trim();
+              if (trimmed.startsWith('ERROR:')) symError = trimmed;
             }
           });
 
-          proc.stderr.on('data', (data) => {
-            const errText = data.toString().trim();
-            console.error(`[Backtest Error]: ${errText}`);
-            const lines = errText.split('\n').map((l: string) => l.trim()).filter(Boolean);
-            const lastLine = lines.length > 0 ? lines[lines.length - 1] : 'Python execution crashed.';
-            symbolLastError = `ERROR in ${sym}: ${lastLine}`;
-            backtestLastError = symbolLastError;
+          proc.stderr.on('data', data => {
+            const errLines = data.toString().split('\n').filter(Boolean);
+            if (errLines.length > 0) symError = `ERROR in ${sym}: ${errLines[errLines.length - 1].trim()}`;
           });
 
-          proc.on('exit', (code) => {
-            activeBacktestProcess = null;
+          proc.on('exit', code => {
+            completedCount++;
+            backtestProgress = `[Phase 2/2] ${completedCount}/${symbolsQueue.length} assets completed.`;
             if (code === 0) {
-              backtestResults.push({
-                symbol: sym,
-                status: 'OK',
-                message: 'Completed 8/8 matrix',
-                timing: symbolTiming
-              });
+              backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 8/8 matrix', timing: symTiming });
             } else {
-              backtestResults.push({
-                symbol: sym,
-                status: 'FAILED',
-                message: symbolLastError || `Exited with code ${code}`,
-                timing: symbolTiming
-              });
+              backtestResults.push({ symbol: sym, status: 'FAILED', message: symError || `Exited with code ${code}`, timing: symTiming });
             }
             resolve();
           });
 
-          proc.on('error', (err) => {
-            activeBacktestProcess = null;
-            symbolLastError = `ERROR: Failed to spawn Python process: ${err.message}`;
-            backtestLastError = symbolLastError;
-            backtestResults.push({ symbol: sym, status: 'FAILED', message: symbolLastError });
+          proc.on('error', err => {
+            completedCount++;
+            backtestResults.push({ symbol: sym, status: 'FAILED', message: err.message });
             resolve();
           });
         });
       }
 
+      const activePool: Promise<void>[] = [];
+      while (activeIndex < symbolsQueue.length && backtestRunning) {
+        while (activePool.length < maxWorkers && activeIndex < symbolsQueue.length) {
+          const nextSym = symbolsQueue[activeIndex++];
+          const p = runWorker(nextSym).then(() => {
+            activePool.splice(activePool.indexOf(p), 1);
+          });
+          activePool.push(p);
+        }
+        if (activePool.length > 0) {
+          await Promise.race(activePool);
+        }
+      }
+      await Promise.all(activePool);
+
       backtestRunning = false;
-      const anyFailed = backtestResults.some(r => r.status === 'FAILED');
-      backtestExitCode = anyFailed ? 1 : 0;
-      backtestProgress = `Matrix batch finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} passed.`;
-      console.log(`[Backtest Finished]: ${backtestProgress}`);
+      backtestProgress = `Finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} assets completed.`;
     }
 
-    runQueue().catch((err) => {
+    executeMatrix().catch(e => {
       backtestRunning = false;
-      backtestLastError = err?.message || 'Unexpected runner queue error';
-      console.error('[Backtest Queue Error]:', err);
+      backtestLastError = e.message;
     });
 
-    res.status(200).json({ status: 'success', message: `Backtest matrix initiated for ${requestedSymbol}` });
+    res.status(200).json({ status: 'success', message: `Execution initiated for ${requestedSymbol}` });
   });
 
   app.get('/api/journal', async (_req, res) => {
@@ -782,22 +789,8 @@ async function startServer() {
   app.post('/api/bot/config', (req, res) => {
     try {
       const config = req.body;
-      activeBotConfig = { 
-        ...activeBotConfig, 
-        ...config,
-        adaptiveMode: config.adaptiveMode !== undefined ? Boolean(config.adaptiveMode) : activeBotConfig.adaptiveMode,
-        minRr: config.minRr !== undefined ? Number(config.minRr) : activeBotConfig.minRr,
-        stopOnDailyGoalReached: config.stopOnDailyGoalReached !== undefined 
-          ? Boolean(config.stopOnDailyGoalReached) 
-          : (config.stop_on_daily_goal_reached !== undefined ? Boolean(config.stop_on_daily_goal_reached) : activeBotConfig.stopOnDailyGoalReached),
-        dailyGoalTarget: config.dailyGoalTarget !== undefined ? Number(config.dailyGoalTarget) : activeBotConfig.dailyGoalTarget,
-        weeklyGoalTarget: config.weeklyGoalTarget !== undefined ? Number(config.weeklyGoalTarget) : activeBotConfig.weeklyGoalTarget,
-        monthlyGoalTarget: config.monthlyGoalTarget !== undefined ? Number(config.monthlyGoalTarget) : activeBotConfig.monthlyGoalTarget,
-        updatedAt: new Date().toISOString() 
-      };
-
-      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify({ ...existingConfig, ...activeBotConfig }, null, 2));
+      activeBotConfig = { ...activeBotConfig, ...config, updatedAt: new Date().toISOString() };
+      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(activeBotConfig, null, 2));
       res.json({ status: 'success', config: activeBotConfig });
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error?.message });
@@ -812,19 +805,11 @@ async function startServer() {
   app.post('/api/limits', (req, res) => {
     try {
       const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, resetBreaker } = req.body;
-
       if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
       if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
       if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
       if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
       if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
-
-      const existingConfig = fs.existsSync(BOT_CONFIG_FILE) ? JSON.parse(fs.readFileSync(BOT_CONFIG_FILE, 'utf8')) : {};
-      const confirmedPayload = { 
-        ...existingConfig, 
-        ...riskLimits, 
-        limitsConfirmedAt: new Date().toISOString()
-      };
 
       if (resetBreaker) {
         riskState.breakerTriggered = false;
@@ -833,7 +818,7 @@ async function startServer() {
         activeBotConfig.masterExecution = true;
       }
 
-      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify(confirmedPayload, null, 2));
+      fs.writeFileSync(BOT_CONFIG_FILE, JSON.stringify({ ...activeBotConfig, ...riskLimits, limitsConfirmedAt: new Date().toISOString() }, null, 2));
       res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
     } catch (error: any) {
       res.status(500).json({ status: 'error', message: error?.message });
@@ -846,30 +831,22 @@ async function startServer() {
   });
 
   app.post('/api/broker/telemetry', (req, res) => {
-    const payload = req.body;
-    activeBrokerTelemetry = { ...activeBrokerTelemetry, ...payload, lastHeartbeat: new Date().toISOString() };
+    activeBrokerTelemetry = { ...activeBrokerTelemetry, ...req.body, lastHeartbeat: new Date().toISOString() };
     res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
   });
 
   function launchPythonBot() {
-    console.log('🤖 Launching Nexus Matrix Python Trading Engine...');
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    
     const bot = spawn(pythonCmd, ['engine/matrix.py'], {
       env: { ...process.env, PYTHONPATH: process.cwd() },
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    bot.on('error', (err) => {
-      console.error(`[Python Engine Spawn Warning]: ${err.message}`);
-    });
-
-    bot.stdout.on('data', (chunk) => {
+    bot.stdout.on('data', chunk => {
       const line = chunk.toString().trim();
       if (line.includes('[MATRIX_TELEMETRY]')) {
         try {
-          const jsonStr = line.split('[MATRIX_TELEMETRY]')[1].trim();
-          const telem = JSON.parse(jsonStr);
+          const telem = JSON.parse(line.split('[MATRIX_TELEMETRY]')[1].trim());
           activeBrokerTelemetry.balance = telem.balance;
           activeBrokerTelemetry.equity = telem.equity;
           if (telem.currency) activeBrokerTelemetry.currency = telem.currency;
@@ -878,22 +855,14 @@ async function startServer() {
           if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
           if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
           if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
-          if (Array.isArray(telem.openPositions)) {
-            activeBrokerTelemetry.openPositions = telem.openPositions;
-          }
+          if (Array.isArray(telem.openPositions)) activeBrokerTelemetry.openPositions = telem.openPositions;
           activeBrokerTelemetry.connected = true;
           activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
         } catch {}
       }
-      console.log(`[Python Engine] ${line}`);
     });
 
-    bot.stderr.on('data', (chunk) => {
-      console.error(`[Python Engine Error] ${chunk.toString().trim()}`);
-    });
-
-    bot.on('exit', (code) => {
-      console.warn(`⚠️ Python Bot process exited with code ${code}. Restarting in 5s...`);
+    bot.on('exit', () => {
       setTimeout(launchPythonBot, 5000);
     });
   }
@@ -901,18 +870,11 @@ async function startServer() {
   launchPythonBot();
 
   const distPath = path.join(process.cwd(), 'dist');
-  const isProduction = fs.existsSync(path.join(distPath, 'index.html'));
-
-  if (isProduction) {
+  if (fs.existsSync(path.join(distPath, 'index.html'))) {
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true, host: '0.0.0.0' },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true, host: '0.0.0.0' }, appType: 'spa' });
     app.use(vite.middlewares);
   }
 
@@ -921,7 +883,7 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
+startServer().catch(err => {
   console.error('Server startup error:', err);
   process.exit(1);
 });
