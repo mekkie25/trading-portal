@@ -20,7 +20,6 @@ import {
   Wallet, 
   Sliders, 
   CheckCircle2, 
-  Percent,
   Terminal,
   Zap,
   Activity,
@@ -153,7 +152,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       lastAppliedTimestamp: timestamp,
     };
     onSaveBotSettings(updated);
-    setSaveToast(`Risk and Targets saved at ${timestamp}!`);
+    setSaveToast(`Daily trade limit saved at ${timestamp}!`);
     setTimeout(() => setSaveToast(null), 3500);
   };
 
@@ -686,82 +685,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <form onSubmit={handleSave} className="flex-1 flex flex-col justify-between mt-4 space-y-5">
             <div className="space-y-4">
-              <div className="p-4 rounded-xl bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold text-black dark:text-white">Master Execution</span>
-                    <span className={`text-[9px] font-mono px-2 py-0.5 rounded font-bold ${
-                      formSettings.masterExecution ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/15 text-rose-600'
-                    }`}>
-                      {formSettings.masterExecution ? 'ARMED' : 'HALTED'}
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-black dark:text-slate-400 mt-0.5">Master toggle across all strategies</p>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={formSettings.masterExecution}
-                    onChange={(e) => setFormSettings({ ...formSettings, masterExecution: e.target.checked })}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-slate-300 dark:bg-slate-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                </label>
-              </div>
-
-              <div className="space-y-2 p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
-                <div className="flex items-center justify-between text-xs">
-                  <label className="text-black dark:text-slate-300 font-bold flex items-center gap-1.5">
-                    <Percent className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> Risk Per Trade (Up to 100%)
-                  </label>
-                  <div className="flex items-center gap-1">
-                    <input
-                      type="number"
-                      min="0.1"
-                      max="100.0"
-                      step="0.5"
-                      value={formSettings.riskPerTradePct}
-                      onChange={(e) => setFormSettings({ ...formSettings, riskPerTradePct: parseFloat(e.target.value) || 0.1 })}
-                      className="w-16 px-2 py-0.5 rounded bg-white dark:bg-[#151922] border border-slate-300 dark:border-[#212838] font-mono text-xs font-bold text-blue-600 dark:text-blue-400 text-right"
-                    />
-                    <span className="font-mono text-xs font-bold text-blue-600">%</span>
-                  </div>
-                </div>
-
-                <input
-                  type="range"
-                  min="0.5"
-                  max="100.0"
-                  step="0.5"
-                  value={formSettings.riskPerTradePct}
-                  onChange={(e) => setFormSettings({ ...formSettings, riskPerTradePct: parseFloat(e.target.value) || 0.5 })}
-                  className="w-full h-2 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                />
-                <div className="flex justify-between text-[10px] font-mono text-slate-500">
-                  <span>0.5% (Conservative)</span>
-                  <span>50% (Aggressive)</span>
-                  <span>100% (Max)</span>
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-xs">
-                  <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
-                    <Target className="w-3.5 h-3.5 text-indigo-500" /> Target R:R (1 : R)
-                  </label>
-                  <span className="font-mono text-xs font-bold text-indigo-600 dark:text-indigo-400">1 : {formSettings.riskToReward}</span>
-                </div>
-                <input
-                  type="number"
-                  min="0.5"
-                  max="10"
-                  step="0.5"
-                  value={formSettings.riskToReward}
-                  onChange={(e) => setFormSettings({ ...formSettings, riskToReward: parseFloat(e.target.value) || 2.0 })}
-                  className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white"
-                />
-              </div>
-
+              {/* Only Max Daily Trades is editable here. Risk %, R:R and Master
+                  Execution live in Settings / the header kill switch. */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
                   <label className="text-black dark:text-slate-300 font-semibold flex items-center gap-1.5">
@@ -777,6 +702,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   onChange={(e) => setFormSettings({ ...formSettings, maxDailyTrades: parseInt(e.target.value, 10) || 4 })}
                   className="w-full px-3.5 py-2 bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] rounded-xl font-mono text-xs text-black dark:text-white"
                 />
+                <p className="text-[10px] text-slate-500 mt-1 leading-snug">
+                  Hard cap per SAST calendar day. The bot stops opening new trades once this many have been filled.
+                </p>
               </div>
             </div>
 
