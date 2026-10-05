@@ -1778,8 +1778,14 @@ class MatrixEngineMaster:
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
 
-                # PROPOSED (Gap 3b): one-shot log when the active profile changes.
+                                # PROPOSED (Gap 3b): one-shot log when the active profile changes.
                 # Fires once per change, not every scan.
+                # Refresh persistent_risk from bot_config.json so the log reflects the
+                # UI selection even before a signal reaches validate_pre_trade.
+                # Do NOT move this into InstitutionalRiskEngine.sync_ui_config():
+                # that would change sizing at execution time (calculate_smart_lot_size
+                # reads persistent_risk.active_profile via combined_risk_pct).
+                self.risk_mgr.persistent_risk.sync_ui_config()
                 current_profile = self.risk_mgr.persistent_risk.active_profile_name
                 if current_profile != self._last_profile_seen:
                     self._last_profile_seen = current_profile
@@ -1965,6 +1971,10 @@ class MatrixEngineMaster:
                 # chosen risk %, and daily allowance remaining. Fires once every 5 minutes.
                 if (time.time() - self._last_status_log_time) >= 300.0:
                     self._last_status_log_time = time.time()
+                    # Refresh persistent_risk so BOT_STATUS reflects the current UI
+                    # profile. Log-only; see comment above for why this is not lifted
+                    # into InstitutionalRiskEngine.sync_ui_config().
+                    self.risk_mgr.persistent_risk.sync_ui_config()
                     b_state = self.risk_mgr.persistent_risk
                     breaker_str = "TRIGGERED" if b_state.breaker_triggered else "CLEAR"
                     master_str = "ARMED" if self.risk_mgr.master_execution else "HALTED"
