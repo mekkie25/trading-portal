@@ -547,7 +547,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             ['SuperTrend Trailing', 'An active trend-following exit that trails open positions along the 10-period, 1.6-multiplier SuperTrend line until an opposite-direction flip occurs.'],
             ['Inconclusive Sample (<30)', 'Any combination or strategy generating fewer than 30 trade executions is flagged as INCONCLUSIVE due to lack of statistical significance.'],
             ['TUNE / VALIDATE split', 'Each test window is split 70/30 by date. TUNE = first 70% (in-sample). VALIDATE = last 30% (unseen). A strategy that fails on VALIDATE does not hold on unseen data.'],
-            ['Blueprint Diagnostics', 'Phase-1 post-hoc analytics: hourly expectancy, session-rollover friction, ATR tier KPIs, loss-streak recovery, circuit-breaker simulation, outlier dependency, Monte Carlo drawdown distribution, and buy-and-hold alpha.']
+            ['Blueprint Diagnostics', 'Phase-1 + Phase-2 post-hoc analytics: hourly expectancy, session-rollover friction, ATR tier KPIs, loss-streak recovery, circuit-breaker simulation, outlier dependency, Monte Carlo drawdown distribution, buy-and-hold alpha, post-SL/post-TP excursion, premature BE exits, EMA-200 alignment, confirmation type, and news-window slippage profiling.']
           ];
 
           autoTable(doc, {
@@ -984,7 +984,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         return (
           <div className="space-y-6">
 
-            {/* Section 4 item 19 - 24-hour hourly expectancy matrix */}
+            {/* Phase 1 - Section 4 item 19: 24-hour hourly expectancy matrix */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-bold text-black dark:text-white">§19 · 24-Hour Hourly Expectancy Matrix (SAST)</h3>
@@ -1023,7 +1023,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 4 item 20 - Day of Week performance */}
+            {/* Phase 1 - Section 4 item 20: Day of Week performance */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§20 · Performance by Day of Week</h3>
               <div className="overflow-x-auto">
@@ -1063,7 +1063,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 4 item 21 - Session rollover friction */}
+            {/* Phase 1 - Section 4 item 21: Session rollover friction */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§21 · Session-Rollover Friction</h3>
               <p className="text-[11px] text-slate-500 mb-3 font-mono">Comparison: trades taken inside ±15min of major session transitions vs outside.</p>
@@ -1086,7 +1086,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 6 item 26 - ATR volatility tiering */}
+            {/* Phase 1 - Section 6 item 26: ATR volatility tiering */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§26 · ATR Volatility Tiering</h3>
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
@@ -1111,7 +1111,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 7 items 31 + 32 - Streak analysis + circuit breaker */}
+            {/* Phase 1 - Sections 7 items 31 + 32: Streak analysis + circuit breaker */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
                 <h3 className="text-sm font-bold text-black dark:text-white mb-3">§31 · Consecutive Loss Streak</h3>
@@ -1161,7 +1161,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 7 item 36 - Outlier dependency removal */}
+            {/* Phase 1 - Section 7 item 36: Outlier dependency removal */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§36 · Outlier Dependency Removal</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">Drops the top 5% best trades and recomputes. If edge collapses, it was luck.</p>
@@ -1200,7 +1200,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 7 item 37 - Monte Carlo resampling */}
+            {/* Phase 1 - Section 7 item 37: Monte Carlo resampling */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§37 · Monte Carlo Resampling</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">{diag.monte_carlo.iterations} shuffles of the trade sequence.</p>
@@ -1228,7 +1228,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Section 7 item 38 - Buy and Hold benchmark */}
+            {/* Phase 1 - Section 7 item 38: Buy and Hold benchmark */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§38 · Buy-and-Hold Benchmark (Alpha)</h3>
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
@@ -1255,6 +1255,190 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                   : 'bg-amber-500/10 border-amber-500/30 text-amber-600'
               }`}>
                 Verdict: {diag.buy_and_hold.verdict.replace(/_/g, ' ')}
+              </div>
+            </div>
+
+            {/* ============================================================
+                PHASE 2 CARDS
+                ============================================================ */}
+
+            {/* Phase 2 - Section 3 item 16: Post-SL continuation distance */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§16 · Post-SL Continuation Distance ("Bad Stop")</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                How far price kept moving against us after SL. Large numbers mean our stop is placed too tight relative to noise.
+              </p>
+              {diag.post_sl.count === 0 ? (
+                <div className="text-xs text-slate-400 italic">No SL exits with post-exit tracking available.</div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+                    <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                      <div className="text-[10px] text-slate-500 uppercase">Sample</div>
+                      <div className="text-lg font-bold text-black dark:text-white">{diag.post_sl.count}</div>
+                    </div>
+                    <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                      <div className="text-[10px] text-slate-500 uppercase">Mean Overshoot</div>
+                      <div className="text-lg font-bold text-rose-500">{diag.post_sl.mean_pips} pips</div>
+                    </div>
+                    <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                      <div className="text-[10px] text-slate-500 uppercase">Median</div>
+                      <div className="text-lg font-bold text-black dark:text-white">{diag.post_sl.median_pips} pips</div>
+                    </div>
+                    <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                      <div className="text-[10px] text-slate-500 uppercase">Worst</div>
+                      <div className="text-lg font-bold text-rose-500">{diag.post_sl.max_pips} pips</div>
+                    </div>
+                  </div>
+                  <div className="mt-3 p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] font-mono text-amber-600">
+                    <strong>{diag.post_sl.recovered_count}</strong> of {diag.post_sl.count} SL exits ({diag.post_sl.recovered_pct}%) would have recovered to the original TP within 2 hours.
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Phase 2 - Section 3 item 17: Post-TP extra pips */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§17 · Post-TP Movement ("Money Left on Table")</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                Extra pips price travelled in our favour after TP was hit. Large values suggest target is set too conservative.
+              </p>
+              {diag.post_tp.count === 0 ? (
+                <div className="text-xs text-slate-400 italic">No TP exits with post-exit tracking available.</div>
+              ) : (
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Sample</div>
+                    <div className="text-lg font-bold text-black dark:text-white">{diag.post_tp.count}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Mean Extra</div>
+                    <div className="text-lg font-bold text-emerald-500">{diag.post_tp.mean_pips} pips</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Best Case</div>
+                    <div className="text-lg font-bold text-emerald-500">{diag.post_tp.max_pips} pips</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Avg Missed</div>
+                    <div className="text-lg font-bold text-blue-500">{diag.post_tp.avg_missed_r}R</div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Phase 2 - Section 3 item 18: Premature BE exit detection */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§18 · Premature BE Exit Detection</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                Trades where SL was moved to BE, got stopped at BE, then rallied to the original TP. These are "should have held" cases.
+              </p>
+              {diag.premature_be.total_be_moved === 0 ? (
+                <div className="text-xs text-slate-400 italic">No BE-moved trades in this run.</div>
+              ) : (
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">BE Moved</div>
+                    <div className="text-lg font-bold text-black dark:text-white">{diag.premature_be.total_be_moved}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Premature</div>
+                    <div className="text-lg font-bold text-amber-500">{diag.premature_be.premature_count}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Rate</div>
+                    <div className="text-lg font-bold text-amber-500">{diag.premature_be.premature_pct}%</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Missed R</div>
+                    <div className="text-lg font-bold text-rose-500">{diag.premature_be.total_missed_r}R</div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Phase 2 - Section 6 item 27: 200 EMA alignment differential */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3">§27 · 200 EMA Trend-Alignment Differential</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
+                {[
+                  { label: 'Trend-Aligned', d: diag.ema_200_alignment.aligned, tone: 'emerald' },
+                  { label: 'Counter-Trend', d: diag.ema_200_alignment.counter_trend, tone: 'rose' },
+                  { label: 'Unknown', d: diag.ema_200_alignment.unknown, tone: 'slate' },
+                ].map(({ label, d }) => (
+                  <div key={label} className="p-4 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="font-bold text-black dark:text-white mb-2">{label}</div>
+                    {d.count === 0 ? (
+                      <div className="text-slate-400 italic text-[11px]">no data</div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>Trades: <span className="font-bold">{d.count}</span></div>
+                        <div>WR: <span className={`font-bold ${d.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{d.win_rate}%</span></div>
+                        <div>Exp: <span className={`font-bold ${kpiColor(d.expectancy)}`}>{d.expectancy}R</span></div>
+                        <div>PF: <span className="font-bold">{d.profit_factor}</span></div>
+                        <div className="col-span-2">Net: <span className={`font-bold ${kpiColor(d.net_pnl)}`}>${d.net_pnl}</span></div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Phase 2 - Section 6 item 28: Confirmation type (close vs touch) */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§28 · Candle-Close vs Touch Confirmation</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                All current strategies use candle-close confirmation. This panel populates once touch-based entries exist.
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
+                {[
+                  { label: 'Close Confirmation', d: diag.confirmation_type.close },
+                  { label: 'Touch Confirmation', d: diag.confirmation_type.touch },
+                ].map(({ label, d }) => (
+                  <div key={label} className="p-4 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="font-bold text-black dark:text-white mb-2">{label}</div>
+                    {d.count === 0 ? (
+                      <div className="text-slate-400 italic text-[11px]">no data</div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>Trades: <span className="font-bold">{d.count}</span></div>
+                        <div>WR: <span className={`font-bold ${d.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{d.win_rate}%</span></div>
+                        <div>Exp: <span className={`font-bold ${kpiColor(d.expectancy)}`}>{d.expectancy}R</span></div>
+                        <div>PF: <span className="font-bold">{d.profit_factor}</span></div>
+                        <div className="col-span-2">Net: <span className={`font-bold ${kpiColor(d.net_pnl)}`}>${d.net_pnl}</span></div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Phase 2 - Section 6 item 29: News-window slippage profiling */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§29 · News-Event Slippage Profiling</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                Compares trades opened inside vs outside scheduled high-impact news windows (NFP, CPI, FOMC).
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
+                {[
+                  { label: 'Inside News Window', d: diag.news_window.in_news },
+                  { label: 'Outside News Window', d: diag.news_window.out_of_news },
+                ].map(({ label, d }) => (
+                  <div key={label} className="p-4 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="font-bold text-black dark:text-white mb-2">{label}</div>
+                    {d.count === 0 ? (
+                      <div className="text-slate-400 italic text-[11px]">no data</div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>Trades: <span className="font-bold">{d.count}</span></div>
+                        <div>WR: <span className={`font-bold ${d.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{d.win_rate}%</span></div>
+                        <div>Exp: <span className={`font-bold ${kpiColor(d.expectancy)}`}>{d.expectancy}R</span></div>
+                        <div>PF: <span className="font-bold">{d.profit_factor}</span></div>
+                        <div className="col-span-2">Net: <span className={`font-bold ${kpiColor(d.net_pnl)}`}>${d.net_pnl}</span></div>
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
 

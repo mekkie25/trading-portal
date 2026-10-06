@@ -206,7 +206,7 @@ export interface ImprovementTip {
   action: string;
 }
 
-// PROPOSED: Blueprint Phase-1 diagnostics (backtest/diagnostics.py).
+// PROPOSED: Blueprint Phase-1 + Phase-2 diagnostics (backtest/diagnostics.py).
 export interface DiagnosticKPIs {
   count: number;
   win_rate: number;
@@ -217,6 +217,7 @@ export interface DiagnosticKPIs {
 
 export interface BacktestDiagnostics {
   version?: string;
+  // Phase 1
   hour_kpis: Record<string, DiagnosticKPIs>;
   session_rollover: {
     in_transition: DiagnosticKPIs;
@@ -259,6 +260,42 @@ export interface BacktestDiagnostics {
     alpha: number;
     verdict: string;
   };
+  // Phase 2
+  post_sl: {
+    count: number;
+    mean_pips: number;
+    median_pips: number;
+    max_pips: number;
+    recovered_count: number;
+    recovered_pct: number;
+  };
+  post_tp: {
+    count: number;
+    mean_pips: number;
+    median_pips: number;
+    max_pips: number;
+    avg_missed_r: number;
+  };
+  premature_be: {
+    total_be_moved: number;
+    premature_count: number;
+    premature_pct: number;
+    total_missed_r: number;
+    avg_missed_r: number;
+  };
+  ema_200_alignment: {
+    aligned: DiagnosticKPIs;
+    counter_trend: DiagnosticKPIs;
+    unknown: DiagnosticKPIs;
+  };
+  confirmation_type: {
+    close: DiagnosticKPIs;
+    touch: DiagnosticKPIs;
+  };
+  news_window: {
+    in_news: DiagnosticKPIs;
+    out_of_news: DiagnosticKPIs;
+  };
 }
 
 export interface BacktestReportPayload {
@@ -273,6 +310,6 @@ export interface BacktestReportPayload {
   improvement_tips?: ImprovementTip[];
   tune_validate?: any;
   strategy_tune_validate?: Record<string, any>;
-  // PROPOSED: Blueprint Phase-1 diagnostics block.
+  // PROPOSED: Blueprint Phase-1 + Phase-2 diagnostics block.
   diagnostics?: BacktestDiagnostics;
 }
