@@ -655,6 +655,46 @@ function formatExportTxtWithLengthRule(data: any): string {
   return text;
 }
 
+// PROPOSED: refuse to start a backtest when the container is close to its
+// memory ceiling, so the runner cannot push the live bot into the OOM killer.
+// Fails open: any unreadable/unknown value allows the run and logs a warning.
+function checkContainerMemory(): { ok: boolean; reason?: string; warning?: string } {
+  if (process.platform !== 'linux') {
+    return { ok: true, warning: 'Memory guard skipped (non-Linux platform).' };
+  }
+
+  try {
+    const currentRaw = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
+    const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+
+    // cgroup v2 uses the literal string "max" when the limit is unlimited.
+    if (maxRaw === 'max') {
+      return { ok: true, warning: 'Memory guard skipped (cgroup memory.max is "max").' };
+    }
+
+    const currentBytes = parseInt(currentRaw, 10);
+    const maxBytes = parseInt(maxRaw, 10);
+    if (!Number.isFinite(currentBytes) || !Number.isFinite(maxBytes) || maxBytes <= 0) {
+      return { ok: true, warning: 'Memory guard skipped (unreadable cgroup values).' };
+    }
+
+    const ratio = currentBytes / maxBytes;
+    if (ratio > 0.70) {
+      const pct = (ratio * 100).toFixed(1);
+      const maxMb = Math.round(maxBytes / (1024 * 1024));
+      return {
+        ok: false,
+        reason: `Container memory is at ${pct}% of its ${maxMb} MB limit. Refusing to start the backtest to protect the live bot. Try again once memory has recovered.`,
+      };
+    }
+
+    return { ok: true };
+  } catch (e: any) {
+    // Never block because of a read failure.
+    return { ok: true, warning: `Memory guard skipped (read failed: ${e?.message || String(e)}).` };
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -922,9 +962,18 @@ async function startServer() {
     }
   });
 
-  app.post('/api/backtest/run', (req, res) => {
+    app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) {
       return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
+    }
+
+    const memCheck = checkContainerMemory();
+    if (!memCheck.ok) {
+      console.warn(`[BT] ${memCheck.reason}`);
+      return res.status(503).json({ status: 'error', message: memCheck.reason });
+    }
+    if (memCheck.warning) {
+      console.warn(`[BT] ${memCheck.warning}`);
     }
 
     const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
@@ -958,13 +1007,16 @@ async function startServer() {
         }
       }
 
-      const maxWorkers = Math.min(4, os.cpus().length || 2);
+            // PROPOSED: one runner at a time. Protects the live bot's memory — a
+      // 2-worker batch on a small Railway plan doubles the peak RSS and can
+      // push the container into the OOM killer.
+      const maxWorkers = 1;
       let activeIndex = 0;
       let completedCount = 0;
 
-      async function runWorker(sym: string): Promise<void> {
+            async function runWorker(sym: string): Promise<void> {
         let symTiming = '';
-        let symError = '';
+        const stderrTail: string[] = []; // rolling last-20-lines stderr buffer
 
         const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days), '--rr', String(rr)];
         if (requestedSymbol === 'ALL') args.push('--skip-download');
@@ -978,29 +1030,47 @@ async function startServer() {
             for (const l of lines) {
               const trimmed = l.trim();
               if (trimmed.startsWith('[time]')) symTiming = trimmed.replace('[time]', '').trim();
-              if (trimmed.startsWith('ERROR:')) symError = trimmed;
             }
           });
 
           proc.stderr.on('data', data => {
-            const errLines = data.toString().split('\n').filter(Boolean);
-            if (errLines.length > 0) symError = `ERROR in ${sym}: ${errLines[errLines.length - 1].trim()}`;
+            const lines = data.toString().split('\n');
+            for (const raw of lines) {
+              const line = raw.trimEnd();
+              if (!line) continue;
+              stderrTail.push(line);
+              if (stderrTail.length > 20) stderrTail.shift();
+            }
           });
 
-          proc.on('exit', code => {
+          proc.on('exit', (code, signal) => {
             completedCount++;
             backtestProgress = `[Phase 2/2] ${completedCount}/${symbolsQueue.length} assets completed.`;
-            if (code === 0) {
+
+            const tailText = stderrTail.length > 0
+              ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}`
+              : '';
+            const reason = signal
+              ? `Killed by ${signal}${signal === 'SIGKILL' ? ' (likely out of memory)' : ''}`
+              : `Exited with code ${code}`;
+
+            if (!signal && code === 0) {
               backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 8/8 matrix', timing: symTiming });
             } else {
-              backtestResults.push({ symbol: sym, status: 'FAILED', message: symError || `Exited with code ${code}`, timing: symTiming });
+              console.error(`[BT] ${sym}: ${reason}${tailText}`);
+              backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}`, timing: symTiming });
             }
             resolve();
           });
 
           proc.on('error', err => {
             completedCount++;
-            backtestResults.push({ symbol: sym, status: 'FAILED', message: err.message });
+            const reason = `spawn error: ${err.message}`;
+            const tailText = stderrTail.length > 0
+              ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}`
+              : '';
+            console.error(`[BT] ${sym}: ${reason}${tailText}`);
+            backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}` });
             resolve();
           });
         });
