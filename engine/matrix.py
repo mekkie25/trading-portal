@@ -550,7 +550,23 @@ class CTraderClient:
                     if deal_id_str not in self.notified_closed_deals:
                         self.notified_closed_deals.add(deal_id_str)
                         if hasattr(self, 'risk_engine') and self.risk_engine:
-                            self.risk_engine.persistent_risk.record_trade_outcome(real_pnl)
+                            # PROPOSED (Step 2 of deal-replay fix): route through
+                            # the scoped recorder. Deals that closed BEFORE this
+                            # process started go to trades_db.json only; they
+                            # never move day/week/month loss, streak, or
+                            # expected_balance. Only deals closed AFTER startup
+                            # change live risk state. Counter incremented only
+                            # when the scoped call actually touched state.
+                            replayed_count += 1
+                            closed_at_utc = (
+                                datetime.fromtimestamp(t_ms / 1000.0, timezone.utc)
+                                if t_ms else None
+                            )
+                            changed = self.risk_engine.persistent_risk.record_trade_outcome_scoped(
+                                real_pnl, closed_at_utc
+                            )
+                            if changed:
+                                counted_count += 1
                         curr_balance, _ = await self.get_balance_and_equity()
                         acc_str = self.account_currency or "USD"
                         curr_sym = "$" if acc_str == "USD" else f"{acc_str} "
@@ -581,7 +597,7 @@ class CTraderClient:
                             )
                         await whatsapp.send_alert(alert)
 
-                        # PROPOSED (Step 2 of deal-replay fix): one-shot log + rebuild.
+            # PROPOSED (Step 2 of deal-replay fix): one-shot log + rebuild.
             # Fires only on the FIRST sync of this process. Later syncs
             # during the run stay silent. The rebuild picks up deals that
             # closed while the bot was down and are now inside the current
@@ -604,7 +620,7 @@ class CTraderClient:
         except Exception as e:
             log.warning(f"Error syncing deals from cTrader: {e}")
             return []
-            
+
     def fetch_real_account_id_from_http(self) -> Optional[int]:
         try:
             url = f"https://api.spotware.com/connect/tradingaccounts?access_token={self.access_token}"
@@ -942,8 +958,49 @@ class CTraderClient:
                 "volume": volume_cents,
                 "lots": lots
             }
-        elif res and "errorMessage" in res.get("payload", {}):
-            log.error(f"cTrader Order Error: {res['payload']['errorMessage']}")
+
+        # PROPOSED (logging-only): full broker diagnostic on every failure path.
+        # Never hangs (balance/equity is under asyncio.wait_for), never throws.
+        # The success path above this block is unchanged.
+        payload_type_str = "n/a"
+        err_code_str = "n/a"
+        err_desc_str = "n/a"
+        payload_keys_str = "n/a"
+
+        if res is None:
+            payload_type_str = "NONE"
+            err_desc_str = "no response from broker (timeout or connection error)"
+        else:
+            payload = res.get("payload") or {}
+            payload_type_str = str(res.get("payloadType", "n/a"))
+            err_code_str = str(payload.get("errorCode", "n/a"))
+            err_desc_str = str(
+                payload.get("description")
+                or payload.get("errorMessage")
+                or "n/a"
+            )
+            if err_code_str == "n/a" and err_desc_str == "n/a":
+                payload_keys_str = ",".join(payload.keys()) or "empty"
+
+        balance_str = "n/a"
+        equity_str = "n/a"
+        try:
+            bal, eq = await asyncio.wait_for(
+                self.get_balance_and_equity(), timeout=5.0
+            )
+            balance_str = f"{bal:.2f}"
+            equity_str = f"{eq:.2f}"
+        except Exception as e:
+            log.warning(f"[ORDER FAIL] balance/equity lookup failed: {e}")
+
+        log.error(
+            f"[ORDER FAIL] {direction} {symbol_name} | Lots: {lots:.4f} | "
+            f"VolumeSent: {volume_cents} | SL: {round(stop_loss, 5)} | "
+            f"TP: {round(take_profit, 5)} | Strat: {strategy_name} | "
+            f"PayloadType: {payload_type_str} | ErrorCode: {err_code_str} | "
+            f"Desc: {err_desc_str} | PayloadKeys: {payload_keys_str} | "
+            f"Balance: {balance_str} | Equity: {equity_str}"
+        )
         return None
 
     async def update_position_sl(self, position_id: int, new_sl: float) -> bool:
@@ -1431,13 +1488,40 @@ class AIOverseer:
 # ==============================================================================
 
 class CloudExecutionEngine:
+    # PROPOSED (logging-only): seconds to wait after a failed dispatch before
+    # the same symbol can be retried by the market scan loop.
+    FAILED_ORDER_COOLDOWN_SECONDS: float = 600.0
+
+    # PROPOSED (logging-only): minimum gap between repeated "still in cooldown"
+    # log lines for the same symbol, so we don't spam one line per candle.
+    COOLDOWN_LOG_INTERVAL_SECONDS: float = 60.0
+
     def __init__(self, ctrader_client: CTraderClient, risk_mgr: InstitutionalRiskEngine):
         self.ctrader = ctrader_client
         self.risk = risk_mgr
         self.ai_overseer = AIOverseer()
+        # PROPOSED (logging-only): symbol -> {"expires_at": epoch, "last_log_at": epoch}
+        self._failed_order_cooldowns: Dict[str, Dict[str, float]] = {}
 
     async def process_signal(self, signal: Any, current_balance: float, current_equity: float, candle_stats: dict) -> bool:
         symbol = getattr(signal, 'symbol')
+
+        # PROPOSED (logging-only): per-symbol cooldown gate. If the last
+        # dispatch for this symbol failed, skip until the cooldown expires.
+        # "still active" log is throttled to once per COOLDOWN_LOG_INTERVAL_SECONDS.
+        cd = self._failed_order_cooldowns.get(symbol)
+        if cd is not None:
+            now = time.time()
+            if now < cd["expires_at"]:
+                if now - cd.get("last_log_at", 0.0) >= self.COOLDOWN_LOG_INTERVAL_SECONDS:
+                    remaining = int(cd["expires_at"] - now)
+                    log.info(f"ORDER RETRY COOLDOWN {symbol} | {remaining}s remaining")
+                    cd["last_log_at"] = now
+                return False
+            else:
+                # Cooldown expired, clear silently so a fresh signal can run.
+                self._failed_order_cooldowns.pop(symbol, None)
+
         direction = getattr(signal, 'direction')
         entry = getattr(signal, 'entry_price')
         sl = getattr(signal, 'stop_loss', None) or getattr(signal, 'sl', 0.0)
@@ -1570,7 +1654,23 @@ class CloudExecutionEngine:
                 f"• TP: {bp['take_profit']}"
             )
             await whatsapp.send_alert(whatsapp_msg)
+            # PROPOSED (logging-only): clear any stale cooldown for this symbol
+            # after a successful fill, so a later fresh signal is not gated.
+            self._failed_order_cooldowns.pop(bp['symbol'], None)
             return True
+
+        # PROPOSED (logging-only): failed dispatch. Arm a per-symbol cooldown
+        # and log once. Success path above is unchanged.
+        now = time.time()
+        self._failed_order_cooldowns[bp['symbol']] = {
+            "expires_at": now + self.FAILED_ORDER_COOLDOWN_SECONDS,
+            "last_log_at": now,
+        }
+        log.warning(
+            f"ORDER RETRY COOLDOWN {bp['symbol']} | armed for "
+            f"{int(self.FAILED_ORDER_COOLDOWN_SECONDS)}s after failed dispatch"
+        )
+        return False
 
 # ==============================================================================
 # 10. MASTER ORCHESTRATOR
@@ -1806,7 +1906,7 @@ class MatrixEngineMaster:
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
 
-                                # PROPOSED (Gap 3b): one-shot log when the active profile changes.
+                # PROPOSED (Gap 3b): one-shot log when the active profile changes.
                 # Fires once per change, not every scan.
                 # Refresh persistent_risk from bot_config.json so the log reflects the
                 # UI selection even before a signal reaches validate_pre_trade.
@@ -1995,7 +2095,8 @@ class MatrixEngineMaster:
                     "losingTrades": losses,
                     "openPositions": open_positions_telemetry
                 })
-                                # PROPOSED (Gap 3a + 3b): Periodic status log with profile, min R:R,
+
+                # PROPOSED (Gap 3a + 3b): Periodic status log with profile, min R:R,
                 # chosen risk %, and daily allowance remaining. Fires once every 5 minutes.
                 if (time.time() - self._last_status_log_time) >= 300.0:
                     self._last_status_log_time = time.time()
@@ -2028,7 +2129,7 @@ class MatrixEngineMaster:
                         f"Currency: {self.ctrader.account_currency or 'UNKNOWN'} | Equity: ${equity:.2f} | "
                         f"Last Block: {block_msg}"
                     )
-                    
+
                 print(f"[MATRIX_TELEMETRY] {telem_msg}", flush=True)
                 write_telemetry(balance, equity, regime_status, active_setup_str, verdict_str, open_positions_telemetry)
 
