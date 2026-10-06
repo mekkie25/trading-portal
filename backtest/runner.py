@@ -415,7 +415,8 @@ def run_backtest_reference(
         if signal:
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
-                sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
+                # Reference path does not precompute EMAs; alignment will be UNKNOWN.
+                sim.open_trade(signal, curr_time, adr_val, regime, session_levels, ema_200_value=None)
 
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
@@ -597,6 +598,7 @@ def run_cached_combination(
     sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct, eurusd_df=eurusd_df)
     cached_signals = precomputed["cached_signals"]
     m5_times_list = m5_df['time'].tolist()
+    has_ema200_col = 'ema_200' in m5_df.columns
 
     unique_setups = 0
     prev_signal_key = None
@@ -673,7 +675,20 @@ def run_cached_combination(
             funnel["sim_trades_attempted"] += 1
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
-                opened = sim.open_trade(signal, curr_time, adr_val, regime, session_levels)
+                # Phase-2 Blueprint Section 6 item 27: pass the precomputed
+                # 200 EMA at this bar so the simulator can tag alignment.
+                ema_200_val: Optional[float] = None
+                if has_ema200_col:
+                    try:
+                        v = float(m5_df.iloc[i]['ema_200'])
+                        if not math.isnan(v):
+                            ema_200_val = v
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        ema_200_val = None
+                opened = sim.open_trade(
+                    signal, curr_time, adr_val, regime, session_levels,
+                    ema_200_value=ema_200_val,
+                )
                 if opened:
                     funnel["sim_trades_filled"] += 1
         t_sim += time.perf_counter() - _t0
@@ -753,8 +768,7 @@ def run_cached_combination(
 
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
-    # PROPOSED: Blueprint Phase-1 deep analytics (see backtest/diagnostics.py).
-    # Pure post-hoc analysis of the completed trade list. No simulator changes.
+    # PROPOSED: Blueprint Phase-1 + Phase-2 deep analytics.
     diag_payload = compute_diagnostics(
         trades=all_trades,
         m5_df=m5_df,

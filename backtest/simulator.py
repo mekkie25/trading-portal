@@ -8,6 +8,14 @@ Replicates the exact single-order live position management of engine/matrix.py:
 - Daily trade cap tracked per SAST calendar date (max_daily_trades)
 - Minimum-lot risk tolerance check matching live bot
 - Skip logging with candle_skips and unique_setups (strategy, direction, day)
+
+Phase-2 Blueprint extensions (all additive, backtest-only):
+  Section 3 item 16 - post-SL continuation distance ("bad stop")
+  Section 3 item 17 - post-TP extra pips ("money left on table")
+  Section 3 item 18 - premature BE exit detection
+  Section 6 item 27 - 200 EMA alignment at entry
+  Section 6 item 28 - confirmation type (close vs touch)
+  Section 6 item 29 - news-window flag at entry
 """
 
 import sys
@@ -22,9 +30,13 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from core.session_config import TZ_SAST, GLOBAL_PARAMS
+from core.session_config import TZ_SAST, GLOBAL_PARAMS, MarketSessionManager
 from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
+
+# How many M5 bars to keep watching after an exit for post-SL / post-TP analytics.
+# 24 bars x 5 min = 2 hours of forward price action.
+POST_EXIT_TRACK_BARS = 24
 
 ASSETS = {
     "GOLD": {"pip_size": 0.01, "contract_size": 100.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
@@ -35,6 +47,7 @@ ASSETS = {
     "USDJPY": {"pip_size": 0.01, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
     "GBPUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
 }
+
 
 class TradeSimulator:
     def __init__(
@@ -51,6 +64,8 @@ class TradeSimulator:
         self.account_currency = account_currency
         self.open_positions: List[Dict[str, Any]] = []
         self.completed_trades: List[Dict[str, Any]] = []
+        # NOTE: this list now holds BOTH SL and TP post-exit trackers.
+        # Each entry has a "kind" field of "SL" or "TP".
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
         self.skipped: List[Dict[str, Any]] = []
         self.daily_trade_counts: Dict[str, int] = {}
@@ -124,7 +139,15 @@ class TradeSimulator:
         })
         return False
 
-    def open_trade(self, signal: Any, current_time: datetime, adr_val: Optional[float], regime: str, ref_levels: dict) -> bool:
+    def open_trade(
+        self,
+        signal: Any,
+        current_time: datetime,
+        adr_val: Optional[float],
+        regime: str,
+        ref_levels: dict,
+        ema_200_value: Optional[float] = None,
+    ) -> bool:
         symbol = signal.symbol
         direction = signal.direction.upper()
         strategy = getattr(signal, "strategy", "UNKNOWN")
@@ -189,6 +212,26 @@ class TradeSimulator:
         self._trade_counter += 1
         trade_id = f"{symbol}_{int(current_time.timestamp())}_{self._trade_counter}"
 
+        # ---- Phase-2 Blueprint metadata (backtest-only) ----
+        # Section 6 item 27 - 200 EMA alignment
+        alignment = "UNKNOWN"
+        if ema_200_value is not None and ema_200_value > 0:
+            if direction == "BUY":
+                alignment = "BULLISH_ALIGNED" if entry_price > ema_200_value else "COUNTER_TREND"
+            else:
+                alignment = "BEARISH_ALIGNED" if entry_price < ema_200_value else "COUNTER_TREND"
+
+        # Section 6 item 28 - confirmation type. All current strategies require
+        # a 5M candle close, so this defaults to CLOSE. Field exists so future
+        # touch-based strategies can override it on the signal object.
+        confirmation_type = getattr(signal, "confirmation_type", "CLOSE")
+
+        # Section 6 item 29 - news-window flag
+        try:
+            is_in_news, _ = MarketSessionManager.is_blackout_active(current_time)
+        except Exception:
+            is_in_news = False
+
         position = {
             "trade_id": trade_id,
             "symbol": symbol,
@@ -213,7 +256,12 @@ class TradeSimulator:
             "profit_seen": False,
             "loss_seen": False,
             "profit_first": False,
-            "eod_deadline_sast": eod_deadline
+            "eod_deadline_sast": eod_deadline,
+            # Phase-2 metadata
+            "ema_200_at_entry": ema_200_value,
+            "alignment_200ema": alignment,
+            "confirmation_type": confirmation_type,
+            "is_in_news_window": bool(is_in_news),
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
@@ -296,6 +344,7 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
+        # ---- Phase-2: post-exit tracker processing ----
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
@@ -307,28 +356,101 @@ class TradeSimulator:
                 continue
 
             direction = pending["direction"]
-            target_tp = pending["target_tp"]
-            max_adverse = pending["max_adverse_allowed"]
+            kind = pending.get("kind", "SL")
 
-            if not pending["adverse_blown"]:
-                if direction == "BUY" and c_low <= max_adverse:
-                    pending["adverse_blown"] = True
-                elif direction == "SELL" and c_high >= max_adverse:
-                    pending["adverse_blown"] = True
+            if kind == "SL":
+                # Track worst excursion past SL, and whether price would
+                # have eventually reached the original TP.
+                if direction == "BUY":
+                    pending["min_low_after_exit"] = min(pending.get("min_low_after_exit", c_low), c_low)
+                else:
+                    pending["max_high_after_exit"] = max(pending.get("max_high_after_exit", c_high), c_high)
 
-            if not pending["adverse_blown"]:
-                reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
-                if reached_tp:
-                    pending["record"]["failure_reason"] = "NOISE_STOPOUT_RECOVERED"
-                    pending["record"]["recovered_to_tp"] = True
-                    pending["bars_remaining"] = 0
+                target_tp = pending["target_tp"]
+                max_adverse = pending["max_adverse_allowed"]
+
+                if not pending["adverse_blown"]:
+                    if direction == "BUY" and c_low <= max_adverse:
+                        pending["adverse_blown"] = True
+                    elif direction == "SELL" and c_high >= max_adverse:
+                        pending["adverse_blown"] = True
+
+                if not pending["adverse_blown"]:
+                    reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
+                    if reached_tp:
+                        pending["record"]["failure_reason"] = "NOISE_STOPOUT_RECOVERED"
+                        pending["record"]["recovered_to_tp"] = True
+                        pending["reached_original_tp"] = True
+                        pending["bars_remaining"] = 0
+
+            elif kind == "TP":
+                # Track how much further price travelled in the trade's
+                # favour after TP was hit ("money left on table").
+                if direction == "BUY":
+                    pending["max_favorable_after_tp"] = max(
+                        pending.get("max_favorable_after_tp", c_high), c_high
+                    )
+                else:
+                    pending["min_favorable_after_tp"] = min(
+                        pending.get("min_favorable_after_tp", c_low), c_low
+                    )
 
             pending["bars_remaining"] -= 1
 
-            if pending["bars_remaining"] > 0 and sast_time < pending["eod_deadline_sast"]:
+            if pending["bars_remaining"] > 0 and sast_time < pending.get("eod_deadline_sast", pending["created_candle_time"]):
                 active_pending.append(pending)
+            else:
+                self._finalize_post_exit(pending)
 
         self.pending_sl_evaluations = active_pending
+
+    def _finalize_post_exit(self, pending: Dict[str, Any]) -> None:
+        """Attach post-exit metrics to the trade record when a tracker expires."""
+        record = pending["record"]
+        kind = pending.get("kind", "SL")
+        exit_price = pending["exit_price"]
+        pip_size = pending["pip_size"]
+        direction = pending["direction"]
+
+        if kind == "SL":
+            if direction == "BUY":
+                worst = pending.get("min_low_after_exit", exit_price)
+                cont_pips = max(0.0, (exit_price - worst) / pip_size) if pip_size > 0 else 0.0
+            else:
+                worst = pending.get("max_high_after_exit", exit_price)
+                cont_pips = max(0.0, (worst - exit_price) / pip_size) if pip_size > 0 else 0.0
+
+            record["post_sl_cont_pips"] = round(cont_pips, 1)
+
+            # Section 3 item 18 - premature BE exit detection.
+            # BE was moved, price came back to BE, then rallied to original TP.
+            original_tp = pending.get("target_tp", 0.0)
+            is_be = bool(pending.get("is_be_moved", False))
+            reached_tp = bool(pending.get("reached_original_tp", False))
+
+            if is_be and reached_tp and original_tp > 0:
+                entry = record.get("entry_price", 0.0)
+                tp_dist = abs(original_tp - entry)
+                sl_dist = record.get("initial_sl_dist") or tp_dist
+                if sl_dist > 0:
+                    missed_r = tp_dist / sl_dist
+                else:
+                    missed_r = 0.0
+                record["premature_be_exit"] = True
+                record["missed_r_at_tp"] = round(missed_r, 2)
+            else:
+                record["premature_be_exit"] = False
+                record["missed_r_at_tp"] = 0.0
+
+        elif kind == "TP":
+            if direction == "BUY":
+                best = pending.get("max_favorable_after_tp", exit_price)
+                extra_pips = max(0.0, (best - exit_price) / pip_size) if pip_size > 0 else 0.0
+            else:
+                best = pending.get("min_favorable_after_tp", exit_price)
+                extra_pips = max(0.0, (exit_price - best) / pip_size) if pip_size > 0 else 0.0
+
+            record["post_tp_extra_pips"] = round(extra_pips, 1)
 
     def close_all(self, symbol: str, last_candle: pd.Series):
         c_close = float(last_candle['close'])
@@ -341,6 +463,11 @@ class TradeSimulator:
             else:
                 remaining_positions.append(pos)
         self.open_positions = remaining_positions
+
+        # Flush any pending post-exit trackers so records are fully finalised.
+        for pending in self.pending_sl_evaluations:
+            self._finalize_post_exit(pending)
+        self.pending_sl_evaluations = []
 
     def _close_position(self, pos: Dict[str, Any], exit_price: float, exit_time: datetime, reason: str):
         direction = pos["direction"]
@@ -427,22 +554,53 @@ class TradeSimulator:
             "recovered_to_tp": False,
             "spread_paid": spread_pts,
             "adr": pos["adr_val"],
-            "regime": pos["regime"]
+            "regime": pos["regime"],
+            # Phase-2 metadata
+            "is_be_moved": bool(pos.get("is_be_moved", False)),
+            "ema_200_at_entry": pos.get("ema_200_at_entry"),
+            "alignment_200ema": pos.get("alignment_200ema", "UNKNOWN"),
+            "confirmation_type": pos.get("confirmation_type", "CLOSE"),
+            "is_in_news_window": bool(pos.get("is_in_news_window", False)),
+            "post_sl_cont_pips": None,
+            "post_tp_extra_pips": None,
+            "premature_be_exit": False,
+            "missed_r_at_tp": 0.0,
         }
 
         if result == "LOSS" and "SL" in reason:
             max_adverse = (pos["stop_loss"] - (0.50 * sl_dist)) if direction == "BUY" else (pos["stop_loss"] + (0.50 * sl_dist))
             self.pending_sl_evaluations.append({
+                "kind": "SL",
                 "record": record,
                 "symbol": pos["symbol"],
                 "direction": direction,
                 "target_tp": pos["take_profit"],
                 "max_adverse_allowed": max_adverse,
                 "adverse_blown": False,
-                "bars_remaining": 24,
+                "bars_remaining": POST_EXIT_TRACK_BARS,
                 "pip_size": pip_size,
+                "exit_price": actual_exit,
+                "is_be_moved": bool(pos.get("is_be_moved", False)),
                 "created_candle_time": exit_time,
-                "eod_deadline_sast": pos["eod_deadline_sast"]
+                "eod_deadline_sast": pos.get("eod_deadline_sast", exit_time + timedelta(hours=4)),
+                "min_low_after_exit": actual_exit,
+                "max_high_after_exit": actual_exit,
+                "reached_original_tp": False,
+            })
+
+        elif result == "WIN" and reason == "TP":
+            self.pending_sl_evaluations.append({
+                "kind": "TP",
+                "record": record,
+                "symbol": pos["symbol"],
+                "direction": direction,
+                "bars_remaining": POST_EXIT_TRACK_BARS,
+                "pip_size": pip_size,
+                "exit_price": actual_exit,
+                "created_candle_time": exit_time,
+                "eod_deadline_sast": pos.get("eod_deadline_sast", exit_time + timedelta(hours=4)),
+                "max_favorable_after_tp": actual_exit,
+                "min_favorable_after_tp": actual_exit,
             })
 
         self.balance += money_pnl
