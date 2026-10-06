@@ -71,7 +71,6 @@ export interface BotSettings {
   monthlyGoalTarget?: number;
   weeklyDepositBaseline?: number;
 
-  // PROPOSED: Selectable risk profile. null = legacy fixed-risk behaviour.
   riskProfile?: RiskProfileName | null;
 }
 
@@ -117,9 +116,6 @@ export interface AdvancedLimits {
   autoLiquidateAllOnTrip?: boolean;
   activeTripScope?: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'CURRENCY';
   haltUntilTimestamp?: string;
-
-  // PROPOSED (Gap 2): when true and a risk profile is active, the profile's %
-  // loss caps win over the USD limits above. Default true.
   useProfileDrawdownPct?: boolean;
 }
 
@@ -220,4 +216,6 @@ export interface BacktestReportPayload {
   day_data: Record<string, BacktestDayData>;
   all_trades: any[];
   improvement_tips?: ImprovementTip[];
+  tune_validate?: any;
+  strategy_tune_validate?: Record<string, any>;
 }

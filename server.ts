@@ -34,7 +34,6 @@ interface RiskLimitsConfig {
   maxDailyDrawdownPct?: number;
   autoLiquidateAllOnTrip?: boolean;
   breakerAction: 'HALT_PREVENT_NEW';
-  // PROPOSED (Gap 2): when true and a profile is active, profile % wins over USD limits.
   useProfileDrawdownPct?: boolean;
 }
 
@@ -243,8 +242,6 @@ let activeBrokerTelemetry: BrokerTelemetry = {
   trades: [],
 };
 
-// PROPOSED: crash-loop tracking for the auto-restarted Python bot.
-// Cleared only when a full cluster of restarts ages out of the 2-minute window.
 let botRestartTimestamps: number[] = [];
 let botCrashLoopWarned = false;
 
@@ -267,6 +264,67 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
       type: 'PAIR_VIABILITY'
     });
   }
+
+  // TUNE / VALIDATE hold-out check for every combination.
+  combos.forEach((c: any) => {
+    const tv = c.tune_validate || {};
+    const tune = tv.tune || {};
+    const val = tv.validate || {};
+    const tuneCnt = tune.count || 0;
+    const valCnt = val.count || 0;
+    if (tuneCnt >= 30 && valCnt >= 30) {
+      const tunePf = tune.profit_factor || 0;
+      const valPf = val.profit_factor || 0;
+      if (valPf < 1.0 || valPf < 0.7 * tunePf) {
+        const loss = Math.abs(val.net_pnl || 0);
+        suggestions.push({
+          tag: `[MEASURED $${loss.toFixed(2)}]`,
+          text: `Combination '${c.label}' on ${symbol} does not hold on unseen data: TUNE PF ${tunePf.toFixed(2)} -> VALIDATE PF ${valPf.toFixed(2)} (TUNE ${tuneCnt} trades / VALIDATE ${valCnt} trades).`,
+          impact: Number(loss.toFixed(2)),
+          is_measured: true,
+          type: 'HOLD_OUT_FAIL'
+        });
+      }
+    } else if (tuneCnt > 0 || valCnt > 0) {
+      suggestions.push({
+        tag: '[INCONCLUSIVE]',
+        text: `Combination '${c.label}' on ${symbol} hold-out: TUNE ${tuneCnt} trades, VALIDATE ${valCnt} trades. Both need >= 30 for a valid hold-out test.`,
+        impact: 0.0,
+        is_measured: false,
+        type: 'HOLD_OUT_INCONCLUSIVE'
+      });
+    }
+  });
+
+  const stratTv: Record<string, any> = best.strategy_tune_validate || {};
+  Object.entries(stratTv).forEach(([sName, tvRow]) => {
+    const tune = (tvRow as any).tune || {};
+    const val = (tvRow as any).validate || {};
+    const tuneCnt = tune.count || 0;
+    const valCnt = val.count || 0;
+    if (tuneCnt >= 30 && valCnt >= 30) {
+      const tunePf = tune.profit_factor || 0;
+      const valPf = val.profit_factor || 0;
+      if (valPf < 1.0 || valPf < 0.7 * tunePf) {
+        const loss = Math.abs(val.net_pnl || 0);
+        suggestions.push({
+          tag: `[MEASURED $${loss.toFixed(2)}]`,
+          text: `${sName} on ${symbol} does not hold on unseen data: TUNE PF ${tunePf.toFixed(2)} -> VALIDATE PF ${valPf.toFixed(2)} (TUNE ${tuneCnt} / VALIDATE ${valCnt}).`,
+          impact: Number(loss.toFixed(2)),
+          is_measured: true,
+          type: 'HOLD_OUT_FAIL'
+        });
+      }
+    } else if (tuneCnt >= 15 || valCnt >= 15) {
+      suggestions.push({
+        tag: '[INCONCLUSIVE]',
+        text: `${sName} on ${symbol} hold-out: TUNE ${tuneCnt} trades, VALIDATE ${valCnt} trades. Both need >= 30.`,
+        impact: 0.0,
+        is_measured: false,
+        type: 'HOLD_OUT_INCONCLUSIVE'
+      });
+    }
+  });
 
   if (totalTrades < 30) return suggestions;
 
@@ -444,6 +502,10 @@ function computePortfolioNextTests(allSuggestions: Array<{ tag: string; text: st
   if (bes.length > 0) tests.push(`Lock in the statistically dominant Breakeven policy across validated pairs.`);
   const skips = allSuggestions.filter(s => s.type === 'SKIP_TUNING');
   if (skips.length > 0) tests.push(`Run simulation with loosened daily cap and spread tolerance to test whether skipped setups hold edge.`);
+  const holdOut = allSuggestions.filter(s => s.type === 'HOLD_OUT_FAIL');
+  if (holdOut.length > 0) {
+    tests.push(`Retest with hold-out separation: ${holdOut.length} setup(s) failed on VALIDATE (unseen) data — review ${holdOut[0].text.split(':')[0]}.`);
+  }
   tests.push(`Test expanding target R:R from 1.0 to 1.5 on pairs demonstrating profit factor above 1.3.`);
   return tests.slice(0, 5);
 }
@@ -518,6 +580,9 @@ function generateExportDataPayload(): any {
         symbol: sym,
         status: "OK",
         seconds_taken: pairSeconds,
+        phase_seconds: (summary as any).phase_seconds || null,
+        cpu_cores: (summary as any).cpu_cores || null,
+        concurrent_processes: (summary as any).concurrent_processes || null,
         combinations: combos,
         best_combination: {
           ...(bestCombo || {}),
@@ -525,7 +590,9 @@ function generateExportDataPayload(): any {
           dow_kpis: bestReportDetail.dow_kpis || {},
           skipped_summary: bestReportDetail.skipped_summary || {},
           warnings: bestReportDetail.warnings || [],
-          adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100
+          adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100,
+          strategy_tune_validate: bestReportDetail.strategy_tune_validate || {},
+          tune_validate: bestReportDetail.tune_validate || (bestCombo ? bestCombo.tune_validate : null) || {}
         }
       };
 
@@ -566,9 +633,16 @@ function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; 
   const totalTimeStr = (typeof data.total_run_seconds === 'number' && data.total_run_seconds > 0) ? `${data.total_run_seconds}s` : 'n/a';
 
   const lines: string[] = [];
-  lines.push(`LEGEND: [TR]=Trades | [WR]=WinRate% | [EXP]=Expectancy(R) | [PF]=ProfitFactor | [DD]=MaxDrawdown | [PNL]=NetRealized$ | [COV]=AdaptiveCover%`);
+  lines.push(`LEGEND: [TR]=Trades | [WR]=WinRate% | [EXP]=Expectancy(R) | [PF]=ProfitFactor | [DD]=MaxDrawdown | [PNL]=NetRealized$ | [COV]=AdaptiveCover% | [TUNE]/[VALIDATE]=70/30 date split`);
   lines.push(`RUN: Date: ${data.generated_at.slice(0, 10)} | Days: ${data.days} | Target R:R: 1:${data.target_rr} | Total Run Time: ${totalTimeStr}`);
-  lines.push(`RULES: Trades < 30 tagged as INCONCLUSIVE | Suggestions require >= 30 trades\n`);
+  let coresSeen: number | null = null;
+  let concurrentSeen: number | null = null;
+  for (const p of (data.pairs || [])) {
+    if (p && p.cpu_cores && coresSeen === null) coresSeen = p.cpu_cores;
+    if (p && p.concurrent_processes && concurrentSeen === null) concurrentSeen = p.concurrent_processes;
+  }
+  lines.push(`HOST: CPU cores detected: ${coresSeen ?? 'n/a'} | Pair processes ran concurrently: ${concurrentSeen ?? 'n/a'}`);
+  lines.push(`RULES: Trades < 30 tagged INCONCLUSIVE | Hold-out rules require >= 30 trades in BOTH TUNE and VALIDATE\n`);
 
   lines.push(`=== CROSS-PAIR ROLLUP PER COMBINATION ===`);
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
@@ -578,8 +652,11 @@ function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; 
 
   for (const p of data.pairs || []) {
     const runTimeStr = (typeof p.seconds_taken === 'number' && p.seconds_taken > 0) ? `${p.seconds_taken}s` : 'n/a';
+    const ps = p.phase_seconds || {};
+    const phaseStr = `aggregator ${ps.aggregator_s ?? 'n/a'}s, volatility ${ps.volatility_s ?? 'n/a'}s, session_levels ${ps.session_levels_s ?? 'n/a'}s, strategies ${ps.strategies_s ?? 'n/a'}s, simulator ${ps.simulator_s ?? 'n/a'}s, report_writing ${ps.report_writing_s ?? 'n/a'}s`;
     lines.push(`================================================================================`);
     lines.push(`ASSET: ${p.symbol} (${p.status}) | Run Time: ${runTimeStr}`);
+    lines.push(`PHASES: ${phaseStr}`);
     if (p.status !== "OK") {
       lines.push(`STATUS: ${p.error || 'Not tested'}\n`);
       continue;
@@ -588,14 +665,25 @@ function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; 
     lines.push(`--- 8 Combinations ---`);
     for (const c of p.combinations || []) {
       const incon = (c.total_trades || 0) < 30 ? " [INCONCLUSIVE]" : "";
-      lines.push(`${c.label.padEnd(32)} | TR: ${String(c.total_trades).padStart(4)} | WR: ${c.win_rate.toFixed(1)}% | EXP: ${c.expectancy.toFixed(2)}R | PF: ${c.profit_factor.toFixed(2)} | DD: -$${c.max_drawdown.toFixed(2)} | PNL: $${c.net_pnl.toFixed(2)} | COV: ${c.adaptive_effective_pct.toFixed(0)}%${incon}`);
+      const ctv: any = c.tune_validate || {};
+      const cTune: any = ctv.tune || {};
+      const cVal: any = ctv.validate || {};
+      const cTuneStr = `TUNE[TR:${cTune.count ?? 0} WR:${(cTune.win_rate ?? 0).toFixed(1)}% PF:${(cTune.profit_factor ?? 0).toFixed(2)}]`;
+      const cValStr = `VALIDATE[TR:${cVal.count ?? 0} WR:${(cVal.win_rate ?? 0).toFixed(1)}% PF:${(cVal.profit_factor ?? 0).toFixed(2)}]`;
+      lines.push(`${c.label.padEnd(32)} | TR: ${String(c.total_trades).padStart(4)} | WR: ${c.win_rate.toFixed(1)}% | EXP: ${c.expectancy.toFixed(2)}R | PF: ${c.profit_factor.toFixed(2)} | DD: -$${c.max_drawdown.toFixed(2)} | PNL: $${c.net_pnl.toFixed(2)} | COV: ${c.adaptive_effective_pct.toFixed(0)}% | ${cTuneStr} | ${cValStr}${incon}`);
     }
 
     const b = p.best_combination || {};
     lines.push(`\n--- Best Combination: ${b.label || 'N/A'} ---`);
     lines.push(`Performance by Strategy:`);
+    const bStv: Record<string, any> = (b as any).strategy_tune_validate || {};
     Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
-      lines.push(`  ${sName.padEnd(28)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | PF: ${s.profit_factor.toFixed(2)} | PNL: $${s.net_pnl.toFixed(2)}`);
+      const stv: any = bStv[sName] || {};
+      const sTune: any = stv.tune || {};
+      const sVal: any = stv.validate || {};
+      const sTuneStr = `TUNE[TR:${sTune.count ?? 0} WR:${(sTune.win_rate ?? 0).toFixed(1)}% PF:${(sTune.profit_factor ?? 0).toFixed(2)}]`;
+      const sValStr = `VALIDATE[TR:${sVal.count ?? 0} WR:${(sVal.win_rate ?? 0).toFixed(1)}% PF:${(sVal.profit_factor ?? 0).toFixed(2)}]`;
+      lines.push(`  ${sName.padEnd(28)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | PF: ${s.profit_factor.toFixed(2)} | PNL: $${s.net_pnl.toFixed(2)} | ${sTuneStr} | ${sValStr}`);
     });
 
     lines.push(`Performance by Day of Week:`);
@@ -655,9 +743,6 @@ function formatExportTxtWithLengthRule(data: any): string {
   return text;
 }
 
-// PROPOSED: refuse to start a backtest when the container is close to its
-// memory ceiling, so the runner cannot push the live bot into the OOM killer.
-// Fails open: any unreadable/unknown value allows the run and logs a warning.
 function checkContainerMemory(): { ok: boolean; reason?: string; warning?: string } {
   if (process.platform !== 'linux') {
     return { ok: true, warning: 'Memory guard skipped (non-Linux platform).' };
@@ -667,7 +752,6 @@ function checkContainerMemory(): { ok: boolean; reason?: string; warning?: strin
     const currentRaw = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
     const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
 
-    // cgroup v2 uses the literal string "max" when the limit is unlimited.
     if (maxRaw === 'max') {
       return { ok: true, warning: 'Memory guard skipped (cgroup memory.max is "max").' };
     }
@@ -690,7 +774,6 @@ function checkContainerMemory(): { ok: boolean; reason?: string; warning?: strin
 
     return { ok: true };
   } catch (e: any) {
-    // Never block because of a read failure.
     return { ok: true, warning: `Memory guard skipped (read failed: ${e?.message || String(e)}).` };
   }
 }
@@ -962,7 +1045,7 @@ async function startServer() {
     }
   });
 
-    app.post('/api/backtest/run', (req, res) => {
+  app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) {
       return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
     }
@@ -1007,22 +1090,19 @@ async function startServer() {
         }
       }
 
-            // PROPOSED: one runner at a time. Protects the live bot's memory — a
-      // 2-worker batch on a small Railway plan doubles the peak RSS and can
-      // push the container into the OOM killer.
       const maxWorkers = 1;
       let activeIndex = 0;
       let completedCount = 0;
 
-            async function runWorker(sym: string): Promise<void> {
+      async function runWorker(sym: string): Promise<void> {
         let symTiming = '';
-        const stderrTail: string[] = []; // rolling last-20-lines stderr buffer
+        const stderrTail: string[] = [];
 
         const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days), '--rr', String(rr)];
         if (requestedSymbol === 'ALL') args.push('--skip-download');
 
         await new Promise<void>((resolve) => {
-          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd() } });
+          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd(), BACKTEST_CONCURRENT_WORKERS: String(maxWorkers) } });
           activeBacktestProcesses.push(proc);
 
           proc.stdout.on('data', data => {
@@ -1172,7 +1252,6 @@ async function startServer() {
       if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
       if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
       if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
-      // PROPOSED (Gap 2): persist the switch so the Python engine picks it up next scan.
       if (typeof useProfileDrawdownPct === 'boolean') riskLimits.useProfileDrawdownPct = useProfileDrawdownPct;
 
       if (resetBreaker) {
@@ -1199,14 +1278,13 @@ async function startServer() {
     res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig });
   });
 
-    function launchPythonBot() {
+  function launchPythonBot() {
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
     const bot = spawn(pythonCmd, ['engine/matrix.py'], {
       env: { ...process.env, PYTHONPATH: process.cwd() },
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    // Per-launch state (fresh on every launch).
     let restartScheduled = false;
     let stdoutBuffer = '';
     let stderrBuffer = '';
@@ -1220,8 +1298,6 @@ async function startServer() {
       botRestartTimestamps = botRestartTimestamps.filter(t => now - t <= 120000);
       const count = botRestartTimestamps.length;
 
-      // PROPOSED: cluster reset. If after pruning only this launch remains,
-      // any previous crash cluster has aged out, so allow a fresh warning.
       if (count <= 1) {
         botCrashLoopWarned = false;
       }
@@ -1240,7 +1316,6 @@ async function startServer() {
     bot.stdout.on('data', chunk => {
       stdoutBuffer += chunk.toString();
       const lines = stdoutBuffer.split('\n');
-      // Keep the last element: it may be a partial line.
       stdoutBuffer = lines.pop() ?? '';
 
       for (const rawLine of lines) {
@@ -1262,7 +1337,6 @@ async function startServer() {
             activeBrokerTelemetry.connected = true;
             activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
           } catch {}
-          // Telemetry is deliberately not logged to console.
           continue;
         }
 

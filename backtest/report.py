@@ -10,6 +10,7 @@ Generates a standalone, double-clickable interactive HTML backtest report:
 import sys
 import os
 import json
+import math
 import argparse
 import pandas as pd
 import numpy as np
@@ -21,6 +22,38 @@ if PROJECT_ROOT not in sys.path:
 
 from core.session_config import TZ_SAST
 from backtest.paths import DATA_DIR
+
+
+def sanitize_for_json(obj):
+    """Recursively converts NaN, +inf, -inf, numpy types and Timestamps to JSON-safe values."""
+    if obj is None:
+        return None
+    if isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [sanitize_for_json(v) for v in obj.tolist()]
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return sanitize_for_json(float(obj))
+    except Exception:
+        return str(obj)
+
 
 def calculate_kpis(trades: list) -> dict:
     if not trades:
@@ -69,6 +102,7 @@ def calculate_kpis(trades: list) -> dict:
         "net_pnl": round(net_pnl, 2),
         "is_inconclusive": count < 30
     }
+
 
 def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
     trades_file = os.path.join(DATA_DIR, f"{symbol}_{mode}_trades.json")
@@ -191,7 +225,6 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
 
   <div class="content">
 
-    <!-- TAB 1: SUMMARY -->
     <div id="tab-summary">
       <div class="grid-kpi">
         <div class="kpi-card">
@@ -276,7 +309,6 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
       </table>
     </div>
 
-    <!-- TAB 2: DAY CHART INSPECTOR -->
     <div id="tab-dayPage" style="display: none;">
       <div style="display: flex; justify-content: space-between; align-items: center;">
         <div>
@@ -294,7 +326,6 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
       <div id="dayTradesContainer" style="margin-top: 24px;"></div>
     </div>
 
-    <!-- TAB 3: FULL TRADES TABLE -->
     <div id="tab-tradesTable" style="display: none;">
       <h3 style="font-size: 15px; color: #fff;">Complete Audited Trade Ledger ({len(trades)} records)</h3>
       <table>
@@ -338,7 +369,7 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
   </div>
 
   <script>
-    const DAY_DATA = {json.dumps(day_charts_data)};
+    const DAY_DATA = {json.dumps(sanitize_for_json(day_charts_data), allow_nan=False)};
     let activeChart = null;
 
     function switchTab(tabId) {{
@@ -427,6 +458,7 @@ def generate_html_report(symbol: str = "US30", mode: str = "adaptive"):
 
     print(f"\n[✓] Visual Audit Report generated successfully: {out_file}")
     print("[*] You can double-click this HTML file to view the complete report in your browser.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -27,6 +27,7 @@ interface SummaryCombination {
   max_drawdown: number;
   net_pnl: number;
   adaptive_effective_pct: number;
+  tune_validate?: any;
   funnel?: {
     raw_signals_fired: number;
     adapted_signals_passed: number;
@@ -42,6 +43,9 @@ interface SymbolSummaryPayload {
   target_rr: number;
   generated_at: string;
   total_seconds?: number;
+  phase_seconds?: any;
+  cpu_cores?: number;
+  concurrent_processes?: number;
   combinations: SummaryCombination[];
 }
 
@@ -328,7 +332,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             doc.text(str, pageWidth / 2, pageHeight - 8, { align: 'center' });
           };
 
-          // PAGE 1: COVER PAGE
           doc.setFillColor(15, 23, 42);
           doc.rect(0, 0, pageWidth, pageHeight, 'F');
           doc.setTextColor(255, 255, 255);
@@ -358,7 +361,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           doc.text('3. Identifies the statistically superior setup per asset ranked by estimated dollar impact.', 26, 157);
           doc.text('4. Zero look-ahead bias: higher timeframe candles are reconstructed bar-by-bar at time T.', 26, 164);
 
-          // PAGE 2: PORTFOLIO OVERVIEW & P&L BAR CHART
           doc.addPage();
           addHeaderFooter('Portfolio Overview');
           doc.setFontSize(16);
@@ -385,7 +387,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           doc.setTextColor(15, 23, 42);
           doc.text('Net Realized P&L by Instrument ($)', 14, chartY);
 
-          // Draw vector P&L bar chart with jsPDF primitives
           const validPairs = (exp.pairs || []).filter((p: any) => p.status === 'OK');
           const maxPnl = Math.max(50, ...validPairs.map((p: any) => Math.abs(p.best_combination?.net_pnl || 0)));
           const barBaseY = chartY + 10;
@@ -414,7 +415,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             }
           });
 
-          // ONE PAGE PER PAIR
           for (const p of (exp.pairs || [])) {
             if (p.status !== 'OK') continue;
             doc.addPage();
@@ -424,25 +424,39 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             doc.text(`${p.symbol} - 8-Combination Matrix Performance (${p.seconds_taken || 0}s)`, 14, 22);
 
             const bLabel = p.best_combination?.label || '';
-            const comboRows = (p.combinations || []).map((c: any) => [
-              (c.label === bLabel ? `★ ${c.label}` : c.label),
-              c.total_trades || 0, `${formatNum(c.win_rate)}%`, `${formatNum(c.expectancy)}R`,
-              formatNum(c.profit_factor), `-$${formatNum(c.max_drawdown)}`, `$${formatNum(c.net_pnl)}`, `${formatNum(c.adaptive_effective_pct)}%`
-            ]);
+            const comboRows = (p.combinations || []).map((c: any) => {
+              const tv = c.tune_validate || {};
+              const cTune = tv.tune || {};
+              const cVal = tv.validate || {};
+              const tStr = `${cTune.count || 0}/${formatNum(cTune.profit_factor)}/${formatNum(cTune.win_rate)}%`;
+              const vStr = `${cVal.count || 0}/${formatNum(cVal.profit_factor)}/${formatNum(cVal.win_rate)}%`;
+              return [
+                (c.label === bLabel ? `★ ${c.label}` : c.label),
+                c.total_trades || 0, `${formatNum(c.win_rate)}%`, `${formatNum(c.expectancy)}R`,
+                formatNum(c.profit_factor), `-$${formatNum(c.max_drawdown)}`, `$${formatNum(c.net_pnl)}`, `${formatNum(c.adaptive_effective_pct)}%`,
+                tStr, vStr
+              ];
+            });
 
             autoTable(doc, {
               startY: 26,
-              head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage']],
+              head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage', 'TUNE (TR/PF/WR)', 'VALIDATE (TR/PF/WR)']],
               body: comboRows,
               theme: 'grid',
-              headStyles: { fillColor: [15, 23, 42], fontSize: 7 },
-              bodyStyles: { fontSize: 7 }
+              headStyles: { fillColor: [15, 23, 42], fontSize: 6.5 },
+              bodyStyles: { fontSize: 6.5 }
             });
 
             let currentY = (doc as any).lastAutoTable.finalY + 8;
-            const stratRows = Object.entries(p.best_combination?.strategy_kpis || {}).map(([sName, s]: any) => [
-              sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`
-            ]);
+            const bStv: Record<string, any> = p.best_combination?.strategy_tune_validate || {};
+            const stratRows = Object.entries(p.best_combination?.strategy_kpis || {}).map(([sName, s]: any) => {
+              const stv = bStv[sName] || {};
+              const sTune = stv.tune || {};
+              const sVal = stv.validate || {};
+              const tStr = `${sTune.count || 0}/${formatNum(sTune.profit_factor)}/${formatNum(sTune.win_rate)}%`;
+              const vStr = `${sVal.count || 0}/${formatNum(sVal.profit_factor)}/${formatNum(sVal.win_rate)}%`;
+              return [sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`, tStr, vStr];
+            });
 
             if (stratRows.length > 0) {
               doc.setFontSize(10);
@@ -450,16 +464,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               doc.text(`Strategy Breakdown (${bLabel})`, 14, currentY);
               autoTable(doc, {
                 startY: currentY + 3,
-                head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L']],
+                head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L', 'TUNE (TR/PF/WR)', 'VALIDATE (TR/PF/WR)']],
                 body: stratRows,
                 theme: 'striped',
-                headStyles: { fillColor: [71, 85, 105], fontSize: 7 },
-                bodyStyles: { fontSize: 7 }
+                headStyles: { fillColor: [71, 85, 105], fontSize: 6.5 },
+                bodyStyles: { fontSize: 6.5 }
               });
               currentY = (doc as any).lastAutoTable.finalY + 8;
             }
 
-            // Skipped signals display
             const skipMap = p.best_combination?.skipped_summary || {};
             const skipEntries = Object.entries(skipMap);
             if (skipEntries.length > 0) {
@@ -470,7 +483,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               currentY += 6;
             }
 
-            // Rule-based suggestions for this pair
             const ruleSuggestions = p.best_combination?.rule_suggestions || [];
             if (ruleSuggestions.length > 0) {
               doc.setFontSize(10);
@@ -484,7 +496,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             }
           }
 
-          // FINAL TOP-10 SUGGESTIONS & WHAT TO TEST NEXT PAGE
           doc.addPage();
           addHeaderFooter('Strategic Recommendations');
           doc.setFontSize(16);
@@ -520,7 +531,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             doc.text(`${i + 1}. ${item}`, 16, nextTestY + 7 + (i * 6));
           });
 
-          // AUDIT GLOSSARY PAGE
           doc.addPage();
           addHeaderFooter('Glossary & Definitions');
           doc.setFontSize(16);
@@ -535,7 +545,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             ['Adaptive vs Legacy Mode', 'Adaptive mode recalculates stop distances and target expansions dynamically based on market volatility; Legacy mode uses static fixed-point stop loss bands.'],
             ['Breakeven Supervisor (BE)', 'A protective trailing rule that moves the stop loss directly to the entry price once price travels 80% toward the Take Profit target, locking in a risk-free trade.'],
             ['SuperTrend Trailing', 'An active trend-following exit that trails open positions along the 10-period, 1.6-multiplier SuperTrend line until an opposite-direction flip occurs.'],
-            ['Inconclusive Sample (<30)', 'Any combination or strategy generating fewer than 30 trade executions is flagged as INCONCLUSIVE due to lack of statistical significance.']
+            ['Inconclusive Sample (<30)', 'Any combination or strategy generating fewer than 30 trade executions is flagged as INCONCLUSIVE due to lack of statistical significance.'],
+            ['TUNE / VALIDATE split', 'Each test window is split 70/30 by date. TUNE = first 70% (in-sample). VALIDATE = last 30% (unseen). A strategy that fails on VALIDATE does not hold on unseen data.']
           ];
 
           autoTable(doc, {
@@ -615,7 +626,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
-      {/* Top Header */}
       <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-300 dark:border-[#1a2030]">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-black dark:text-white flex items-center gap-2.5">
@@ -629,7 +639,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           </p>
         </div>
 
-        {/* Controls Strip */}
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1.5 rounded-xl border border-slate-300 dark:border-[#1a2030]">
             <select value={testSymbol} onChange={(e) => setTestSymbol(e.target.value)} disabled={isRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none">
@@ -684,7 +693,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       </motion.div>
 
-      {/* Verification Diff Box */}
       {verifyResult && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -704,7 +712,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Storage Strip */}
       {storageInfo && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-3">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
@@ -735,7 +742,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Per-Symbol Results Box */}
       {runResults.length > 0 && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-2 animate-in fade-in">
           <div className="flex items-center justify-between">
@@ -762,7 +768,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Live Running Banner */}
       {isRunning && (
         <div className="p-4 rounded-2xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-between text-xs animate-in fade-in">
           <div className="flex items-center gap-3">
@@ -776,7 +781,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* RESULTS BY COMBINATION MATRIX TABLE */}
       {summaryData?.combinations && summaryData.combinations.length > 0 && (
         <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-3">
           <div className="flex items-center justify-between">
@@ -798,31 +802,50 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                   <th className="py-2.5 px-3 text-right">Max DD</th>
                   <th className="py-2.5 px-3 text-right">Net P&L</th>
                   <th className="py-2.5 px-3 text-center">Adp Cov</th>
+                  <th className="py-2.5 px-3 text-center">TUNE (PF / WR / TR)</th>
+                  <th className="py-2.5 px-3 text-center">VALIDATE (PF / WR / TR)</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                {summaryData.combinations.map((c, idx) => (
-                  <tr key={idx} onClick={() => setSelectedFile(c.report_file)} className={`cursor-pointer transition-colors ${selectedFile === c.report_file ? 'bg-blue-500/15' : idx === bestComboIdx ? 'bg-amber-500/10 hover:bg-amber-500/20' : 'hover:bg-slate-50 dark:hover:bg-[#121520]'}`}>
-                    <td className="py-3 px-3 font-bold text-black dark:text-white flex items-center gap-2">
-                      {idx === bestComboIdx && <span className="text-amber-500">★</span>}
-                      <span>{c.label}</span>
-                    </td>
-                    <td className="py-3 px-3 text-center font-bold">{c.total_trades}</td>
-                    <td className={`py-3 px-3 text-center font-bold ${c.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{c.win_rate}%</td>
-                    <td className="py-3 px-3 text-center">{c.expectancy}R</td>
-                    <td className="py-3 px-3 text-center">{c.profit_factor}</td>
-                    <td className="py-3 px-3 text-right text-rose-500">-${c.max_drawdown}</td>
-                    <td className={`py-3 px-3 text-right font-bold ${c.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${c.net_pnl}</td>
-                    <td className="py-3 px-3 text-center text-blue-500">{c.adaptive_effective_pct}%</td>
-                  </tr>
-                ))}
+                {summaryData.combinations.map((c: any, idx: number) => {
+                  const tv = c.tune_validate || {};
+                  const cTune = tv.tune || {};
+                  const cVal = tv.validate || {};
+                  const inconTune = (cTune.count ?? 0) < 30;
+                  const inconVal = (cVal.count ?? 0) < 30;
+                  const failHoldOut = (!inconTune && !inconVal) &&
+                    ((cVal.profit_factor ?? 0) < 1.0 || (cVal.profit_factor ?? 0) < 0.7 * (cTune.profit_factor ?? 0));
+                  return (
+                    <tr key={idx} onClick={() => setSelectedFile(c.report_file)} className={`cursor-pointer transition-colors ${selectedFile === c.report_file ? 'bg-blue-500/15' : idx === bestComboIdx ? 'bg-amber-500/10 hover:bg-amber-500/20' : 'hover:bg-slate-50 dark:hover:bg-[#121520]'} ${failHoldOut ? 'ring-1 ring-rose-500/40' : ''}`}>
+                      <td className="py-3 px-3 font-bold text-black dark:text-white">
+                        <div className="flex items-center gap-2">
+                          {idx === bestComboIdx && <span className="text-amber-500">★</span>}
+                          <span>{c.label}</span>
+                          {failHoldOut && <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-rose-500/15 text-rose-600">HOLD-OUT FAIL</span>}
+                        </div>
+                      </td>
+                      <td className="py-3 px-3 text-center font-bold">{c.total_trades}</td>
+                      <td className={`py-3 px-3 text-center font-bold ${c.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{c.win_rate}%</td>
+                      <td className="py-3 px-3 text-center">{c.expectancy}R</td>
+                      <td className="py-3 px-3 text-center">{c.profit_factor}</td>
+                      <td className="py-3 px-3 text-right text-rose-500">-${c.max_drawdown}</td>
+                      <td className={`py-3 px-3 text-right font-bold ${c.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${c.net_pnl}</td>
+                      <td className="py-3 px-3 text-center text-blue-500">{c.adaptive_effective_pct}%</td>
+                      <td className={`py-3 px-3 text-center font-mono text-[11px] ${inconTune ? 'text-slate-400' : ((cTune.profit_factor ?? 0) >= 1.0 ? 'text-emerald-600' : 'text-rose-500')}`}>
+                        {inconTune ? 'INCONCLUSIVE' : `${(cTune.profit_factor ?? 0).toFixed(2)} / ${(cTune.win_rate ?? 0).toFixed(0)}% / ${cTune.count}`}
+                      </td>
+                      <td className={`py-3 px-3 text-center font-mono text-[11px] ${inconVal ? 'text-slate-400' : ((cVal.profit_factor ?? 0) >= 1.0 ? 'text-emerald-600' : 'text-rose-500')}`}>
+                        {inconVal ? 'INCONCLUSIVE' : `${(cVal.profit_factor ?? 0).toFixed(2)} / ${(cVal.win_rate ?? 0).toFixed(0)}% / ${cVal.count}`}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         </div>
       )}
 
-      {/* Report Selector Strip */}
       {reportData && (
         <div className="p-4 rounded-2xl bg-slate-100 dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-2">
@@ -835,7 +858,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Navigation Sub-Tabs */}
       <div className="flex flex-wrap gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
         <button onClick={() => setActiveSubTab('summary')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'summary' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
           <TrendingUp className="w-3.5 h-3.5" /><span>Summary Dashboard</span>
@@ -851,7 +873,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </button>
       </div>
 
-      {/* SUB-TAB 1: SUMMARY */}
       {activeSubTab === 'summary' && (
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
@@ -900,19 +921,41 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                     <th className="py-2.5 px-3 text-center">Avg R</th>
                     <th className="py-2.5 px-3 text-center">PF</th>
                     <th className="py-2.5 px-3 text-right">Net P&L</th>
+                    <th className="py-2.5 px-3 text-center">TUNE (PF / WR / TR)</th>
+                    <th className="py-2.5 px-3 text-center">VALIDATE (PF / WR / TR)</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                  {Object.entries(reportData?.strategy_kpis || {}).map(([sName, sKpi]) => (
-                    <tr key={sName} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
-                      <td className="py-3 px-3 font-bold text-black dark:text-white">{sName}</td>
-                      <td className="py-3 px-3 text-center font-bold">{sKpi.count}</td>
-                      <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{sKpi.win_rate}%</td>
-                      <td className="py-3 px-3 text-center">{sKpi.avg_r}R</td>
-                      <td className="py-3 px-3 text-center">{sKpi.profit_factor}</td>
-                      <td className={`py-3 px-3 text-right font-bold ${sKpi.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${sKpi.net_pnl}</td>
-                    </tr>
-                  ))}
+                  {Object.entries(reportData?.strategy_kpis || {}).map(([sName, sKpi]: any) => {
+                    const tv = (reportData as any)?.strategy_tune_validate?.[sName] || {};
+                    const sTune = tv.tune || {};
+                    const sVal = tv.validate || {};
+                    const inconTune = (sTune.count ?? 0) < 30;
+                    const inconVal = (sVal.count ?? 0) < 30;
+                    const failHoldOut = (!inconTune && !inconVal) &&
+                      ((sVal.profit_factor ?? 0) < 1.0 || (sVal.profit_factor ?? 0) < 0.7 * (sTune.profit_factor ?? 0));
+                    return (
+                      <tr key={sName} className={`hover:bg-slate-50 dark:hover:bg-[#121520] ${failHoldOut ? 'ring-1 ring-rose-500/30' : ''}`}>
+                        <td className="py-3 px-3 font-bold text-black dark:text-white">
+                          <div className="flex items-center gap-2">
+                            <span>{sName}</span>
+                            {failHoldOut && <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-rose-500/15 text-rose-600">HOLD-OUT FAIL</span>}
+                          </div>
+                        </td>
+                        <td className="py-3 px-3 text-center font-bold">{sKpi.count}</td>
+                        <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{sKpi.win_rate}%</td>
+                        <td className="py-3 px-3 text-center">{sKpi.avg_r}R</td>
+                        <td className="py-3 px-3 text-center">{sKpi.profit_factor}</td>
+                        <td className={`py-3 px-3 text-right font-bold ${sKpi.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${sKpi.net_pnl}</td>
+                        <td className={`py-3 px-3 text-center font-mono text-[11px] ${inconTune ? 'text-slate-400' : ((sTune.profit_factor ?? 0) >= 1.0 ? 'text-emerald-600' : 'text-rose-500')}`}>
+                          {inconTune ? 'INCONCLUSIVE' : `${(sTune.profit_factor ?? 0).toFixed(2)} / ${(sTune.win_rate ?? 0).toFixed(0)}% / ${sTune.count}`}
+                        </td>
+                        <td className={`py-3 px-3 text-center font-mono text-[11px] ${inconVal ? 'text-slate-400' : ((sVal.profit_factor ?? 0) >= 1.0 ? 'text-emerald-600' : 'text-rose-500')}`}>
+                          {inconVal ? 'INCONCLUSIVE' : `${(sVal.profit_factor ?? 0).toFixed(2)} / ${(sVal.win_rate ?? 0).toFixed(0)}% / ${sVal.count}`}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -920,7 +963,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* SUB-TAB 2: TIPS */}
       {activeSubTab === 'tips' && (
         <div className="space-y-4">
           {activeTips.length === 0 ? (
@@ -948,7 +990,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* SUB-TAB 3: CHART */}
       {activeSubTab === 'chart' && (
         <div className="space-y-4">
           <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
@@ -960,7 +1001,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* SUB-TAB 4: LEDGER */}
       {activeSubTab === 'ledger' && (
         <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs overflow-hidden">
           <div className="overflow-x-auto">

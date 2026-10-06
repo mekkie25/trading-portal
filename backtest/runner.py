@@ -10,6 +10,7 @@ import shutil
 import json
 import time
 import copy
+import math
 import random
 import asyncio
 import argparse
@@ -37,7 +38,6 @@ from backtest.advisor import generate_improvement_tips
 from backtest.export_advice import generate_pair_advice
 from backtest.paths import DATA_DIR, OUTPUT_DIR
 
-# 500-day target history ensures 120-day D1 warm-up before any 365-day test window
 STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
 
@@ -51,6 +51,107 @@ COMBINATIONS = [
     {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "off", "use_trail": False, "label": "Legacy · BE on · Trail off"},
     {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Legacy · BE on · Trail on"},
 ]
+
+
+# ==============================================================================
+# ADDED: sanitize_for_json
+# Recursively replaces NaN / +inf / -inf (Python floats and numpy floats) with
+# None, and converts numpy scalars/arrays and pandas Timestamps to JSON-safe
+# plain Python values. Safe for json.dump(..., allow_nan=False).
+# ==============================================================================
+def sanitize_for_json(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [sanitize_for_json(v) for v in obj.tolist()]
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return sanitize_for_json(float(obj))
+    except Exception:
+        return str(obj)
+
+
+# ==============================================================================
+# ADDED: tune / validate split helpers
+# First 70% of the test window by date = TUNE. Last 30% = VALIDATE.
+# ==============================================================================
+def _parse_window_time(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        cleaned = str(s).replace("UTC", "").strip()
+        return datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _trade_time_utc(t: Dict[str, Any]) -> Optional[datetime]:
+    ts = t.get("signal_time_utc")
+    if ts:
+        try:
+            return datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    d = t.get("date")
+    if d:
+        try:
+            return datetime.strptime(str(d), "%Y-%m-%d")
+        except Exception:
+            pass
+    return None
+
+
+def compute_tune_validate_kpis(trades: List[Dict[str, Any]], window_start_str: str, window_end_str: str) -> Dict[str, Any]:
+    empty = {"count": 0, "win_rate": 0.0, "avg_r": 0.0, "expectancy": 0.0,
+             "profit_factor": 0.0, "max_dd_money": 0.0, "net_pnl": 0.0,
+             "is_inconclusive": True}
+    if not trades:
+        return {"tune": dict(empty), "validate": dict(empty), "tune_days": 0.0, "validate_days": 0.0}
+
+    start = _parse_window_time(window_start_str)
+    end = _parse_window_time(window_end_str)
+    if start is None or end is None or end <= start:
+        k = calculate_kpis(list(trades))
+        return {"tune": k, "validate": dict(empty), "tune_days": 0.0, "validate_days": 0.0}
+
+    total_days = (end - start).total_seconds() / 86400.0
+    tune_days = total_days * 0.70
+    cutoff = start + timedelta(days=tune_days)
+
+    tune_trades: List[Dict[str, Any]] = []
+    val_trades: List[Dict[str, Any]] = []
+    for t in trades:
+        tt = _trade_time_utc(t)
+        if tt is None or tt < cutoff:
+            tune_trades.append(t)
+        else:
+            val_trades.append(t)
+
+    return {
+        "tune": calculate_kpis(tune_trades),
+        "validate": calculate_kpis(val_trades),
+        "tune_days": round(tune_days, 1),
+        "validate_days": round(total_days - tune_days, 1),
+    }
+
 
 def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
     dirname = os.path.dirname(target_path)
@@ -66,6 +167,7 @@ def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
             except OSError:
                 pass
         raise
+
 
 async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
     m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
@@ -163,6 +265,7 @@ async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
         print(f"ERROR: Failed updating data store for {symbol} ({e}). Preserving existing files.", flush=True)
         return False
 
+
 def compute_121_window_emas(df: pd.DataFrame) -> None:
     close = df['close'].values.astype(np.float64)
     n = len(close)
@@ -185,6 +288,7 @@ def compute_121_window_emas(df: pd.DataFrame) -> None:
         col_arr[window_size - 1:] = valid_vals
         df[col_name] = col_arr
 
+
 def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
     total = len(df)
     if total < 130:
@@ -206,6 +310,7 @@ def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
         print(f"[check] indicators match (max diff: {max_diff:.2e})", flush=True)
     else:
         print(f"[check] indicator discrepancy: {max_diff:.6f}", flush=True)
+
 
 def run_backtest_reference(
     symbol: str,
@@ -329,6 +434,7 @@ def run_backtest_reference(
         "trades": sim.completed_trades,
         "kpis": kpis
     }
+
 
 def precompute_market_pass(
     symbol: str,
@@ -462,6 +568,7 @@ def precompute_market_pass(
             "strategies_s": t_strat
         }
     }
+
 
 def run_cached_combination(
     symbol: str,
@@ -605,13 +712,20 @@ def run_cached_combination(
 
     strat_kpis = {}
     dow_kpis = {}
+    strat_tune_validate: Dict[str, Any] = {}
     if not df_trades.empty:
         for s_name, s_group in df_trades.groupby("strategy"):
             strat_kpis[s_name] = calculate_kpis(s_group.to_dict("records"))
+            strat_tune_validate[s_name] = compute_tune_validate_kpis(
+                s_group.to_dict("records"), window_start_str, window_end_str
+            )
 
         df_trades["weekday"] = pd.to_datetime(df_trades["display_date"]).dt.day_name()
         for dow, dow_group in df_trades.groupby("weekday"):
             dow_kpis[dow] = calculate_kpis(dow_group.to_dict("records"))
+
+    # ADDED: tune/validate split for the whole combination.
+    combo_tune_validate = compute_tune_validate_kpis(all_trades, window_start_str, window_end_str)
 
     m5_df["dt"] = m5_df["time"]
     m5_df["date_sast_str"] = m5_df["dt"].dt.tz_convert(TZ_SAST).dt.strftime("%Y-%m-%d")
@@ -647,7 +761,6 @@ def run_cached_combination(
             }
         }
 
-    # In-app UI tips retain old advisor tips for the dashboard view
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
     run_settings_text = (
@@ -687,13 +800,18 @@ def run_cached_combination(
         "all_trades": all_trades,
         "skipped_summary": full_skip_summary.get("by_reason", {}),
         "skipped_detail": full_skip_summary,
-        "improvement_tips": improvement_tips
+        "improvement_tips": improvement_tips,
+        # ADDED: tune/validate outputs
+        "tune_validate": combo_tune_validate,
+        "strategy_tune_validate": strat_tune_validate,
     }
 
     report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
     out_file = os.path.join(OUTPUT_DIR, report_filename)
+    # CHANGED: sanitize + allow_nan=False.
+    safe_payload = sanitize_for_json(report_payload)
     with open(out_file, "w") as f:
-        json.dump(report_payload, f, separators=(",", ":"))
+        json.dump(safe_payload, f, separators=(",", ":"), allow_nan=False)
     t_rep += time.perf_counter() - _t0
 
     return {
@@ -704,6 +822,8 @@ def run_cached_combination(
         "funnel": funnel,
         "adaptive_pct": adaptive_pct,
         "day_candles": day_candles_by_date,
+        "tune_validate": combo_tune_validate,
+        "strategy_tune_validate": strat_tune_validate,
         "timing": {
             "volatility_s": t_vol,
             "strategies_s": t_strat,
@@ -711,6 +831,7 @@ def run_cached_combination(
             "report_writing_s": t_rep,
         }
     }
+
 
 def compare_runs(
     symbol: str = "US30",
@@ -877,6 +998,7 @@ def compare_runs(
     print(final_report, flush=True)
     return final_report
 
+
 async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
     orig_adaptive = GLOBAL_PARAMS.adaptive_mode
     orig_be = GLOBAL_PARAMS.use_breakeven
@@ -978,6 +1100,7 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
             tot_sim += timing.get("simulator_s", 0.0)
             tot_rep += timing.get("report_writing_s", 0.0)
 
+            # ADDED: per-combination tune/validate block.
             matrix_rows.append({
                 "label": combo["label"],
                 "mode": combo["mode"],
@@ -991,7 +1114,8 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
                 "max_drawdown": k["max_dd_money"],
                 "net_pnl": k["net_pnl"],
                 "adaptive_effective_pct": res["adaptive_pct"],
-                "funnel": res["funnel"]
+                "funnel": res["funnel"],
+                "tune_validate": res["tune_validate"],
             })
 
             day_candles = res.get("day_candles", {})
@@ -1004,21 +1128,38 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
         _t0 = time.perf_counter()
         if all_day_candles:
             candles_file = os.path.join(OUTPUT_DIR, f"{symbol}_daycandles.json")
+            # CHANGED: sanitize + allow_nan=False.
+            safe_candles = sanitize_for_json(all_day_candles)
             with open(candles_file, "w") as f:
-                json.dump(all_day_candles, f, separators=(",", ":"))
+                json.dump(safe_candles, f, separators=(",", ":"), allow_nan=False)
 
         total_pair_seconds = round(tot_agg + tot_vol + tot_lvl + tot_strat + tot_sim + tot_rep, 1)
 
+        # ADDED: phase seconds, CPU cores and concurrent-process count in the summary.
+        summary_payload = {
+            "symbol": symbol,
+            "days": days_count,
+            "target_rr": GLOBAL_PARAMS.target_rr,
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "total_seconds": total_pair_seconds,
+            "phase_seconds": {
+                "aggregator_s": round(tot_agg, 1),
+                "volatility_s": round(tot_vol, 1),
+                "session_levels_s": round(tot_lvl, 1),
+                "strategies_s": round(tot_strat, 1),
+                "simulator_s": round(tot_sim, 1),
+                "report_writing_s": round(tot_rep, 1),
+            },
+            "cpu_cores": os.cpu_count() or 1,
+            "concurrent_processes": int(os.getenv("BACKTEST_CONCURRENT_WORKERS", "1")),
+            "combinations": matrix_rows,
+        }
+
         summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
+        # CHANGED: sanitize + allow_nan=False.
+        safe_summary = sanitize_for_json(summary_payload)
         with open(summary_file, "w") as f:
-            json.dump({
-                "symbol": symbol,
-                "days": days_count,
-                "target_rr": GLOBAL_PARAMS.target_rr,
-                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "total_seconds": total_pair_seconds,
-                "combinations": matrix_rows
-            }, f, separators=(",", ":"))
+            json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
         tot_rep += time.perf_counter() - _t0
 
         print(
@@ -1035,6 +1176,7 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
         GLOBAL_PARAMS.adaptive_mode = orig_adaptive
         GLOBAL_PARAMS.use_breakeven = orig_be
         GLOBAL_PARAMS.use_supertrend_trail = orig_trail
+
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -1119,6 +1261,7 @@ async def main():
     if not ok or not success:
         sys.exit(1)
 
+
 def print_startup_diagnostics() -> None:
     print("=" * 60, flush=True)
     print("BACKTEST STARTUP DIAGNOSTICS", flush=True)
@@ -1136,6 +1279,7 @@ def print_startup_diagnostics() -> None:
         status = "SET" if value else "MISSING"
         print(f"{key}: {status}", flush=True)
     print("=" * 60, flush=True)
+
 
 if __name__ == "__main__":
     try:
