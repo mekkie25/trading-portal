@@ -29,6 +29,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DATA_DIR = os.getenv("DATA_DIR", "").strip() or PROJECT_ROOT
 os.makedirs(DATA_DIR, exist_ok=True)
 RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", os.path.join(DATA_DIR, "risk_state.json"))
+# PROPOSED: path to the journal so we can rebuild live counters at startup.
+TRADES_DB_FILE = os.path.join(DATA_DIR, "trades_db.json")
 
 
 # ==============================================================================
@@ -154,8 +156,23 @@ class RiskManager:
         self.current_monthly_loss: float = 0.0
         self.open_positions: Dict[str, dict] = {}
 
+        # PROPOSED (Step 1 of deal-replay fix): record the process start time.
+        # record_trade_outcome_scoped uses this as a hard gate so replayed
+        # historical deals never touch live risk state.
+        self._bot_started_at_utc: datetime = datetime.now(timezone.utc)
+
+        # PROPOSED (Option A): read bot_config.json once at construction so a
+        # freshly built RiskManager already has the active risk profile,
+        # min R:R, USD limits and master_execution flag. No-op if the file
+        # does not exist. Live sizing already called sync_ui_config() before
+        # every trade, so this does not change live behaviour — it only makes
+        # the object's state match what the first scan would have set anyway.
         self.sync_ui_config()
-        self.load_persistent_state()
+
+        # PROPOSED (Step 1 of deal-replay fix): rebuild day/week/month loss
+        # counters from the journal once at startup. Fired from __init__
+        # because load_persistent_state() is not called anywhere in this repo.
+        self.rebuild_period_counters_from_history()
 
     def sync_ui_config(self) -> None:
         if not os.path.exists(self.config_file):
@@ -420,6 +437,165 @@ class RiskManager:
             log.info(f"WIN RECORDED (+${pnl:.2f}). Consecutive loss streak reset.")
         self.save_persistent_state()
 
+    def record_trade_outcome_scoped(self, pnl: float, closed_at_utc: Optional[datetime]) -> bool:
+        """
+        PROPOSED (Step 1 of deal-replay fix).
+
+        Scoped variant used only by the deal-replay sync path.
+
+        Hard rule: this method changes NOTHING -- no daily/weekly/monthly
+        loss, no today_closed_profit, no consecutive_losses, no
+        expected_balance -- unless the deal closed AFTER self._bot_started_at_utc.
+        Deals that closed earlier go to trades_db.json only.
+
+        Returns True only if it changed state.
+        """
+        if closed_at_utc is None:
+            return False
+
+        if closed_at_utc.tzinfo is None:
+            closed_at_utc = closed_at_utc.replace(tzinfo=timezone.utc)
+
+        startup = getattr(self, "_bot_started_at_utc", None)
+        if startup is None:
+            return False
+
+        if startup.tzinfo is None:
+            startup = startup.replace(tzinfo=timezone.utc)
+
+        if closed_at_utc < startup:
+            return False
+
+        close_sast = closed_at_utc.astimezone(TZ_SAST)
+        today_str = get_sast_session_date()
+        week_str = close_sast.strftime("%Y-W%W")
+        month_str = close_sast.strftime("%Y-%m")
+
+        touched = False
+
+        if pnl < 0:
+            if close_sast.strftime("%Y-%m-%d") == today_str:
+                self.current_daily_loss += abs(pnl)
+                touched = True
+            if week_str == self.current_week_str:
+                self.current_weekly_loss += abs(pnl)
+                touched = True
+            if month_str == self.current_month_str:
+                self.current_monthly_loss += abs(pnl)
+                touched = True
+            self.consecutive_losses += 1
+            touched = True
+        elif pnl > 0:
+            if close_sast.strftime("%Y-%m-%d") == today_str:
+                self.today_closed_profit += pnl
+                touched = True
+            self.consecutive_losses = 0
+            touched = True
+        else:
+            return False
+
+        if touched:
+            self.expected_balance += pnl
+            self.save_persistent_state()
+
+        return touched
+
+    def rebuild_period_counters_from_history(self) -> None:
+        """
+        PROPOSED (Step 1 of deal-replay fix).
+
+        Rebuilds current_daily_loss, current_weekly_loss, current_monthly_loss
+        and today_closed_profit from trades_db.json at process startup.
+
+        Only deals whose close time (stored in UTC as "YYYY-MM-DD HH:MM:SS")
+        falls inside the current SAST day / week / month are counted. Duplicate
+                tickets are counted once. Missing or empty file -> counters are set
+        to zero. Corrupt (non-list) JSON -> log a warning, leave counters
+        untouched.
+        """
+        try:
+            if not os.path.exists(TRADES_DB_FILE):
+                self.current_daily_loss = 0.0
+                self.current_weekly_loss = 0.0
+                self.current_monthly_loss = 0.0
+                self.today_closed_profit = 0.0
+                log.info("[RISK] rebuilt loss counters: day=0.00, week=0.00, month=0.00 (no trades_db.json)")
+                return
+
+            with open(TRADES_DB_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+
+            if not content:
+                self.current_daily_loss = 0.0
+                self.current_weekly_loss = 0.0
+                self.current_monthly_loss = 0.0
+                self.today_closed_profit = 0.0
+                log.info("[RISK] rebuilt loss counters: day=0.00, week=0.00, month=0.00 (empty trades_db.json)")
+                return
+
+            rows = json.loads(content)
+            if not isinstance(rows, list):
+                log.warning("[RISK] trades_db.json is not a JSON list; skipping counter rebuild.")
+                return
+
+            today_str = get_sast_session_date()
+            day_loss = 0.0
+            week_loss = 0.0
+            month_loss = 0.0
+            today_profit = 0.0
+            seen_tickets: set = set()
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+
+                ticket = str(row.get("ticket", "")).strip()
+                if ticket:
+                    if ticket in seen_tickets:
+                        continue
+                    seen_tickets.add(ticket)
+
+                close_time_str = row.get("closeTime")
+                if not close_time_str or close_time_str == "OPEN":
+                    continue
+
+                try:
+                    close_dt = datetime.strptime(str(close_time_str), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    continue
+
+                close_sast = close_dt.astimezone(TZ_SAST)
+                row_day = close_sast.strftime("%Y-%m-%d")
+                row_week = close_sast.strftime("%Y-W%W")
+                row_month = close_sast.strftime("%Y-%m")
+
+                try:
+                    pnl = float(row.get("pnl", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    pnl = 0.0
+
+                if row_day == today_str:
+                    if pnl < 0:
+                        day_loss += abs(pnl)
+                    elif pnl > 0:
+                        today_profit += pnl
+                if row_week == self.current_week_str and pnl < 0:
+                    week_loss += abs(pnl)
+                if row_month == self.current_month_str and pnl < 0:
+                    month_loss += abs(pnl)
+
+            self.current_daily_loss = round(day_loss, 4)
+            self.current_weekly_loss = round(week_loss, 4)
+            self.current_monthly_loss = round(month_loss, 4)
+            self.today_closed_profit = round(today_profit, 4)
+
+            log.info(
+                f"[RISK] rebuilt loss counters: day={self.current_daily_loss:.2f}, "
+                f"week={self.current_weekly_loss:.2f}, month={self.current_monthly_loss:.2f}"
+            )
+        except Exception as e:
+            log.warning(f"[RISK] rebuild_period_counters_from_history failed: {e}")
+
     def _get_profile_band_risk_pct(self, profile: Dict[str, Any], zar_equity: float) -> float:
         bands = profile["bands_zar"]
         risks = profile["risk_pct_by_band"]
@@ -435,7 +611,7 @@ class RiskManager:
         else:
             return risks[4]
 
-        def combined_risk_pct(
+    def combined_risk_pct(
         self,
         current_equity: float,
         dow_mult: float = 1.0,
@@ -445,8 +621,8 @@ class RiskManager:
     ) -> float:
         # PROPOSED: Aggressive and Max Growth ignore the Monday/Friday halving.
         # Steady, Balanced and no-profile keep the existing day-of-week reduction.
-         if self.active_profile is not None and not self.active_profile.get("apply_dow_reduction", True):
-          dow_mult = 1.0
+        if self.active_profile is not None and not self.active_profile.get("apply_dow_reduction", True):
+            dow_mult = 1.0
 
         if self.active_profile is None:
             micro_mode = getattr(GLOBAL_PARAMS, 'micro_account_mode', False)

@@ -467,7 +467,7 @@ def test_gap2_default_switch_true_when_key_missing(tmp_path, monkeypatch):
     assert rm.use_profile_drawdown_pct is True
     assert rm.max_daily_loss_usd == 0.0
 
-    def test_max_growth_ignores_dow_reduction():
+def test_max_growth_ignores_dow_reduction():
     """Max Growth: Monday risk == Wednesday risk (35% band on R360-equivalent)."""
     rm = RiskManager(config_file="nonexistent.json", state_file="/tmp/test_dow_mg.json")
     rm.active_profile_name = "Max Growth"

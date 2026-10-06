@@ -354,6 +354,11 @@ class CTraderClient:
         self._listen_task: Optional[asyncio.Task] = None
         self.risk_engine: Optional[Any] = None
 
+        # PROPOSED (Step 2 of deal-replay fix): one-shot flag so only the
+        # first sync of this process logs replay counts and triggers a
+        # final counter rebuild from the journal.
+        self._first_sync_done: bool = False
+
     def _load_position_strategies(self):
         strat_file = os.path.join(DATA_DIR, "position_strategies.json")
         try:
@@ -494,6 +499,10 @@ class CTraderClient:
             deals = deal_res["payload"]["deal"]
             synced_trades = []
 
+            # PROPOSED (Step 2 of deal-replay fix): counters for this sync only.
+            replayed_count = 0
+            counted_count = 0
+
             for d in deals:
                 pos_det = d.get("closePositionDetail")
                 if pos_det:
@@ -572,11 +581,24 @@ class CTraderClient:
                             )
                         await whatsapp.send_alert(alert)
 
+                        # PROPOSED (Step 2 of deal-replay fix): one-shot log + rebuild.
+            # Fires only on the FIRST sync of this process. Later syncs
+            # during the run stay silent. The rebuild picks up deals that
+            # closed while the bot was down and are now inside the current
+            # SAST day/week/month window.
+            if not self._first_sync_done:
+                self._first_sync_done = True
+                if hasattr(self, 'risk_engine') and self.risk_engine:
+                    log.info(
+                        f"[RISK] replayed {replayed_count} historical deals, counted {counted_count}"
+                    )
+                    self.risk_engine.persistent_risk.rebuild_period_counters_from_history()
+
             return synced_trades
         except Exception as e:
             log.warning(f"Error syncing deals from cTrader: {e}")
             return []
-
+            
     def fetch_real_account_id_from_http(self) -> Optional[int]:
         try:
             url = f"https://api.spotware.com/connect/tradingaccounts?access_token={self.access_token}"
