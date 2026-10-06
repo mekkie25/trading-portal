@@ -8,3 +8,12 @@ coverage/
 !.env.example
 backtest/data/
 backtest/output/
+# Runtime state created in DATA_DIR (never commit)
+trades_db.json
+bot_config.json
+risk_state.json
+bot_telemetry.json
+candles_cache.json
+close_command.json
+__pycache__/
+*.pyc
