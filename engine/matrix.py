@@ -592,7 +592,13 @@ class CTraderClient:
                     log.info(
                         f"[RISK] replayed {replayed_count} historical deals, counted {counted_count}"
                     )
-                    self.risk_engine.persistent_risk.rebuild_period_counters_from_history()
+                    # PROPOSED (Step 2 of deal-replay fix): wrap the rebuild so a
+                    # failure can never stop the deal sync. The log line above
+                    # always fires; only the rebuild is guarded.
+                    try:
+                        self.risk_engine.persistent_risk.rebuild_period_counters_from_history()
+                    except Exception as e:
+                        log.warning(f"[RISK] post-sync rebuild failed: {e}")
 
             return synced_trades
         except Exception as e:
