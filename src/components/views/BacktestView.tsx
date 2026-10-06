@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion } from 'motion/react';
 import { createChart, IChartApi, ColorType, LineStyle, UTCTimestamp } from 'lightweight-charts';
-import { 
-  Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw, 
+import {
+  Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw,
   Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer,
-  FileText
+  FileText, Activity
 } from 'lucide-react';
 import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
 import { formatCurrency } from '../../utils/currency';
@@ -100,7 +100,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
   const [summaryData, setSummaryData] = useState<SymbolSummaryPayload | null>(null);
-  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'chart' | 'ledger' | 'tips'>('summary');
+  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'diagnostics' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
   const [testSymbol, setTestSymbol] = useState<string>('US30');
@@ -546,7 +546,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             ['Breakeven Supervisor (BE)', 'A protective trailing rule that moves the stop loss directly to the entry price once price travels 80% toward the Take Profit target, locking in a risk-free trade.'],
             ['SuperTrend Trailing', 'An active trend-following exit that trails open positions along the 10-period, 1.6-multiplier SuperTrend line until an opposite-direction flip occurs.'],
             ['Inconclusive Sample (<30)', 'Any combination or strategy generating fewer than 30 trade executions is flagged as INCONCLUSIVE due to lack of statistical significance.'],
-            ['TUNE / VALIDATE split', 'Each test window is split 70/30 by date. TUNE = first 70% (in-sample). VALIDATE = last 30% (unseen). A strategy that fails on VALIDATE does not hold on unseen data.']
+            ['TUNE / VALIDATE split', 'Each test window is split 70/30 by date. TUNE = first 70% (in-sample). VALIDATE = last 30% (unseen). A strategy that fails on VALIDATE does not hold on unseen data.'],
+            ['Blueprint Diagnostics', 'Phase-1 post-hoc analytics: hourly expectancy, session-rollover friction, ATR tier KPIs, loss-streak recovery, circuit-breaker simulation, outlier dependency, Monte Carlo drawdown distribution, and buy-and-hold alpha.']
           ];
 
           autoTable(doc, {
@@ -862,6 +863,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         <button onClick={() => setActiveSubTab('summary')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'summary' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
           <TrendingUp className="w-3.5 h-3.5" /><span>Summary Dashboard</span>
         </button>
+        <button onClick={() => setActiveSubTab('diagnostics')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'diagnostics' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <Activity className="w-3.5 h-3.5 text-purple-400" /><span>Blueprint Diagnostics</span>
+        </button>
         <button onClick={() => setActiveSubTab('tips')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'tips' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
           <Lightbulb className="w-3.5 h-3.5 text-amber-400" /><span>Actionable Improvement Tips</span>
         </button>
@@ -962,6 +966,301 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           </div>
         </div>
       )}
+
+      {activeSubTab === 'diagnostics' && (() => {
+        const diag = reportData?.diagnostics;
+        if (!diag) {
+          return (
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center">
+              <Activity className="w-8 h-8 text-purple-400 mx-auto" />
+              <div className="text-sm font-bold text-black dark:text-white mt-2">No diagnostics yet</div>
+              <div className="text-xs text-slate-500 mt-1">Run a backtest to generate the Blueprint analytics block.</div>
+            </div>
+          );
+        }
+
+        const kpiColor = (v: number) => v >= 0 ? 'text-emerald-500' : 'text-rose-500';
+
+        return (
+          <div className="space-y-6">
+
+            {/* Section 4 item 19 - 24-hour hourly expectancy matrix */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-bold text-black dark:text-white">§19 · 24-Hour Hourly Expectancy Matrix (SAST)</h3>
+                <span className="text-[10px] font-mono text-slate-500">Unbiased · all 24 hours scanned</span>
+              </div>
+              <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-12 gap-2">
+                {Array.from({ length: 24 }, (_, h) => {
+                  const k = diag.hour_kpis?.[String(h)];
+                  const hasData = k && k.count > 0;
+                  const isWin = hasData && k.net_pnl >= 0;
+                  const isThin = hasData && k.count < 30;
+                  return (
+                    <div key={h}
+                      title={hasData ? `Hour ${String(h).padStart(2,'0')}:00 SAST\n${k.count} trades · ${k.win_rate}% WR · ${k.expectancy}R · PF ${k.profit_factor}\nNet P&L: $${k.net_pnl}` : `Hour ${String(h).padStart(2,'0')}:00 SAST — no trades`}
+                      className={`p-2 rounded-xl border text-[10px] font-mono ${
+                        !hasData
+                          ? 'bg-slate-50 dark:bg-[#08090d] border-slate-200 dark:border-[#1a2030] text-slate-400'
+                          : isWin
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600'
+                            : 'bg-rose-500/10 border-rose-500/30 text-rose-600'
+                      }`}>
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-bold">{String(h).padStart(2,'0')}</span>
+                        {isThin && <span className="text-[8px] px-1 rounded bg-amber-500/20 text-amber-600">thin</span>}
+                      </div>
+                      {hasData ? (
+                        <>
+                          <div className="truncate">n={k.count}</div>
+                          <div className="truncate font-bold">{k.win_rate}%</div>
+                          <div className="truncate">{k.net_pnl >= 0 ? '+' : ''}${k.net_pnl}</div>
+                        </>
+                      ) : <div className="text-center text-slate-300 dark:text-slate-600">—</div>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Section 4 item 20 - Day of Week performance */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3">§20 · Performance by Day of Week</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2.5 px-3">Weekday</th>
+                      <th className="py-2.5 px-3 text-center">Trades</th>
+                      <th className="py-2.5 px-3 text-center">Win Rate</th>
+                      <th className="py-2.5 px-3 text-center">Exp (R)</th>
+                      <th className="py-2.5 px-3 text-center">PF</th>
+                      <th className="py-2.5 px-3 text-right">Net P&L</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    {["Monday","Tuesday","Wednesday","Thursday","Friday"].map((dow) => {
+                      const k = reportData?.dow_kpis?.[dow];
+                      if (!k) return (
+                        <tr key={dow}>
+                          <td className="py-2.5 px-3 text-slate-400 italic">{dow}</td>
+                          <td colSpan={5} className="py-2.5 px-3 text-slate-400 italic">no trades</td>
+                        </tr>
+                      );
+                      return (
+                        <tr key={dow} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
+                          <td className="py-3 px-3 font-bold text-black dark:text-white">{dow}</td>
+                          <td className="py-3 px-3 text-center font-bold">{k.count}</td>
+                          <td className={`py-3 px-3 text-center font-bold ${k.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{k.win_rate}%</td>
+                          <td className={`py-3 px-3 text-center ${kpiColor(k.expectancy)}`}>{k.expectancy}R</td>
+                          <td className="py-3 px-3 text-center">{k.profit_factor}</td>
+                          <td className={`py-3 px-3 text-right font-bold ${kpiColor(k.net_pnl)}`}>${k.net_pnl}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Section 4 item 21 - Session rollover friction */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§21 · Session-Rollover Friction</h3>
+              <p className="text-[11px] text-slate-500 mb-3 font-mono">Comparison: trades taken inside ±15min of major session transitions vs outside.</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {[
+                  { label: 'Inside Rollover Windows', d: diag.session_rollover.in_transition },
+                  { label: 'Outside Rollover Windows', d: diag.session_rollover.out_of_transition },
+                ].map(({ label, d }) => (
+                  <div key={label} className="p-4 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] text-xs font-mono">
+                    <div className="font-bold text-black dark:text-white mb-2">{label}</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>Trades: <span className="font-bold">{d.count}</span></div>
+                      <div>WR: <span className={`font-bold ${d.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{d.win_rate}%</span></div>
+                      <div>Exp: <span className={`font-bold ${kpiColor(d.expectancy)}`}>{d.expectancy}R</span></div>
+                      <div>PF: <span className="font-bold">{d.profit_factor}</span></div>
+                      <div className="col-span-2">Net: <span className={`font-bold ${kpiColor(d.net_pnl)}`}>${d.net_pnl}</span></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Section 6 item 26 - ATR volatility tiering */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3">§26 · ATR Volatility Tiering</h3>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+                {['LOW','NORMAL','HIGH','UNKNOWN'].map((tier) => {
+                  const k = diag.atr_tier_kpis?.[tier];
+                  if (!k || k.count === 0) {
+                    return (
+                      <div key={tier} className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] opacity-50">
+                        <div className="font-bold text-slate-500">{tier}</div>
+                        <div className="text-slate-400 text-[10px] mt-1">no data</div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div key={tier} className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                      <div className="font-bold text-black dark:text-white">{tier}</div>
+                      <div className="mt-1 text-[11px]">n={k.count} · WR {k.win_rate}%</div>
+                      <div className={`text-[11px] font-bold ${kpiColor(k.net_pnl)}`}>${k.net_pnl}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Section 7 items 31 + 32 - Streak analysis + circuit breaker */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+                <h3 className="text-sm font-bold text-black dark:text-white mb-3">§31 · Consecutive Loss Streak</h3>
+                <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Max Streak</div>
+                    <div className="text-lg font-bold text-rose-500">{diag.streak_analysis.max_consecutive_losses}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Avg Streak</div>
+                    <div className="text-lg font-bold text-black dark:text-white">{diag.streak_analysis.average_streak}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Peak Drawdown</div>
+                    <div className="text-lg font-bold text-rose-500">-${diag.streak_analysis.peak_drawdown}</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="text-[10px] text-slate-500 uppercase">Recovery Trades</div>
+                    <div className="text-lg font-bold text-blue-500">{diag.streak_analysis.recovery_trades_from_peak_dd}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+                <h3 className="text-sm font-bold text-black dark:text-white mb-1">§32 · Circuit-Breaker Simulation</h3>
+                <p className="text-[10px] text-slate-500 mb-3 font-mono">What if we halve risk after every 3rd consecutive loss?</p>
+                <div className="space-y-2 text-xs font-mono">
+                  <div className="flex justify-between p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <span className="text-slate-500">Original Net P&L</span>
+                    <span className={`font-bold ${kpiColor(diag.circuit_breaker_sim.original_net_pnl)}`}>${diag.circuit_breaker_sim.original_net_pnl}</span>
+                  </div>
+                  <div className="flex justify-between p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <span className="text-slate-500">With Halving</span>
+                    <span className={`font-bold ${kpiColor(diag.circuit_breaker_sim.simulated_net_pnl)}`}>${diag.circuit_breaker_sim.simulated_net_pnl}</span>
+                  </div>
+                  <div className="flex justify-between p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <span className="text-slate-500">Trades Halved</span>
+                    <span className="font-bold text-black dark:text-white">{diag.circuit_breaker_sim.trades_halved}</span>
+                  </div>
+                  <div className="flex justify-between p-2 rounded-lg bg-blue-500/10 border border-blue-500/30">
+                    <span className="text-blue-600 font-bold">Protection Delta</span>
+                    <span className={`font-bold ${kpiColor(diag.circuit_breaker_sim.protection_delta)}`}>
+                      {diag.circuit_breaker_sim.protection_delta >= 0 ? '+' : ''}${diag.circuit_breaker_sim.protection_delta}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Section 7 item 36 - Outlier dependency removal */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§36 · Outlier Dependency Removal</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">Drops the top 5% best trades and recomputes. If edge collapses, it was luck.</p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2 px-3">Scenario</th>
+                      <th className="py-2 px-3 text-center">Trades</th>
+                      <th className="py-2 px-3 text-center">WR</th>
+                      <th className="py-2 px-3 text-center">PF</th>
+                      <th className="py-2 px-3 text-right">Net P&L</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    <tr>
+                      <td className="py-3 px-3 font-bold text-black dark:text-white">Full Set</td>
+                      <td className="py-3 px-3 text-center">{diag.outlier_removal.full.count}</td>
+                      <td className="py-3 px-3 text-center">{diag.outlier_removal.full.win_rate}%</td>
+                      <td className="py-3 px-3 text-center">{diag.outlier_removal.full.profit_factor}</td>
+                      <td className={`py-3 px-3 text-right font-bold ${kpiColor(diag.outlier_removal.full.net_pnl)}`}>${diag.outlier_removal.full.net_pnl}</td>
+                    </tr>
+                    <tr>
+                      <td className="py-3 px-3 font-bold text-black dark:text-white">Top 5% Removed ({diag.outlier_removal.outlier_count})</td>
+                      <td className="py-3 px-3 text-center">{diag.outlier_removal.trimmed.count}</td>
+                      <td className="py-3 px-3 text-center">{diag.outlier_removal.trimmed.win_rate}%</td>
+                      <td className="py-3 px-3 text-center">{diag.outlier_removal.trimmed.profit_factor}</td>
+                      <td className={`py-3 px-3 text-right font-bold ${kpiColor(diag.outlier_removal.trimmed.net_pnl)}`}>${diag.outlier_removal.trimmed.net_pnl}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-3 p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] font-mono text-amber-600">
+                Dependency on top 5%: <strong>{diag.outlier_removal.impact_pct}%</strong> of net P&L.
+                {diag.outlier_removal.impact_pct > 50 && ' ⚠ Highly concentrated — strategy relies on rare outliers.'}
+              </div>
+            </div>
+
+            {/* Section 7 item 37 - Monte Carlo resampling */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§37 · Monte Carlo Resampling</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">{diag.monte_carlo.iterations} shuffles of the trade sequence.</p>
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 text-xs font-mono">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Median Max DD</div>
+                  <div className="text-lg font-bold text-rose-500">-${diag.monte_carlo.median_max_dd}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">P5 Max DD</div>
+                  <div className="text-lg font-bold text-emerald-500">-${diag.monte_carlo.p5_max_dd}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">P95 Max DD</div>
+                  <div className="text-lg font-bold text-rose-500">-${diag.monte_carlo.p95_max_dd}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Median Final Eq</div>
+                  <div className="text-lg font-bold text-blue-500">${diag.monte_carlo.median_final_equity}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Prob Positive</div>
+                  <div className={`text-lg font-bold ${diag.monte_carlo.prob_positive >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{diag.monte_carlo.prob_positive}%</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Section 7 item 38 - Buy and Hold benchmark */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3">§38 · Buy-and-Hold Benchmark (Alpha)</h3>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Hold Return</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.buy_and_hold.bh_return_pct)}`}>{diag.buy_and_hold.bh_return_pct}%</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Hold P&L</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.buy_and_hold.bh_net_pnl)}`}>${diag.buy_and_hold.bh_net_pnl}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Strategy P&L</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.buy_and_hold.strategy_net_pnl)}`}>${diag.buy_and_hold.strategy_net_pnl}</div>
+                </div>
+                <div className={`p-3 rounded-xl border ${diag.buy_and_hold.alpha >= 0 ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-rose-500/10 border-rose-500/30'}`}>
+                  <div className="text-[10px] text-slate-500 uppercase">Alpha</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.buy_and_hold.alpha)}`}>${diag.buy_and_hold.alpha}</div>
+                </div>
+              </div>
+              <div className={`mt-3 p-2 rounded-lg border text-[11px] font-mono font-bold ${
+                diag.buy_and_hold.verdict === 'STRATEGY_BEATS_HOLD'
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600'
+                  : 'bg-amber-500/10 border-amber-500/30 text-amber-600'
+              }`}>
+                Verdict: {diag.buy_and_hold.verdict.replace(/_/g, ' ')}
+              </div>
+            </div>
+
+          </div>
+        );
+      })()}
 
       {activeSubTab === 'tips' && (
         <div className="space-y-4">

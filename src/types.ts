@@ -206,6 +206,61 @@ export interface ImprovementTip {
   action: string;
 }
 
+// PROPOSED: Blueprint Phase-1 diagnostics (backtest/diagnostics.py).
+export interface DiagnosticKPIs {
+  count: number;
+  win_rate: number;
+  expectancy: number;
+  profit_factor: number;
+  net_pnl: number;
+}
+
+export interface BacktestDiagnostics {
+  version?: string;
+  hour_kpis: Record<string, DiagnosticKPIs>;
+  session_rollover: {
+    in_transition: DiagnosticKPIs;
+    out_of_transition: DiagnosticKPIs;
+  };
+  atr_tier_kpis: Record<string, DiagnosticKPIs>;
+  streak_analysis: {
+    max_consecutive_losses: number;
+    average_streak: number;
+    streak_count: number;
+    recovery_trades_from_peak_dd: number;
+    peak_drawdown: number;
+  };
+  circuit_breaker_sim: {
+    original_net_pnl: number;
+    simulated_net_pnl: number;
+    trades_halved: number;
+    protection_delta: number;
+  };
+  outlier_removal: {
+    full: DiagnosticKPIs;
+    trimmed: DiagnosticKPIs;
+    outlier_count: number;
+    impact_pct: number;
+  };
+  monte_carlo: {
+    iterations: number;
+    median_max_dd: number;
+    p5_max_dd: number;
+    p95_max_dd: number;
+    median_final_equity: number;
+    prob_positive: number;
+  };
+  buy_and_hold: {
+    first_close: number;
+    last_close: number;
+    bh_return_pct: number;
+    bh_net_pnl: number;
+    strategy_net_pnl: number;
+    alpha: number;
+    verdict: string;
+  };
+}
+
 export interface BacktestReportPayload {
   symbol: string;
   mode: string;
@@ -218,4 +273,6 @@ export interface BacktestReportPayload {
   improvement_tips?: ImprovementTip[];
   tune_validate?: any;
   strategy_tune_validate?: Record<string, any>;
+  // PROPOSED: Blueprint Phase-1 diagnostics block.
+  diagnostics?: BacktestDiagnostics;
 }
