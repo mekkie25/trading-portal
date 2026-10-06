@@ -37,6 +37,7 @@ from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from
 from backtest.advisor import generate_improvement_tips
 from backtest.export_advice import generate_pair_advice
 from backtest.paths import DATA_DIR, OUTPUT_DIR
+from backtest.diagnostics import compute_diagnostics
 
 STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
@@ -53,12 +54,6 @@ COMBINATIONS = [
 ]
 
 
-# ==============================================================================
-# ADDED: sanitize_for_json
-# Recursively replaces NaN / +inf / -inf (Python floats and numpy floats) with
-# None, and converts numpy scalars/arrays and pandas Timestamps to JSON-safe
-# plain Python values. Safe for json.dump(..., allow_nan=False).
-# ==============================================================================
 def sanitize_for_json(obj):
     if obj is None:
         return None
@@ -89,10 +84,6 @@ def sanitize_for_json(obj):
         return str(obj)
 
 
-# ==============================================================================
-# ADDED: tune / validate split helpers
-# First 70% of the test window by date = TUNE. Last 30% = VALIDATE.
-# ==============================================================================
 def _parse_window_time(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -724,7 +715,6 @@ def run_cached_combination(
         for dow, dow_group in df_trades.groupby("weekday"):
             dow_kpis[dow] = calculate_kpis(dow_group.to_dict("records"))
 
-    # ADDED: tune/validate split for the whole combination.
     combo_tune_validate = compute_tune_validate_kpis(all_trades, window_start_str, window_end_str)
 
     m5_df["dt"] = m5_df["time"]
@@ -762,6 +752,15 @@ def run_cached_combination(
         }
 
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
+
+    # PROPOSED: Blueprint Phase-1 deep analytics (see backtest/diagnostics.py).
+    # Pure post-hoc analysis of the completed trade list. No simulator changes.
+    diag_payload = compute_diagnostics(
+        trades=all_trades,
+        m5_df=m5_df,
+        sim_start_idx=sim_start_idx,
+        starting_equity=balance,
+    )
 
     run_settings_text = (
         f"mode: {mode_str}, target_rr: {GLOBAL_PARAMS.target_rr}, "
@@ -801,14 +800,13 @@ def run_cached_combination(
         "skipped_summary": full_skip_summary.get("by_reason", {}),
         "skipped_detail": full_skip_summary,
         "improvement_tips": improvement_tips,
-        # ADDED: tune/validate outputs
         "tune_validate": combo_tune_validate,
         "strategy_tune_validate": strat_tune_validate,
+        "diagnostics": diag_payload,
     }
 
     report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
     out_file = os.path.join(OUTPUT_DIR, report_filename)
-    # CHANGED: sanitize + allow_nan=False.
     safe_payload = sanitize_for_json(report_payload)
     with open(out_file, "w") as f:
         json.dump(safe_payload, f, separators=(",", ":"), allow_nan=False)
@@ -1100,7 +1098,6 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
             tot_sim += timing.get("simulator_s", 0.0)
             tot_rep += timing.get("report_writing_s", 0.0)
 
-            # ADDED: per-combination tune/validate block.
             matrix_rows.append({
                 "label": combo["label"],
                 "mode": combo["mode"],
@@ -1128,14 +1125,12 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
         _t0 = time.perf_counter()
         if all_day_candles:
             candles_file = os.path.join(OUTPUT_DIR, f"{symbol}_daycandles.json")
-            # CHANGED: sanitize + allow_nan=False.
             safe_candles = sanitize_for_json(all_day_candles)
             with open(candles_file, "w") as f:
                 json.dump(safe_candles, f, separators=(",", ":"), allow_nan=False)
 
         total_pair_seconds = round(tot_agg + tot_vol + tot_lvl + tot_strat + tot_sim + tot_rep, 1)
 
-        # ADDED: phase seconds, CPU cores and concurrent-process count in the summary.
         summary_payload = {
             "symbol": symbol,
             "days": days_count,
@@ -1156,7 +1151,6 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
         }
 
         summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
-        # CHANGED: sanitize + allow_nan=False.
         safe_summary = sanitize_for_json(summary_payload)
         with open(summary_file, "w") as f:
             json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
