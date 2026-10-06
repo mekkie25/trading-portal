@@ -38,6 +38,7 @@ from backtest.advisor import generate_improvement_tips
 from backtest.export_advice import generate_pair_advice
 from backtest.paths import DATA_DIR, OUTPUT_DIR
 from backtest.diagnostics import compute_diagnostics
+from backtest.portfolio import compute_portfolio_correlation, DEFAULT_WHITELIST
 
 STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
@@ -51,6 +52,60 @@ COMBINATIONS = [
     {"mode": "legacy",   "adaptive_mode": False, "be": "off", "use_be": False, "trail": "on",  "use_trail": True,  "label": "Legacy · BE off · Trail on"},
     {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "off", "use_trail": False, "label": "Legacy · BE on · Trail off"},
     {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Legacy · BE on · Trail on"},
+]
+
+# Phase-3 Blueprint variants (Section 5 items 22 / 23 / 25).
+VARIANT_COMBINATIONS = [
+    {
+        "label": "BE Structural (2-close break)",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "on", "use_be": True,
+        "be_mode": "STRUCTURAL",
+        "trail": "off", "use_trail": False,
+        "trail_override": None,
+        "max_daily_override": None,
+        "report_file": "variant_be_structural_report.json",
+    },
+    {
+        "label": "Trail EMA_9 (no BE)",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "on", "use_trail": True,
+        "trail_override": "EMA_9",
+        "max_daily_override": None,
+        "report_file": "variant_trail_ema9_report.json",
+    },
+    {
+        "label": "Trail EMA_25 (no BE)",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "on", "use_trail": True,
+        "trail_override": "EMA_25",
+        "max_daily_override": None,
+        "report_file": "variant_trail_ema25_report.json",
+    },
+    {
+        "label": "Daily Cap 1",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "off", "use_trail": False,
+        "trail_override": None,
+        "max_daily_override": 1,
+        "report_file": "variant_dailycap1_report.json",
+    },
+    {
+        "label": "Daily Cap 4",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "off", "use_trail": False,
+        "trail_override": None,
+        "max_daily_override": 4,
+        "report_file": "variant_dailycap4_report.json",
+    },
 ]
 
 
@@ -415,7 +470,6 @@ def run_backtest_reference(
         if signal:
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
-                # Reference path does not precompute EMAs; alignment will be UNKNOWN.
                 sim.open_trade(signal, curr_time, adr_val, regime, session_levels, ema_200_value=None)
 
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
@@ -575,7 +629,11 @@ def run_cached_combination(
     history_days_before_window: float,
     balance: float = 1000.0,
     risk_pct: float = 1.0,
-    eurusd_df: Optional[pd.DataFrame] = None
+    eurusd_df: Optional[pd.DataFrame] = None,
+    be_mode: str = "FIXED_80",
+    trail_override: Optional[str] = None,
+    max_daily_override: Optional[int] = None,
+    report_file_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     t_vol = 0.0
     t_strat = 0.0
@@ -595,7 +653,16 @@ def run_cached_combination(
     GLOBAL_PARAMS.use_breakeven = use_be
     GLOBAL_PARAMS.use_supertrend_trail = use_trail
 
-    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct, eurusd_df=eurusd_df)
+    orig_max_daily = getattr(GLOBAL_PARAMS, 'max_daily_trades', 2)
+    if max_daily_override is not None:
+        GLOBAL_PARAMS.max_daily_trades = max_daily_override
+
+    sim = TradeSimulator(
+        starting_balance=balance,
+        risk_pct=risk_pct,
+        eurusd_df=eurusd_df,
+        be_mode=be_mode,
+    )
     cached_signals = precomputed["cached_signals"]
     m5_times_list = m5_df['time'].tolist()
     has_ema200_col = 'ema_200' in m5_df.columns
@@ -633,6 +700,9 @@ def run_cached_combination(
         adr_val = item["adr_val"]
         regime = item["regime"]
 
+        if trail_override:
+            signal.trail_mode = trail_override
+
         current_signal_key = (signal.strategy, signal.direction)
         if current_signal_key != prev_signal_key:
             unique_setups += 1
@@ -653,6 +723,8 @@ def run_cached_combination(
                     )
                     if vol_ok:
                         signal = adapted
+                        if trail_override:
+                            signal.trail_mode = trail_override
                     else:
                         funnel["vol_filters_blocked"] += 1
                         reason_clean = vol_msg.split(":")[0].strip() if ":" in vol_msg else vol_msg[:30]
@@ -675,8 +747,6 @@ def run_cached_combination(
             funnel["sim_trades_attempted"] += 1
             has_open = any(p["symbol"] == symbol for p in sim.open_positions)
             if not has_open:
-                # Phase-2 Blueprint Section 6 item 27: pass the precomputed
-                # 200 EMA at this bar so the simulator can tag alignment.
                 ema_200_val: Optional[float] = None
                 if has_ema200_col:
                     try:
@@ -696,6 +766,8 @@ def run_cached_combination(
     _t0 = time.perf_counter()
     if len(m5_df) > 0 and len(sim.open_positions) > 0:
         sim.close_all(symbol, m5_df.iloc[-1])
+
+    GLOBAL_PARAMS.max_daily_trades = orig_max_daily
 
     funnel["unique_setups"] = unique_setups
     simulated_bars_count = precomputed["simulated_bars_count"]
@@ -768,7 +840,6 @@ def run_cached_combination(
 
     improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
-    # PROPOSED: Blueprint Phase-1 + Phase-2 deep analytics.
     diag_payload = compute_diagnostics(
         trades=all_trades,
         m5_df=m5_df,
@@ -781,6 +852,7 @@ def run_cached_combination(
         f"use_breakeven: {GLOBAL_PARAMS.use_breakeven}, "
         f"use_supertrend_trail: {GLOBAL_PARAMS.use_supertrend_trail}, days: {days_count}, "
         f"adaptive_effective_pct: {adaptive_pct}%, "
+        f"be_mode: {be_mode}, trail_override: {trail_override}, max_daily_override: {max_daily_override}, "
         f"funnel: {json.dumps(funnel)}, "
         f"vol_block_reasons: {json.dumps(vol_block_reasons)}, "
         f"strategy_errors: {json.dumps(strategy_errors)}, "
@@ -819,7 +891,10 @@ def run_cached_combination(
         "diagnostics": diag_payload,
     }
 
-    report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
+    if report_file_override:
+        report_filename = report_file_override
+    else:
+        report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
     out_file = os.path.join(OUTPUT_DIR, report_filename)
     safe_payload = sanitize_for_json(report_payload)
     with open(out_file, "w") as f:
@@ -843,6 +918,21 @@ def run_cached_combination(
             "report_writing_s": t_rep,
         }
     }
+
+
+def write_portfolio_correlation() -> bool:
+    """Read every <symbol>_*_report.json in OUTPUT_DIR and write portfolio_correlation.json."""
+    try:
+        payload = compute_portfolio_correlation(OUTPUT_DIR, DEFAULT_WHITELIST)
+        out_file = os.path.join(OUTPUT_DIR, "portfolio_correlation.json")
+        safe = sanitize_for_json(payload)
+        with open(out_file, "w") as f:
+            json.dump(safe, f, separators=(",", ":"), allow_nan=False)
+        print(f"[✓] Portfolio correlation saved to {out_file}", flush=True)
+        return True
+    except Exception as e:
+        print(f"ERROR: Portfolio correlation failed: {e}", flush=True)
+        return False
 
 
 def compare_runs(
@@ -1011,12 +1101,19 @@ def compare_runs(
     return final_report
 
 
-async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int, eurusd_df: Optional[pd.DataFrame] = None) -> bool:
+async def run_symbol_matrix(
+    client: CTraderClient,
+    symbol: str,
+    days_count: int,
+    eurusd_df: Optional[pd.DataFrame] = None,
+    variants: bool = False,
+) -> bool:
     orig_adaptive = GLOBAL_PARAMS.adaptive_mode
     orig_be = GLOBAL_PARAMS.use_breakeven
     orig_trail = GLOBAL_PARAMS.use_supertrend_trail
 
-    for pattern in [f"{symbol}_*_report.json", f"{symbol}_summary.json", f"{symbol}_daycandles.json", f"{symbol}_adaptive_report.json", f"{symbol}_legacy_report.json"]:
+    for pattern in [f"{symbol}_*_report.json", f"{symbol}_summary.json", f"{symbol}_daycandles.json",
+                    f"{symbol}_adaptive_report.json", f"{symbol}_legacy_report.json", f"{symbol}_variants.json"]:
         for fpath in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
             try:
                 os.remove(fpath)
@@ -1136,6 +1233,77 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
 
             print(f"[*] {symbol} combo {idx + 1}/8 done", flush=True)
 
+        # ---- Phase-3 variant matrix (Section 5 items 22 / 23 / 25) ----
+        variant_rows: List[Dict[str, Any]] = []
+        if variants:
+            print(f"[*] {symbol}: running {len(VARIANT_COMBINATIONS)} variant combos...", flush=True)
+            for v_idx, vcombo in enumerate(VARIANT_COMBINATIONS):
+                try:
+                    v_res = run_cached_combination(
+                        symbol=symbol,
+                        m5_df=m5_df,
+                        precomputed=precomputed,
+                        sim_start_idx=sim_start_idx,
+                        total_bars=total_bars,
+                        combo=vcombo,
+                        days_count=days_count,
+                        window_start_str=window_start_str,
+                        window_end_str=window_end_str,
+                        history_days_before_window=history_days_before_window,
+                        eurusd_df=eurusd_df,
+                        be_mode=vcombo.get("be_mode", "FIXED_80"),
+                        trail_override=vcombo.get("trail_override"),
+                        max_daily_override=vcombo.get("max_daily_override"),
+                        report_file_override=vcombo.get("report_file"),
+                    )
+
+                    v_k = v_res["kpis"]
+                    v_timing = v_res.get("timing", {})
+                    tot_vol += v_timing.get("volatility_s", 0.0)
+                    tot_strat += v_timing.get("strategies_s", 0.0)
+                    tot_sim += v_timing.get("simulator_s", 0.0)
+                    tot_rep += v_timing.get("report_writing_s", 0.0)
+
+                    variant_rows.append({
+                        "label": vcombo["label"],
+                        "mode": vcombo["mode"],
+                        "be": vcombo["be"],
+                        "trail": vcombo["trail"],
+                        "be_mode": vcombo.get("be_mode", "FIXED_80"),
+                        "trail_override": vcombo.get("trail_override"),
+                        "max_daily_override": vcombo.get("max_daily_override"),
+                        "report_file": v_res["report_file"],
+                        "total_trades": v_k["count"],
+                        "win_rate": v_k["win_rate"],
+                        "expectancy": v_k["expectancy"],
+                        "profit_factor": v_k["profit_factor"],
+                        "max_drawdown": v_k["max_dd_money"],
+                        "net_pnl": v_k["net_pnl"],
+                        "adaptive_effective_pct": v_res["adaptive_pct"],
+                        "funnel": v_res["funnel"],
+                        "tune_validate": v_res["tune_validate"],
+                    })
+
+                    v_day_candles = v_res.get("day_candles", {})
+                    for d_str, c_list in v_day_candles.items():
+                        if d_str not in all_day_candles:
+                            all_day_candles[d_str] = c_list
+
+                except Exception as ve:
+                    print(f"ERROR: variant '{vcombo.get('label', '?')}' failed on {symbol}: {ve}", flush=True)
+                    variant_rows.append({
+                        "label": vcombo.get("label", "UNKNOWN"),
+                        "error": str(ve),
+                        "total_trades": 0,
+                        "win_rate": 0.0,
+                        "expectancy": 0.0,
+                        "profit_factor": 0.0,
+                        "max_drawdown": 0.0,
+                        "net_pnl": 0.0,
+                    })
+
+                print(f"[*] {symbol} variant {v_idx + 1}/{len(VARIANT_COMBINATIONS)} done", flush=True)
+
         _t0 = time.perf_counter()
         if all_day_candles:
             candles_file = os.path.join(OUTPUT_DIR, f"{symbol}_daycandles.json")
@@ -1170,6 +1338,24 @@ async def run_symbol_matrix(client: CTraderClient, symbol: str, days_count: int,
             json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
         tot_rep += time.perf_counter() - _t0
 
+        # ---- Phase-3 variants summary file ----
+        if variants and variant_rows:
+            try:
+                variants_payload = {
+                    "symbol": symbol,
+                    "days": days_count,
+                    "target_rr": GLOBAL_PARAMS.target_rr,
+                    "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "variants": variant_rows,
+                }
+                variants_file = os.path.join(OUTPUT_DIR, f"{symbol}_variants.json")
+                safe_variants = sanitize_for_json(variants_payload)
+                with open(variants_file, "w") as f:
+                    json.dump(safe_variants, f, separators=(",", ":"), allow_nan=False)
+                print(f"[✓] {symbol} Variants saved to {variants_file}", flush=True)
+            except Exception as ve:
+                print(f"ERROR: saving variants file for {symbol} failed: {ve}", flush=True)
+
         print(
             f"[time] {symbol} aggregator {tot_agg:.1f}s, volatility {tot_vol:.1f}s, "
             f"session_levels {tot_lvl:.1f}s, strategies {tot_strat:.1f}s, "
@@ -1198,9 +1384,15 @@ async def main():
     parser.add_argument("--compare", action="store_true", default=False, help="Run 4-combination verification vs reference engine")
     parser.add_argument("--prepare-only", action="store_true", default=False, help="Prepare and update market data only, then exit")
     parser.add_argument("--skip-download", action="store_true", default=False, help="Skip downloading data and run matrix from local cache")
+    parser.add_argument("--variants", action="store_true", default=False, help="Also run Phase-3 variant combos and save <symbol>_variants.json")
+    parser.add_argument("--portfolio-only", action="store_true", default=False, help="Only compute the cross-pair correlation matrix and exit")
     args = parser.parse_args()
 
     client = CTraderClient()
+
+    if args.portfolio_only:
+        ok = write_portfolio_correlation()
+        sys.exit(0 if ok else 1)
 
     if args.prepare_only:
         ok = await ensure_symbol_data(client, args.symbol)
@@ -1258,7 +1450,18 @@ async def main():
 
     success = False
     if ok:
-        success = await run_symbol_matrix(client, args.symbol, args.days, eurusd_df=eurusd_df)
+        success = await run_symbol_matrix(
+            client, args.symbol, args.days,
+            eurusd_df=eurusd_df,
+            variants=args.variants,
+        )
+
+    # ---- Refresh the portfolio correlation whenever a pair matrix finishes ----
+    if success:
+        try:
+            write_portfolio_correlation()
+        except Exception as pe:
+            print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
 
     if client.ws:
         try:

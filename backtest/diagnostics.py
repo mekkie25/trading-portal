@@ -1,6 +1,6 @@
 """
 backtest/diagnostics.py
-Blueprint Deep Analytics Module (Phase 1 + Phase 2).
+Blueprint Deep Analytics Module (Phase 1 + Phase 2 + Phase 3 + Phase 4).
 
 Purely additive. Reads a finished trades array plus the M5 price series and
 returns diagnostic payloads. Zero changes to the simulator, live bot, or
@@ -9,34 +9,46 @@ strategy engine.
 Blueprint coverage:
   Phase 1:
     Section 4 item 19 - 24-hour hourly expectancy matrix
-    Section 4 item 20 - day-of-week profiling (also surfaced by runner)
+    Section 4 item 20 - day-of-week profiling
     Section 4 item 21 - session-rollover friction
     Section 6 item 26 - ATR volatility tiering
     Section 7 item 31 - consecutive loss streak and recovery metrics
-    Section 7 item 32 - circuit-breaker simulation (risk halving)
-    Section 7 item 36 - outlier dependency removal (top 5 percent dropped)
-    Section 7 item 37 - Monte Carlo resampling (1000 shuffles)
+    Section 7 item 32 - circuit-breaker simulation
+    Section 7 item 36 - outlier dependency removal
+    Section 7 item 37 - Monte Carlo resampling
     Section 7 item 38 - buy-and-hold benchmark (alpha)
   Phase 2:
-    Section 3 item 16 - post-SL continuation distance ("bad stop")
-    Section 3 item 17 - post-TP extra pips ("money left on table")
+    Section 3 item 16 - post-SL continuation distance
+    Section 3 item 17 - post-TP extra pips
     Section 3 item 18 - premature BE exit detection
     Section 6 item 27 - 200 EMA alignment differential
     Section 6 item 28 - confirmation type (close vs touch)
     Section 6 item 29 - news-window slippage profiling
+  Phase 3 + 4:
+    Section 5 item 24 - position sizing comparison (fixed vs compounding)
+    Section 5 item 25 - daily execution caps (1 / 2 / 4 / unlimited)
+    Section 7 item 33 - daily maximum drawdown cutoff simulation
+    Section 7 item 34 - slippage sensitivity curve (1-5 pips)
 """
 
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any
 
-DIAGNOSTICS_VERSION = "2.0"
+DIAGNOSTICS_VERSION = "3.0"
 
 SESSION_ROLLOVER_WINDOWS = [
     ("London Open",    7, 45,  8, 15),
     ("NY Open",       15, 15, 15, 45),
     ("Daily Rollover",20, 45, 21, 15),
 ]
+
+# Local pip-size lookup - self-contained so this module never has to import
+# from backtest.simulator (avoids any circular import risk).
+_PIP_SIZES = {
+    "GOLD": 0.01, "US30": 1.0, "NAS100": 0.1, "GERMAN30": 0.1,
+    "EURUSD": 0.0001, "USDJPY": 0.01, "GBPUSD": 0.0001,
+}
 
 
 def _kpis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -296,11 +308,10 @@ def _buy_and_hold(m5_df, sim_start_idx, starting_equity, strategy_net_pnl):
 # ==============================================================================
 
 def _post_sl_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Section 3 item 16 - post-SL continuation distance ("bad stop")."""
     sl_exits = [
         t for t in trades
         if isinstance(t, dict)
-        and ("SL" in str(t.get("exit_reason", "")) or "SL" in str(t.get("exit_reason", "")))
+        and "SL" in str(t.get("exit_reason", ""))
         and t.get("post_sl_cont_pips") is not None
     ]
 
@@ -324,7 +335,6 @@ def _post_sl_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Section 3 item 17 - post-TP extra pips ("money left on table")."""
     tp_exits = [
         t for t in trades
         if isinstance(t, dict)
@@ -342,11 +352,9 @@ def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     missed_rs = []
     for t in tp_exits:
-        sl_dist = t.get("initial_sl_dist")
-        try:
-            sl_d = float(sl_dist) if sl_dist else 0.0
-        except (TypeError, ValueError):
-            sl_d = 0.0
+        entry = float(t.get("entry_price", 0.0))
+        sl = float(t.get("sl", 0.0))
+        sl_d = abs(entry - sl)
         if sl_d > 0:
             missed_rs.append(float(t.get("post_tp_extra_pips", 0.0)) / sl_d)
     avg_missed_r = float(np.mean(missed_rs)) if missed_rs else 0.0
@@ -361,7 +369,6 @@ def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _premature_be_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Section 3 item 18 - premature BE exit detection."""
     if not trades:
         return {
             "total_be_moved": 0, "premature_count": 0, "premature_pct": 0.0,
@@ -385,7 +392,6 @@ def _premature_be_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _ema_200_alignment(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Section 6 item 27 - 200 EMA trend-alignment differential."""
     aligned: List[Dict[str, Any]] = []
     counter: List[Dict[str, Any]] = []
     unknown: List[Dict[str, Any]] = []
@@ -407,7 +413,6 @@ def _ema_200_alignment(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
 
 
 def _confirmation_type_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Section 6 item 28 - candle-close vs touch confirmation."""
     close: List[Dict[str, Any]] = []
     touch: List[Dict[str, Any]] = []
 
@@ -422,7 +427,6 @@ def _confirmation_type_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[
 
 
 def _news_window_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Section 6 item 29 - news-window slippage profiling."""
     in_news: List[Dict[str, Any]] = []
     out_news: List[Dict[str, Any]] = []
 
@@ -434,6 +438,206 @@ def _news_window_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 
     return {"in_news": _kpis(in_news), "out_of_news": _kpis(out_news)}
 
+
+# ==============================================================================
+# Phase-3 / Phase-4 diagnostics
+# ==============================================================================
+
+def _position_sizing_comparison(
+    trades: List[Dict[str, Any]],
+    starting_equity: float = 1000.0,
+    risk_pct: float = 1.0,
+) -> Dict[str, Any]:
+    """Section 5 item 24 - fixed lots vs compounding % of current equity."""
+    ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
+    if not ordered:
+        return {
+            "fixed": {"net_pnl": 0.0, "final_equity": starting_equity},
+            "compounding": {"net_pnl": 0.0, "final_equity": starting_equity},
+            "difference": 0.0,
+        }
+
+    fixed_risk = starting_equity * (risk_pct / 100.0)
+    fixed_eq = starting_equity
+    for t in ordered:
+        r = float(t.get("r_multiple", 0.0))
+        fixed_eq += r * fixed_risk
+
+    comp_eq = starting_equity
+    for t in ordered:
+        r = float(t.get("r_multiple", 0.0))
+        risk_cash = comp_eq * (risk_pct / 100.0)
+        comp_eq += r * risk_cash
+
+    return {
+        "fixed": {
+            "net_pnl": round(fixed_eq - starting_equity, 2),
+            "final_equity": round(fixed_eq, 2),
+        },
+        "compounding": {
+            "net_pnl": round(comp_eq - starting_equity, 2),
+            "final_equity": round(comp_eq, 2),
+        },
+        "difference": round(comp_eq - fixed_eq, 2),
+    }
+
+
+def _daily_cap_comparison(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Section 5 item 25 - simulate tighter daily caps.
+
+    NOTE: the simulator's own cap already limited how many trades were taken.
+    This panel therefore only shows the effect of a TIGHTER cap than the run
+    used. The "unlimited" column is what the run actually produced and
+    functions as a comparison baseline.
+    """
+    ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
+    if not ordered:
+        empty = _kpis([])
+        return {
+            "cap_1": empty, "cap_2": empty, "cap_4": empty,
+            "unlimited": empty,
+        }
+
+    per_day_count: Dict[str, int] = {}
+    buckets: Dict[str, List[Dict[str, Any]]] = {
+        "cap_1": [], "cap_2": [], "cap_4": [], "unlimited": []
+    }
+
+    for t in ordered:
+        day = t.get("date_sast") or t.get("date") or ""
+        cnt = per_day_count.get(day, 0) + 1
+        per_day_count[day] = cnt
+        if cnt <= 1:
+            buckets["cap_1"].append(t)
+        if cnt <= 2:
+            buckets["cap_2"].append(t)
+        if cnt <= 4:
+            buckets["cap_4"].append(t)
+        buckets["unlimited"].append(t)
+
+    return {k: _kpis(v) for k, v in buckets.items()}
+
+
+def _daily_dd_cutoff(
+    trades: List[Dict[str, Any]],
+    starting_equity: float = 1000.0,
+    cutoff_pct: float = 5.0,
+    risk_pct: float = 1.0,
+) -> Dict[str, Any]:
+    """Section 7 item 33 - what if the day halts once daily loss exceeds cutoff_pct?"""
+    ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
+    if not ordered:
+        return {
+            "cutoff_pct": cutoff_pct, "days_triggered": 0, "trades_blocked": 0,
+            "original_net_pnl": 0.0, "cutoff_net_pnl": 0.0,
+            "protection_delta": 0.0,
+        }
+
+    orig_eq = starting_equity
+    cutoff_eq = starting_equity
+    day_start_equity = starting_equity
+    current_day = None
+    day_pnl = 0.0
+    days_triggered = 0
+    trades_blocked = 0
+    triggered_today = False
+
+    for t in ordered:
+        day = t.get("date_sast") or t.get("date") or ""
+        if day != current_day:
+            current_day = day
+            day_start_equity = cutoff_eq
+            day_pnl = 0.0
+            triggered_today = False
+
+        r = float(t.get("r_multiple", 0.0))
+        orig_eq += float(t.get("money_pnl", 0.0))
+
+        if triggered_today:
+            trades_blocked += 1
+            continue
+
+        risk_cash = cutoff_eq * (risk_pct / 100.0)
+        sim_pnl = r * risk_cash
+        cutoff_eq += sim_pnl
+        day_pnl += sim_pnl
+
+        cutoff_cash = day_start_equity * (cutoff_pct / 100.0)
+        if -day_pnl >= cutoff_cash:
+            triggered_today = True
+            days_triggered += 1
+
+    return {
+        "cutoff_pct": cutoff_pct,
+        "days_triggered": days_triggered,
+        "trades_blocked": trades_blocked,
+        "original_net_pnl": round(orig_eq - starting_equity, 2),
+        "cutoff_net_pnl": round(cutoff_eq - starting_equity, 2),
+        "protection_delta": round(cutoff_eq - orig_eq, 2),
+    }
+
+
+def _slippage_sensitivity(
+    trades: List[Dict[str, Any]],
+    slippage_range=(1, 2, 3, 4, 5),
+    starting_equity: float = 1000.0,
+    risk_pct: float = 1.0,
+) -> Dict[str, Any]:
+    """Section 7 item 34 - degrade each trade by N pips of entry + exit slippage."""
+    if not trades:
+        return {}
+
+    baseline_net = sum(float(t.get("money_pnl", 0.0)) for t in trades)
+    results: Dict[str, Any] = {
+        "baseline": {"slippage_pips": 0, "net_pnl": round(baseline_net, 2),
+                     "win_rate": round(_kpis(trades)["win_rate"], 1)}
+    }
+
+    for slip in slippage_range:
+        net = 0.0
+        wins = 0
+        total = 0
+
+        for t in trades:
+            sym = str(t.get("symbol", ""))
+            pip_size = _PIP_SIZES.get(sym, 0.0001)
+            entry = float(t.get("entry_price", 0.0))
+            sl = float(t.get("sl", 0.0))
+            sl_dist = abs(entry - sl)
+            if sl_dist <= 0 or pip_size <= 0:
+                continue
+            sl_pips = sl_dist / pip_size
+            if sl_pips <= 0:
+                continue
+
+            old_r = float(t.get("r_multiple", 0.0))
+            cost_r = (2.0 * slip) / sl_pips
+            new_r = old_r - cost_r
+
+            old_pnl = float(t.get("money_pnl", 0.0))
+            if abs(old_r) > 1e-6:
+                risk_cash_used = old_pnl / old_r
+            else:
+                risk_cash_used = starting_equity * (risk_pct / 100.0)
+
+            net += new_r * risk_cash_used
+            total += 1
+            if new_r > 0.1:
+                wins += 1
+
+        results[f"slip_{slip}"] = {
+            "slippage_pips": slip,
+            "net_pnl": round(net, 2),
+            "win_rate": round((wins / total * 100.0), 1) if total > 0 else 0.0,
+        }
+
+    return results
+
+
+# ==============================================================================
+# Master entry point
+# ==============================================================================
 
 def compute_diagnostics(
     trades: List[Dict[str, Any]],
@@ -479,6 +683,19 @@ def compute_diagnostics(
             "ema_200_alignment": {"aligned": empty_kpi, "counter_trend": empty_kpi, "unknown": empty_kpi},
             "confirmation_type": {"close": empty_kpi, "touch": empty_kpi},
             "news_window": {"in_news": empty_kpi, "out_of_news": empty_kpi},
+            "sizing_comparison": {
+                "fixed": {"net_pnl": 0.0, "final_equity": starting_equity},
+                "compounding": {"net_pnl": 0.0, "final_equity": starting_equity},
+                "difference": 0.0,
+            },
+            "daily_cap_comparison": {
+                "cap_1": empty_kpi, "cap_2": empty_kpi, "cap_4": empty_kpi, "unlimited": empty_kpi,
+            },
+            "daily_dd_cutoff": {
+                "cutoff_pct": 5.0, "days_triggered": 0, "trades_blocked": 0,
+                "original_net_pnl": 0.0, "cutoff_net_pnl": 0.0, "protection_delta": 0.0,
+            },
+            "slippage_sensitivity": {},
         }
 
     full_kpis = _kpis(valid)
@@ -502,4 +719,9 @@ def compute_diagnostics(
         "ema_200_alignment": _ema_200_alignment(valid),
         "confirmation_type": _confirmation_type_analysis(valid),
         "news_window": _news_window_analysis(valid),
+        # Phase 3 + 4
+        "sizing_comparison": _position_sizing_comparison(valid, starting_equity=starting_equity),
+        "daily_cap_comparison": _daily_cap_comparison(valid),
+        "daily_dd_cutoff": _daily_dd_cutoff(valid, starting_equity=starting_equity),
+        "slippage_sensitivity": _slippage_sensitivity(valid, starting_equity=starting_equity),
     }

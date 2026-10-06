@@ -3,19 +3,23 @@ backtest/simulator.py
 Replicates the exact single-order live position management of engine/matrix.py:
 - Single market order with full lot size
 - Fixed R:R target via compute_fixed_target
-- 80% R:R Break-Even trigger gated by GLOBAL_PARAMS.use_breakeven
-- SuperTrend 5M trailing exit gated by GLOBAL_PARAMS.use_supertrend_trail
+- 80% R:R Break-Even trigger (or STRUCTURAL variant) gated by GLOBAL_PARAMS.use_breakeven
+- Trail exits: SuperTrend 5M, EMA_9, EMA_25
 - Daily trade cap tracked per SAST calendar date (max_daily_trades)
 - Minimum-lot risk tolerance check matching live bot
 - Skip logging with candle_skips and unique_setups (strategy, direction, day)
 
-Phase-2 Blueprint extensions (all additive, backtest-only):
+Phase-2 Blueprint extensions (backtest-only):
   Section 3 item 16 - post-SL continuation distance ("bad stop")
   Section 3 item 17 - post-TP extra pips ("money left on table")
   Section 3 item 18 - premature BE exit detection
   Section 6 item 27 - 200 EMA alignment at entry
   Section 6 item 28 - confirmation type (close vs touch)
   Section 6 item 29 - news-window flag at entry
+
+Phase-3 Blueprint extensions (backtest-only):
+  Section 5 item 22 - STRUCTURAL BE variant (2 consecutive closes beyond entry)
+  Section 5 item 23 - EMA_9 and EMA_25 trail variants
 """
 
 import sys
@@ -34,8 +38,6 @@ from core.session_config import TZ_SAST, GLOBAL_PARAMS, MarketSessionManager
 from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 
-# How many M5 bars to keep watching after an exit for post-SL / post-TP analytics.
-# 24 bars x 5 min = 2 hours of forward price action.
 POST_EXIT_TRACK_BARS = 24
 
 ASSETS = {
@@ -55,17 +57,17 @@ class TradeSimulator:
         starting_balance: float = 1000.0,
         risk_pct: float = 1.0,
         account_currency: str = "USD",
-        eurusd_df: Optional[pd.DataFrame] = None
+        eurusd_df: Optional[pd.DataFrame] = None,
+        be_mode: str = "FIXED_80",
     ):
         self.starting_balance = starting_balance
         self.balance = starting_balance
         self.equity = starting_balance
         self.risk_pct = risk_pct
         self.account_currency = account_currency
+        self.be_mode = be_mode  # "FIXED_80" or "STRUCTURAL"
         self.open_positions: List[Dict[str, Any]] = []
         self.completed_trades: List[Dict[str, Any]] = []
-        # NOTE: this list now holds BOTH SL and TP post-exit trackers.
-        # Each entry has a "kind" field of "SL" or "TP".
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
         self.skipped: List[Dict[str, Any]] = []
         self.daily_trade_counts: Dict[str, int] = {}
@@ -212,8 +214,6 @@ class TradeSimulator:
         self._trade_counter += 1
         trade_id = f"{symbol}_{int(current_time.timestamp())}_{self._trade_counter}"
 
-        # ---- Phase-2 Blueprint metadata (backtest-only) ----
-        # Section 6 item 27 - 200 EMA alignment
         alignment = "UNKNOWN"
         if ema_200_value is not None and ema_200_value > 0:
             if direction == "BUY":
@@ -221,12 +221,8 @@ class TradeSimulator:
             else:
                 alignment = "BEARISH_ALIGNED" if entry_price < ema_200_value else "COUNTER_TREND"
 
-        # Section 6 item 28 - confirmation type. All current strategies require
-        # a 5M candle close, so this defaults to CLOSE. Field exists so future
-        # touch-based strategies can override it on the signal object.
         confirmation_type = getattr(signal, "confirmation_type", "CLOSE")
 
-        # Section 6 item 29 - news-window flag
         try:
             is_in_news, _ = MarketSessionManager.is_blackout_active(current_time)
         except Exception:
@@ -257,11 +253,13 @@ class TradeSimulator:
             "loss_seen": False,
             "profit_first": False,
             "eod_deadline_sast": eod_deadline,
-            # Phase-2 metadata
             "ema_200_at_entry": ema_200_value,
             "alignment_200ema": alignment,
             "confirmation_type": confirmation_type,
             "is_in_news_window": bool(is_in_news),
+            # Phase-3 structural BE counters
+            "consec_above_entry": 0,
+            "consec_below_entry": 0,
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
@@ -297,6 +295,11 @@ class TradeSimulator:
                     pos["profit_seen"] = True
                 if c_low < entry:
                     pos["loss_seen"] = True
+                # Phase-3 structural BE counters
+                if c_close > entry:
+                    pos["consec_above_entry"] = pos.get("consec_above_entry", 0) + 1
+                else:
+                    pos["consec_above_entry"] = 0
             else:
                 pos["mfe_price"] = min(pos["mfe_price"], c_low)
                 pos["mae_price"] = max(pos["mae_price"], c_high)
@@ -306,6 +309,10 @@ class TradeSimulator:
                     pos["profit_seen"] = True
                 if c_high > entry:
                     pos["loss_seen"] = True
+                if c_close < entry:
+                    pos["consec_below_entry"] = pos.get("consec_below_entry", 0) + 1
+                else:
+                    pos["consec_below_entry"] = 0
 
             sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
             tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
@@ -322,18 +329,58 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
+            # ---- Break-Even logic ----
             if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
-                if target_dist > 0 and (progress / target_dist) >= 0.80 and progress >= (0.50 * sl_dist):
+                progress_met = (
+                    target_dist > 0
+                    and (progress / target_dist) >= 0.80
+                    and progress >= (0.50 * sl_dist)
+                )
+
+                if self.be_mode == "STRUCTURAL":
+                    # Section 5 item 22: only move to BE after 2 consecutive
+                    # closes beyond entry (i.e. structure has been confirmed).
+                    structural_break = (
+                        pos.get("consec_above_entry", 0) >= 2
+                        if direction == "BUY"
+                        else pos.get("consec_below_entry", 0) >= 2
+                    )
+                else:
+                    structural_break = True
+
+                if progress_met and structural_break:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            if GLOBAL_PARAMS.use_supertrend_trail and pos["trail_mode"] == "SUPERTREND" and len(m5_slice) >= 15:
-                st = calculate_supertrend(m5_slice, period=10, factor=1.6)
-                curr_dir = int(st['supertrend_direction'].iloc[-1])
-                if (direction == "BUY" and curr_dir == -1) or (direction == "SELL" and curr_dir == 1):
-                    self._close_position(pos, c_close, curr_time, "SUPERTREND_TRAIL")
+            # ---- Trail exits (SuperTrend / EMA_9 / EMA_25) ----
+            if GLOBAL_PARAMS.use_supertrend_trail and len(m5_slice) >= 15:
+                exited = False
+                if pos["trail_mode"] == "SUPERTREND":
+                    st = calculate_supertrend(m5_slice, period=10, factor=1.6)
+                    curr_dir = int(st['supertrend_direction'].iloc[-1])
+                    if (direction == "BUY" and curr_dir == -1) or (direction == "SELL" and curr_dir == 1):
+                        self._close_position(pos, c_close, curr_time, "SUPERTREND_TRAIL")
+                        exited = True
+                elif pos["trail_mode"] == "EMA_9":
+                    if 'ema_9' in m5_slice.columns:
+                        curr_ema = float(m5_slice['ema_9'].iloc[-1])
+                    else:
+                        curr_ema = float(m5_slice['close'].ewm(span=9, adjust=False).mean().iloc[-1])
+                    if (direction == "BUY" and c_close < curr_ema) or (direction == "SELL" and c_close > curr_ema):
+                        self._close_position(pos, c_close, curr_time, "EMA9_TRAIL")
+                        exited = True
+                elif pos["trail_mode"] == "EMA_25":
+                    if 'ema_25' in m5_slice.columns:
+                        curr_ema = float(m5_slice['ema_25'].iloc[-1])
+                    else:
+                        curr_ema = float(m5_slice['close'].ewm(span=25, adjust=False).mean().iloc[-1])
+                    if (direction == "BUY" and c_close < curr_ema) or (direction == "SELL" and c_close > curr_ema):
+                        self._close_position(pos, c_close, curr_time, "EMA25_TRAIL")
+                        exited = True
+
+                if exited:
                     continue
 
             if sast_time >= pos["eod_deadline_sast"]:
@@ -344,7 +391,7 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
-        # ---- Phase-2: post-exit tracker processing ----
+        # ---- Post-exit tracker processing ----
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
@@ -359,8 +406,6 @@ class TradeSimulator:
             kind = pending.get("kind", "SL")
 
             if kind == "SL":
-                # Track worst excursion past SL, and whether price would
-                # have eventually reached the original TP.
                 if direction == "BUY":
                     pending["min_low_after_exit"] = min(pending.get("min_low_after_exit", c_low), c_low)
                 else:
@@ -384,8 +429,6 @@ class TradeSimulator:
                         pending["bars_remaining"] = 0
 
             elif kind == "TP":
-                # Track how much further price travelled in the trade's
-                # favour after TP was hit ("money left on table").
                 if direction == "BUY":
                     pending["max_favorable_after_tp"] = max(
                         pending.get("max_favorable_after_tp", c_high), c_high
@@ -405,7 +448,6 @@ class TradeSimulator:
         self.pending_sl_evaluations = active_pending
 
     def _finalize_post_exit(self, pending: Dict[str, Any]) -> None:
-        """Attach post-exit metrics to the trade record when a tracker expires."""
         record = pending["record"]
         kind = pending.get("kind", "SL")
         exit_price = pending["exit_price"]
@@ -422,8 +464,6 @@ class TradeSimulator:
 
             record["post_sl_cont_pips"] = round(cont_pips, 1)
 
-            # Section 3 item 18 - premature BE exit detection.
-            # BE was moved, price came back to BE, then rallied to original TP.
             original_tp = pending.get("target_tp", 0.0)
             is_be = bool(pending.get("is_be_moved", False))
             reached_tp = bool(pending.get("reached_original_tp", False))
@@ -464,7 +504,6 @@ class TradeSimulator:
                 remaining_positions.append(pos)
         self.open_positions = remaining_positions
 
-        # Flush any pending post-exit trackers so records are fully finalised.
         for pending in self.pending_sl_evaluations:
             self._finalize_post_exit(pending)
         self.pending_sl_evaluations = []
@@ -555,7 +594,6 @@ class TradeSimulator:
             "spread_paid": spread_pts,
             "adr": pos["adr_val"],
             "regime": pos["regime"],
-            # Phase-2 metadata
             "is_be_moved": bool(pos.get("is_be_moved", False)),
             "ema_200_at_entry": pos.get("ema_200_at_entry"),
             "alignment_200ema": pos.get("alignment_200ema", "UNKNOWN"),
