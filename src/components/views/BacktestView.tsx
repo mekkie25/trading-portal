@@ -4,9 +4,12 @@ import { createChart, IChartApi, ColorType, LineStyle, UTCTimestamp } from 'ligh
 import {
   Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw,
   Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer,
-  FileText, Activity
+  FileText, Activity, Network, GitBranch
 } from 'lucide-react';
-import { ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip } from '../../types';
+import {
+  ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip,
+  PortfolioCorrelation, BacktestVariants, BacktestVariantRow
+} from '../../types';
 import { formatCurrency } from '../../utils/currency';
 
 interface BacktestViewProps {
@@ -95,17 +98,28 @@ function prettifyReportName(filename: string): string {
   return filename;
 }
 
+// Colour a correlation cell: green for negative (diversifying), red for positive (concentrated).
+function corrColor(v: number): string {
+  if (v >= 0.7) return 'bg-rose-500/40 text-rose-900 dark:text-rose-100 border-rose-500/50';
+  if (v >= 0.4) return 'bg-amber-500/30 text-amber-900 dark:text-amber-100 border-amber-500/40';
+  if (v >= 0.15) return 'bg-slate-400/20 text-slate-800 dark:text-slate-200 border-slate-400/30';
+  if (v > -0.15) return 'bg-slate-200/40 dark:bg-[#0d1017] text-slate-600 dark:text-slate-300 border-slate-300 dark:border-[#1a2030]';
+  if (v > -0.4) return 'bg-emerald-500/20 text-emerald-800 dark:text-emerald-200 border-emerald-500/30';
+  return 'bg-emerald-500/40 text-emerald-900 dark:text-emerald-100 border-emerald-500/50';
+}
+
 export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', brokerCurrency = 'USD' }) => {
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
   const [summaryData, setSummaryData] = useState<SymbolSummaryPayload | null>(null);
-  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'diagnostics' | 'chart' | 'ledger' | 'tips'>('summary');
+  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'diagnostics' | 'portfolio' | 'variants' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
   const [testSymbol, setTestSymbol] = useState<string>('US30');
   const [testDays, setTestDays] = useState<number>(60);
   const [testRr, setTestRr] = useState<number>(1.0);
+  const [includeVariants, setIncludeVariants] = useState<boolean>(false);
 
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
@@ -121,6 +135,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<string>('ALL');
   const [tipFilter, setTipFilter] = useState<string>('ALL');
+
+  const [portfolioData, setPortfolioData] = useState<PortfolioCorrelation | null>(null);
+  const [portfolioError, setPortfolioError] = useState<string | null>(null);
+  const [isLoadingPortfolio, setIsLoadingPortfolio] = useState<boolean>(false);
+
+  const [variantsData, setVariantsData] = useState<BacktestVariants | null>(null);
+  const [variantsError, setVariantsError] = useState<string | null>(null);
+  const [isLoadingVariants, setIsLoadingVariants] = useState<boolean>(false);
 
   const [dismissedTipIds, setDismissedTipIds] = useState<string[]>(() => {
     try {
@@ -188,6 +210,53 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   useEffect(() => { fetchSummaryData(testSymbol); }, [testSymbol, fetchSummaryData]);
 
+  const fetchPortfolio = useCallback(async () => {
+    setIsLoadingPortfolio(true);
+    setPortfolioError(null);
+    try {
+      const res = await fetch('/api/backtest/portfolio');
+      if (res.ok) {
+        const json = await res.json();
+        setPortfolioData(json.data || null);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setPortfolioError(err.message || 'Portfolio correlation unavailable.');
+        setPortfolioData(null);
+      }
+    } catch (e: any) {
+      setPortfolioError(`Network error: ${e.message}`);
+      setPortfolioData(null);
+    } finally {
+      setIsLoadingPortfolio(false);
+    }
+  }, []);
+
+  const fetchVariants = useCallback(async (sym: string) => {
+    setIsLoadingVariants(true);
+    setVariantsError(null);
+    try {
+      const res = await fetch(`/api/backtest/variants/${sym}`);
+      if (res.ok) {
+        const json = await res.json();
+        setVariantsData(json.data || null);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setVariantsError(err.message || `No variants for ${sym}.`);
+        setVariantsData(null);
+      }
+    } catch (e: any) {
+      setVariantsError(`Network error: ${e.message}`);
+      setVariantsData(null);
+    } finally {
+      setIsLoadingVariants(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeSubTab === 'portfolio') fetchPortfolio();
+    if (activeSubTab === 'variants') fetchVariants(testSymbol);
+  }, [activeSubTab, testSymbol, fetchPortfolio, fetchVariants]);
+
   useEffect(() => {
     if (!selectedFile) return;
     const loadReport = async () => {
@@ -219,15 +288,17 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             await fetchReportList();
             await fetchSummaryData(testSymbol);
             await fetchStorageInfo();
+            if (activeSubTab === 'portfolio') fetchPortfolio();
+            if (activeSubTab === 'variants') fetchVariants(testSymbol);
           }
         }
       } catch {}
     }, 2000);
     return () => clearInterval(interval);
-  }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, testSymbol]);
+  }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, fetchPortfolio, fetchVariants, testSymbol, activeSubTab]);
 
   const currentSymbolReports = useMemo(() => {
-    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`));
+    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && !f.endsWith('_variants.json') && f !== 'portfolio_correlation.json');
   }, [reportFiles, testSymbol]);
 
   const handleCleanup = async (scope: 'all_reports' | 'symbol') => {
@@ -252,16 +323,16 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     } finally { setIsCleaning(false); }
   };
 
-  const handleRunBacktest = async (targetSym: string) => {
+  const handleRunBacktest = async (targetSym: string, withVariants: boolean = false) => {
     if (isRunning) return;
     setIsRunning(true);
     setRunResults([]);
-    setProgressText(`Preparing matrix for ${targetSym}...`);
+    setProgressText(`Preparing matrix for ${targetSym}${withVariants ? ' + variants' : ''}...`);
     try {
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: targetSym, days: testDays, rr: testRr }),
+        body: JSON.stringify({ symbol: targetSym, days: testDays, rr: testRr, variants: withVariants }),
       });
       if (!res.ok) {
         const err = await res.json();
@@ -544,10 +615,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             ['Average Daily Range (ADR)', 'A rolling 90-day smoothed daily price range used by the Volatility Engine to dynamically size stop losses and profit targets according to current market regime.'],
             ['Adaptive vs Legacy Mode', 'Adaptive mode recalculates stop distances and target expansions dynamically based on market volatility; Legacy mode uses static fixed-point stop loss bands.'],
             ['Breakeven Supervisor (BE)', 'A protective trailing rule that moves the stop loss directly to the entry price once price travels 80% toward the Take Profit target, locking in a risk-free trade.'],
+            ['Structural BE Variant', 'Alternative BE rule that only moves the stop to breakeven after two consecutive 5-minute closes beyond entry, filtering out single-bar noise.'],
             ['SuperTrend Trailing', 'An active trend-following exit that trails open positions along the 10-period, 1.6-multiplier SuperTrend line until an opposite-direction flip occurs.'],
+            ['EMA Trail Variants', 'Alternative trailing exits using EMA_9 or EMA_25 crossovers instead of SuperTrend, evaluated in the Variants tab.'],
             ['Inconclusive Sample (<30)', 'Any combination or strategy generating fewer than 30 trade executions is flagged as INCONCLUSIVE due to lack of statistical significance.'],
             ['TUNE / VALIDATE split', 'Each test window is split 70/30 by date. TUNE = first 70% (in-sample). VALIDATE = last 30% (unseen). A strategy that fails on VALIDATE does not hold on unseen data.'],
-            ['Blueprint Diagnostics', 'Phase-1 + Phase-2 post-hoc analytics: hourly expectancy, session-rollover friction, ATR tier KPIs, loss-streak recovery, circuit-breaker simulation, outlier dependency, Monte Carlo drawdown distribution, buy-and-hold alpha, post-SL/post-TP excursion, premature BE exits, EMA-200 alignment, confirmation type, and news-window slippage profiling.']
+            ['Blueprint Diagnostics', 'Phase-1 to Phase-4 post-hoc analytics: hourly expectancy, session-rollover friction, ATR tier KPIs, loss-streak recovery, circuit-breaker simulation, outlier dependency, Monte Carlo drawdown distribution, buy-and-hold alpha, post-SL/post-TP excursion, premature BE exits, EMA-200 alignment, confirmation type, news-window slippage, position sizing, daily caps, DD cutoff, slippage sensitivity.'],
+            ['Portfolio Correlation (§30)', 'Cross-pair daily P&L correlation matrix. Low/negative correlations diversify the portfolio; high correlations concentrate risk. The diversification ratio compares sum-of-individual-drawdowns against concurrent portfolio drawdown.'],
+            ['Slippage Sensitivity (§34)', 'Re-degrades every trade by 1-5 pips of entry+exit slippage to determine how quickly edge erodes under realistic execution frictions.']
           ];
 
           autoTable(doc, {
@@ -656,13 +731,24 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               <input type="number" step="0.1" min="0.5" max="5.0" value={testRr} onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)} disabled={isRunning} className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none" />
             </div>
 
+            <label className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={includeVariants}
+                onChange={(e) => setIncludeVariants(e.target.checked)}
+                disabled={isRunning}
+                className="accent-blue-600"
+              />
+              <span className="text-[10px] font-bold text-slate-600 dark:text-slate-300">+ Variants</span>
+            </label>
+
             {!isRunning ? (
               <>
-                <button type="button" onClick={() => handleRunBacktest(testSymbol)} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white">
+                <button type="button" onClick={() => handleRunBacktest(testSymbol, includeVariants)} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white">
                   <Play className="w-3.5 h-3.5" />
                   <span>Run {testSymbol}</span>
                 </button>
-                <button type="button" onClick={() => handleRunBacktest('ALL')} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white">
+                <button type="button" onClick={() => handleRunBacktest('ALL', includeVariants)} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white">
                   <Layers className="w-3.5 h-3.5" />
                   <span>Run All</span>
                 </button>
@@ -721,7 +807,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               <span className="font-bold text-black dark:text-white">Storage Volume:</span>
               <span className="font-mono text-slate-600 dark:text-slate-300">{storageInfo.used_mb} MB used / {storageInfo.free_mb} MB free (Total: {storageInfo.total_mb} MB)</span>
               <span className="text-slate-400 hidden sm:inline">|</span>
-              <span className="font-mono text-[11px] text-slate-500">Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> • Market Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong></span>
+              <span className="font-mono text-[11px] text-slate-500">Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> · Market Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong></span>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button type="button" disabled={isCleaning || isRunning} onClick={() => handleCleanup('symbol')} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
@@ -866,6 +952,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         <button onClick={() => setActiveSubTab('diagnostics')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'diagnostics' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
           <Activity className="w-3.5 h-3.5 text-purple-400" /><span>Blueprint Diagnostics</span>
         </button>
+        <button onClick={() => setActiveSubTab('portfolio')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'portfolio' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <Network className="w-3.5 h-3.5 text-emerald-400" /><span>Portfolio Correlation</span>
+        </button>
+        <button onClick={() => setActiveSubTab('variants')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'variants' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
+          <GitBranch className="w-3.5 h-3.5 text-amber-400" /><span>Variant Matrix</span>
+        </button>
         <button onClick={() => setActiveSubTab('tips')} className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${activeSubTab === 'tips' ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>
           <Lightbulb className="w-3.5 h-3.5 text-amber-400" /><span>Actionable Improvement Tips</span>
         </button>
@@ -967,6 +1059,204 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
+      {activeSubTab === 'portfolio' && (
+        <div className="space-y-6">
+          {isLoadingPortfolio ? (
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center">
+              <RefreshCw className="w-6 h-6 text-blue-500 animate-spin mx-auto" />
+              <div className="text-xs text-slate-500 mt-2 font-mono">Loading cross-pair correlation matrix...</div>
+            </div>
+          ) : portfolioError ? (
+            <div className="p-6 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-center">
+              <Network className="w-7 h-7 text-amber-500 mx-auto" />
+              <div className="text-sm font-bold text-amber-700 dark:text-amber-400 mt-2">Portfolio Correlation Not Available</div>
+              <div className="text-xs text-amber-600/80 mt-1 font-mono">{portfolioError}</div>
+              <button type="button" onClick={fetchPortfolio} className="mt-3 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold cursor-pointer">Refresh</button>
+            </div>
+          ) : portfolioData ? (
+            <>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
+                  <div className="text-[10px] uppercase font-bold text-slate-500">Portfolio Max DD (concurrent)</div>
+                  <div className="text-2xl font-bold font-mono text-rose-500 mt-1">-${portfolioData.portfolio_drawdown}</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
+                  <div className="text-[10px] uppercase font-bold text-slate-500">Sum of Individual DDs</div>
+                  <div className="text-2xl font-bold font-mono text-slate-500 mt-1">-${portfolioData.sum_of_individual_drawdowns}</div>
+                </div>
+                <div className={`p-4 rounded-2xl border shadow-xs ${portfolioData.diversification_ratio >= 1.5 ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-white dark:bg-[#0f1118] border-slate-300 dark:border-[#1a2030]'}`}>
+                  <div className="text-[10px] uppercase font-bold text-slate-500">Diversification Ratio</div>
+                  <div className={`text-2xl font-bold font-mono mt-1 ${portfolioData.diversification_ratio >= 1.5 ? 'text-emerald-500' : portfolioData.diversification_ratio >= 1.0 ? 'text-blue-500' : 'text-rose-500'}`}>
+                    {portfolioData.diversification_ratio.toFixed(2)}x
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-1 font-mono">Higher = better diversification</div>
+                </div>
+                <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
+                  <div className="text-[10px] uppercase font-bold text-slate-500">Avg Daily Correlation</div>
+                  <div className={`text-2xl font-bold font-mono mt-1 ${Math.abs(portfolioData.avg_daily_correlation) < 0.3 ? 'text-emerald-500' : 'text-amber-500'}`}>
+                    {portfolioData.avg_daily_correlation.toFixed(3)}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-1 font-mono">{portfolioData.days} overlapping days</div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-bold text-black dark:text-white">§30 · Cross-Pair Daily P&L Correlation Matrix</h3>
+                  <div className="flex items-center gap-3 text-[10px] font-mono text-slate-500">
+                    <span><span className="inline-block w-3 h-3 rounded bg-emerald-500/40 mr-1 align-middle" />neg (diversifying)</span>
+                    <span><span className="inline-block w-3 h-3 rounded bg-slate-400/30 mr-1 align-middle" />neutral</span>
+                    <span><span className="inline-block w-3 h-3 rounded bg-rose-500/40 mr-1 align-middle" />pos (concentrated)</span>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="text-[11px] font-mono border-separate border-spacing-0.5">
+                    <thead>
+                      <tr>
+                        <th className="px-2 py-1.5 text-slate-500 text-left sticky left-0 bg-white dark:bg-[#0f1118] z-10"></th>
+                        {portfolioData.symbols.map((s) => (
+                          <th key={s} className="px-2 py-1.5 text-black dark:text-white font-bold text-center">{s}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {portfolioData.symbols.map((rowSym) => (
+                        <tr key={rowSym}>
+                          <td className="px-2 py-1.5 text-black dark:text-white font-bold sticky left-0 bg-white dark:bg-[#0f1118] z-10 text-right pr-3">{rowSym}</td>
+                          {portfolioData.symbols.map((colSym) => {
+                            const v = portfolioData.correlation_matrix?.[rowSym]?.[colSym];
+                            const num = typeof v === 'number' ? v : 0;
+                            const isSelf = rowSym === colSym;
+                            return (
+                              <td key={colSym} className={`px-2 py-1.5 text-center rounded border ${isSelf ? 'bg-blue-500/20 text-blue-900 dark:text-blue-100 border-blue-500/40 font-bold' : corrColor(num)}`}>
+                                {isSelf ? '1.00' : num.toFixed(2)}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="mt-4 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] text-[11px] font-mono text-slate-600 dark:text-slate-300">
+                  <strong className="text-blue-600 dark:text-blue-400">Interpretation:</strong>{' '}
+                  {portfolioData.avg_daily_correlation < 0.2
+                    ? 'Portfolio is well diversified. Pair drawdowns rarely coincide.'
+                    : portfolioData.avg_daily_correlation < 0.5
+                    ? 'Moderate concentration. Consider reducing risk on the highest-correlated pairs.'
+                    : 'High concentration. Concurrent drawdowns likely. The strategy may be one directional bet across multiple symbols.'}
+                </div>
+
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[10px] font-mono">
+                  {portfolioData.symbols.map((s) => (
+                    <div key={s} className="flex justify-between p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                      <span className="text-black dark:text-white font-bold">{s}</span>
+                      <span className="text-slate-500">{portfolioData.trade_counts[s] || 0} trades</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center">
+              <Network className="w-8 h-8 text-emerald-400 mx-auto" />
+              <div className="text-sm font-bold text-black dark:text-white mt-2">No portfolio correlation yet</div>
+              <div className="text-xs text-slate-500 mt-1">Run a symbol backtest first; the correlation file is written automatically.</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeSubTab === 'variants' && (
+        <div className="space-y-6">
+          {isLoadingVariants ? (
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center">
+              <RefreshCw className="w-6 h-6 text-amber-500 animate-spin mx-auto" />
+              <div className="text-xs text-slate-500 mt-2 font-mono">Loading variants for {testSymbol}...</div>
+            </div>
+          ) : variantsError ? (
+            <div className="p-6 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-center">
+              <GitBranch className="w-7 h-7 text-amber-500 mx-auto" />
+              <div className="text-sm font-bold text-amber-700 dark:text-amber-400 mt-2">No Variant Matrix for {testSymbol}</div>
+              <div className="text-xs text-amber-600/80 mt-1 font-mono">{variantsError}</div>
+              <div className="text-xs text-slate-500 mt-2">Tick the <strong>+ Variants</strong> checkbox above and click Run.</div>
+              <button type="button" onClick={() => fetchVariants(testSymbol)} className="mt-3 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold cursor-pointer">Refresh</button>
+            </div>
+          ) : variantsData ? (
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <GitBranch className="w-4 h-4 text-amber-500" />
+                  <h3 className="text-sm font-bold text-black dark:text-white">
+                    Variant Matrix — {variantsData.symbol} · {variantsData.days} Days · R:R {variantsData.target_rr}
+                  </h3>
+                </div>
+                <span className="text-[10px] font-mono text-slate-500">Generated {variantsData.generated_at}</span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2.5 px-3">Variant</th>
+                      <th className="py-2.5 px-3 text-center">Trades</th>
+                      <th className="py-2.5 px-3 text-center">Win Rate</th>
+                      <th className="py-2.5 px-3 text-center">Exp (R)</th>
+                      <th className="py-2.5 px-3 text-center">PF</th>
+                      <th className="py-2.5 px-3 text-right">Max DD</th>
+                      <th className="py-2.5 px-3 text-right">Net P&L</th>
+                      <th className="py-2.5 px-3 text-center">Overrides</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    {(variantsData.variants || []).map((v: BacktestVariantRow, idx: number) => {
+                      const isErr = Boolean(v.error);
+                      const overrides: string[] = [];
+                      if (v.be_mode && v.be_mode !== 'FIXED_80') overrides.push(`BE:${v.be_mode}`);
+                      if (v.trail_override) overrides.push(`Trail:${v.trail_override}`);
+                      if (v.max_daily_override !== null && v.max_daily_override !== undefined) overrides.push(`Cap:${v.max_daily_override}`);
+
+                      return (
+                        <tr key={idx} className={`hover:bg-slate-50 dark:hover:bg-[#121520] ${isErr ? 'bg-rose-500/10' : ''}`}>
+                          <td className="py-3 px-3 font-bold text-black dark:text-white">{v.label}</td>
+                          {isErr ? (
+                            <td colSpan={6} className="py-3 px-3 text-rose-500 italic text-[11px]">{v.error}</td>
+                          ) : (
+                            <>
+                              <td className="py-3 px-3 text-center font-bold">{v.total_trades}</td>
+                              <td className={`py-3 px-3 text-center font-bold ${v.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{v.win_rate}%</td>
+                              <td className="py-3 px-3 text-center">{v.expectancy}R</td>
+                              <td className="py-3 px-3 text-center">{v.profit_factor}</td>
+                              <td className="py-3 px-3 text-right text-rose-500">-${v.max_drawdown}</td>
+                              <td className={`py-3 px-3 text-right font-bold ${v.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${v.net_pnl}</td>
+                            </>
+                          )}
+                          <td className="py-3 px-3 text-center text-[10px] text-slate-500">
+                            {overrides.length > 0 ? overrides.join(' · ') : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-4 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030] text-[11px] font-mono text-slate-600 dark:text-slate-300">
+                Compare the variant rows against the same symbol's baseline combos in the <strong className="text-blue-600 dark:text-blue-400">Summary Dashboard</strong> tab. If a variant beats the matching baseline (same Adaptive/Legacy mode), it should replace the default rule set in the live bot.
+              </div>
+            </div>
+          ) : (
+            <div className="p-8 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-center">
+              <GitBranch className="w-8 h-8 text-amber-400 mx-auto" />
+              <div className="text-sm font-bold text-black dark:text-white mt-2">No variants loaded</div>
+              <div className="text-xs text-slate-500 mt-1">Tick the + Variants checkbox above and run a backtest to generate them.</div>
+            </div>
+          )}
+        </div>
+      )}
+
       {activeSubTab === 'diagnostics' && (() => {
         const diag = reportData?.diagnostics;
         if (!diag) {
@@ -984,7 +1274,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         return (
           <div className="space-y-6">
 
-            {/* Phase 1 - Section 4 item 19: 24-hour hourly expectancy matrix */}
+            {/* §19 24-hour matrix */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-bold text-black dark:text-white">§19 · 24-Hour Hourly Expectancy Matrix (SAST)</h3>
@@ -1023,7 +1313,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Section 4 item 20: Day of Week performance */}
+            {/* §20 Day of week */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§20 · Performance by Day of Week</h3>
               <div className="overflow-x-auto">
@@ -1063,7 +1353,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Section 4 item 21: Session rollover friction */}
+            {/* §21 Session rollover */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§21 · Session-Rollover Friction</h3>
               <p className="text-[11px] text-slate-500 mb-3 font-mono">Comparison: trades taken inside ±15min of major session transitions vs outside.</p>
@@ -1086,7 +1376,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Section 6 item 26: ATR volatility tiering */}
+            {/* §26 ATR tiering */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§26 · ATR Volatility Tiering</h3>
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
@@ -1111,7 +1401,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Sections 7 items 31 + 32: Streak analysis + circuit breaker */}
+            {/* §31 + §32 */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
                 <h3 className="text-sm font-bold text-black dark:text-white mb-3">§31 · Consecutive Loss Streak</h3>
@@ -1161,7 +1451,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Section 7 item 36: Outlier dependency removal */}
+            {/* §36 Outlier removal */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§36 · Outlier Dependency Removal</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">Drops the top 5% best trades and recomputes. If edge collapses, it was luck.</p>
@@ -1200,7 +1490,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Section 7 item 37: Monte Carlo resampling */}
+            {/* §37 Monte Carlo */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§37 · Monte Carlo Resampling</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">{diag.monte_carlo.iterations} shuffles of the trade sequence.</p>
@@ -1228,7 +1518,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 1 - Section 7 item 38: Buy and Hold benchmark */}
+            {/* §38 Buy and Hold */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§38 · Buy-and-Hold Benchmark (Alpha)</h3>
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
@@ -1258,11 +1548,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* ============================================================
-                PHASE 2 CARDS
-                ============================================================ */}
-
-            {/* Phase 2 - Section 3 item 16: Post-SL continuation distance */}
+            {/* Phase-2 §16 post-SL */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§16 · Post-SL Continuation Distance ("Bad Stop")</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">
@@ -1297,7 +1583,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* Phase 2 - Section 3 item 17: Post-TP extra pips */}
+            {/* §17 post-TP */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§17 · Post-TP Movement ("Money Left on Table")</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">
@@ -1327,7 +1613,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* Phase 2 - Section 3 item 18: Premature BE exit detection */}
+            {/* §18 Premature BE */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§18 · Premature BE Exit Detection</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">
@@ -1357,14 +1643,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* Phase 2 - Section 6 item 27: 200 EMA alignment differential */}
+            {/* §27 EMA 200 alignment */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3">§27 · 200 EMA Trend-Alignment Differential</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
                 {[
-                  { label: 'Trend-Aligned', d: diag.ema_200_alignment.aligned, tone: 'emerald' },
-                  { label: 'Counter-Trend', d: diag.ema_200_alignment.counter_trend, tone: 'rose' },
-                  { label: 'Unknown', d: diag.ema_200_alignment.unknown, tone: 'slate' },
+                  { label: 'Trend-Aligned', d: diag.ema_200_alignment.aligned },
+                  { label: 'Counter-Trend', d: diag.ema_200_alignment.counter_trend },
+                  { label: 'Unknown', d: diag.ema_200_alignment.unknown },
                 ].map(({ label, d }) => (
                   <div key={label} className="p-4 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
                     <div className="font-bold text-black dark:text-white mb-2">{label}</div>
@@ -1384,7 +1670,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 2 - Section 6 item 28: Confirmation type (close vs touch) */}
+            {/* §28 Confirmation type */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§28 · Candle-Close vs Touch Confirmation</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">
@@ -1413,7 +1699,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 2 - Section 6 item 29: News-window slippage profiling */}
+            {/* §29 News window */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1">§29 · News-Event Slippage Profiling</h3>
               <p className="text-[10px] text-slate-500 mb-3 font-mono">
@@ -1440,6 +1726,134 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                   </div>
                 ))}
               </div>
+            </div>
+
+            {/* PHASE 3 + 4 CARDS */}
+
+            {/* §24 Position sizing comparison */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§24 · Position Sizing Comparison</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                Replays the same trade sequence with fixed risk per trade vs compounding (risk % of current equity).
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-mono">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Fixed Risk</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.sizing_comparison.fixed.net_pnl)}`}>${diag.sizing_comparison.fixed.net_pnl}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">Final: ${diag.sizing_comparison.fixed.final_equity}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Compounding</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.sizing_comparison.compounding.net_pnl)}`}>${diag.sizing_comparison.compounding.net_pnl}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">Final: ${diag.sizing_comparison.compounding.final_equity}</div>
+                </div>
+                <div className={`p-3 rounded-xl border ${diag.sizing_comparison.difference >= 0 ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-rose-500/10 border-rose-500/30'}`}>
+                  <div className="text-[10px] text-slate-500 uppercase">Compounding Advantage</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.sizing_comparison.difference)}`}>
+                    {diag.sizing_comparison.difference >= 0 ? '+' : ''}${diag.sizing_comparison.difference}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-1">
+                    {diag.sizing_comparison.difference > 0 ? 'Compounding wins' : diag.sizing_comparison.difference < 0 ? 'Fixed wins' : 'Tied'}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* §25 Daily cap comparison */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§25 · Daily Execution Cap Comparison</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                First N trades per day that were taken under tighter caps. "Unlimited" is the run's actual output.
+              </p>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+                {[
+                  { label: 'Cap = 1', d: diag.daily_cap_comparison.cap_1 },
+                  { label: 'Cap = 2', d: diag.daily_cap_comparison.cap_2 },
+                  { label: 'Cap = 4', d: diag.daily_cap_comparison.cap_4 },
+                  { label: 'Unlimited', d: diag.daily_cap_comparison.unlimited },
+                ].map(({ label, d }) => (
+                  <div key={label} className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                    <div className="font-bold text-black dark:text-white">{label}</div>
+                    <div className="mt-1 text-[11px]">n={d.count} · WR {d.win_rate}%</div>
+                    <div className={`text-[11px] font-bold ${kpiColor(d.net_pnl)}`}>${d.net_pnl}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* §33 Daily DD cutoff */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§33 · Daily Max-Drawdown Cutoff Simulation</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                Halts all trading for the day once the daily loss exceeds {diag.daily_dd_cutoff.cutoff_pct}% of that day's starting equity.
+              </p>
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 text-xs font-mono">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Days Triggered</div>
+                  <div className="text-lg font-bold text-amber-500">{diag.daily_dd_cutoff.days_triggered}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Trades Blocked</div>
+                  <div className="text-lg font-bold text-amber-500">{diag.daily_dd_cutoff.trades_blocked}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Original P&L</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.daily_dd_cutoff.original_net_pnl)}`}>${diag.daily_dd_cutoff.original_net_pnl}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">With Cutoff</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.daily_dd_cutoff.cutoff_net_pnl)}`}>${diag.daily_dd_cutoff.cutoff_net_pnl}</div>
+                </div>
+                <div className={`p-3 rounded-xl border ${diag.daily_dd_cutoff.protection_delta >= 0 ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-rose-500/10 border-rose-500/30'}`}>
+                  <div className="text-[10px] text-slate-500 uppercase">Protection Δ</div>
+                  <div className={`text-lg font-bold ${kpiColor(diag.daily_dd_cutoff.protection_delta)}`}>
+                    {diag.daily_dd_cutoff.protection_delta >= 0 ? '+' : ''}${diag.daily_dd_cutoff.protection_delta}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* §34 Slippage sensitivity */}
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-1">§34 · Slippage Sensitivity Curve</h3>
+              <p className="text-[10px] text-slate-500 mb-3 font-mono">
+                Degrades every trade by 1-5 pips of entry + exit slippage to model realistic execution friction.
+              </p>
+              {Object.keys(diag.slippage_sensitivity || {}).length === 0 ? (
+                <div className="text-xs text-slate-400 italic">No slippage data.</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs font-mono">
+                    <thead>
+                      <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                        <th className="py-2 px-3">Slippage</th>
+                        <th className="py-2 px-3 text-right">Net P&L</th>
+                        <th className="py-2 px-3 text-center">Win Rate</th>
+                        <th className="py-2 px-3 text-right">Δ vs Baseline</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                      {Object.values(diag.slippage_sensitivity).map((pt: any, i: number) => {
+                        const baseline = diag.slippage_sensitivity.baseline?.net_pnl ?? 0;
+                        const delta = (pt.net_pnl || 0) - baseline;
+                        const isBaseline = pt.slippage_pips === 0;
+                        return (
+                          <tr key={i} className={isBaseline ? 'bg-blue-500/5' : ''}>
+                            <td className="py-2.5 px-3 font-bold text-black dark:text-white">
+                              {isBaseline ? 'Baseline (0 pips)' : `${pt.slippage_pips} pip${pt.slippage_pips > 1 ? 's' : ''}`}
+                            </td>
+                            <td className={`py-2.5 px-3 text-right font-bold ${kpiColor(pt.net_pnl)}`}>${pt.net_pnl}</td>
+                            <td className="py-2.5 px-3 text-center">{pt.win_rate}%</td>
+                            <td className={`py-2.5 px-3 text-right font-bold ${isBaseline ? 'text-slate-400' : kpiColor(delta)}`}>
+                              {isBaseline ? '—' : `${delta >= 0 ? '+' : ''}$${delta.toFixed(2)}`}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
           </div>

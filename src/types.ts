@@ -206,7 +206,7 @@ export interface ImprovementTip {
   action: string;
 }
 
-// PROPOSED: Blueprint Phase-1 + Phase-2 diagnostics (backtest/diagnostics.py).
+// PROPOSED: Blueprint Phase-1 + Phase-2 + Phase-3 + Phase-4 diagnostics (backtest/diagnostics.py).
 export interface DiagnosticKPIs {
   count: number;
   win_rate: number;
@@ -215,14 +215,32 @@ export interface DiagnosticKPIs {
   net_pnl: number;
 }
 
+export interface SizingComparison {
+  fixed: { net_pnl: number; final_equity: number };
+  compounding: { net_pnl: number; final_equity: number };
+  difference: number;
+}
+
+export interface DailyDdCutoff {
+  cutoff_pct: number;
+  days_triggered: number;
+  trades_blocked: number;
+  original_net_pnl: number;
+  cutoff_net_pnl: number;
+  protection_delta: number;
+}
+
+export interface SlippagePoint {
+  slippage_pips: number;
+  net_pnl: number;
+  win_rate: number;
+}
+
 export interface BacktestDiagnostics {
   version?: string;
   // Phase 1
   hour_kpis: Record<string, DiagnosticKPIs>;
-  session_rollover: {
-    in_transition: DiagnosticKPIs;
-    out_of_transition: DiagnosticKPIs;
-  };
+  session_rollover: { in_transition: DiagnosticKPIs; out_of_transition: DiagnosticKPIs };
   atr_tier_kpis: Record<string, DiagnosticKPIs>;
   streak_analysis: {
     max_consecutive_losses: number;
@@ -288,14 +306,13 @@ export interface BacktestDiagnostics {
     counter_trend: DiagnosticKPIs;
     unknown: DiagnosticKPIs;
   };
-  confirmation_type: {
-    close: DiagnosticKPIs;
-    touch: DiagnosticKPIs;
-  };
-  news_window: {
-    in_news: DiagnosticKPIs;
-    out_of_news: DiagnosticKPIs;
-  };
+  confirmation_type: { close: DiagnosticKPIs; touch: DiagnosticKPIs };
+  news_window: { in_news: DiagnosticKPIs; out_of_news: DiagnosticKPIs };
+  // Phase 3 + 4
+  sizing_comparison: SizingComparison;
+  daily_cap_comparison: Record<string, DiagnosticKPIs>;
+  daily_dd_cutoff: DailyDdCutoff;
+  slippage_sensitivity: Record<string, SlippagePoint>;
 }
 
 export interface BacktestReportPayload {
@@ -310,6 +327,47 @@ export interface BacktestReportPayload {
   improvement_tips?: ImprovementTip[];
   tune_validate?: any;
   strategy_tune_validate?: Record<string, any>;
-  // PROPOSED: Blueprint Phase-1 + Phase-2 diagnostics block.
   diagnostics?: BacktestDiagnostics;
+}
+
+// PROPOSED: Phase-4 cross-pair correlation matrix (Section 7 item 30).
+export interface PortfolioCorrelation {
+  symbols: string[];
+  trade_counts: Record<string, number>;
+  correlation_matrix: Record<string, Record<string, number>>;
+  portfolio_drawdown: number;
+  sum_of_individual_drawdowns: number;
+  diversification_ratio: number;
+  days: number;
+  avg_daily_correlation: number;
+}
+
+// PROPOSED: Phase-3 variant matrix (Section 5 items 22 / 23 / 25).
+export interface BacktestVariantRow {
+  label: string;
+  mode?: string;
+  be?: string;
+  trail?: string;
+  be_mode?: string;
+  trail_override?: string | null;
+  max_daily_override?: number | null;
+  report_file?: string;
+  total_trades: number;
+  win_rate: number;
+  expectancy: number;
+  profit_factor: number;
+  max_drawdown: number;
+  net_pnl: number;
+  adaptive_effective_pct?: number;
+  funnel?: any;
+  tune_validate?: any;
+  error?: string;
+}
+
+export interface BacktestVariants {
+  symbol: string;
+  days: number;
+  target_rr: number;
+  generated_at: string;
+  variants: BacktestVariantRow[];
 }

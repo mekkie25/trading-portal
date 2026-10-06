@@ -265,7 +265,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     });
   }
 
-  // TUNE / VALIDATE hold-out check for every combination.
   combos.forEach((c: any) => {
     const tv = c.tune_validate || {};
     const tune = tv.tune || {};
@@ -900,6 +899,35 @@ async function startServer() {
     }
   });
 
+  // PROPOSED: Phase-4 cross-pair correlation matrix (Section 7 item 30).
+  app.get('/api/backtest/portfolio', (_req, res) => {
+    try {
+      const portfolioFile = path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_correlation.json');
+      if (fs.existsSync(portfolioFile)) {
+        const data = JSON.parse(fs.readFileSync(portfolioFile, 'utf8'));
+        return res.status(200).json({ status: 'success', data });
+      }
+      return res.status(404).json({ status: 'error', message: 'Portfolio correlation not yet generated. Run a pair backtest first.' });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // PROPOSED: Phase-3 variant matrix (Section 5 items 22 / 23 / 25).
+  app.get('/api/backtest/variants/:symbol', (req, res) => {
+    try {
+      const sym = String(req.params.symbol || '').toUpperCase();
+      const variantsFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_variants.json`);
+      if (fs.existsSync(variantsFile)) {
+        const data = JSON.parse(fs.readFileSync(variantsFile, 'utf8'));
+        return res.status(200).json({ status: 'success', data });
+      }
+      return res.status(404).json({ status: 'error', message: `No variants file for ${sym}. Re-run with "Include Variants" enabled.` });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
   app.get('/api/backtest/status', (_req, res) => {
     res.status(200).json({
       status: 'success',
@@ -1062,6 +1090,9 @@ async function startServer() {
     const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
     const days = parseInt(req.body?.days || '60', 10);
     const rr = parseFloat(req.body?.rr || 1.0);
+    // PROPOSED: Phase-3 flag. When true, the Python runner also executes the
+    // five variant combos and saves <symbol>_variants.json.
+    const variants = Boolean(req.body?.variants ?? false);
 
     backtestResults = [];
     activeBacktestProcesses = [];
@@ -1100,6 +1131,7 @@ async function startServer() {
 
         const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days), '--rr', String(rr)];
         if (requestedSymbol === 'ALL') args.push('--skip-download');
+        if (variants) args.push('--variants');
 
         await new Promise<void>((resolve) => {
           const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd(), BACKTEST_CONCURRENT_WORKERS: String(maxWorkers) } });
