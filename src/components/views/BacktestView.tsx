@@ -4,7 +4,7 @@ import { createChart, IChartApi, ColorType, LineStyle, UTCTimestamp } from 'ligh
 import {
   Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw,
   Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer,
-  FileText, Activity, Network, GitBranch, Info
+  FileText, Activity, Network, GitBranch, Info, FlaskConical, CheckSquare, Square as SquareOff
 } from 'lucide-react';
 import {
   ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip,
@@ -67,6 +67,31 @@ interface RunResultItem {
   status: 'OK' | 'FAILED';
   message: string;
   timing?: string;
+}
+
+interface LabVariantRow {
+  label: string;
+  trades: number;
+  win_rate: number;
+  profit_factor: number;
+  max_drawdown: number;
+  net_pnl: number;
+  expectancy: number;
+  tune_pf: number;
+  tune_trades: number;
+  validate_pf: number;
+  validate_trades: number;
+  verdict: 'IMPROVES' | 'NO' | 'INCONCLUSIVE';
+}
+
+interface LabPayload {
+  symbol: string;
+  days: number;
+  generated_at: string;
+  window_start: string;
+  window_end: string;
+  baseline_label: string;
+  variants: LabVariantRow[];
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
@@ -158,6 +183,37 @@ const HowToRead: React.FC<{ metricKey: string }> = ({ metricKey }) => {
   );
 };
 
+const VerdictPill: React.FC<{ verdict?: string; className?: string }> = ({ verdict, className = '' }) => {
+  const v = verdict || 'INCONCLUSIVE';
+  const cfg: Record<string, string> = {
+    HOLDS: 'bg-emerald-500/15 text-emerald-600 border border-emerald-500/30',
+    FLAT: 'bg-slate-500/15 text-slate-500 border border-slate-400/30',
+    FAILS: 'bg-rose-500/15 text-rose-600 border border-rose-500/30',
+    INCONCLUSIVE: 'bg-slate-400/15 text-slate-500 border border-slate-400/30',
+    IMPROVES: 'bg-emerald-500/15 text-emerald-600 border border-emerald-500/30',
+    NO: 'bg-slate-500/15 text-slate-500 border border-slate-400/30',
+  };
+  return (
+    <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${cfg[v] || cfg.INCONCLUSIVE} ${className}`}>
+      {v}
+    </span>
+  );
+};
+
+// Local mirror of the server-side three-state verdict, used only for optimistic display
+// before the summary file is regenerated. Falls back to INCONCLUSIVE when either window
+// is too thin.
+function holdoutVerdictLocal(tune: any, val: any): string {
+  const tCount = tune?.count ?? 0;
+  const vCount = val?.count ?? 0;
+  if (tCount < 30 || vCount < 30) return 'INCONCLUSIVE';
+  const tPf = tune?.profit_factor ?? 0;
+  const vPf = val?.profit_factor ?? 0;
+  if (vPf < 0.95 || vPf < 0.7 * tPf) return 'FAILS';
+  if (vPf < 1.10) return 'FLAT';
+  return 'HOLDS';
+}
+
 export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', brokerCurrency = 'USD' }) => {
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
@@ -166,7 +222,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [activeSubTab, setActiveSubTab] = useState<'summary' | 'diagnostics' | 'portfolio' | 'variants' | 'chart' | 'ledger' | 'tips'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
+  // Multi-select pair UI. Single-pair testSymbol is kept in sync so the summary
+  // loader and other single-symbol actions keep working.
   const [testSymbol, setTestSymbol] = useState<string>('US30');
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>(['US30']);
+  const [multiSelectOpen, setMultiSelectOpen] = useState<boolean>(false);
+
   const [testDays, setTestDays] = useState<number>(60);
   const [testRr, setTestRr] = useState<number>(1.0);
   const [includeVariants, setIncludeVariants] = useState<boolean>(false);
@@ -193,6 +254,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [variantsData, setVariantsData] = useState<BacktestVariants | null>(null);
   const [variantsError, setVariantsError] = useState<string | null>(null);
   const [isLoadingVariants, setIsLoadingVariants] = useState<boolean>(false);
+
+  // ---- Strategy Lab state ----
+  const [labRunning, setLabRunning] = useState<boolean>(false);
+  const [labProgress, setLabProgress] = useState<string>('');
+  const [labError, setLabError] = useState<string | null>(null);
+  const [labResults, setLabResults] = useState<Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string }>>([]);
+  const [labPayloadBySymbol, setLabPayloadBySymbol] = useState<Record<string, LabPayload | null>>({});
+  const [isLoadingLab, setIsLoadingLab] = useState<boolean>(false);
+  const [labCopyStatus, setLabCopyStatus] = useState<Record<string, 'idle' | 'copied'>>({});
 
   const [dismissedTipIds, setDismissedTipIds] = useState<string[]>(() => {
     try {
@@ -229,6 +299,17 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           if (Array.isArray(json.results) && json.results.length > 0) setRunResults(json.results);
         }
       } catch {}
+      try {
+        const res = await fetch('/api/backtest/lab-status');
+        if (res.ok) {
+          const json = await res.json();
+          if (json.isRunning) {
+            setLabRunning(true);
+            setLabProgress(json.progress || 'Strategy Lab in progress...');
+          }
+          if (Array.isArray(json.results) && json.results.length > 0) setLabResults(json.results);
+        }
+      } catch {}
     };
     checkStatus();
   }, []);
@@ -259,6 +340,30 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   }, []);
 
   useEffect(() => { fetchSummaryData(testSymbol); }, [testSymbol, fetchSummaryData]);
+
+  const fetchLabForSymbol = useCallback(async (sym: string) => {
+    setIsLoadingLab(true);
+    try {
+      const res = await fetch(`/api/backtest/lab/${sym}`);
+      if (res.ok) {
+        const json = await res.json();
+        setLabPayloadBySymbol(prev => ({ ...prev, [sym]: json.data || null }));
+      } else {
+        setLabPayloadBySymbol(prev => ({ ...prev, [sym]: null }));
+      }
+    } catch {
+      setLabPayloadBySymbol(prev => ({ ...prev, [sym]: null }));
+    } finally {
+      setIsLoadingLab(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Load lab payload for the currently focused symbol on demand.
+    if (labPayloadBySymbol[testSymbol] === undefined) {
+      fetchLabForSymbol(testSymbol);
+    }
+  }, [testSymbol, labPayloadBySymbol, fetchLabForSymbol]);
 
   const fetchPortfolio = useCallback(async () => {
     setIsLoadingPortfolio(true);
@@ -347,9 +452,54 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return () => clearInterval(interval);
   }, [isRunning, fetchReportList, fetchSummaryData, fetchStorageInfo, fetchPortfolio, fetchVariants, testSymbol, activeSubTab]);
 
+  useEffect(() => {
+    if (!labRunning) return;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/backtest/lab-status');
+        if (res.ok) {
+          const json = await res.json();
+          if (json.progress) setLabProgress(json.progress);
+          if (Array.isArray(json.results)) setLabResults(json.results);
+          if (!json.isRunning) {
+            setLabRunning(false);
+            // Refresh the lab payloads for every symbol we just tested.
+            for (const sym of selectedSymbols) {
+              await fetchLabForSymbol(sym);
+            }
+          }
+        }
+      } catch {}
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [labRunning, selectedSymbols, fetchLabForSymbol]);
+
   const currentSymbolReports = useMemo(() => {
-    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && !f.endsWith('_variants.json') && f !== 'portfolio_correlation.json');
+    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && !f.endsWith('_variants.json') && !f.endsWith('_lab.json') && f !== 'portfolio_correlation.json');
   }, [reportFiles, testSymbol]);
+
+  // ---- Multi-select pair handlers ----
+  const toggleSymbol = (sym: string) => {
+    setSelectedSymbols(prev => {
+      const has = prev.includes(sym);
+      const next = has ? prev.filter(s => s !== sym) : [...prev, sym];
+      // Keep testSymbol pointing at a valid selection so the summary tab has data.
+      if (has && testSymbol === sym && next.length > 0) {
+        setTestSymbol(next[0]);
+      }
+      if (!has && next.length === 1) {
+        setTestSymbol(sym);
+      }
+      return next;
+    });
+  };
+
+  const selectAllSymbols = () => {
+    setSelectedSymbols([...WHITELIST_ASSETS]);
+  };
+  const clearAllSymbols = () => {
+    setSelectedSymbols([]);
+  };
 
   const handleCleanup = async (scope: 'all_reports' | 'symbol') => {
     const sym = testSymbol;
@@ -373,7 +523,60 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     } finally { setIsCleaning(false); }
   };
 
-  const handleRunBacktest = async (targetSym: string, withVariants: boolean = false) => {
+  const handleRunSelected = async () => {
+    if (isRunning) return;
+    if (selectedSymbols.length === 0) {
+      alert('Tick at least one pair first.');
+      return;
+    }
+    setIsRunning(true);
+    setRunResults([]);
+    setProgressText(`Preparing matrix for ${selectedSymbols.join(', ')}${includeVariants ? ' + variants' : ''}...`);
+    try {
+      const res = await fetch('/api/backtest/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: selectedSymbols.length === 1 ? selectedSymbols[0] : selectedSymbols,
+          days: testDays,
+          rr: testRr,
+          variants: includeVariants,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        setRunResults(selectedSymbols.map(s => ({ symbol: s, status: 'FAILED' as const, message: err.message || 'Run failed' })));
+        setIsRunning(false);
+      }
+    } catch {
+      setRunResults(selectedSymbols.map(s => ({ symbol: s, status: 'FAILED' as const, message: 'Network error connecting to runner' })));
+      setIsRunning(false);
+    }
+  };
+
+  const handleRunAll = async () => {
+    if (isRunning) return;
+    setIsRunning(true);
+    setRunResults([]);
+    setProgressText(`Preparing matrix for all 7 pairs${includeVariants ? ' + variants' : ''}...`);
+    try {
+      const res = await fetch('/api/backtest/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: 'ALL', days: testDays, rr: testRr, variants: includeVariants }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        setRunResults([{ symbol: 'ALL', status: 'FAILED', message: err.message || 'Run failed' }]);
+        setIsRunning(false);
+      }
+    } catch {
+      setRunResults([{ symbol: 'ALL', status: 'FAILED', message: 'Network error connecting to runner' }]);
+      setIsRunning(false);
+    }
+  };
+
+  const handleRunBacktestSingle = async (targetSym: string, withVariants: boolean = false) => {
     if (isRunning) return;
     setIsRunning(true);
     setRunResults([]);
@@ -402,6 +605,65 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
       setProgressText('Cancelled.');
       await fetchStorageInfo();
     } catch {}
+  };
+
+  const handleRunStrategyLab = async () => {
+    if (labRunning) return;
+    if (selectedSymbols.length === 0) {
+      alert('Tick at least one pair before running the Strategy Lab.');
+      return;
+    }
+    setLabRunning(true);
+    setLabResults([]);
+    setLabError(null);
+    setLabProgress(`Launching Strategy Lab for ${selectedSymbols.join(', ')}...`);
+    try {
+      const res = await fetch('/api/backtest/lab', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbols: selectedSymbols }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setLabError(err.message || 'Lab launch failed.');
+        setLabRunning(false);
+      }
+    } catch (e: any) {
+      setLabError(`Network error: ${e.message}`);
+      setLabRunning(false);
+    }
+  };
+
+  const handleStopStrategyLab = async () => {
+    try {
+      await fetch('/api/backtest/lab-stop', { method: 'POST' });
+      setLabRunning(false);
+      setLabProgress('Strategy Lab cancelled.');
+    } catch {}
+  };
+
+  const handleCopyLabForAI = (sym: string) => {
+    const lab = labPayloadBySymbol[sym];
+    if (!lab) return;
+    const lines: string[] = [];
+    lines.push(`STRATEGY LAB — ${sym} (${lab.days}-day window: ${lab.window_start} → ${lab.window_end})`);
+    lines.push(`Baseline = Adaptive · BE on · Trail off. Each other variant changes ONE setting.`);
+    lines.push('');
+    lines.push('Label                          | TR   | WR    | PF    | DD      | PNL      | TUNE PF (TR) | VALIDATE PF (TR) | Verdict');
+    lines.push('-------------------------------|------|-------|-------|---------|----------|--------------|------------------|----------');
+    const sorted = [...lab.variants].sort((a, b) => {
+      const rank = (v: string) => v === 'IMPROVES' ? 0 : v === 'NO' ? 1 : 2;
+      return rank(a.verdict) - rank(b.verdict);
+    });
+    for (const v of sorted) {
+      lines.push(
+        `${v.label.padEnd(30)} | ${String(v.trades).padStart(4)} | ${formatNum(v.win_rate, 1).padStart(5)}% | ${formatNum(v.profit_factor).padStart(5)} | $${formatNum(v.max_drawdown).padStart(6)} | $${formatNum(v.net_pnl).padStart(7)} | ${formatNum(v.tune_pf).padStart(5)} (${String(v.tune_trades).padStart(3)}) | ${formatNum(v.validate_pf).padStart(5)} (${String(v.validate_trades).padStart(3)}) | ${v.verdict}`
+      );
+    }
+    const copyText = lines.join('\n');
+    navigator.clipboard.writeText(copyText).catch(() => {});
+    setLabCopyStatus(prev => ({ ...prev, [sym]: 'copied' }));
+    setTimeout(() => setLabCopyStatus(prev => ({ ...prev, [sym]: 'idle' })), 2500);
   };
 
   const handleVerifyVsOriginal = async () => {
@@ -487,7 +749,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           doc.setTextColor(148, 163, 184);
           doc.text('1. Tests 8 combinations per asset across Adaptive/Legacy, Breakeven, and SuperTrend trail.', 26, 143);
           doc.text('2. Every rule in the suggestion engine strictly requires at least 30 trades before firing.', 26, 150);
-          doc.text('3. TUNE = first 70% of window. VALIDATE = last 30%. HOLD-OUT FAIL = collapse on unseen.', 26, 157);
+          doc.text('3. TUNE = first 70% of window. VALIDATE = last 30%. HOLDS / FLAT / FAILS are the verdicts.', 26, 157);
           doc.text('4. Identifies the statistically superior setup per asset ranked by estimated dollar impact.', 26, 164);
           doc.text('5. Zero look-ahead bias: higher timeframe candles are reconstructed bar-by-bar at time T.', 26, 171);
           doc.text('6. All values are post-hoc; the backtester does not modify the live bot.', 26, 178);
@@ -573,7 +835,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
             autoTable(doc, {
               startY: 32,
-              head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage', 'TUNE (TR/PF/WR)', 'VALIDATE (TR/PF/WR)', 'Hold-out']],
+              head: [['Combination', 'Trades', 'Win Rate', 'Exp (R)', 'PF', 'Max DD', 'Net P&L', 'Coverage', 'TUNE (TR/PF/WR)', 'VALIDATE (TR/PF/WR)', 'Verdict']],
               body: comboRows,
               theme: 'grid',
               headStyles: { fillColor: [15, 23, 42], fontSize: 6.5 },
@@ -588,7 +850,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               const sVal = stv.validate || {};
               const tStr = `${sTune.count || 0}/${formatNum(sTune.profit_factor)}/${formatNum(sTune.win_rate)}%`;
               const vStr = `${sVal.count || 0}/${formatNum(sVal.profit_factor)}/${formatNum(sVal.win_rate)}%`;
-              return [sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`, tStr, vStr];
+              return [sName, s.count, `${formatNum(s.win_rate)}%`, `${formatNum(s.avg_r)}R`, formatNum(s.profit_factor), `$${formatNum(s.net_pnl)}`, tStr, vStr, holdoutVerdictLocal(sTune, sVal)];
             });
 
             if (stratRows.length > 0) {
@@ -597,7 +859,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               doc.text(`Strategy Breakdown (${bLabel})`, 14, currentY);
               autoTable(doc, {
                 startY: currentY + 3,
-                head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L', 'TUNE (TR/PF/WR)', 'VALIDATE (TR/PF/WR)']],
+                head: [['Strategy', 'Trades', 'Win Rate', 'Avg R', 'PF', 'Net P&L', 'TUNE (TR/PF/WR)', 'VALIDATE (TR/PF/WR)', 'Verdict']],
                 body: stratRows,
                 theme: 'striped',
                 headStyles: { fillColor: [71, 85, 105], fontSize: 6.5 },
@@ -618,7 +880,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                 }
                 return `${r}: ${c}`;
               }).join(' | ');
-              doc.text(`Skipped Signals: ${skipStr}`, 14, currentY);
+              doc.text(`Skipped Signals: ${skipStr}`, 14, currentY, { maxWidth: pageWidth - 28 });
               currentY += 6;
             }
 
@@ -652,6 +914,35 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               currentY += 3;
             }
 
+            // Strategy Lab (if present)
+            const lab = p.lab;
+            if (lab && Array.isArray(lab.variants) && lab.variants.length > 0) {
+              doc.setFontSize(11);
+              doc.setTextColor(37, 99, 235);
+              doc.text('Strategy Lab (single-setting variants, 365-day window)', 14, currentY);
+              currentY += 6;
+
+              const labRows = [...lab.variants].sort((a: any, b: any) => {
+                const rank = (v: string) => v === 'IMPROVES' ? 0 : v === 'NO' ? 1 : 2;
+                return rank(a.verdict) - rank(b.verdict);
+              }).map((v: any) => [
+                v.label, v.trades, `${formatNum(v.win_rate, 1)}%`, formatNum(v.profit_factor),
+                `-$${formatNum(v.max_drawdown)}`, `$${formatNum(v.net_pnl)}`,
+                `${formatNum(v.tune_pf)} (${v.tune_trades})`,
+                `${formatNum(v.validate_pf)} (${v.validate_trades})`,
+                v.verdict
+              ]);
+              autoTable(doc, {
+                startY: currentY,
+                head: [['Variant', 'TR', 'WR', 'PF', 'Max DD', 'Net P&L', 'TUNE PF (TR)', 'VALIDATE PF (TR)', 'Verdict']],
+                body: labRows,
+                theme: 'grid',
+                headStyles: { fillColor: [37, 99, 235], fontSize: 6.5 },
+                bodyStyles: { fontSize: 6.5 }
+              });
+              currentY = (doc as any).lastAutoTable.finalY + 8;
+            }
+
             const ruleSuggestions = p.best_combination?.rule_suggestions || [];
             if (ruleSuggestions.length > 0) {
               doc.setFontSize(10);
@@ -665,7 +956,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             }
           }
 
-          // Portfolio correlation as a colour grid
           if (exp.portfolio_correlation) {
             doc.addPage();
             addHeaderFooter('Portfolio Correlation');
@@ -731,7 +1021,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             doc.text(`${i + 1}. ${item}`, 16, nextTestY + 7 + (i * 6), { maxWidth: pageWidth - 32 });
           });
 
-          // Not-implemented list
           doc.addPage();
           addHeaderFooter('Not Implemented');
           doc.setFontSize(16);
@@ -748,7 +1037,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             bodyStyles: { fontSize: 8 }
           });
 
-          // Glossary
           doc.addPage();
           addHeaderFooter('Glossary');
           doc.setFontSize(16);
@@ -761,9 +1049,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             ['Maximum Drawdown', describe('max_drawdown').description],
             ['Adaptive Coverage', describe('adaptive_coverage').description],
             ['TUNE / VALIDATE split', describe('col_tune').description + ' ' + describe('col_validate').description],
-            ['Hold-out Verdict', describe('col_holdout_verdict').description],
+            ['HOLDS', describe('tag_holds').description],
+            ['FLAT', describe('tag_flat').description],
+            ['FAILS', describe('tag_fails').description],
             ['INCONCLUSIVE tag', describe('tag_inconclusive').description],
-            ['HOLD-OUT FAIL tag', describe('tag_hold_out_fail').description],
             ['Blueprint Diagnostics', describe('sec_diagnostics').description],
             ['Portfolio Correlation', describe('sec_portfolio').description],
             ['Slippage Sensitivity', describe('diag_slippage').description],
@@ -776,6 +1065,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             ['Monte Carlo Resampling', describe('diag_monte_carlo').description],
             ['Outlier Dependency', describe('diag_outlier_removal').description],
             ['Circuit-Breaker Simulation', describe('diag_circuit_breaker').description],
+            ['Strategy Lab', describe('sec_strategy_lab').description],
           ];
 
           autoTable(doc, {
@@ -853,15 +1143,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return curr.profit_factor > arr[bestIdx].profit_factor ? currIdx : bestIdx;
   }, -1) ?? -1;
 
-  const holdoutVerdictLocal = (tune: any, val: any): string => {
-    const tCount = tune?.count ?? 0;
-    const vCount = val?.count ?? 0;
-    if (tCount < 30 || vCount < 30) return 'INCONCLUSIVE';
-    const tPf = tune?.profit_factor ?? 0;
-    const vPf = val?.profit_factor ?? 0;
-    if (vPf < 1.0 || vPf < 0.7 * tPf) return 'HOLD-OUT FAIL';
-    return 'PASS';
-  };
+  // Count pairs that will be included by the next export. Matches server logic:
+  // any pair with a summary file is included; the panel dropdown does not filter.
+  const exportPairCount = reportFiles.filter(f => f.endsWith('_summary.json') && !f.startsWith('.')).length;
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
@@ -878,69 +1162,171 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           </p>
           <HowToRead metricKey="sec_summary" />
         </div>
+      </motion.div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 dark:bg-[#0f1118] p-1.5 rounded-xl border border-slate-300 dark:border-[#1a2030]">
-            <select value={testSymbol} onChange={(e) => setTestSymbol(e.target.value)} disabled={isRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none">
-              {WHITELIST_ASSETS.map((sym) => (<option key={sym} value={sym}>{sym}</option>))}
-            </select>
-            <select value={testDays} onChange={(e) => setTestDays(parseInt(e.target.value, 10))} disabled={isRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none">
-              <option value={60}>60 Days</option>
-              <option value={90}>90 Days</option>
-              <option value={180}>180 Days</option>
-              <option value={365}>365 Days</option>
-            </select>
-            <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
-              <span className="text-[10px] font-bold text-slate-500">R:R</span>
-              <input type="number" step="0.1" min="0.5" max="5.0" value={testRr} onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)} disabled={isRunning} className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none" />
-            </div>
+      {/* Multi-select pair row + Run controls */}
+      <motion.div
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-4 space-y-3"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Layers className="w-4 h-4 text-blue-500" />
+            <span className="text-xs font-bold text-black dark:text-white">Pairs to test</span>
+            <span className="text-[10px] font-mono text-slate-500">
+              ({selectedSymbols.length} of {WHITELIST_ASSETS.length} selected)
+            </span>
+            <InfoTip metricKey="sec_summary" />
+          </div>
 
-            <label className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={includeVariants}
-                onChange={(e) => setIncludeVariants(e.target.checked)}
-                disabled={isRunning}
-                className="accent-blue-600"
-              />
-              <span className="text-[10px] font-bold text-slate-600 dark:text-slate-300">+ Variants</span>
-            </label>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setMultiSelectOpen(v => !v)}
+              className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] dark:hover:bg-[#1a202c] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] cursor-pointer transition-colors"
+            >
+              {multiSelectOpen ? 'Hide pairs' : 'Show pairs'}
+            </button>
+            <button
+              type="button"
+              onClick={selectAllSymbols}
+              className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#08090d] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] hover:border-blue-400 cursor-pointer transition-colors"
+            >
+              All
+            </button>
+            <button
+              type="button"
+              onClick={clearAllSymbols}
+              className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#08090d] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] hover:border-rose-400 cursor-pointer transition-colors"
+            >
+              None
+            </button>
+          </div>
+        </div>
 
-            {!isRunning ? (
-              <>
-                <button type="button" onClick={() => handleRunBacktest(testSymbol, includeVariants)} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white">
-                  <Play className="w-3.5 h-3.5" />
-                  <span>Run {testSymbol}</span>
+        {multiSelectOpen && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 pt-1">
+            {WHITELIST_ASSETS.map((sym) => {
+              const checked = selectedSymbols.includes(sym);
+              const focused = testSymbol === sym;
+              return (
+                <button
+                  key={sym}
+                  type="button"
+                  onClick={() => toggleSymbol(sym)}
+                  className={`flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-xs font-mono font-bold transition-colors cursor-pointer border ${
+                    checked
+                      ? 'bg-blue-600/15 border-blue-500/40 text-blue-700 dark:text-blue-300'
+                      : 'bg-slate-50 dark:bg-[#08090d] border-slate-300 dark:border-[#1a2030] text-slate-600 dark:text-slate-400 hover:border-slate-400'
+                  }`}
+                  title={focused ? `${sym} is the focused pair shown in the tabs below` : `Tick to include ${sym} in the next run`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    {checked ? <CheckSquare className="w-3.5 h-3.5" /> : <SquareOff className="w-3.5 h-3.5 opacity-50" />}
+                    <span>{sym}</span>
+                  </span>
+                  {focused && <span className="text-[8px] px-1 py-0.5 rounded bg-slate-500/15 text-slate-500 font-normal">focused</span>}
                 </button>
-                <button type="button" onClick={() => handleRunBacktest('ALL', includeVariants)} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white">
-                  <Layers className="w-3.5 h-3.5" />
-                  <span>Run All</span>
-                </button>
-              </>
-            ) : (
-              <button type="button" onClick={handleStopBacktest} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white">
-                <Square className="w-3.5 h-3.5" />
-                <span>Stop</span>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-100 dark:border-[#1a2030]">
+          <select value={testDays} onChange={(e) => setTestDays(parseInt(e.target.value, 10))} disabled={isRunning || labRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none border border-slate-300 dark:border-[#1a2030]">
+            <option value={60}>60 Days</option>
+            <option value={90}>90 Days</option>
+            <option value={180}>180 Days</option>
+            <option value={365}>365 Days</option>
+          </select>
+          <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+            <span className="text-[10px] font-bold text-slate-500">R:R</span>
+            <input type="number" step="0.1" min="0.5" max="5.0" value={testRr} onChange={(e) => setTestRr(parseFloat(e.target.value) || 1.0)} disabled={isRunning || labRunning} className="w-12 text-xs font-mono font-bold text-center bg-transparent text-black dark:text-white focus:outline-none" />
+          </div>
+
+          <label className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-white dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={includeVariants}
+              onChange={(e) => setIncludeVariants(e.target.checked)}
+              disabled={isRunning || labRunning}
+              className="accent-blue-600"
+            />
+            <span className="text-[10px] font-bold text-slate-600 dark:text-slate-300">+ Variants</span>
+          </label>
+
+          {!isRunning ? (
+            <>
+              <button
+                type="button"
+                onClick={handleRunSelected}
+                disabled={selectedSymbols.length === 0 || labRunning}
+                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50"
+              >
+                <Play className="w-3.5 h-3.5" />
+                <span>Run Selected ({selectedSymbols.length})</span>
               </button>
-            )}
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            <a href="/api/backtest/export.txt" download className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
-              <Download className="w-3.5 h-3.5 text-blue-500" />
-              <span>Export for AI (.txt)</span>
-            </a>
-
-            <button type="button" onClick={handleExportPDF} disabled={isExportingPdf} className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs disabled:opacity-50">
-              <Printer className="w-3.5 h-3.5 text-emerald-500" />
-              <span>{isExportingPdf ? 'Building PDF...' : 'Export PDF'}</span>
+              <button
+                type="button"
+                onClick={handleRunAll}
+                disabled={labRunning}
+                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>Run All</span>
+              </button>
+              {!labRunning && (
+                <button
+                  type="button"
+                  onClick={handleRunStrategyLab}
+                  disabled={selectedSymbols.length === 0}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50"
+                  title="Runs 12 single-setting variants on the 365-day window for every ticked pair."
+                >
+                  <FlaskConical className="w-3.5 h-3.5" />
+                  <span>Strategy Lab</span>
+                </button>
+              )}
+            </>
+          ) : (
+            <button type="button" onClick={handleStopBacktest} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white">
+              <Square className="w-3.5 h-3.5" />
+              <span>Stop</span>
             </button>
-
-            <button type="button" disabled={isVerifying || isRunning} onClick={handleVerifyVsOriginal} className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>{isVerifying ? 'Verifying...' : 'Verify vs original (60 days)'}</span>
+          )}
+          {labRunning && (
+            <button type="button" onClick={handleStopStrategyLab} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-rose-600 hover:bg-rose-500 text-white">
+              <Square className="w-3.5 h-3.5" />
+              <span>Stop Lab</span>
             </button>
-          </div>
+          )}
+        </div>
+      </motion.div>
+
+      {/* Export row + N pairs indicator */}
+      <motion.div
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs"
+      >
+        <div className="flex items-center gap-2 text-[11px] font-mono text-slate-600 dark:text-slate-300">
+          <FileText className="w-3.5 h-3.5 text-blue-500" />
+          <span>Exporting <strong className="text-black dark:text-white">{exportPairCount}</strong> pair{exportPairCount === 1 ? '' : 's'} (every pair with a saved summary — the dropdown does not filter the export)</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <a href="/api/backtest/export.txt" download className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
+            <Download className="w-3.5 h-3.5 text-blue-500" />
+            <span>Export for AI (.txt)</span>
+          </a>
+          <button type="button" onClick={handleExportPDF} disabled={isExportingPdf} className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs disabled:opacity-50">
+            <Printer className="w-3.5 h-3.5 text-emerald-500" />
+            <span>{isExportingPdf ? 'Building PDF...' : 'Export PDF'}</span>
+          </button>
+          <button type="button" disabled={isVerifying || isRunning || labRunning} onClick={handleVerifyVsOriginal} className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors">
+            <ShieldCheck className="w-3.5 h-3.5" />
+            <span>{isVerifying ? 'Verifying...' : 'Verify vs original (60 days)'}</span>
+          </button>
         </div>
       </motion.div>
 
@@ -963,6 +1349,108 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
+      {labRunning && (
+        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between text-xs animate-in fade-in">
+          <div className="flex items-center gap-3">
+            <FlaskConical className="w-4 h-4 text-amber-500 animate-pulse shrink-0" />
+            <div>
+              <div className="font-bold text-amber-700 dark:text-amber-400">Strategy Lab in Progress</div>
+              <div className="text-slate-500 font-mono text-[11px] mt-0.5">{labProgress || 'Testing single-setting variants on the 365-day window...'}</div>
+            </div>
+          </div>
+          <button type="button" onClick={handleStopStrategyLab} className="px-3 py-1.5 rounded-lg text-[11px] font-bold font-mono bg-rose-600 hover:bg-rose-500 text-white transition-colors cursor-pointer">Stop Lab</button>
+        </div>
+      )}
+
+      {labError && (
+        <div className="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-700 dark:text-rose-300 flex items-center justify-between">
+          <span className="font-mono">Strategy Lab error: {labError}</span>
+          <button type="button" onClick={() => setLabError(null)} className="text-xs text-slate-400 hover:text-rose-600 cursor-pointer">Dismiss</button>
+        </div>
+      )}
+
+      {/* Per-pair Strategy Lab results table */}
+      {(labPayloadBySymbol[testSymbol] || labResults.length > 0) && (
+        <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-amber-500/30 shadow-xs p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <FlaskConical className="w-4 h-4 text-amber-500" />
+              <h3 className="text-sm font-bold text-black dark:text-white">
+                Strategy Lab {labPayloadBySymbol[testSymbol] ? `— ${testSymbol} · ${labPayloadBySymbol[testSymbol]!.days}-day window` : ''}
+              </h3>
+              <InfoTip metricKey="sec_strategy_lab" />
+            </div>
+            <div className="flex items-center gap-2">
+              {labPayloadBySymbol[testSymbol] && (
+                <button
+                  type="button"
+                  onClick={() => handleCopyLabForAI(testSymbol)}
+                  className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                >
+                  {labCopyStatus[testSymbol] === 'copied' ? <Check className="w-3.5 h-3.5 text-emerald-200" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{labCopyStatus[testSymbol] === 'copied' ? 'Copied' : 'Copy for AI'}</span>
+                </button>
+              )}
+              {isLoadingLab && <RefreshCw className="w-3.5 h-3.5 text-amber-500 animate-spin" />}
+            </div>
+          </div>
+
+          <HowToRead metricKey="sec_strategy_lab" />
+
+          {labPayloadBySymbol[testSymbol] ? (
+            <>
+              <div className="text-[10px] font-mono text-slate-500">
+                Window: {labPayloadBySymbol[testSymbol]!.window_start} → {labPayloadBySymbol[testSymbol]!.window_end} · Baseline = {labPayloadBySymbol[testSymbol]!.baseline_label}
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2.5 px-3">Variant</th>
+                      <th className="py-2.5 px-3 text-center">Trades</th>
+                      <th className="py-2.5 px-3 text-center">Win Rate</th>
+                      <th className="py-2.5 px-3 text-center">PF</th>
+                      <th className="py-2.5 px-3 text-right">Max DD</th>
+                      <th className="py-2.5 px-3 text-right">Net P&L</th>
+                      <th className="py-2.5 px-3 text-center">TUNE PF (TR)</th>
+                      <th className="py-2.5 px-3 text-center">VALIDATE PF (TR)</th>
+                      <th className="py-2.5 px-3 text-center">Verdict</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    {[...labPayloadBySymbol[testSymbol]!.variants]
+                      .sort((a, b) => {
+                        const rank = (v: string) => v === 'IMPROVES' ? 0 : v === 'NO' ? 1 : 2;
+                        return rank(a.verdict) - rank(b.verdict);
+                      })
+                      .map((v, i) => (
+                        <tr key={i} className={`hover:bg-slate-50 dark:hover:bg-[#121520] ${v.verdict === 'IMPROVES' ? 'bg-emerald-500/5' : ''}`}>
+                          <td className="py-2.5 px-3 font-bold text-black dark:text-white">{v.label}</td>
+                          <td className="py-2.5 px-3 text-center">{v.trades}</td>
+                          <td className={`py-2.5 px-3 text-center font-bold ${v.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{formatNum(v.win_rate, 1)}%</td>
+                          <td className="py-2.5 px-3 text-center">{formatNum(v.profit_factor)}</td>
+                          <td className="py-2.5 px-3 text-right text-rose-500">-${formatNum(v.max_drawdown)}</td>
+                          <td className={`py-2.5 px-3 text-right font-bold ${v.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${formatNum(v.net_pnl)}</td>
+                          <td className={`py-2.5 px-3 text-center ${v.tune_trades < 30 ? 'text-slate-400' : ''}`}>{formatNum(v.tune_pf)} ({v.tune_trades})</td>
+                          <td className={`py-2.5 px-3 text-center ${v.validate_trades < 30 ? 'text-slate-400' : ''}`}>{formatNum(v.validate_pf)} ({v.validate_trades})</td>
+                          <td className="py-2.5 px-3 text-center"><VerdictPill verdict={v.verdict} /></td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="text-[10px] font-mono text-slate-500">
+                IMPROVES = PF above baseline by at least 0.05 in both TUNE and VALIDATE with at least 30 trades in each. INCONCLUSIVE = fewer than 30 trades in either window.
+              </div>
+            </>
+          ) : (
+            <div className="py-4 text-center text-xs text-slate-500 font-mono">
+              No lab file for {testSymbol}. Click <strong className="text-amber-600">Strategy Lab</strong> above to generate one.
+            </div>
+          )}
+        </div>
+      )}
+
       {storageInfo && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-3">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
@@ -974,10 +1462,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               <span className="font-mono text-[11px] text-slate-500">Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> · Market Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong></span>
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <button type="button" disabled={isCleaning || isRunning} onClick={() => handleCleanup('symbol')} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+              <button type="button" disabled={isCleaning || isRunning || labRunning} onClick={() => handleCleanup('symbol')} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
                 <Trash2 className="w-3 h-3 text-amber-500" /><span>Clear {testSymbol} reports</span>
               </button>
-              <button type="button" disabled={isCleaning || isRunning} onClick={() => handleCleanup('all_reports')} className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+              <button type="button" disabled={isCleaning || isRunning || labRunning} onClick={() => handleCleanup('all_reports')} className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
                 <Trash2 className="w-3 h-3 text-rose-500" /><span>Clear all reports</span>
               </button>
             </div>
@@ -1057,7 +1545,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                   <th className="py-2.5 px-3 text-center">Adp Cov <InfoTip metricKey="col_adp_cov" /></th>
                   <th className="py-2.5 px-3 text-center">TUNE (PF / WR / TR) <InfoTip metricKey="col_tune" /></th>
                   <th className="py-2.5 px-3 text-center">VALIDATE (PF / WR / TR) <InfoTip metricKey="col_validate" /></th>
-                  <th className="py-2.5 px-3 text-center">Hold-out <InfoTip metricKey="col_holdout_verdict" /></th>
+                  <th className="py-2.5 px-3 text-center">Verdict <InfoTip metricKey="col_holdout_verdict" /></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
@@ -1068,14 +1556,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                   const inconTune = (cTune.count ?? 0) < 30;
                   const inconVal = (cVal.count ?? 0) < 30;
                   const holdout = c.holdout_verdict || holdoutVerdictLocal(cTune, cVal);
-                  const failHoldOut = holdout === 'HOLD-OUT FAIL';
+                  const isFail = holdout === 'FAILS';
                   return (
-                    <tr key={idx} onClick={() => setSelectedFile(c.report_file)} className={`cursor-pointer transition-colors ${selectedFile === c.report_file ? 'bg-blue-500/15' : idx === bestComboIdx ? 'bg-amber-500/10 hover:bg-amber-500/20' : 'hover:bg-slate-50 dark:hover:bg-[#121520]'} ${failHoldOut ? 'ring-1 ring-rose-500/40' : ''}`}>
+                    <tr key={idx} onClick={() => setSelectedFile(c.report_file)} className={`cursor-pointer transition-colors ${selectedFile === c.report_file ? 'bg-blue-500/15' : idx === bestComboIdx ? 'bg-amber-500/10 hover:bg-amber-500/20' : 'hover:bg-slate-50 dark:hover:bg-[#121520]'} ${isFail ? 'ring-1 ring-rose-500/40' : ''}`}>
                       <td className="py-3 px-3 font-bold text-black dark:text-white">
                         <div className="flex items-center gap-2">
                           {idx === bestComboIdx && <span className="text-amber-500">★</span>}
                           <span>{c.label}</span>
-                          {failHoldOut && <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-rose-500/15 text-rose-600">HOLD-OUT FAIL</span>}
                         </div>
                       </td>
                       <td className="py-3 px-3 text-center font-bold">{c.total_trades}</td>
@@ -1092,9 +1579,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                         {inconVal ? 'INCONCLUSIVE' : `${(cVal.profit_factor ?? 0).toFixed(2)} / ${(cVal.win_rate ?? 0).toFixed(0)}% / ${cVal.count}`}
                       </td>
                       <td className="py-3 px-3 text-center">
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${holdout === 'PASS' ? 'bg-emerald-500/15 text-emerald-600' : holdout === 'HOLD-OUT FAIL' ? 'bg-rose-500/15 text-rose-600' : 'bg-slate-400/15 text-slate-500'}`}>
-                          {holdout}
-                        </span>
+                        <VerdictPill verdict={holdout} />
                       </td>
                     </tr>
                   );
@@ -1182,13 +1667,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           </div>
 
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
-            <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">Performance by Strategy <InfoTip metricKey="sec_summary" /></h3>
+            <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">Performance by Strategy <InfoTip metricKey="strat_513" /></h3>
             <HowToRead metricKey="win_rate" />
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs font-mono">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
-                    <th className="py-2.5 px-3">Strategy Name <InfoTip metricKey="strat_grubber_kick" /></th>
+                    <th className="py-2.5 px-3">Strategy Name</th>
                     <th className="py-2.5 px-3 text-center">Trades <InfoTip metricKey="col_trades" /></th>
                     <th className="py-2.5 px-3 text-center">Win Rate <InfoTip metricKey="win_rate" /></th>
                     <th className="py-2.5 px-3 text-center">Avg R <InfoTip metricKey="expectancy" /></th>
@@ -1196,6 +1681,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                     <th className="py-2.5 px-3 text-right">Net P&L <InfoTip metricKey="net_pnl" /></th>
                     <th className="py-2.5 px-3 text-center">TUNE (PF / WR / TR) <InfoTip metricKey="col_tune" /></th>
                     <th className="py-2.5 px-3 text-center">VALIDATE (PF / WR / TR) <InfoTip metricKey="col_validate" /></th>
+                    <th className="py-2.5 px-3 text-center">Verdict <InfoTip metricKey="col_holdout_verdict" /></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
@@ -1205,16 +1691,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                     const sVal = tv.validate || {};
                     const inconTune = (sTune.count ?? 0) < 30;
                     const inconVal = (sVal.count ?? 0) < 30;
-                    const failHoldOut = (!inconTune && !inconVal) &&
-                      ((sVal.profit_factor ?? 0) < 1.0 || (sVal.profit_factor ?? 0) < 0.7 * (sTune.profit_factor ?? 0));
+                    const verdict = holdoutVerdictLocal(sTune, sVal);
+                    const isFail = verdict === 'FAILS';
                     return (
-                      <tr key={sName} className={`hover:bg-slate-50 dark:hover:bg-[#121520] ${failHoldOut ? 'ring-1 ring-rose-500/30' : ''}`}>
-                        <td className="py-3 px-3 font-bold text-black dark:text-white">
-                          <div className="flex items-center gap-2">
-                            <span>{sName}</span>
-                            {failHoldOut && <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-rose-500/15 text-rose-600">HOLD-OUT FAIL</span>}
-                          </div>
-                        </td>
+                      <tr key={sName} className={`hover:bg-slate-50 dark:hover:bg-[#121520] ${isFail ? 'ring-1 ring-rose-500/30' : ''}`}>
+                        <td className="py-3 px-3 font-bold text-black dark:text-white">{sName}</td>
                         <td className="py-3 px-3 text-center font-bold">{sKpi.count}</td>
                         <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{sKpi.win_rate}%</td>
                         <td className="py-3 px-3 text-center">{sKpi.avg_r}R</td>
@@ -1226,6 +1707,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                         <td className={`py-3 px-3 text-center font-mono text-[11px] ${inconVal ? 'text-slate-400' : ((sVal.profit_factor ?? 0) >= 1.0 ? 'text-emerald-600' : 'text-rose-500')}`}>
                           {inconVal ? 'INCONCLUSIVE' : `${(sVal.profit_factor ?? 0).toFixed(2)} / ${(sVal.win_rate ?? 0).toFixed(0)}% / ${sVal.count}`}
                         </td>
+                        <td className="py-3 px-3 text-center"><VerdictPill verdict={verdict} /></td>
                       </tr>
                     );
                   })}
@@ -1380,13 +1862,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                 <table className="w-full text-left text-xs font-mono">
                   <thead>
                     <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
-                      <th className="py-2.5 px-3">Variant <InfoTip metricKey="sec_variants" /></th>
-                      <th className="py-2.5 px-3 text-center">Trades <InfoTip metricKey="col_trades" /></th>
-                      <th className="py-2.5 px-3 text-center">Win Rate <InfoTip metricKey="win_rate" /></th>
-                      <th className="py-2.5 px-3 text-center">Exp (R) <InfoTip metricKey="col_exp_r" /></th>
-                      <th className="py-2.5 px-3 text-center">PF <InfoTip metricKey="col_pf" /></th>
-                      <th className="py-2.5 px-3 text-right">Max DD <InfoTip metricKey="col_max_dd" /></th>
-                      <th className="py-2.5 px-3 text-right">Net P&L <InfoTip metricKey="col_net_pnl" /></th>
+                      <th className="py-2.5 px-3">Variant</th>
+                      <th className="py-2.5 px-3 text-center">Trades</th>
+                      <th className="py-2.5 px-3 text-center">Win Rate</th>
+                      <th className="py-2.5 px-3 text-center">Exp (R)</th>
+                      <th className="py-2.5 px-3 text-center">PF</th>
+                      <th className="py-2.5 px-3 text-right">Max DD</th>
+                      <th className="py-2.5 px-3 text-right">Net P&L</th>
                       <th className="py-2.5 px-3 text-center">Overrides</th>
                     </tr>
                   </thead>
@@ -1455,7 +1937,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           <div className="space-y-6">
             <HowToRead metricKey="sec_diagnostics" />
 
-            {/* §19 24-hour matrix */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-bold text-black dark:text-white flex items-center">§19 · 24-Hour Hourly Expectancy Matrix (SAST) <InfoTip metricKey="diag_hour_matrix" /></h3>
@@ -1495,7 +1976,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §20 Day of week */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§20 · Performance by Day of Week <InfoTip metricKey="diag_hour_matrix" /></h3>
               <HowToRead metricKey="diag_hour_matrix" />
@@ -1536,7 +2016,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §21 Session rollover */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§21 · Session-Rollover Friction <InfoTip metricKey="diag_session_rollover" /></h3>
               <HowToRead metricKey="diag_session_rollover" />
@@ -1559,7 +2038,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §26 ATR tiering */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§26 · ATR Volatility Tiering <InfoTip metricKey="diag_atr_tier" /></h3>
               <HowToRead metricKey="diag_atr_tier" />
@@ -1585,7 +2063,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §31 + §32 */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
                 <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§31 · Consecutive Loss Streak <InfoTip metricKey="diag_streak" /></h3>
@@ -1636,7 +2113,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §36 Outlier removal */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§36 · Outlier Dependency Removal <InfoTip metricKey="diag_outlier_removal" /></h3>
               <HowToRead metricKey="diag_outlier_removal" />
@@ -1675,7 +2151,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §37 Monte Carlo */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§37 · Monte Carlo Resampling <InfoTip metricKey="diag_monte_carlo" /></h3>
               <HowToRead metricKey="diag_monte_carlo" />
@@ -1703,7 +2178,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §38 Buy and Hold */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§38 · Buy-and-Hold Benchmark (Alpha) <InfoTip metricKey="diag_buy_and_hold" /></h3>
               <HowToRead metricKey="diag_buy_and_hold" />
@@ -1734,7 +2208,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §16 post-SL */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§16 · Post-SL Continuation Distance <InfoTip metricKey="diag_post_sl" /></h3>
               <HowToRead metricKey="diag_post_sl" />
@@ -1767,7 +2240,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* §17 post-TP */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§17 · Post-TP Movement <InfoTip metricKey="diag_post_tp" /></h3>
               <HowToRead metricKey="diag_post_tp" />
@@ -1795,7 +2267,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* §18 Premature BE */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§18 · Premature BE Exit Detection <InfoTip metricKey="diag_premature_be" /></h3>
               <HowToRead metricKey="diag_premature_be" />
@@ -1823,7 +2294,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* §27 EMA 200 alignment */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§27 · 200 EMA Trend-Alignment Differential <InfoTip metricKey="diag_ema_200" /></h3>
               <HowToRead metricKey="diag_ema_200" />
@@ -1851,7 +2321,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §28 Confirmation type */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§28 · Candle-Close vs Touch Confirmation <InfoTip metricKey="diag_confirmation" /></h3>
               <HowToRead metricKey="diag_confirmation" />
@@ -1878,7 +2347,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §29 News window */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§29 · News-Event Slippage Profiling <InfoTip metricKey="diag_news" /></h3>
               <HowToRead metricKey="diag_news" />
@@ -1905,9 +2373,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* Phase 3 + 4 cards */}
-
-            {/* §22 BE variants A/B/C */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§22 · Break-even Variants A / B / C (post-hoc estimate) <InfoTip metricKey="diag_breakeven_variants" /></h3>
               <HowToRead metricKey="diag_breakeven_variants" />
@@ -1939,7 +2404,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* §35 Parameter sensitivity */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§35 · Parameter Sensitivity (Target R:R sweep) <InfoTip metricKey="diag_parameter_sensitivity" /></h3>
               <HowToRead metricKey="diag_parameter_sensitivity" />
@@ -1977,7 +2441,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               )}
             </div>
 
-            {/* §24 Position sizing */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§24 · Position Sizing Comparison <InfoTip metricKey="diag_sizing" /></h3>
               <HowToRead metricKey="diag_sizing" />
@@ -2004,7 +2467,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §25 Daily cap */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§25 · Daily Execution Cap Comparison <InfoTip metricKey="diag_daily_caps" /></h3>
               <HowToRead metricKey="diag_daily_caps" />
@@ -2024,7 +2486,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §33 DD cutoff */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§33 · Daily Max-Drawdown Cutoff Simulation <InfoTip metricKey="diag_dd_cutoff" /></h3>
               <HowToRead metricKey="diag_dd_cutoff" />
@@ -2054,7 +2515,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               </div>
             </div>
 
-            {/* §34 Slippage sensitivity */}
             <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
               <h3 className="text-sm font-bold text-black dark:text-white mb-1 flex items-center">§34 · Slippage Sensitivity Curve <InfoTip metricKey="diag_slippage" /></h3>
               <HowToRead metricKey="diag_slippage" />

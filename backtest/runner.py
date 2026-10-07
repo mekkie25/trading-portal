@@ -108,6 +108,25 @@ VARIANT_COMBINATIONS = [
     },
 ]
 
+# -----------------------------------------------------------------------------
+# Strategy Lab: 12 single-setting variants on the 365-day window.
+# Baseline is Adaptive · BE on · Trail off. Each other variant changes ONE setting.
+# -----------------------------------------------------------------------------
+LAB_VARIANTS: List[Dict[str, Any]] = [
+    {"label": "Baseline",                 "overrides": {}},
+    {"label": "Max spread-in-R 0.10",     "overrides": {"strat_max_spread_in_r": 0.10}},
+    {"label": "Max spread-in-R 0.05",     "overrides": {"strat_max_spread_in_r": 0.05}},
+    {"label": "Min stop ATR 1.0",         "overrides": {"strat_min_stop_atr": 1.0}},
+    {"label": "Min stop ATR 1.5",         "overrides": {"strat_min_stop_atr": 1.5}},
+    {"label": "Session 09-22 SAST",       "overrides": {"strat_session_window_sast": (9, 22)}},
+    {"label": "Session 15-22 SAST",       "overrides": {"strat_session_window_sast": (15, 22)}},
+    {"label": "HTF trend filter ON",      "overrides": {"strat_htf_trend_filter": True}},
+    {"label": "Disable AVWAP",            "overrides": {"strat_disabled": ["AVWAP_200EMA_CONTINUATION"]}},
+    {"label": "Disable STRATEGY_513",     "overrides": {"strat_disabled": ["STRATEGY_513"]}},
+    {"label": "Target R:R 1.5",           "overrides": {"target_rr": 1.5}},
+    {"label": "Target R:R 2.0",           "overrides": {"target_rr": 2.0}},
+]
+
 
 def sanitize_for_json(obj):
     if obj is None:
@@ -598,7 +617,10 @@ def precompute_market_pass(
                 "session_levels": session_levels,
                 "adr_val": adr_val,
                 "regime": regime,
-                "curr_time": curr_time
+                "curr_time": curr_time,
+                # d1_view cached so lab-mode filters can read the last closed D1
+                # close and its 20 EMA without re-running the aggregator.
+                "d1_view": d1_view,
             }
 
     print(f"[*] {symbol} precompute 100% complete.", flush=True)
@@ -1372,21 +1394,317 @@ async def run_symbol_matrix(
         GLOBAL_PARAMS.use_supertrend_trail = orig_trail
 
 
+# -----------------------------------------------------------------------------
+# Strategy Lab
+# -----------------------------------------------------------------------------
+
+def _lab_kpis_and_split(trades: List[Dict[str, Any]], window_start_str: str, window_end_str: str) -> Dict[str, Any]:
+    kpis = calculate_kpis(trades)
+    tv = compute_tune_validate_kpis(trades, window_start_str, window_end_str)
+    return {
+        "trades": kpis["count"],
+        "win_rate": kpis["win_rate"],
+        "profit_factor": kpis["profit_factor"],
+        "max_drawdown": kpis["max_dd_money"],
+        "net_pnl": kpis["net_pnl"],
+        "expectancy": kpis["expectancy"],
+        "tune_pf": tv["tune"]["profit_factor"],
+        "tune_trades": tv["tune"]["count"],
+        "validate_pf": tv["validate"]["profit_factor"],
+        "validate_trades": tv["validate"]["count"],
+    }
+
+
+def _lab_verdict(baseline: Optional[Dict[str, Any]], variant: Dict[str, Any]) -> str:
+    """
+    Verdict for a lab variant relative to the baseline:
+      IMPROVES      PF above baseline by >= 0.05 in BOTH TUNE and VALIDATE,
+                    with >= 30 trades in each window.
+      INCONCLUSIVE  Fewer than 30 trades in either window.
+      NO            Anything else.
+    """
+    if baseline is None:
+        return "INCONCLUSIVE"
+    if variant["tune_trades"] < 30 or variant["validate_trades"] < 30:
+        return "INCONCLUSIVE"
+    if (variant["tune_pf"] >= baseline["tune_pf"] + 0.05
+            and variant["validate_pf"] >= baseline["validate_pf"] + 0.05):
+        return "IMPROVES"
+    return "NO"
+
+
+def run_lab_combination(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    precomputed: Dict[str, Any],
+    sim_start_idx: int,
+    total_bars: int,
+    filter_overrides: Dict[str, Any],
+    target_rr_value: float,
+    sm_for_filters: StrategyManager,
+    balance: float = 1000.0,
+    risk_pct: float = 1.0,
+    eurusd_df: Optional[pd.DataFrame] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Runs ONE lab variant. Always uses Adaptive · BE on · Trail off. Applies the
+    per-variant filter overrides via the strategy manager's _apply_post_filters
+    hook (which reads from GLOBAL_PARAMS). Restores GLOBAL_PARAMS on exit.
+    """
+    saved = {
+        'adaptive_mode': GLOBAL_PARAMS.adaptive_mode,
+        'use_breakeven': GLOBAL_PARAMS.use_breakeven,
+        'use_supertrend_trail': GLOBAL_PARAMS.use_supertrend_trail,
+        'target_rr': GLOBAL_PARAMS.target_rr,
+        'strat_disabled': list(getattr(GLOBAL_PARAMS, 'strat_disabled', []) or []),
+        'strat_session_window_sast': getattr(GLOBAL_PARAMS, 'strat_session_window_sast', None),
+        'strat_htf_trend_filter': getattr(GLOBAL_PARAMS, 'strat_htf_trend_filter', False),
+        'strat_min_stop_atr': getattr(GLOBAL_PARAMS, 'strat_min_stop_atr', 0.0),
+        'strat_max_spread_in_r': getattr(GLOBAL_PARAMS, 'strat_max_spread_in_r', 0.0),
+    }
+    try:
+        GLOBAL_PARAMS.adaptive_mode = True
+        GLOBAL_PARAMS.use_breakeven = True
+        GLOBAL_PARAMS.use_supertrend_trail = False
+        GLOBAL_PARAMS.target_rr = float(target_rr_value)
+
+        if 'strat_disabled' in filter_overrides:
+            GLOBAL_PARAMS.strat_disabled = list(filter_overrides['strat_disabled'])
+        if 'strat_session_window_sast' in filter_overrides:
+            GLOBAL_PARAMS.strat_session_window_sast = filter_overrides['strat_session_window_sast']
+        if 'strat_htf_trend_filter' in filter_overrides:
+            GLOBAL_PARAMS.strat_htf_trend_filter = bool(filter_overrides['strat_htf_trend_filter'])
+        if 'strat_min_stop_atr' in filter_overrides:
+            GLOBAL_PARAMS.strat_min_stop_atr = float(filter_overrides['strat_min_stop_atr'])
+        if 'strat_max_spread_in_r' in filter_overrides:
+            GLOBAL_PARAMS.strat_max_spread_in_r = float(filter_overrides['strat_max_spread_in_r'])
+
+        sim = TradeSimulator(
+            starting_balance=balance,
+            risk_pct=risk_pct,
+            eurusd_df=eurusd_df,
+            be_mode="FIXED_80",
+        )
+        cached_signals = precomputed["cached_signals"]
+        m5_times_list = m5_df['time'].tolist()
+        has_ema200_col = 'ema_200' in m5_df.columns
+
+        for i in range(sim_start_idx, total_bars):
+            curr_bar = m5_df.iloc[i]
+            curr_time = m5_times_list[i].to_pydatetime()
+
+            if sim.open_positions or sim.pending_sl_evaluations:
+                m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+                sim.process_candle(symbol, curr_bar, m5_slice)
+
+            if i not in cached_signals:
+                continue
+
+            item = cached_signals[i]
+            signal = copy.deepcopy(item["raw_signal"])
+            active_vol = item["active_vol"]
+            session_levels = item["session_levels"]
+            adr_val = item["adr_val"]
+            regime = item["regime"]
+            d1_view = item.get("d1_view")
+
+            m5_slice_for_filter = m5_df.iloc[max(0, i - 120):i + 1]
+
+            # Reuse the strategy manager's filter method.
+            reason = sm_for_filters._apply_post_filters(signal, m5_slice_for_filter, d1_view, curr_time)
+            if reason is not None:
+                continue
+
+            if not active_vol.get("valid", False):
+                continue
+
+            adapted = volatility_engine.adapt_signal(
+                signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels
+            )
+            if not adapted:
+                continue
+
+            spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+            sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+            tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+            vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+                active_vol, spread, sl_dist, tp_dist,
+                adapted.direction, adapted.entry_price, adapted.strategy
+            )
+            if not vol_ok:
+                continue
+
+            signal = adapted
+
+            has_open = any(p["symbol"] == symbol for p in sim.open_positions)
+            if not has_open:
+                ema_200_val: Optional[float] = None
+                if has_ema200_col:
+                    try:
+                        v = float(m5_df.iloc[i]['ema_200'])
+                        if not math.isnan(v):
+                            ema_200_val = v
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        ema_200_val = None
+                sim.open_trade(
+                    signal, curr_time, adr_val, regime, session_levels,
+                    ema_200_value=ema_200_val,
+                )
+
+        if len(m5_df) > 0 and len(sim.open_positions) > 0:
+            sim.close_all(symbol, m5_df.iloc[-1])
+
+        return sim.completed_trades
+    finally:
+        for k, v in saved.items():
+            setattr(GLOBAL_PARAMS, k, v)
+
+
+async def run_strategy_lab(
+    client: CTraderClient,
+    symbol: str,
+    days_count: int = 365,
+    eurusd_df: Optional[pd.DataFrame] = None,
+) -> bool:
+    """
+    Runs all 12 lab variants on the 365-day window (Adaptive · BE on · Trail off),
+    writes {SYMBOL}_lab.json to OUTPUT_DIR, and returns True on success.
+    Reuses the precompute pass across all variants.
+    """
+    print(f"[LAB] {symbol}: starting Strategy Lab on {days_count}-day window...", flush=True)
+
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        print(f"[LAB] ERROR: Incomplete data files for {symbol}. Run a normal backtest first.", flush=True)
+        return False
+
+    m5_df = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    total_bars = len(m5_df)
+
+    if total_bars < 130:
+        print(f"[LAB] ERROR: Insufficient bars for {symbol} ({total_bars} < 130).", flush=True)
+        return False
+
+    last_bar_time = m5_df['time'].iloc[-1]
+    window_cutoff = last_bar_time - timedelta(days=days_count)
+    matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
+    window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
+    window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    print(f"[LAB] {symbol}: precomputing once over {total_bars - sim_start_idx:,} candles...", flush=True)
+    precomputed = precompute_market_pass(
+        symbol=symbol,
+        m5_df=m5_df,
+        h1_df=h1_df,
+        h4_df=h4_df,
+        d1_df=d1_df,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars,
+    )
+
+    lab_file = os.path.join(OUTPUT_DIR, f"{symbol}_lab.json")
+    if os.path.exists(lab_file):
+        try:
+            os.remove(lab_file)
+        except OSError:
+            pass
+
+    sm_for_filters = StrategyManager()
+    results: List[Dict[str, Any]] = []
+    baseline_kpis: Optional[Dict[str, Any]] = None
+
+    for idx, variant in enumerate(LAB_VARIANTS):
+        label = variant["label"]
+        overrides = dict(variant["overrides"])
+        target_rr_value = float(overrides.pop("target_rr", 1.0))
+
+        print(f"[LAB] {symbol}: variant {idx + 1}/{len(LAB_VARIANTS)} — {label}", flush=True)
+        try:
+            trades = run_lab_combination(
+                symbol=symbol,
+                m5_df=m5_df,
+                precomputed=precomputed,
+                sim_start_idx=sim_start_idx,
+                total_bars=total_bars,
+                filter_overrides=overrides,
+                target_rr_value=target_rr_value,
+                sm_for_filters=sm_for_filters,
+                eurusd_df=eurusd_df,
+            )
+            kpi = _lab_kpis_and_split(trades, window_start_str, window_end_str)
+        except Exception as e:
+            print(f"[LAB] {symbol}: variant '{label}' failed: {e}", flush=True)
+            kpi = {
+                "trades": 0, "win_rate": 0.0, "profit_factor": 0.0,
+                "max_drawdown": 0.0, "net_pnl": 0.0, "expectancy": 0.0,
+                "tune_pf": 0.0, "tune_trades": 0,
+                "validate_pf": 0.0, "validate_trades": 0,
+            }
+
+        row = {"label": label, **kpi}
+        if label == "Baseline":
+            baseline_kpis = kpi
+        results.append(row)
+
+    for row in results:
+        row["verdict"] = _lab_verdict(baseline_kpis, row)
+
+    payload = {
+        "symbol": symbol,
+        "days": days_count,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "window_start": window_start_str,
+        "window_end": window_end_str,
+        "baseline_label": "Baseline",
+        "variants": results,
+    }
+    safe = sanitize_for_json(payload)
+    with open(lab_file, "w") as f:
+        json.dump(safe, f, separators=(",", ":"), allow_nan=False)
+
+    print(f"[LAB] {symbol}: saved lab results to {lab_file}", flush=True)
+    return True
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
+    parser.add_argument("--symbols", type=str, default=None,
+                        help="Comma-separated list of symbols (overrides --symbol)")
     parser.add_argument("--days", type=int, default=60)
     parser.add_argument("--rr", type=float, default=1.0, help="Target R:R multiplier")
     parser.add_argument("--mode", type=str, default=None)
     parser.add_argument("--adaptive", action="store_true", default=True)
     parser.add_argument("--breakeven", type=str, default="off")
     parser.add_argument("--supertrend", type=str, default="on")
-    parser.add_argument("--compare", action="store_true", default=False, help="Run 4-combination verification vs reference engine")
-    parser.add_argument("--prepare-only", action="store_true", default=False, help="Prepare and update market data only, then exit")
-    parser.add_argument("--skip-download", action="store_true", default=False, help="Skip downloading data and run matrix from local cache")
-    parser.add_argument("--variants", action="store_true", default=False, help="Also run Phase-3 variant combos and save <symbol>_variants.json")
-    parser.add_argument("--portfolio-only", action="store_true", default=False, help="Only compute the cross-pair correlation matrix and exit")
+    parser.add_argument("--compare", action="store_true", default=False,
+                        help="Run 4-combination verification vs reference engine")
+    parser.add_argument("--prepare-only", action="store_true", default=False,
+                        help="Prepare and update market data only, then exit")
+    parser.add_argument("--skip-download", action="store_true", default=False,
+                        help="Skip downloading data and run matrix from local cache")
+    parser.add_argument("--variants", action="store_true", default=False,
+                        help="Also run Phase-3 variant combos and save <symbol>_variants.json")
+    parser.add_argument("--portfolio-only", action="store_true", default=False,
+                        help="Only compute the cross-pair correlation matrix and exit")
+    parser.add_argument("--lab", action="store_true", default=False,
+                        help="Run Strategy Lab on the given symbol(s) and write <symbol>_lab.json")
     args = parser.parse_args()
+
+    # Resolve symbol list
+    if args.symbols:
+        symbols_list = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols_list = [args.symbol.upper()]
 
     client = CTraderClient()
 
@@ -1395,30 +1713,63 @@ async def main():
         sys.exit(0 if ok else 1)
 
     if args.prepare_only:
-        ok = await ensure_symbol_data(client, args.symbol)
-        if args.symbol.upper() == "GERMAN30":
-            await ensure_symbol_data(client, "EURUSD")
+        overall_ok = True
+        for sym in symbols_list:
+            ok = await ensure_symbol_data(client, sym)
+            if not ok:
+                overall_ok = False
+            if sym == "GERMAN30":
+                await ensure_symbol_data(client, "EURUSD")
         if client.ws:
             try:
                 await client.ws.close()
             except Exception:
                 pass
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if overall_ok else 1)
 
     if args.compare:
+        sym = symbols_list[0]
         eurusd_df: Optional[pd.DataFrame] = None
-        if args.symbol.upper() == "GERMAN30":
-            eurusd_m5_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
-            if os.path.exists(eurusd_m5_path):
-                eurusd_df = pd.read_csv(eurusd_m5_path)
-
-        res_text = compare_runs(
-            symbol=args.symbol,
-            days_count=30,
-            eurusd_df=eurusd_df
-        )
+        if sym == "GERMAN30":
+            eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+            if os.path.exists(eurusd_path):
+                eurusd_df = pd.read_csv(eurusd_path)
+        res_text = compare_runs(symbol=sym, days_count=30, eurusd_df=eurusd_df)
         return
 
+    if args.lab:
+        overall_ok = True
+        for sym in symbols_list:
+            eurusd_df: Optional[pd.DataFrame] = None
+            if sym == "GERMAN30":
+                eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+                if os.path.exists(eurusd_path):
+                    try:
+                        eurusd_df = pd.read_csv(eurusd_path)
+                    except Exception as e:
+                        print(f"[LAB] {sym}: could not load EURUSD history: {e}", flush=True)
+                        overall_ok = False
+                        continue
+                else:
+                    print(f"[LAB] {sym}: EURUSD history missing (required for GERMAN30)", flush=True)
+                    overall_ok = False
+                    continue
+            try:
+                ok = await run_strategy_lab(client, sym, days_count=365, eurusd_df=eurusd_df)
+                if not ok:
+                    overall_ok = False
+            except Exception as e:
+                print(f"[LAB] {sym}: fatal error: {e}", flush=True)
+                overall_ok = False
+
+        if client.ws:
+            try:
+                await client.ws.close()
+            except Exception:
+                pass
+        sys.exit(0 if overall_ok else 1)
+
+    # Normal backtest path (single or multi-symbol)
     usage = shutil.disk_usage(OUTPUT_DIR)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < 80.0:
@@ -1427,41 +1778,46 @@ async def main():
 
     GLOBAL_PARAMS.target_rr = args.rr
 
-    if not args.skip_download:
-        ok = await ensure_symbol_data(client, args.symbol)
-    else:
-        ok = True
-
-    eurusd_df: Optional[pd.DataFrame] = None
-    if args.symbol.upper() == "GERMAN30":
+    all_ok = True
+    for sym in symbols_list:
         if not args.skip_download:
-            eurusd_ok = await ensure_symbol_data(client, "EURUSD")
+            ok = await ensure_symbol_data(client, sym)
         else:
-            eurusd_ok = True
-        eurusd_m5_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
-        if not eurusd_ok or not os.path.exists(eurusd_m5_path):
-            print("ERROR: GERMAN30 needs EURUSD history", flush=True)
-            sys.exit(1)
-        try:
-            eurusd_df = pd.read_csv(eurusd_m5_path)
-        except Exception:
-            print("ERROR: GERMAN30 needs EURUSD history", flush=True)
-            sys.exit(1)
+            ok = True
 
-    success = False
-    if ok:
-        success = await run_symbol_matrix(
-            client, args.symbol, args.days,
-            eurusd_df=eurusd_df,
-            variants=args.variants,
-        )
+        eurusd_df: Optional[pd.DataFrame] = None
+        if sym == "GERMAN30":
+            if not args.skip_download:
+                eurusd_ok = await ensure_symbol_data(client, "EURUSD")
+            else:
+                eurusd_ok = True
+            eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+            if not eurusd_ok or not os.path.exists(eurusd_path):
+                print(f"ERROR: GERMAN30 needs EURUSD history", flush=True)
+                all_ok = False
+                continue
+            try:
+                eurusd_df = pd.read_csv(eurusd_path)
+            except Exception:
+                print(f"ERROR: GERMAN30 needs EURUSD history", flush=True)
+                all_ok = False
+                continue
 
-    # ---- Refresh the portfolio correlation whenever a pair matrix finishes ----
-    if success:
-        try:
-            write_portfolio_correlation()
-        except Exception as pe:
-            print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
+        success = False
+        if ok:
+            success = await run_symbol_matrix(
+                client, sym, args.days,
+                eurusd_df=eurusd_df,
+                variants=args.variants,
+            )
+        if not success:
+            all_ok = False
+
+    # Refresh the portfolio correlation once at the end
+    try:
+        write_portfolio_correlation()
+    except Exception as pe:
+        print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
 
     if client.ws:
         try:
@@ -1469,8 +1825,7 @@ async def main():
         except Exception:
             pass
 
-    if not ok or not success:
-        sys.exit(1)
+    sys.exit(0 if all_ok else 1)
 
 
 def print_startup_diagnostics() -> None:

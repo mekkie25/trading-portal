@@ -1,19 +1,54 @@
 """
 backtest/export_advice.py
 Rule-based suggestion and advisory engine for backtest export.
+
 Every suggestion gets an honest tag: [MEASURED $x] or [TEST NEEDED].
 No invented numbers or constant fractions.
 Every rule fires strictly when at least 30 trades are behind it.
+
+Hold-out verdict uses three states (plus an inconclusive catch-all):
+  HOLDS        VALIDATE PF >= 1.10 AND VALIDATE PF >= 70% of TUNE PF
+  FLAT         VALIDATE PF between 0.95 and 1.10
+  FAILS        VALIDATE PF < 0.95 OR VALIDATE PF < 70% of TUNE PF
+  INCONCLUSIVE Fewer than 30 trades in TUNE or VALIDATE
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+
+
+def compute_holdout_verdict(tune: Optional[Dict[str, Any]], val: Optional[Dict[str, Any]]) -> str:
+    """
+    Three-state hold-out verdict (plus INCONCLUSIVE).
+    Called from the panel, the TXT export, the PDF export and the report writer
+    so every surface agrees.
+    """
+    t_count = int((tune or {}).get("count", 0) or 0)
+    v_count = int((val or {}).get("count", 0) or 0)
+    if t_count < 30 or v_count < 30:
+        return "INCONCLUSIVE"
+
+    t_pf = float((tune or {}).get("profit_factor", 0.0) or 0.0)
+    v_pf = float((val or {}).get("profit_factor", 0.0) or 0.0)
+
+    if v_pf < 0.95 or v_pf < 0.70 * t_pf:
+        return "FAILS"
+    if v_pf < 1.10:
+        return "FLAT"
+    return "HOLDS"
+
+
+def _estimated_cost_gap_r(win_rate_pct: float, expectancy_r: float) -> float:
+    """
+    At 1:1 R:R a break-even win rate is 50%. The expected expectancy at the
+    measured win rate is (W - (1 - W)) = 2W - 1. The gap between that and the
+    measured expectancy is the estimated cost drag in R per trade.
+    """
+    w = max(0.0, min(100.0, float(win_rate_pct))) / 100.0
+    expected_at_1to1 = (w * 1.0) - ((1.0 - w) * 1.0)
+    return expected_at_1to1 - float(expectancy_r)
 
 
 def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Evaluates rule-based suggestions for an individual asset based on its summary
-    and best combination metrics. Every rule requires at least 30 trades.
-    """
     suggestions: List[Dict[str, Any]] = []
     combos = pair_data.get("combinations", [])
     best = pair_data.get("best_combination", {})
@@ -22,6 +57,9 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     symbol = pair_data.get("symbol", "")
     total_trades = best.get("total_trades", 0)
+
+    best_tv = best.get("tune_validate", {}) or {}
+    best_verdict = compute_holdout_verdict(best_tv.get("tune"), best_tv.get("validate"))
 
     # Rule 8: Unviable pair across all combinations (requires >= 30 trades on valid combos)
     valid_combos_30 = [c for c in combos if (c.get("total_trades", 0) >= 30)]
@@ -42,7 +80,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     strat_kpis = best.get("strategy_kpis", {})
 
-    # Rule 1: Strategy PF < 1.0 with net loss (fires only when strategy trades >= 30)
+    # Rule 1: Strategy PF < 1.0 with net loss
     for s_name, s_data in strat_kpis.items():
         s_count = s_data.get("count", 0)
         s_pf = s_data.get("profit_factor", 1.0)
@@ -57,7 +95,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "type": "STRATEGY_RETUNE"
             })
 
-    # Rule 2: Strategy PF >= 1.3 with net profit (fires only when strategy trades >= 30)
+    # Rule 2: Strategy PF >= 1.3 with net profit
     for s_name, s_data in strat_kpis.items():
         s_count = s_data.get("count", 0)
         s_pf = s_data.get("profit_factor", 1.0)
@@ -71,7 +109,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "type": "STRATEGY_EXPAND"
             })
 
-    # Rule 3: Weekday with negative expectancy (fires only when weekday trades >= 30)
+    # Rule 3: Weekday with negative expectancy
     dow_kpis = best.get("dow_kpis", {})
     for dow, d_data in dow_kpis.items():
         d_count = d_data.get("count", 0)
@@ -87,7 +125,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "type": "DAY_FILTER"
             })
 
-    # Rule 4: Adaptive vs Legacy comparison (fires only when both modes have >= 30 trades)
+    # Rule 4: Adaptive vs Legacy comparison
     adp_combos = [c for c in combos if c.get("mode") == "adaptive" and c.get("total_trades", 0) >= 30]
     leg_combos = [c for c in combos if c.get("mode") == "legacy" and c.get("total_trades", 0) >= 30]
     adp_cov = best.get("adaptive_effective_pct", 100.0)
@@ -117,7 +155,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "type": "MODE_SELECTION"
                 })
 
-    # Rule 5: BE and Trail recommendation (fires only when combos have >= 30 trades)
+    # Rule 5: BE and Trail recommendation
     be_off_combos = [c for c in combos if c.get("be") == "off" and c.get("total_trades", 0) >= 30]
     be_on_combos = [c for c in combos if c.get("be") == "on" and c.get("total_trades", 0) >= 30]
     if be_off_combos and be_on_combos:
@@ -154,7 +192,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "type": "BE_TUNING"
             })
 
-    # Rule 6: Skip reasons > 30% of unique setups skipped (fires only when unique skips >= 30)
+    # Rule 6: Skip reasons > 30% of unique setups skipped
     skip_summary = best.get("skipped_summary", {})
     if isinstance(skip_summary, dict):
         total_unique_skips = sum(
@@ -175,7 +213,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "type": "SKIP_TUNING"
                     })
 
-    # Rule 7: Adaptive coverage below 90% (fires only when trades >= 30)
+    # Rule 7: Adaptive coverage below 90%
     if adp_cov < 90.0:
         suggestions.append({
             "tag": "[TEST NEEDED]",
@@ -185,7 +223,76 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "type": "DATA_WARMUP"
         })
 
-    # Rank MEASURED suggestions first by dollar impact descending, then TEST NEEDED suggestions
+    # ------------------------------------------------------------------
+    # Rule 9: Estimated cost drag in R per trade
+    # ------------------------------------------------------------------
+    try:
+        wr = float(best.get("win_rate", 0.0) or 0.0)
+        exp = float(best.get("expectancy", 0.0) or 0.0)
+        gap_r = _estimated_cost_gap_r(wr, exp)
+        if gap_r > 0.07:
+            suggestions.append({
+                "tag": f"[MEASURED {gap_r:.2f}R]",
+                "text": (
+                    f"Estimated cost drag of {gap_r:.2f}R per trade on {symbol} at {wr:.1f}% win rate. "
+                    f"Add a spread filter or a minimum-stop filter on the affected strategies."
+                ),
+                "impact": 0.0,
+                "is_measured": True,
+                "type": "COST_DRAG"
+            })
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
+    # Rule 10: Trailing cuts winners without improving profit
+    # ------------------------------------------------------------------
+    try:
+        for c in combos:
+            if c.get("trail") != "off":
+                continue
+            if c.get("total_trades", 0) < 30:
+                continue
+            trail_off = c
+            trail_on = next((
+                x for x in combos
+                if x.get("mode") == trail_off.get("mode")
+                and x.get("be") == trail_off.get("be")
+                and x.get("trail") == "on"
+            ), None)
+            if not trail_on or trail_on.get("total_trades", 0) < 30:
+                continue
+            wr_drop = float(trail_off.get("win_rate", 0.0)) - float(trail_on.get("win_rate", 0.0))
+            pf_diff = abs(float(trail_on.get("profit_factor", 0.0)) - float(trail_off.get("profit_factor", 0.0)))
+            if wr_drop >= 5.0 and pf_diff < 0.05:
+                suggestions.append({
+                    "tag": "[TEST NEEDED]",
+                    "text": (
+                        f"Trailing lowers the win rate on {symbol} by {wr_drop:.1f} points "
+                        f"({trail_off.get('mode')} · BE {trail_off.get('be')}) but PF changes by only "
+                        f"{pf_diff:.2f}. Trailing is cutting winners without improving profit."
+                    ),
+                    "impact": 0.0,
+                    "is_measured": False,
+                    "type": "TRAIL_CUTTING"
+                })
+                break
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
+    # Rule 11: R:R expansion on HOLDS
+    # ------------------------------------------------------------------
+    if best_verdict == "HOLDS" and total_trades >= 30:
+        suggestions.append({
+            "tag": "[TEST NEEDED]",
+            "text": f"Test target R:R 1.5 and 2.0 on {symbol}: the best combination is HOLDS, so R:R expansion is worth testing.",
+            "impact": 0.0,
+            "is_measured": False,
+            "type": "RR_EXPANSION"
+        })
+
+    # Rank MEASURED suggestions first by dollar impact descending, then TEST NEEDED
     measured = [s for s in suggestions if s.get("is_measured", False)]
     test_needed = [s for s in suggestions if not s.get("is_measured", False)]
     measured.sort(key=lambda s: s.get("impact", 0.0), reverse=True)
@@ -215,6 +322,19 @@ def generate_portfolio_next_tests(pairs_data: List[Dict[str, Any]], all_ranked_s
     if skip_items:
         tests.append("Run simulation with loosened daily cap and spread tolerance to test whether skipped setups hold edge.")
 
-    tests.append("Test expanding target R:R from 1.0 to 1.5 on pairs demonstrating profit factor above 1.3.")
+    cost_items = [s for s in all_ranked_suggestions if s.get("type") == "COST_DRAG"]
+    if cost_items:
+        tests.append("Add a spread or minimum-stop filter on the pairs showing a measured cost drag above 0.07R per trade.")
+
+    trail_cuts = [s for s in all_ranked_suggestions if s.get("type") == "TRAIL_CUTTING"]
+    if trail_cuts:
+        tests.append("Retest with trailing disabled on the pairs where it cuts winners without improving profit factor.")
+
+    # Replaces the old hardcoded "R:R 1.5 on PF above 1.3" fallback.
+    rr_items = [s for s in all_ranked_suggestions if s.get("type") == "RR_EXPANSION"]
+    if rr_items:
+        tests.append("Test target R:R 1.5 and 2.0 on any pair whose best combination is HOLDS.")
+    else:
+        tests.append("Run the Strategy Lab on the pairs with the highest PF to find a variant that holds out.")
 
     return tests[:5]

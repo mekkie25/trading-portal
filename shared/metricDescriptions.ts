@@ -149,21 +149,35 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   col_holdout_verdict: {
     title: 'Hold-out Verdict',
     description:
-      'Summary of whether the TUNE edge survived on VALIDATE. HOLD-OUT FAIL means it did not.',
+      'Three-state summary of whether the TUNE edge survived on VALIDATE. HOLDS is good, FLAT is neutral, FAILS is bad.',
     howToRead:
-      'Any HOLD-OUT FAIL on the best combination should trigger a retune, not a promote.',
+      'Only treat HOLDS as a go signal. FLAT means no real edge either way; FAILS means do not promote.',
   },
-  tag_hold_out_fail: {
-    title: 'HOLD-OUT FAIL',
+  tag_holds: {
+    title: 'HOLDS',
     description:
-      'Strategy looked good on TUNE but collapsed on VALIDATE. The edge is unproven until this is fixed.',
+      'VALIDATE profit factor is at least 1.10 and at least 70% of the TUNE profit factor. The edge survived on unseen data.',
     howToRead:
-      'Retune on the TUNE window, rerun, and only promote if VALIDATE holds.',
+      'This is the only verdict that supports promoting a combination into live rules.',
+  },
+  tag_flat: {
+    title: 'FLAT',
+    description:
+      'VALIDATE profit factor sits between 0.95 and 1.10. FLAT means no real edge either way — the strategy is neither winning nor losing on unseen data.',
+    howToRead:
+      'Do not promote a FLAT combination to live. Rerun the Strategy Lab to find a variant that holds out.',
+  },
+  tag_fails: {
+    title: 'FAILS',
+    description:
+      'VALIDATE profit factor fell below 0.95, or below 70% of the TUNE profit factor. The edge collapsed on unseen data.',
+    howToRead:
+      'Retune on the TUNE window, rerun, and only promote if the verdict becomes HOLDS.',
   },
   tag_inconclusive: {
     title: 'INCONCLUSIVE',
     description:
-      'Fewer than 30 trades in the relevant window. Not enough data for a statistically meaningful claim.',
+      'Fewer than 30 trades in TUNE or VALIDATE. Not enough data for a hold-out claim.',
     howToRead:
       'Do not draw conclusions. Either extend the window or accept that the sample is thin.',
   },
@@ -188,7 +202,7 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   sec_diagnostics: {
     title: 'Blueprint Diagnostics',
     description:
-      'Post-hoc analytics on the trade list: hourly expectancy, session rollover, ATR tiers, streaks, Monte Carlo, slippage sensitivity and more.',
+      'Post-hoc analytics on the trade list: hourly expectancy, session rollover, ATR tiers, streaks, Monte Carlo, slippage sensitivity, BE variants, parameter sweep.',
     howToRead:
       'Scan the four biggest cards first: hour matrix, streak analysis, Monte Carlo, slippage sensitivity. They usually drive the next change.',
   },
@@ -209,7 +223,7 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   sec_tips: {
     title: 'Actionable Improvement Tips',
     description:
-      'Rule-based suggestions triggered directly from the trade list: near-TP reversals, noise stop-outs, bad hours, bad weekdays and unviable pairs.',
+      'Rule-based suggestions triggered directly from the trade list: near-TP reversals, noise stop-outs, bad hours, bad weekdays, cost drag and unviable pairs.',
     howToRead:
       'Focus on the HIGH severity tips first. Each is derived only from trades in this run.',
   },
@@ -227,9 +241,16 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
     howToRead:
       'Filter by strategy or outcome. Use it to spot size or timing anomalies in the raw data.',
   },
+  sec_strategy_lab: {
+    title: 'Strategy Lab',
+    description:
+      'One button per pair. Runs the winning baseline combination plus ten single-setting variants on the 365-day window with the same TUNE/VALIDATE split, then labels each variant IMPROVES, NO or INCONCLUSIVE.',
+    howToRead:
+      'Only variants tagged IMPROVES are worth promoting. IMPROVES needs PF above the baseline by at least 0.05 in both TUNE and VALIDATE with at least 30 trades in each.',
+  },
 
   // ---------------------------------------------------------------------------
-  // SKIP REASONS (surfaced in the skipped-signal summary)
+  // SKIP REASONS
   // ---------------------------------------------------------------------------
   skip_daily_cap: {
     title: 'DAILY_CAP',
@@ -300,6 +321,41 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
       'Trade was skipped because TP1 / TP2 / TP3 could not be enforced in strict order.',
     howToRead:
       'A strategy is emitting targets that do not progress. Rare and usually fixable.',
+  },
+  skip_filter_disabled: {
+    title: 'FILTER_DISABLED',
+    description:
+      'Backtest-only filter. The strategy is listed in strat_disabled, so all of its signals are dropped during the backtest.',
+    howToRead:
+      'Only fires when you have explicitly disabled a strategy in the Strategy Lab.',
+  },
+  skip_filter_session: {
+    title: 'FILTER_SESSION',
+    description:
+      'Backtest-only filter. The signal fired outside the SAST session window set by strat_session_window_sast.',
+    howToRead:
+      'A large count here means the strategy is very active outside the hours you want to trade.',
+  },
+  skip_filter_htf: {
+    title: 'FILTER_HTF',
+    description:
+      'Backtest-only filter. The higher-timeframe trend (last closed D1 close vs its 20 EMA) is against the direction of the signal.',
+    howToRead:
+      'If this drops most trades, the strategy is fighting the daily trend on this pair.',
+  },
+  skip_filter_min_stop: {
+    title: 'FILTER_MIN_STOP',
+    description:
+      'Backtest-only filter. The stop distance was below the configured multiple of the 14-period 5-minute ATR.',
+    howToRead:
+      'Protects against FX stops that are too small relative to intrabar noise and spread.',
+  },
+  skip_filter_cost: {
+    title: 'FILTER_COST',
+    description:
+      'Backtest-only filter. The spread divided by the stop distance exceeds strat_max_spread_in_r. The trade would be paying too much in costs relative to the risk.',
+    howToRead:
+      'The measured cost-drag rule already flags this at the pair level. This filter drops the affected signals.',
   },
 
   // ---------------------------------------------------------------------------
