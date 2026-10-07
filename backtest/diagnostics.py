@@ -29,13 +29,15 @@ Blueprint coverage:
     Section 5 item 25 - daily execution caps (1 / 2 / 4 / unlimited)
     Section 7 item 33 - daily maximum drawdown cutoff simulation
     Section 7 item 34 - slippage sensitivity curve (1-5 pips)
+    Section 5 item 22 - break-even variant estimates (A/B/C)
+    Section 6 item 30 - parameter sensitivity (target R:R sweep)
 """
 
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any
 
-DIAGNOSTICS_VERSION = "3.0"
+DIAGNOSTICS_VERSION = "4.0"
 
 SESSION_ROLLOVER_WINDOWS = [
     ("London Open",    7, 45,  8, 15),
@@ -43,8 +45,6 @@ SESSION_ROLLOVER_WINDOWS = [
     ("Daily Rollover",20, 45, 21, 15),
 ]
 
-# Local pip-size lookup - self-contained so this module never has to import
-# from backtest.simulator (avoids any circular import risk).
 _PIP_SIZES = {
     "GOLD": 0.01, "US30": 1.0, "NAS100": 0.1, "GERMAN30": 0.1,
     "EURUSD": 0.0001, "USDJPY": 0.01, "GBPUSD": 0.0001,
@@ -54,11 +54,8 @@ _PIP_SIZES = {
 def _kpis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not trades:
         return {
-            "count": 0,
-            "win_rate": 0.0,
-            "expectancy": 0.0,
-            "profit_factor": 0.0,
-            "net_pnl": 0.0,
+            "count": 0, "win_rate": 0.0, "expectancy": 0.0,
+            "profit_factor": 0.0, "net_pnl": 0.0,
         }
 
     wins = [t for t in trades if t.get("result") == "WIN"]
@@ -69,10 +66,7 @@ def _kpis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     net = sum(float(t.get("money_pnl", 0.0)) for t in trades)
     wr = (len(wins) / len(trades)) * 100.0
 
-    if gross_loss > 0:
-        pf = gross_win / gross_loss
-    else:
-        pf = 99.0 if gross_win > 0 else 0.0
+    pf = (gross_win / gross_loss) if gross_loss > 0 else (99.0 if gross_win > 0 else 0.0)
 
     wins_r = [float(t.get("r_multiple", 0.0)) for t in wins]
     losses_r = [abs(float(t.get("r_multiple", 0.0))) for t in losses]
@@ -89,8 +83,8 @@ def _kpis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _hourly_matrix(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    hourly: Dict[int, List[Dict[str, Any]]] = {}
+def _hourly_matrix(trades):
+    hourly = {}
     for t in trades:
         ts = t.get("signal_time_sast")
         if not ts:
@@ -103,9 +97,8 @@ def _hourly_matrix(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(h): _kpis(v) for h, v in sorted(hourly.items())}
 
 
-def _session_rollover(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    in_window: List[Dict[str, Any]] = []
-    out_window: List[Dict[str, Any]] = []
+def _session_rollover(trades):
+    in_window, out_window = [], []
     for t in trades:
         ts = t.get("signal_time_sast")
         if not ts:
@@ -126,8 +119,8 @@ def _session_rollover(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
     return {"in_transition": _kpis(in_window), "out_of_transition": _kpis(out_window)}
 
 
-def _atr_tier(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    tiers: Dict[str, List[Dict[str, Any]]] = {"LOW": [], "NORMAL": [], "HIGH": [], "UNKNOWN": []}
+def _atr_tier(trades):
+    tiers = {"LOW": [], "NORMAL": [], "HIGH": [], "UNKNOWN": []}
     for t in trades:
         regime = str(t.get("regime", "UNKNOWN") or "UNKNOWN").upper()
         if regime not in tiers:
@@ -136,9 +129,9 @@ def _atr_tier(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {k: _kpis(v) for k, v in tiers.items()}
 
 
-def _streak_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _streak_analysis(trades):
     ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
-    streaks: List[int] = []
+    streaks = []
     cur = 0
     for t in ordered:
         if t.get("result") == "LOSS":
@@ -307,7 +300,7 @@ def _buy_and_hold(m5_df, sim_start_idx, starting_equity, strategy_net_pnl):
 # Phase-2 diagnostics
 # ==============================================================================
 
-def _post_sl_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _post_sl_analysis(trades):
     sl_exits = [
         t for t in trades
         if isinstance(t, dict)
@@ -316,10 +309,8 @@ def _post_sl_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
 
     if not sl_exits:
-        return {
-            "count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
-            "recovered_count": 0, "recovered_pct": 0.0,
-        }
+        return {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
+                "recovered_count": 0, "recovered_pct": 0.0}
 
     pips = np.array([float(t.get("post_sl_cont_pips", 0.0)) for t in sl_exits], dtype=float)
     recovered = [t for t in sl_exits if t.get("recovered_to_tp", False)]
@@ -334,7 +325,7 @@ def _post_sl_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _post_tp_analysis(trades):
     tp_exits = [
         t for t in trades
         if isinstance(t, dict)
@@ -343,10 +334,8 @@ def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
 
     if not tp_exits:
-        return {
-            "count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
-            "avg_missed_r": 0.0,
-        }
+        return {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
+                "avg_missed_r": 0.0}
 
     pips = np.array([float(t.get("post_tp_extra_pips", 0.0)) for t in tp_exits], dtype=float)
 
@@ -368,12 +357,10 @@ def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _premature_be_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _premature_be_analysis(trades):
     if not trades:
-        return {
-            "total_be_moved": 0, "premature_count": 0, "premature_pct": 0.0,
-            "total_missed_r": 0.0, "avg_missed_r": 0.0,
-        }
+        return {"total_be_moved": 0, "premature_count": 0, "premature_pct": 0.0,
+                "total_missed_r": 0.0, "avg_missed_r": 0.0}
 
     be_moved = [t for t in trades if t.get("is_be_moved", False)]
     premature = [t for t in be_moved if t.get("premature_be_exit", False)]
@@ -391,51 +378,31 @@ def _premature_be_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _ema_200_alignment(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    aligned: List[Dict[str, Any]] = []
-    counter: List[Dict[str, Any]] = []
-    unknown: List[Dict[str, Any]] = []
-
+def _ema_200_alignment(trades):
+    aligned, counter, unknown = [], [], []
     for t in trades:
-        alignment = t.get("alignment_200ema", "UNKNOWN")
-        if alignment in ("BULLISH_ALIGNED", "BEARISH_ALIGNED"):
+        a = t.get("alignment_200ema", "UNKNOWN")
+        if a in ("BULLISH_ALIGNED", "BEARISH_ALIGNED"):
             aligned.append(t)
-        elif alignment == "COUNTER_TREND":
+        elif a == "COUNTER_TREND":
             counter.append(t)
         else:
             unknown.append(t)
-
-    return {
-        "aligned": _kpis(aligned),
-        "counter_trend": _kpis(counter),
-        "unknown": _kpis(unknown),
-    }
+    return {"aligned": _kpis(aligned), "counter_trend": _kpis(counter), "unknown": _kpis(unknown)}
 
 
-def _confirmation_type_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    close: List[Dict[str, Any]] = []
-    touch: List[Dict[str, Any]] = []
-
+def _confirmation_type_analysis(trades):
+    close, touch = [], []
     for t in trades:
         ct = str(t.get("confirmation_type", "CLOSE")).upper()
-        if ct == "TOUCH":
-            touch.append(t)
-        else:
-            close.append(t)
-
+        (touch if ct == "TOUCH" else close).append(t)
     return {"close": _kpis(close), "touch": _kpis(touch)}
 
 
-def _news_window_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    in_news: List[Dict[str, Any]] = []
-    out_news: List[Dict[str, Any]] = []
-
+def _news_window_analysis(trades):
+    in_news, out_news = [], []
     for t in trades:
-        if t.get("is_in_news_window", False):
-            in_news.append(t)
-        else:
-            out_news.append(t)
-
+        (in_news if t.get("is_in_news_window", False) else out_news).append(t)
     return {"in_news": _kpis(in_news), "out_of_news": _kpis(out_news)}
 
 
@@ -443,12 +410,7 @@ def _news_window_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 # Phase-3 / Phase-4 diagnostics
 # ==============================================================================
 
-def _position_sizing_comparison(
-    trades: List[Dict[str, Any]],
-    starting_equity: float = 1000.0,
-    risk_pct: float = 1.0,
-) -> Dict[str, Any]:
-    """Section 5 item 24 - fixed lots vs compounding % of current equity."""
+def _position_sizing_comparison(trades, starting_equity=1000.0, risk_pct=1.0):
     ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
     if not ordered:
         return {
@@ -470,39 +432,22 @@ def _position_sizing_comparison(
         comp_eq += r * risk_cash
 
     return {
-        "fixed": {
-            "net_pnl": round(fixed_eq - starting_equity, 2),
-            "final_equity": round(fixed_eq, 2),
-        },
-        "compounding": {
-            "net_pnl": round(comp_eq - starting_equity, 2),
-            "final_equity": round(comp_eq, 2),
-        },
+        "fixed": {"net_pnl": round(fixed_eq - starting_equity, 2),
+                  "final_equity": round(fixed_eq, 2)},
+        "compounding": {"net_pnl": round(comp_eq - starting_equity, 2),
+                        "final_equity": round(comp_eq, 2)},
         "difference": round(comp_eq - fixed_eq, 2),
     }
 
 
-def _daily_cap_comparison(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Section 5 item 25 - simulate tighter daily caps.
-
-    NOTE: the simulator's own cap already limited how many trades were taken.
-    This panel therefore only shows the effect of a TIGHTER cap than the run
-    used. The "unlimited" column is what the run actually produced and
-    functions as a comparison baseline.
-    """
+def _daily_cap_comparison(trades):
     ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
     if not ordered:
         empty = _kpis([])
-        return {
-            "cap_1": empty, "cap_2": empty, "cap_4": empty,
-            "unlimited": empty,
-        }
+        return {"cap_1": empty, "cap_2": empty, "cap_4": empty, "unlimited": empty}
 
-    per_day_count: Dict[str, int] = {}
-    buckets: Dict[str, List[Dict[str, Any]]] = {
-        "cap_1": [], "cap_2": [], "cap_4": [], "unlimited": []
-    }
+    per_day_count = {}
+    buckets = {"cap_1": [], "cap_2": [], "cap_4": [], "unlimited": []}
 
     for t in ordered:
         day = t.get("date_sast") or t.get("date") or ""
@@ -519,19 +464,12 @@ def _daily_cap_comparison(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {k: _kpis(v) for k, v in buckets.items()}
 
 
-def _daily_dd_cutoff(
-    trades: List[Dict[str, Any]],
-    starting_equity: float = 1000.0,
-    cutoff_pct: float = 5.0,
-    risk_pct: float = 1.0,
-) -> Dict[str, Any]:
-    """Section 7 item 33 - what if the day halts once daily loss exceeds cutoff_pct?"""
+def _daily_dd_cutoff(trades, starting_equity=1000.0, cutoff_pct=5.0, risk_pct=1.0):
     ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
     if not ordered:
         return {
             "cutoff_pct": cutoff_pct, "days_triggered": 0, "trades_blocked": 0,
-            "original_net_pnl": 0.0, "cutoff_net_pnl": 0.0,
-            "protection_delta": 0.0,
+            "original_net_pnl": 0.0, "cutoff_net_pnl": 0.0, "protection_delta": 0.0,
         }
 
     orig_eq = starting_equity
@@ -578,18 +516,13 @@ def _daily_dd_cutoff(
     }
 
 
-def _slippage_sensitivity(
-    trades: List[Dict[str, Any]],
-    slippage_range=(1, 2, 3, 4, 5),
-    starting_equity: float = 1000.0,
-    risk_pct: float = 1.0,
-) -> Dict[str, Any]:
-    """Section 7 item 34 - degrade each trade by N pips of entry + exit slippage."""
+def _slippage_sensitivity(trades, slippage_range=(1, 2, 3, 4, 5),
+                          starting_equity=1000.0, risk_pct=1.0):
     if not trades:
         return {}
 
     baseline_net = sum(float(t.get("money_pnl", 0.0)) for t in trades)
-    results: Dict[str, Any] = {
+    results = {
         "baseline": {"slippage_pips": 0, "net_pnl": round(baseline_net, 2),
                      "win_rate": round(_kpis(trades)["win_rate"], 1)}
     }
@@ -636,19 +569,132 @@ def _slippage_sensitivity(
 
 
 # ==============================================================================
+# NEW (this pass): break-even variant estimates (A/B/C) and parameter sensitivity
+# ==============================================================================
+
+def _breakeven_variants(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Post-hoc ESTIMATE, not a re-simulation.
+
+    A_current    : what actually happened in the run.
+    B_no_be      : BE never moves. Every trade that reached MFE >= TP distance
+                   would have hit TP; others would have exited at their SL.
+    C_delayed_be : BE only moves after MFE >= 1.0R. Trades that reached at least
+                   1.0R are marked risk-free. Above 1.0R, the winner is capped
+                   at 1.0R (a conservative estimate), losers unchanged.
+
+    All three are ranked by total R contribution.
+    """
+    if not trades:
+        empty = _kpis([])
+        return {"A_current": empty, "B_no_be": empty, "C_delayed_be": empty,
+                "best_variant": "A_current", "verdict": "NO_DATA"}
+
+    a_r = 0.0
+    b_r = 0.0
+    c_r = 0.0
+    a_n = b_n = c_n = 0
+
+    for t in trades:
+        sl_d = abs(float(t.get("entry_price", 0.0)) - float(t.get("sl", 0.0)))
+        if sl_d <= 0:
+            continue
+        tp = float(t.get("tp", 0.0))
+        entry = float(t.get("entry_price", 0.0))
+        tp_dist = abs(tp - entry) if tp > 0 else 0.0
+        tp_r = (tp_dist / sl_d) if sl_d > 0 else 0.0
+
+        mfe_r = float(t.get("mfe_r", 0.0))
+        actual_r = float(t.get("r_multiple", 0.0))
+
+        a_r += actual_r
+        a_n += 1
+
+        # B: never moved to BE
+        if tp_r > 0 and mfe_r >= tp_r:
+            b_r += tp_r
+        else:
+            b_r += -1.0
+        b_n += 1
+
+        # C: BE only after MFE >= 1.0R
+        if mfe_r >= 1.0 and actual_r > 0.0:
+            c_r += min(actual_r, 1.0)
+        elif mfe_r >= 1.0 and actual_r <= 0.0:
+            c_r += 0.0  # would have been risk-free at worst
+        else:
+            c_r += actual_r
+        c_n += 1
+
+    variants = {
+        "A_current":    {"count": a_n, "total_r": round(a_r, 2), "avg_r": round(a_r / max(a_n, 1), 3)},
+        "B_no_be":      {"count": b_n, "total_r": round(b_r, 2), "avg_r": round(b_r / max(b_n, 1), 3)},
+        "C_delayed_be": {"count": c_n, "total_r": round(c_r, 2), "avg_r": round(c_r / max(c_n, 1), 3)},
+    }
+    best = max(("A_current", "B_no_be", "C_delayed_be"), key=lambda k: variants[k]["total_r"])
+    verdict = {
+        "A_current":    "Current break-even rule is best of the three.",
+        "B_no_be":      "Never moving to BE would have produced more R. Consider disabling BE.",
+        "C_delayed_be": "Waiting for a full R before moving to BE would have produced more R. Consider the STRUCTURAL variant.",
+    }[best]
+    return {"A_current": variants["A_current"], "B_no_be": variants["B_no_be"],
+            "C_delayed_be": variants["C_delayed_be"],
+            "best_variant": best, "verdict": verdict}
+
+
+def _parameter_sensitivity(
+    trades: List[Dict[str, Any]],
+    rrs=(0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    starting_equity: float = 1000.0,
+    risk_pct: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Post-hoc ESTIMATE, not a re-simulation.
+
+    Winners scale linearly with the new R:R (capped by their actual MFE in R).
+    Losers keep their realised R because the stop distance is unchanged.
+    The peak of the sweep tells you where the target was best matched to MFE.
+    """
+    if not trades:
+        return {"sweep": [], "best_rr": 0.0, "best_net_pnl": 0.0, "verdict": "NO_DATA"}
+
+    sweep = []
+    for rr in rrs:
+        net_r = 0.0
+        n = 0
+        for t in trades:
+            actual_r = float(t.get("r_multiple", 0.0))
+            mfe_r = float(t.get("mfe_r", 0.0))
+            if actual_r > 0:
+                # Winner: capped by how far the winner actually ran.
+                net_r += min(rr, mfe_r) if mfe_r > 0 else rr
+            else:
+                # Loser: unchanged.
+                net_r += actual_r
+            n += 1
+
+        net_cash = net_r * (starting_equity * (risk_pct / 100.0))
+        sweep.append({
+            "rr": float(rr),
+            "total_r": round(net_r, 2),
+            "net_pnl": round(net_cash, 2),
+            "count": n,
+        })
+
+    best = max(sweep, key=lambda x: x["total_r"]) if sweep else {"rr": 0.0, "net_pnl": 0.0}
+    return {
+        "sweep": sweep,
+        "best_rr": best["rr"],
+        "best_net_pnl": best["net_pnl"],
+        "verdict": f"Peak of the sweep at R:R 1:{best['rr']:.2f}.",
+    }
+
+
+# ==============================================================================
 # Master entry point
 # ==============================================================================
 
-def compute_diagnostics(
-    trades: List[Dict[str, Any]],
-    m5_df: pd.DataFrame,
-    sim_start_idx: int,
-    starting_equity: float = 1000.0,
-) -> Dict[str, Any]:
-    """
-    Master entry point. Safe to call on any trade list (including empty).
-    Returns a JSON-safe dict consumed by the frontend Diagnostics tab.
-    """
+def compute_diagnostics(trades, m5_df, sim_start_idx, starting_equity=1000.0):
     valid = [
         t for t in trades
         if isinstance(t, dict) and t.get("result") in ("WIN", "LOSS", "BREAKEVEN")
@@ -665,21 +711,21 @@ def compute_diagnostics(
                                 "streak_count": 0, "recovery_trades_from_peak_dd": 0,
                                 "peak_drawdown": 0.0},
             "circuit_breaker_sim": {"original_net_pnl": 0.0, "simulated_net_pnl": 0.0,
-                                     "trades_halved": 0, "protection_delta": 0.0},
+                                    "trades_halved": 0, "protection_delta": 0.0},
             "outlier_removal": {"full": empty_kpi, "trimmed": empty_kpi,
-                                 "outlier_count": 0, "impact_pct": 0.0},
+                                "outlier_count": 0, "impact_pct": 0.0},
             "monte_carlo": {"iterations": 0, "median_max_dd": 0.0, "p5_max_dd": 0.0,
-                             "p95_max_dd": 0.0, "median_final_equity": starting_equity,
-                             "prob_positive": 0.0},
+                            "p95_max_dd": 0.0, "median_final_equity": starting_equity,
+                            "prob_positive": 0.0},
             "buy_and_hold": {"first_close": 0.0, "last_close": 0.0, "bh_return_pct": 0.0,
-                              "bh_net_pnl": 0.0, "strategy_net_pnl": 0.0,
-                              "alpha": 0.0, "verdict": "INSUFFICIENT_DATA"},
+                             "bh_net_pnl": 0.0, "strategy_net_pnl": 0.0,
+                             "alpha": 0.0, "verdict": "INSUFFICIENT_DATA"},
             "post_sl": {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
                         "recovered_count": 0, "recovered_pct": 0.0},
             "post_tp": {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
                         "avg_missed_r": 0.0},
             "premature_be": {"total_be_moved": 0, "premature_count": 0, "premature_pct": 0.0,
-                              "total_missed_r": 0.0, "avg_missed_r": 0.0},
+                             "total_missed_r": 0.0, "avg_missed_r": 0.0},
             "ema_200_alignment": {"aligned": empty_kpi, "counter_trend": empty_kpi, "unknown": empty_kpi},
             "confirmation_type": {"close": empty_kpi, "touch": empty_kpi},
             "news_window": {"in_news": empty_kpi, "out_of_news": empty_kpi},
@@ -696,6 +742,11 @@ def compute_diagnostics(
                 "original_net_pnl": 0.0, "cutoff_net_pnl": 0.0, "protection_delta": 0.0,
             },
             "slippage_sensitivity": {},
+            "breakeven_variants": {"A_current": empty_kpi, "B_no_be": empty_kpi,
+                                    "C_delayed_be": empty_kpi, "best_variant": "A_current",
+                                    "verdict": "NO_DATA"},
+            "parameter_sensitivity": {"sweep": [], "best_rr": 0.0, "best_net_pnl": 0.0,
+                                       "verdict": "NO_DATA"},
         }
 
     full_kpis = _kpis(valid)
@@ -724,4 +775,7 @@ def compute_diagnostics(
         "daily_cap_comparison": _daily_cap_comparison(valid),
         "daily_dd_cutoff": _daily_dd_cutoff(valid, starting_equity=starting_equity),
         "slippage_sensitivity": _slippage_sensitivity(valid, starting_equity=starting_equity),
+        # NEW in this pass
+        "breakeven_variants": _breakeven_variants(valid),
+        "parameter_sensitivity": _parameter_sensitivity(valid, starting_equity=starting_equity),
     }

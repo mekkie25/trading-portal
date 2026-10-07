@@ -2,9 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import os from 'os';
 import { createServer as createViteServer } from 'vite';
 import { spawn, ChildProcess } from 'child_process';
+import { METRIC_DESCRIPTIONS, describe } from './shared/metricDescriptions';
 
 interface BotGatewayConfig {
   masterExecution: boolean;
@@ -82,6 +82,52 @@ interface BrokerTelemetry {
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
+
+/**
+ * The 38-item Master Backtester Specification coverage map.
+ * Used by the TXT export to explicitly list what is and is not implemented.
+ * 'panel' / 'txt' / 'pdf' reflect whether the item is currently surfaced.
+ */
+const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boolean; pdf: boolean; note?: string }> = [
+  { id: 1,  label: 'Warm-up and history window',                panel: true,  txt: true,  pdf: true },
+  { id: 2,  label: 'Zero-lookahead bar reconstruction',         panel: true,  txt: true,  pdf: true },
+  { id: 3,  label: 'MFE / MAE per trade',                       panel: true,  txt: true,  pdf: true },
+  { id: 4,  label: 'Profit-first flag',                         panel: false, txt: true,  pdf: true,  note: 'Field exists in trade list, not shown in panel.' },
+  { id: 5,  label: 'Post-SL noise recovery',                    panel: true,  txt: true,  pdf: true },
+  { id: 6,  label: 'Post-TP extra movement',                    panel: true,  txt: true,  pdf: true },
+  { id: 7,  label: 'Premature BE detection',                    panel: true,  txt: true,  pdf: true },
+  { id: 8,  label: 'Structural BE variant',                     panel: true,  txt: true,  pdf: true },
+  { id: 9,  label: 'EMA-9 / EMA-25 trail variants',             panel: true,  txt: true,  pdf: true },
+  { id: 10, label: 'Fixed R:R target with structural room',      panel: true,  txt: true,  pdf: true },
+  { id: 11, label: 'Twin-lot vs single-lot execution',          panel: false, txt: true,  pdf: false, note: 'Simulator now uses single order only.' },
+  { id: 12, label: 'Adaptive ADR stop clamping',                panel: true,  txt: true,  pdf: true },
+  { id: 13, label: 'Structural target capping',                 panel: true,  txt: true,  pdf: true },
+  { id: 14, label: 'Min R:R filter',                            panel: true,  txt: true,  pdf: true },
+  { id: 15, label: 'Monotonic TP ordering',                     panel: true,  txt: true,  pdf: true },
+  { id: 16, label: 'Post-SL continuation distance',             panel: true,  txt: true,  pdf: true },
+  { id: 17, label: 'Post-TP extra pips',                        panel: true,  txt: true,  pdf: true },
+  { id: 18, label: 'Premature BE exit rate',                    panel: true,  txt: true,  pdf: true },
+  { id: 19, label: '24-hour hourly expectancy matrix',           panel: true,  txt: true,  pdf: true },
+  { id: 20, label: 'Day-of-week performance table',              panel: true,  txt: true,  pdf: true },
+  { id: 21, label: 'Session-rollover friction',                  panel: true,  txt: true,  pdf: true },
+  { id: 22, label: 'Break-even variant comparison (A/B/C)',      panel: true,  txt: true,  pdf: true },
+  { id: 23, label: 'Trail variant comparison',                   panel: true,  txt: true,  pdf: true },
+  { id: 24, label: 'Position sizing comparison',                 panel: true,  txt: true,  pdf: true },
+  { id: 25, label: 'Daily execution cap comparison',             panel: true,  txt: true,  pdf: true },
+  { id: 26, label: 'ATR volatility tiering',                     panel: true,  txt: true,  pdf: true },
+  { id: 27, label: '200 EMA alignment differential',             panel: true,  txt: true,  pdf: true },
+  { id: 28, label: 'Confirmation type (close vs touch)',         panel: true,  txt: true,  pdf: true },
+  { id: 29, label: 'News-window slippage profiling',             panel: true,  txt: true,  pdf: true },
+  { id: 30, label: 'Portfolio correlation matrix',               panel: true,  txt: true,  pdf: true },
+  { id: 31, label: 'Consecutive loss streak & recovery',         panel: true,  txt: true,  pdf: true },
+  { id: 32, label: 'Circuit-breaker simulation',                 panel: true,  txt: true,  pdf: true },
+  { id: 33, label: 'Daily max-drawdown cutoff simulation',       panel: true,  txt: true,  pdf: true },
+  { id: 34, label: 'Slippage sensitivity curve',                 panel: true,  txt: true,  pdf: true },
+  { id: 35, label: 'Parameter sensitivity sweep',                panel: true,  txt: true,  pdf: true },
+  { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
+  { id: 37, label: 'Monte Carlo resampling',                     panel: true,  txt: true,  pdf: true },
+  { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
+];
 
 const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
 if (!fs.existsSync(DATA_DIR)) {
@@ -245,6 +291,27 @@ let activeBrokerTelemetry: BrokerTelemetry = {
 let botRestartTimestamps: number[] = [];
 let botCrashLoopWarned = false;
 
+function safeReadJson(filePath: string): any | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf8').trim();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function holdoutVerdict(tune: any, val: any): string {
+  const tCount = tune?.count ?? 0;
+  const vCount = val?.count ?? 0;
+  if (tCount < 30 || vCount < 30) return 'INCONCLUSIVE';
+  const tPf = tune?.profit_factor ?? 0;
+  const vPf = val?.profit_factor ?? 0;
+  if (vPf < 1.0 || vPf < 0.7 * tPf) return 'HOLD-OUT FAIL';
+  return 'PASS';
+}
+
 function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> {
   const suggestions: Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> = [];
   const combos: any[] = pairPayload.combinations || [];
@@ -269,58 +336,32 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     const tv = c.tune_validate || {};
     const tune = tv.tune || {};
     const val = tv.validate || {};
-    const tuneCnt = tune.count || 0;
-    const valCnt = val.count || 0;
-    if (tuneCnt >= 30 && valCnt >= 30) {
-      const tunePf = tune.profit_factor || 0;
-      const valPf = val.profit_factor || 0;
-      if (valPf < 1.0 || valPf < 0.7 * tunePf) {
-        const loss = Math.abs(val.net_pnl || 0);
-        suggestions.push({
-          tag: `[MEASURED $${loss.toFixed(2)}]`,
-          text: `Combination '${c.label}' on ${symbol} does not hold on unseen data: TUNE PF ${tunePf.toFixed(2)} -> VALIDATE PF ${valPf.toFixed(2)} (TUNE ${tuneCnt} trades / VALIDATE ${valCnt} trades).`,
-          impact: Number(loss.toFixed(2)),
-          is_measured: true,
-          type: 'HOLD_OUT_FAIL'
-        });
-      }
-    } else if (tuneCnt > 0 || valCnt > 0) {
+    const verdict = holdoutVerdict(tune, val);
+    if (verdict === 'HOLD-OUT FAIL') {
+      const loss = Math.abs(val.net_pnl || 0);
       suggestions.push({
-        tag: '[INCONCLUSIVE]',
-        text: `Combination '${c.label}' on ${symbol} hold-out: TUNE ${tuneCnt} trades, VALIDATE ${valCnt} trades. Both need >= 30 for a valid hold-out test.`,
-        impact: 0.0,
-        is_measured: false,
-        type: 'HOLD_OUT_INCONCLUSIVE'
+        tag: `[MEASURED $${loss.toFixed(2)}]`,
+        text: `Combination '${c.label}' on ${symbol} does not hold on unseen data: TUNE PF ${(tune.profit_factor || 0).toFixed(2)} -> VALIDATE PF ${(val.profit_factor || 0).toFixed(2)} (TUNE ${tune.count || 0} trades / VALIDATE ${val.count || 0} trades).`,
+        impact: Number(loss.toFixed(2)),
+        is_measured: true,
+        type: 'HOLD_OUT_FAIL'
       });
     }
   });
 
   const stratTv: Record<string, any> = best.strategy_tune_validate || {};
-  Object.entries(stratTv).forEach(([sName, tvRow]) => {
-    const tune = (tvRow as any).tune || {};
-    const val = (tvRow as any).validate || {};
-    const tuneCnt = tune.count || 0;
-    const valCnt = val.count || 0;
-    if (tuneCnt >= 30 && valCnt >= 30) {
-      const tunePf = tune.profit_factor || 0;
-      const valPf = val.profit_factor || 0;
-      if (valPf < 1.0 || valPf < 0.7 * tunePf) {
-        const loss = Math.abs(val.net_pnl || 0);
-        suggestions.push({
-          tag: `[MEASURED $${loss.toFixed(2)}]`,
-          text: `${sName} on ${symbol} does not hold on unseen data: TUNE PF ${tunePf.toFixed(2)} -> VALIDATE PF ${valPf.toFixed(2)} (TUNE ${tuneCnt} / VALIDATE ${valCnt}).`,
-          impact: Number(loss.toFixed(2)),
-          is_measured: true,
-          type: 'HOLD_OUT_FAIL'
-        });
-      }
-    } else if (tuneCnt >= 15 || valCnt >= 15) {
+  Object.entries(stratTv).forEach(([sName, tvRow]: [string, any]) => {
+    const tune = tvRow?.tune || {};
+    const val = tvRow?.validate || {};
+    const verdict = holdoutVerdict(tune, val);
+    if (verdict === 'HOLD-OUT FAIL') {
+      const loss = Math.abs(val.net_pnl || 0);
       suggestions.push({
-        tag: '[INCONCLUSIVE]',
-        text: `${sName} on ${symbol} hold-out: TUNE ${tuneCnt} trades, VALIDATE ${valCnt} trades. Both need >= 30.`,
-        impact: 0.0,
-        is_measured: false,
-        type: 'HOLD_OUT_INCONCLUSIVE'
+        tag: `[MEASURED $${loss.toFixed(2)}]`,
+        text: `${sName} on ${symbol} does not hold on unseen data: TUNE PF ${(tune.profit_factor || 0).toFixed(2)} -> VALIDATE PF ${(val.profit_factor || 0).toFixed(2)} (TUNE ${tune.count || 0} / VALIDATE ${val.count || 0}).`,
+        impact: Number(loss.toFixed(2)),
+        is_measured: true,
+        type: 'HOLD_OUT_FAIL'
       });
     }
   });
@@ -509,6 +550,11 @@ function computePortfolioNextTests(allSuggestions: Array<{ tag: string; text: st
   return tests.slice(0, 5);
 }
 
+/**
+ * Builds the full export payload: every pair, every combination, best-combination
+ * detail (including diagnostics, TUNE/VALIDATE, hold-out verdict, skipped signals,
+ * warnings, run times), portfolio correlation, variants, and ranked suggestions.
+ */
 function generateExportDataPayload(): any {
   const result: any = {
     generated_at: new Date().toISOString(),
@@ -518,13 +564,21 @@ function generateExportDataPayload(): any {
     combinations_rollup: {},
     pairs: [],
     portfolio_suggestions: [],
-    what_to_test_next: []
+    what_to_test_next: [],
+    portfolio_correlation: null,
+    spec_coverage: SPEC_COVERAGE,
+    descriptions: METRIC_DESCRIPTIONS,
   };
 
   const allSummaryCombos: Record<string, { trades: number; pnl: number; win_count: number }> = {};
   let totalTime = 0.0;
   let hasValidTimes = false;
   const allPortfolioSuggestions: Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> = [];
+
+  // Portfolio correlation (single file written by the runner).
+  const portfolioFile = path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_correlation.json');
+  const portfolio = safeReadJson(portfolioFile);
+  if (portfolio) result.portfolio_correlation = portfolio;
 
   for (const sym of WHITELIST_ASSETS) {
     const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
@@ -550,7 +604,11 @@ function generateExportDataPayload(): any {
 
       const combos: any[] = summary.combinations || [];
 
+      // Add hold-out verdict to each combination row.
       combos.forEach(c => {
+        const tv = c.tune_validate || {};
+        c.holdout_verdict = holdoutVerdict(tv.tune, tv.validate);
+
         if (!allSummaryCombos[c.label]) {
           allSummaryCombos[c.label] = { trades: 0, pnl: 0, win_count: 0 };
         }
@@ -575,6 +633,10 @@ function generateExportDataPayload(): any {
         }
       }
 
+      // Variants file for this pair, if present.
+      const variantFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_variants.json`);
+      const variantsPayload = safeReadJson(variantFile);
+
       const pairPayload: any = {
         symbol: sym,
         status: "OK",
@@ -583,15 +645,24 @@ function generateExportDataPayload(): any {
         cpu_cores: (summary as any).cpu_cores || null,
         concurrent_processes: (summary as any).concurrent_processes || null,
         combinations: combos,
+        variants: variantsPayload?.variants || null,
         best_combination: {
           ...(bestCombo || {}),
           strategy_kpis: bestReportDetail.strategy_kpis || {},
           dow_kpis: bestReportDetail.dow_kpis || {},
           skipped_summary: bestReportDetail.skipped_summary || {},
+          skipped_detail: bestReportDetail.skipped_detail || null,
           warnings: bestReportDetail.warnings || [],
           adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100,
           strategy_tune_validate: bestReportDetail.strategy_tune_validate || {},
-          tune_validate: bestReportDetail.tune_validate || (bestCombo ? bestCombo.tune_validate : null) || {}
+          tune_validate: bestReportDetail.tune_validate || (bestCombo ? bestCombo.tune_validate : null) || {},
+          diagnostics: bestReportDetail.diagnostics || null,
+          improvement_tips: bestReportDetail.improvement_tips || [],
+          run_settings: bestReportDetail.run_settings || '',
+          funnel: bestReportDetail.funnel || null,
+          vol_block_reasons: bestReportDetail.vol_block_reasons || null,
+          rejection_stats: bestReportDetail.rejection_stats || null,
+          generated_at: bestReportDetail.generated_at || null,
         }
       };
 
@@ -625,120 +696,367 @@ function generateExportDataPayload(): any {
   return result;
 }
 
-function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; minDowTrades?: number } = {}): string {
+// -----------------------------------------------------------------------------
+// TXT export
+// -----------------------------------------------------------------------------
+
+function fmt(v: any, decimals = 2): string {
+  const n = typeof v === 'number' ? v : parseFloat(v);
+  if (!Number.isFinite(n)) return 'n/a';
+  return n.toFixed(decimals);
+}
+
+function buildAiBrief(data: any): string[] {
+  const lines: string[] = [];
+  const okPairs = (data.pairs || []).filter((p: any) => p.status === 'OK');
+  const failedPairs = (data.pairs || []).filter((p: any) => p.status !== 'OK');
+
+  let bestCombo: any = null;
+  for (const p of okPairs) {
+    for (const c of (p.combinations || [])) {
+      if ((c.total_trades || 0) < 30) continue;
+      if (!bestCombo || c.profit_factor > bestCombo.pf) {
+        bestCombo = { symbol: p.symbol, label: c.label, pf: c.profit_factor, net: c.net_pnl, trades: c.total_trades, wr: c.win_rate };
+      }
+    }
+  }
+
+  let worstCombo: any = null;
+  for (const p of okPairs) {
+    for (const c of (p.combinations || [])) {
+      if ((c.total_trades || 0) < 30) continue;
+      if (!worstCombo || c.profit_factor < worstCombo.pf) {
+        worstCombo = { symbol: p.symbol, label: c.label, pf: c.profit_factor, net: c.net_pnl, trades: c.total_trades };
+      }
+    }
+  }
+
+  const holdoutFails: string[] = [];
+  for (const p of okPairs) {
+    for (const c of (p.combinations || [])) {
+      if (c.holdout_verdict === 'HOLD-OUT FAIL') {
+        holdoutFails.push(`${p.symbol}/${c.label}`);
+      }
+    }
+  }
+
+  const stratFails: string[] = [];
+  for (const p of okPairs) {
+    const stv = p.best_combination?.strategy_tune_validate || {};
+    for (const [sName, tv] of Object.entries<any>(stv)) {
+      if (holdoutVerdict(tv?.tune, tv?.validate) === 'HOLD-OUT FAIL') {
+        stratFails.push(`${p.symbol}/${sName}`);
+      }
+    }
+  }
+
+  lines.push(`AI BRIEF`);
+  if (bestCombo) lines.push(`Best combination: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, WR ${fmt(bestCombo.wr, 1)}%, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades.`);
+  if (worstCombo) lines.push(`Worst qualifying combination: ${worstCombo.symbol} ${worstCombo.label} — PF ${fmt(worstCombo.pf)}, P&L $${fmt(worstCombo.net)}, ${worstCombo.trades} trades.`);
+  if (failedPairs.length > 0) lines.push(`Pairs not tested: ${failedPairs.map((p: any) => p.symbol).join(', ')}.`);
+  if (holdoutFails.length > 0) lines.push(`Hold-out fails (combination level): ${holdoutFails.slice(0, 6).join('; ')}${holdoutFails.length > 6 ? ` (+${holdoutFails.length - 6} more)` : ''}.`);
+  if (stratFails.length > 0) lines.push(`Hold-out fails (strategy level): ${stratFails.slice(0, 6).join('; ')}${stratFails.length > 6 ? ` (+${stratFails.length - 6} more)` : ''}.`);
+  if (data.portfolio_correlation) {
+    lines.push(`Portfolio avg daily correlation: ${fmt(data.portfolio_correlation.avg_daily_correlation, 3)}; diversification ratio ${fmt(data.portfolio_correlation.diversification_ratio, 2)}x.`);
+  }
+  lines.push('');
+  lines.push('STANDING INSTRUCTION TO THE AI READING THIS FILE:');
+  lines.push('Review this backtest. Suggest concrete improvements to the strategies and to how the bot uses trends,');
+  lines.push('session hours, stops, breakeven and trailing. Use only numbers in this file. Treat anything under 30 trades');
+  lines.push('as inconclusive. Prefer changes that hold on the VALIDATE data.');
+  lines.push('');
+  return lines;
+}
+
+function buildToc(data: any): string[] {
+  const lines: string[] = [];
+  lines.push('TABLE OF CONTENTS');
+  lines.push('  AI BRIEF');
+  lines.push('  LEGEND');
+  lines.push('  CROSS-PAIR ROLLUP');
+  for (const p of data.pairs || []) {
+    lines.push(`  ASSET ${p.symbol} — §19 hour matrix, §21 rollover, §26 ATR tiers, §16-18 trade-path, §22 BE variants, §24 sizing, §25 caps, §31 streaks, §32 breaker, §33 DD cutoff, §34 slippage, §35 parameter sweep, §36 outliers, §37 Monte Carlo, §38 alpha`);
+  }
+  lines.push('  PORTFOLIO CORRELATION');
+  lines.push('  RANKED SUGGESTIONS');
+  lines.push('  NOT IMPLEMENTED');
+  lines.push('');
+  return lines;
+}
+
+function summarizeHourMatrix(hourKpis: any): string {
+  if (!hourKpis) return 'n/a';
+  const parts: string[] = [];
+  for (let h = 0; h < 24; h++) {
+    const k = hourKpis[String(h)];
+    if (!k || k.count === 0) continue;
+    parts.push(`${String(h).padStart(2, '0')}:n=${k.count} wr=${fmt(k.win_rate, 1)} pf=${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`);
+  }
+  return parts.length > 0 ? parts.join(' | ') : 'no trades in any hour';
+}
+
+function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; minDowTrades?: number; compactPairs?: boolean } = {}): string {
   const maxSugg = options.maxSuggestionsPerPair ?? 999;
   const minDow = options.minDowTrades ?? 0;
+  const compactPairs = options.compactPairs ?? false;
 
   const totalTimeStr = (typeof data.total_run_seconds === 'number' && data.total_run_seconds > 0) ? `${data.total_run_seconds}s` : 'n/a';
 
   const lines: string[] = [];
-  lines.push(`LEGEND: [TR]=Trades | [WR]=WinRate% | [EXP]=Expectancy(R) | [PF]=ProfitFactor | [DD]=MaxDrawdown | [PNL]=NetRealized$ | [COV]=AdaptiveCover% | [TUNE]/[VALIDATE]=70/30 date split`);
-  lines.push(`RUN: Date: ${data.generated_at.slice(0, 10)} | Days: ${data.days} | Target R:R: 1:${data.target_rr} | Total Run Time: ${totalTimeStr}`);
+
+  lines.push(...buildAiBrief(data));
+  lines.push(...buildToc(data));
+
+  lines.push('LEGEND');
+  lines.push('  TR=Trades, WR=WinRate%, EXP=Expectancy(R), PF=ProfitFactor, DD=MaxDrawdown$');
+  lines.push('  PNL=Net Realised $, COV=AdaptiveCover%, TUNE=first 70% window, VALIDATE=last 30% window');
+  lines.push('  HOLD-OUT FAIL = TUNE PF collapsed on VALIDATE.');
+  lines.push('  INCONCLUSIVE = fewer than 30 trades in the window.');
+  lines.push('');
+  lines.push(`RUN: Date ${data.generated_at.slice(0, 10)} | Days ${data.days} | Target R:R 1:${data.target_rr} | Total Run Time ${totalTimeStr}`);
+
   let coresSeen: number | null = null;
   let concurrentSeen: number | null = null;
   for (const p of (data.pairs || [])) {
-    if (p && p.cpu_cores && coresSeen === null) coresSeen = p.cpu_cores;
-    if (p && p.concurrent_processes && concurrentSeen === null) concurrentSeen = p.concurrent_processes;
+    if (p?.cpu_cores && coresSeen === null) coresSeen = p.cpu_cores;
+    if (p?.concurrent_processes && concurrentSeen === null) concurrentSeen = p.concurrent_processes;
   }
-  lines.push(`HOST: CPU cores detected: ${coresSeen ?? 'n/a'} | Pair processes ran concurrently: ${concurrentSeen ?? 'n/a'}`);
-  lines.push(`RULES: Trades < 30 tagged INCONCLUSIVE | Hold-out rules require >= 30 trades in BOTH TUNE and VALIDATE\n`);
+  lines.push(`HOST: CPU cores ${coresSeen ?? 'n/a'} | Pair processes concurrent ${concurrentSeen ?? 'n/a'}`);
+  lines.push('');
 
-  lines.push(`=== CROSS-PAIR ROLLUP PER COMBINATION ===`);
+  lines.push('CROSS-PAIR ROLLUP');
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
-    lines.push(`${combo.padEnd(32)} | TR: ${String(r.total_trades).padStart(5)} | WR: ${r.weighted_win_rate.toFixed(1).padStart(5)}% | PNL: $${r.total_pnl.toFixed(2)}`);
+    lines.push(`  ${combo.padEnd(34)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1).padStart(5)}% | PNL $${fmt(r.total_pnl)}`);
   });
-  lines.push(``);
+  lines.push('');
 
   for (const p of data.pairs || []) {
-    const runTimeStr = (typeof p.seconds_taken === 'number' && p.seconds_taken > 0) ? `${p.seconds_taken}s` : 'n/a';
-    const ps = p.phase_seconds || {};
-    const phaseStr = `aggregator ${ps.aggregator_s ?? 'n/a'}s, volatility ${ps.volatility_s ?? 'n/a'}s, session_levels ${ps.session_levels_s ?? 'n/a'}s, strategies ${ps.strategies_s ?? 'n/a'}s, simulator ${ps.simulator_s ?? 'n/a'}s, report_writing ${ps.report_writing_s ?? 'n/a'}s`;
-    lines.push(`================================================================================`);
-    lines.push(`ASSET: ${p.symbol} (${p.status}) | Run Time: ${runTimeStr}`);
-    lines.push(`PHASES: ${phaseStr}`);
-    if (p.status !== "OK") {
-      lines.push(`STATUS: ${p.error || 'Not tested'}\n`);
+    if (p.status !== 'OK') {
+      lines.push(`ASSET ${p.symbol} — NOT TESTED — ${p.error || 'unknown error'}`);
+      lines.push('');
       continue;
     }
 
-    lines.push(`--- 8 Combinations ---`);
+    const runTimeStr = (typeof p.seconds_taken === 'number' && p.seconds_taken > 0) ? `${p.seconds_taken}s` : 'n/a';
+    const ps = p.phase_seconds || {};
+    const phaseStr = `agg ${ps.aggregator_s ?? 'n/a'}s | vol ${ps.volatility_s ?? 'n/a'}s | levels ${ps.session_levels_s ?? 'n/a'}s | strat ${ps.strategies_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s | report ${ps.report_writing_s ?? 'n/a'}s`;
+
+    lines.push('================================================================================');
+    lines.push(`ASSET ${p.symbol} | Run Time ${runTimeStr} | ${phaseStr}`);
+    lines.push('--- 8 Combinations ---');
+
     for (const c of p.combinations || []) {
-      const incon = (c.total_trades || 0) < 30 ? " [INCONCLUSIVE]" : "";
-      const ctv: any = c.tune_validate || {};
-      const cTune: any = ctv.tune || {};
-      const cVal: any = ctv.validate || {};
-      const cTuneStr = `TUNE[TR:${cTune.count ?? 0} WR:${(cTune.win_rate ?? 0).toFixed(1)}% PF:${(cTune.profit_factor ?? 0).toFixed(2)}]`;
-      const cValStr = `VALIDATE[TR:${cVal.count ?? 0} WR:${(cVal.win_rate ?? 0).toFixed(1)}% PF:${(cVal.profit_factor ?? 0).toFixed(2)}]`;
-      lines.push(`${c.label.padEnd(32)} | TR: ${String(c.total_trades).padStart(4)} | WR: ${c.win_rate.toFixed(1)}% | EXP: ${c.expectancy.toFixed(2)}R | PF: ${c.profit_factor.toFixed(2)} | DD: -$${c.max_drawdown.toFixed(2)} | PNL: $${c.net_pnl.toFixed(2)} | COV: ${c.adaptive_effective_pct.toFixed(0)}% | ${cTuneStr} | ${cValStr}${incon}`);
+      const incon = (c.total_trades || 0) < 30 ? ' [INCONCLUSIVE]' : '';
+      const tv = c.tune_validate || {};
+      const tune = tv.tune || {};
+      const val = tv.validate || {};
+      lines.push(
+        `  ${String(c.label).padEnd(32)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | EXP ${fmt(c.expectancy)}R | PF ${fmt(c.profit_factor)} | DD -$${fmt(c.max_drawdown)} | PNL $${fmt(c.net_pnl)} | COV ${fmt(c.adaptive_effective_pct, 0)}% | TUNE[TR ${tune.count ?? 0} PF ${fmt(tune.profit_factor)} WR ${fmt(tune.win_rate, 1)}%] | VALIDATE[TR ${val.count ?? 0} PF ${fmt(val.profit_factor)} WR ${fmt(val.win_rate, 1)}%] | ${c.holdout_verdict || 'INCONCLUSIVE'}${incon}`
+      );
     }
 
     const b = p.best_combination || {};
-    lines.push(`\n--- Best Combination: ${b.label || 'N/A'} ---`);
-    lines.push(`Performance by Strategy:`);
-    const bStv: Record<string, any> = (b as any).strategy_tune_validate || {};
-    Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
-      const stv: any = bStv[sName] || {};
-      const sTune: any = stv.tune || {};
-      const sVal: any = stv.validate || {};
-      const sTuneStr = `TUNE[TR:${sTune.count ?? 0} WR:${(sTune.win_rate ?? 0).toFixed(1)}% PF:${(sTune.profit_factor ?? 0).toFixed(2)}]`;
-      const sValStr = `VALIDATE[TR:${sVal.count ?? 0} WR:${(sVal.win_rate ?? 0).toFixed(1)}% PF:${(sVal.profit_factor ?? 0).toFixed(2)}]`;
-      lines.push(`  ${sName.padEnd(28)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | PF: ${s.profit_factor.toFixed(2)} | PNL: $${s.net_pnl.toFixed(2)} | ${sTuneStr} | ${sValStr}`);
-    });
+    lines.push('');
+    lines.push(`--- Best Combination: ${b.label || 'N/A'} (${b.total_trades || 0} trades) ---`);
 
-    lines.push(`Performance by Day of Week:`);
-    Object.entries(b.dow_kpis || {}).forEach(([dow, s]: any) => {
-      if ((s.count || 0) >= minDow) {
-        lines.push(`  ${dow.padEnd(12)} | TR: ${String(s.count).padStart(3)} | WR: ${s.win_rate.toFixed(1)}% | EXP: ${s.expectancy.toFixed(2)}R | PNL: $${s.net_pnl.toFixed(2)}`);
-      }
-    });
-
-    const skipSummary = b.skipped_summary || {};
-    const skipEntries = Object.entries(skipSummary);
-    if (skipEntries.length > 0) {
-      lines.push(`Skipped Signals Summary:`);
-      const skipParts = skipEntries.map(([reason, val]: [string, any]) => {
-        if (typeof val === 'object' && val !== null) {
-          return `${reason}: ${val.candle_skips ?? 0} candle-skips, ${val.unique_setups ?? 0} unique setups`;
-        }
-        return `${reason}: ${val} candle-skips`;
+    if (!compactPairs) {
+      lines.push('Per-strategy:');
+      const bStv: Record<string, any> = b.strategy_tune_validate || {};
+      Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
+        const stv = bStv[sName] || {};
+        const tune = stv.tune || {};
+        const val = stv.validate || {};
+        const verdict = holdoutVerdict(tune, val);
+        lines.push(
+          `  ${sName.padEnd(28)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)} | TUNE[TR ${tune.count ?? 0} PF ${fmt(tune.profit_factor)}] | VALIDATE[TR ${val.count ?? 0} PF ${fmt(val.profit_factor)}] | ${verdict}`
+        );
       });
-      lines.push(`  ${skipParts.join(' | ')}`);
-    }
 
-    if (b.warnings && b.warnings.length > 0) {
-      lines.push(`Warnings: ${b.warnings.join(' | ')}`);
+      lines.push('Per-weekday (>= ' + minDow + ' trades):');
+      Object.entries(b.dow_kpis || {}).forEach(([dow, s]: any) => {
+        if ((s.count || 0) < minDow) return;
+        lines.push(`  ${dow.padEnd(12)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | EXP ${fmt(s.expectancy)}R | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)}`);
+      });
+
+      const skipSummary = b.skipped_summary || {};
+      const skipEntries = Object.entries(skipSummary);
+      if (skipEntries.length > 0) {
+        const parts = skipEntries.map(([reason, val]: [string, any]) => {
+          if (typeof val === 'object' && val !== null) {
+            return `${reason}: ${val.candle_skips ?? 0} candles / ${val.unique_setups ?? 0} unique setups`;
+          }
+          return `${reason}: ${val} candles`;
+        });
+        lines.push(`Skipped signals: ${parts.join(' | ')}`);
+      }
+
+      if (b.warnings && b.warnings.length > 0) {
+        lines.push(`Warnings: ${b.warnings.join(' | ')}`);
+      }
+
+      const diag = b.diagnostics;
+      if (diag) {
+        lines.push('');
+        lines.push(`--- Diagnostics (${diag.version || 'n/a'}) ---`);
+        lines.push(`§19 Hour matrix: ${summarizeHourMatrix(diag.hour_kpis)}`);
+
+        if (diag.session_rollover) {
+          const it = diag.session_rollover.in_transition || {};
+          const ot = diag.session_rollover.out_of_transition || {};
+          lines.push(`§21 Rollover: in TR ${it.count ?? 0} PF ${fmt(it.profit_factor)} $${fmt(it.net_pnl)} | out TR ${ot.count ?? 0} PF ${fmt(ot.profit_factor)} $${fmt(ot.net_pnl)}`);
+        }
+
+        if (diag.atr_tier_kpis) {
+          const tierStr = ['LOW', 'NORMAL', 'HIGH', 'UNKNOWN']
+            .map(t => {
+              const k = diag.atr_tier_kpis[t];
+              if (!k || k.count === 0) return `${t}: none`;
+              return `${t}: TR ${k.count} WR ${fmt(k.win_rate, 1)}% PF ${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`;
+            })
+            .join(' | ');
+          lines.push(`§26 ATR tiers: ${tierStr}`);
+        }
+
+        const st = diag.streak_analysis || {};
+        lines.push(`§31 Streaks: max ${st.max_consecutive_losses ?? 0} | avg ${fmt(st.average_streak)} | peak DD -$${fmt(st.peak_drawdown)} | recovery ${st.recovery_trades_from_peak_dd ?? 0} trades`);
+
+        const cb = diag.circuit_breaker_sim || {};
+        lines.push(`§32 Breaker sim: orig $${fmt(cb.original_net_pnl)} -> sim $${fmt(cb.simulated_net_pnl)} | halved ${cb.trades_halved ?? 0} | protection $${fmt(cb.protection_delta)}`);
+
+        const or = diag.outlier_removal || {};
+        lines.push(`§36 Outliers: drop ${or.outlier_count ?? 0} top trades | impact ${fmt(or.impact_pct, 1)}% | full $${fmt(or.full?.net_pnl)} -> trimmed $${fmt(or.trimmed?.net_pnl)}`);
+
+        const mc = diag.monte_carlo || {};
+        lines.push(`§37 Monte Carlo: median DD -$${fmt(mc.median_max_dd)} | P5 -$${fmt(mc.p5_max_dd)} | P95 -$${fmt(mc.p95_max_dd)} | prob positive ${fmt(mc.prob_positive, 1)}%`);
+
+        const bh = diag.buy_and_hold || {};
+        lines.push(`§38 Alpha: hold ${fmt(bh.bh_return_pct)}% $${fmt(bh.bh_net_pnl)} | strat $${fmt(bh.strategy_net_pnl)} | alpha $${fmt(bh.alpha)} | verdict ${bh.verdict}`);
+
+        const ps16 = diag.post_sl || {};
+        if (ps16.count > 0) {
+          lines.push(`§16 Post-SL: n=${ps16.count} mean ${fmt(ps16.mean_pips, 1)} pips | max ${fmt(ps16.max_pips, 1)} pips | recovered ${ps16.recovered_count} (${fmt(ps16.recovered_pct, 1)}%)`);
+        }
+        const pt = diag.post_tp || {};
+        if (pt.count > 0) {
+          lines.push(`§17 Post-TP: n=${pt.count} mean ${fmt(pt.mean_pips, 1)} pips | avg missed ${fmt(pt.avg_missed_r)}R`);
+        }
+        const pbe = diag.premature_be || {};
+        if (pbe.total_be_moved > 0) {
+          lines.push(`§18 Premature BE: moved ${pbe.total_be_moved} | premature ${pbe.premature_count} (${fmt(pbe.premature_pct, 1)}%) | missed ${fmt(pbe.total_missed_r)}R`);
+        }
+
+        const ema = diag.ema_200_alignment || {};
+        if (ema.aligned || ema.counter_trend) {
+          lines.push(`§27 EMA-200 alignment: aligned TR ${ema.aligned?.count ?? 0} PF ${fmt(ema.aligned?.profit_factor)} | counter TR ${ema.counter_trend?.count ?? 0} PF ${fmt(ema.counter_trend?.profit_factor)}`);
+        }
+
+        const ct = diag.confirmation_type || {};
+        lines.push(`§28 Confirmation: close TR ${ct.close?.count ?? 0} PF ${fmt(ct.close?.profit_factor)} | touch TR ${ct.touch?.count ?? 0} PF ${fmt(ct.touch?.profit_factor)}`);
+
+        const nw = diag.news_window || {};
+        lines.push(`§29 News: inside TR ${nw.in_news?.count ?? 0} PF ${fmt(nw.in_news?.profit_factor)} | outside TR ${nw.out_of_news?.count ?? 0} PF ${fmt(nw.out_of_news?.profit_factor)}`);
+
+        const sz = diag.sizing_comparison || {};
+        lines.push(`§24 Sizing: fixed $${fmt(sz.fixed?.net_pnl)} | compounding $${fmt(sz.compounding?.net_pnl)} | diff $${fmt(sz.difference)}`);
+
+        const dc = diag.daily_cap_comparison || {};
+        lines.push(`§25 Daily caps: cap1 TR ${dc.cap_1?.count ?? 0} PNL $${fmt(dc.cap_1?.net_pnl)} | cap2 $${fmt(dc.cap_2?.net_pnl)} | cap4 $${fmt(dc.cap_4?.net_pnl)} | unlimited $${fmt(dc.unlimited?.net_pnl)}`);
+
+        const dd = diag.daily_dd_cutoff || {};
+        lines.push(`§33 DD cutoff: triggered ${dd.days_triggered ?? 0} days | blocked ${dd.trades_blocked ?? 0} trades | protection $${fmt(dd.protection_delta)}`);
+
+        const slip = diag.slippage_sensitivity || {};
+        const slipParts = Object.values(slip).map((pt: any) => `${pt.slippage_pips}p $${fmt(pt.net_pnl)}`).join(' | ');
+        if (slipParts) lines.push(`§34 Slippage: ${slipParts}`);
+
+        const bv = diag.breakeven_variants || {};
+        if (bv.A_current) {
+          lines.push(`§22 BE variants: A(current) ${fmt(bv.A_current.total_r)}R | B(no BE) ${fmt(bv.B_no_be.total_r)}R | C(delayed) ${fmt(bv.C_delayed_be.total_r)}R | best ${bv.best_variant} | ${bv.verdict}`);
+        }
+
+        const param = diag.parameter_sensitivity || {};
+        if (Array.isArray(param.sweep) && param.sweep.length > 0) {
+          const sweepStr = param.sweep.map((row: any) => `R:R ${fmt(row.rr, 2)} $${fmt(row.net_pnl)}`).join(' | ');
+          lines.push(`§35 Parameter sweep: ${sweepStr} | best ${fmt(param.best_rr, 2)} | ${param.verdict}`);
+        }
+      }
+
+      const tips: any[] = b.improvement_tips || [];
+      if (tips.length > 0) {
+        lines.push('');
+        lines.push('Improvement tips (from trade list):');
+        tips.forEach((tip: any) => {
+          lines.push(`  [${tip.severity}] ${tip.strategy} — ${tip.title} | Action: ${tip.action}`);
+        });
+      }
     }
 
     const suggestions: any[] = b.rule_suggestions || [];
     if (suggestions.length > 0) {
-      lines.push(`Actionable Suggestions (Impact Ranked):`);
+      lines.push('');
+      lines.push(`Rule-based suggestions for ${p.symbol} (ranked, impact first):`);
       suggestions.slice(0, maxSugg).forEach((s: any) => {
-        lines.push(`  • ${s.tag} ${s.text}`);
+        lines.push(`  ${s.tag} ${s.text}`);
       });
     }
-    lines.push(``);
+
+    lines.push('');
+  }
+
+  if (data.portfolio_correlation) {
+    lines.push('================================================================================');
+    lines.push('PORTFOLIO CORRELATION');
+    const pc = data.portfolio_correlation;
+    lines.push(`Symbols: ${(pc.symbols || []).join(', ')}`);
+    lines.push(`Portfolio max DD $${fmt(pc.portfolio_drawdown)} | Sum of individual DDs $${fmt(pc.sum_of_individual_drawdowns)} | Diversification ratio ${fmt(pc.diversification_ratio)}x | avg daily correlation ${fmt(pc.avg_daily_correlation, 3)} | days ${pc.days}`);
+    lines.push(`Trade counts: ${Object.entries(pc.trade_counts || {}).map(([s, c]) => `${s}=${c}`).join(' | ')}`);
+    lines.push('');
+  }
+
+  if (data.portfolio_suggestions && data.portfolio_suggestions.length > 0) {
+    lines.push('================================================================================');
+    lines.push('RANKED PORTFOLIO SUGGESTIONS');
+    data.portfolio_suggestions.forEach((s: any) => {
+      lines.push(`  ${s.tag} ${s.text}`);
+    });
+    lines.push('');
   }
 
   if (data.what_to_test_next && data.what_to_test_next.length > 0) {
-    lines.push(`================================================================================`);
-    lines.push(`WHAT TO TEST NEXT:`);
+    lines.push('================================================================================');
+    lines.push('WHAT TO TEST NEXT:');
     data.what_to_test_next.forEach((item: string, idx: number) => {
       lines.push(`  ${idx + 1}. ${item}`);
     });
-    lines.push(`================================================================================\n`);
+    lines.push('');
   }
+
+  lines.push('================================================================================');
+  lines.push('NOT IMPLEMENTED IN THE BACKTESTER');
+  const notImpl = (data.spec_coverage || []).filter((row: any) => !(row.panel && row.txt && row.pdf));
+  if (notImpl.length === 0) {
+    lines.push('  (none — every specification item is produced by the panel, the TXT and the PDF.)');
+  } else {
+    notImpl.forEach((row: any) => {
+      lines.push(`  #${row.id} ${row.label} — ${row.note || 'not produced'}`);
+    });
+  }
+  lines.push('================================================================================');
 
   return lines.join('\n');
 }
 
 function formatExportTxtWithLengthRule(data: any): string {
   let text = renderTxtContent(data);
-  if (text.length <= 15000) return text;
+  if (text.length <= 45000) return text;
 
   text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 0 });
-  if (text.length <= 15000) return text;
+  if (text.length <= 45000) return text;
 
-  text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 30 });
+  text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 30, compactPairs: false });
+  if (text.length <= 45000) return text;
+
+  text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 30, compactPairs: true });
   return text;
 }
 
@@ -814,6 +1132,11 @@ async function startServer() {
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
+  });
+
+  // ---- Descriptions endpoint: consumed by the panel for info icons ----
+  app.get('/api/backtest/descriptions', (_req, res) => {
+    res.status(200).json({ status: 'success', data: METRIC_DESCRIPTIONS });
   });
 
   app.get('/api/backtest/export-data', (_req, res) => {
@@ -899,7 +1222,6 @@ async function startServer() {
     }
   });
 
-  // PROPOSED: Phase-4 cross-pair correlation matrix (Section 7 item 30).
   app.get('/api/backtest/portfolio', (_req, res) => {
     try {
       const portfolioFile = path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_correlation.json');
@@ -913,7 +1235,6 @@ async function startServer() {
     }
   });
 
-  // PROPOSED: Phase-3 variant matrix (Section 5 items 22 / 23 / 25).
   app.get('/api/backtest/variants/:symbol', (req, res) => {
     try {
       const sym = String(req.params.symbol || '').toUpperCase();
@@ -959,7 +1280,7 @@ async function startServer() {
         total_mb = Math.round((stats.bsize * stats.blocks) / (1024 * 1024));
         free_mb = Math.round((stats.bsize * stats.bfree) / (1024 * 1024));
         used_mb = total_mb - free_mb;
-      } catch (e) {}
+      } catch {}
 
       let market_data_bytes = 0;
       const allFiles: Array<{ name: string; path: string; size_mb: number; type: string }> = [];
@@ -1090,8 +1411,6 @@ async function startServer() {
     const requestedSymbol = String(req.body?.symbol || 'US30').toUpperCase();
     const days = parseInt(req.body?.days || '60', 10);
     const rr = parseFloat(req.body?.rr || 1.0);
-    // PROPOSED: Phase-3 flag. When true, the Python runner also executes the
-    // five variant combos and saves <symbol>_variants.json.
     const variants = Boolean(req.body?.variants ?? false);
 
     backtestResults = [];
