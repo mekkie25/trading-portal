@@ -17,11 +17,6 @@ from typing import Dict, List, Any, Optional
 
 
 def compute_holdout_verdict(tune: Optional[Dict[str, Any]], val: Optional[Dict[str, Any]]) -> str:
-    """
-    Three-state hold-out verdict (plus INCONCLUSIVE).
-    Called from the panel, the TXT export, the PDF export and the report writer
-    so every surface agrees.
-    """
     t_count = int((tune or {}).get("count", 0) or 0)
     v_count = int((val or {}).get("count", 0) or 0)
     if t_count < 30 or v_count < 30:
@@ -38,11 +33,6 @@ def compute_holdout_verdict(tune: Optional[Dict[str, Any]], val: Optional[Dict[s
 
 
 def _estimated_cost_gap_r(win_rate_pct: float, expectancy_r: float) -> float:
-    """
-    At 1:1 R:R a break-even win rate is 50%. The expected expectancy at the
-    measured win rate is (W - (1 - W)) = 2W - 1. The gap between that and the
-    measured expectancy is the estimated cost drag in R per trade.
-    """
     w = max(0.0, min(100.0, float(win_rate_pct))) / 100.0
     expected_at_1to1 = (w * 1.0) - ((1.0 - w) * 1.0)
     return expected_at_1to1 - float(expectancy_r)
@@ -61,7 +51,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     best_tv = best.get("tune_validate", {}) or {}
     best_verdict = compute_holdout_verdict(best_tv.get("tune"), best_tv.get("validate"))
 
-    # Rule 8: Unviable pair across all combinations (requires >= 30 trades on valid combos)
+    # Rule 8: Unviable pair across all combinations
     valid_combos_30 = [c for c in combos if (c.get("total_trades", 0) >= 30)]
     if len(valid_combos_30) >= 4 and all(c.get("profit_factor", 0.0) < 1.0 for c in valid_combos_30):
         total_loss = sum(abs(c.get("net_pnl", 0.0)) for c in valid_combos_30 if c.get("net_pnl", 0.0) < 0)
@@ -74,7 +64,6 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "type": "PAIR_VIABILITY"
         })
 
-    # Minimum 30 trades threshold for best combination before tuning
     if total_trades < 30:
         return suggestions
 
@@ -125,7 +114,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "type": "DAY_FILTER"
             })
 
-    # Rule 4: Adaptive vs Legacy comparison
+    # Rule 4: Adaptive vs Legacy
     adp_combos = [c for c in combos if c.get("mode") == "adaptive" and c.get("total_trades", 0) >= 30]
     leg_combos = [c for c in combos if c.get("mode") == "legacy" and c.get("total_trades", 0) >= 30]
     adp_cov = best.get("adaptive_effective_pct", 100.0)
@@ -223,9 +212,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "type": "DATA_WARMUP"
         })
 
-    # ------------------------------------------------------------------
     # Rule 9: Estimated cost drag in R per trade
-    # ------------------------------------------------------------------
     try:
         wr = float(best.get("win_rate", 0.0) or 0.0)
         exp = float(best.get("expectancy", 0.0) or 0.0)
@@ -244,9 +231,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # ------------------------------------------------------------------
     # Rule 10: Trailing cuts winners without improving profit
-    # ------------------------------------------------------------------
     try:
         for c in combos:
             if c.get("trail") != "off":
@@ -280,9 +265,7 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # ------------------------------------------------------------------
     # Rule 11: R:R expansion on HOLDS
-    # ------------------------------------------------------------------
     if best_verdict == "HOLDS" and total_trades >= 30:
         suggestions.append({
             "tag": "[TEST NEEDED]",
@@ -292,7 +275,6 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "type": "RR_EXPANSION"
         })
 
-    # Rank MEASURED suggestions first by dollar impact descending, then TEST NEEDED
     measured = [s for s in suggestions if s.get("is_measured", False)]
     test_needed = [s for s in suggestions if not s.get("is_measured", False)]
     measured.sort(key=lambda s: s.get("impact", 0.0), reverse=True)
@@ -300,11 +282,88 @@ def generate_pair_advice(pair_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return measured + test_needed
 
 
-def generate_portfolio_next_tests(pairs_data: List[Dict[str, Any]], all_ranked_suggestions: List[Dict[str, Any]]) -> List[str]:
+def generate_cross_pair_strategy_suggestions(
+    pairs_data: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     """
-    Generates up to 5 prioritized 'What to test next' items for the export summary.
+    Cross-pair rule: if a strategy does well (HOLDS or PF >= 1.2) on at least
+    two pairs AND poorly (FAILS or PF < 1.0) somewhere else, suggest allowing
+    it only on the good pairs, and show its net P&L on each pair.
+
+    Fires only when the strategy has at least 30 trades on every pair it
+    appears on, so the recommendation is never built on a thin sample.
     """
+    per_strategy: Dict[str, List[Dict[str, Any]]] = {}
+
+    for p in pairs_data:
+        if p.get("status") != "OK":
+            continue
+        symbol = p.get("symbol", "")
+        best = p.get("best_combination", {}) or {}
+        tv = best.get("tune_validate", {}) or {}
+        verdict = compute_holdout_verdict(tv.get("tune"), tv.get("validate"))
+
+        strat_kpis = best.get("strategy_kpis", {}) or {}
+        for s_name, s in strat_kpis.items():
+            count = int(s.get("count", 0) or 0)
+            if count < 30:
+                continue
+            pf = float(s.get("profit_factor", 0.0) or 0.0)
+            net = float(s.get("net_pnl", 0.0) or 0.0)
+            per_strategy.setdefault(s_name, []).append({
+                "symbol": symbol,
+                "pf": pf,
+                "net_pnl": net,
+                "verdict": verdict,
+                "count": count,
+            })
+
+    out: List[Dict[str, Any]] = []
+
+    for s_name, rows in per_strategy.items():
+        good = [r for r in rows if r["verdict"] == "HOLDS" or r["pf"] >= 1.2]
+        bad = [r for r in rows if r["verdict"] == "FAILS" or r["pf"] < 1.0]
+
+        if len(good) < 2 or len(bad) < 1:
+            continue
+
+        good_summary = ", ".join(
+            f"{r['symbol']} PF {r['pf']:.2f} ${r['net_pnl']:.2f}" for r in good
+        )
+        bad_summary = ", ".join(
+            f"{r['symbol']} PF {r['pf']:.2f} ${r['net_pnl']:.2f}" for r in bad
+        )
+
+        measured_impact = sum(abs(r["net_pnl"]) for r in bad if r["net_pnl"] < 0)
+
+        out.append({
+            "tag": f"[MEASURED ${measured_impact:.2f}]",
+            "text": (
+                f"Allow {s_name} only on the pairs where it holds: {good_summary}. "
+                f"It fails or loses on: {bad_summary}. "
+                f"Disabling it on the losing pairs removes the measured loss."
+            ),
+            "impact": round(measured_impact, 2),
+            "is_measured": True,
+            "type": "CROSS_PAIR_STRATEGY",
+            "strategy": s_name,
+            "good_pairs": [r["symbol"] for r in good],
+            "bad_pairs": [r["symbol"] for r in bad],
+        })
+
+    out.sort(key=lambda s: s.get("impact", 0.0), reverse=True)
+    return out
+
+
+def generate_portfolio_next_tests(
+    pairs_data: List[Dict[str, Any]],
+    all_ranked_suggestions: List[Dict[str, Any]],
+) -> List[str]:
     tests: List[str] = []
+
+    cross_pair = [s for s in all_ranked_suggestions if s.get("type") == "CROSS_PAIR_STRATEGY"]
+    if cross_pair:
+        tests.append(f"Disable each strategy only on the pairs where it loses ({cross_pair[0]['strategy']} first).")
 
     retune_items = [s for s in all_ranked_suggestions if s.get("type") == "STRATEGY_RETUNE"]
     if retune_items:
@@ -330,7 +389,6 @@ def generate_portfolio_next_tests(pairs_data: List[Dict[str, Any]], all_ranked_s
     if trail_cuts:
         tests.append("Retest with trailing disabled on the pairs where it cuts winners without improving profit factor.")
 
-    # Replaces the old hardcoded "R:R 1.5 on PF above 1.3" fallback.
     rr_items = [s for s in all_ranked_suggestions if s.get("type") == "RR_EXPANSION"]
     if rr_items:
         tests.append("Test target R:R 1.5 and 2.0 on any pair whose best combination is HOLDS.")

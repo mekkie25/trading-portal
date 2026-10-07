@@ -79,6 +79,34 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
     howToRead:
       'Aim for 90% or higher. Below that, treat Adaptive comparisons to Legacy as provisional.',
   },
+  pip_size: {
+    title: 'Pip Size',
+    description:
+      'The number of price units that equal one pip for this symbol. FX majors use 0.0001, JPY pairs 0.01, GOLD 0.01, indices use one or a fraction of an index point. It comes from one shared table so every metric is comparable across pairs.',
+    howToRead:
+      'You do not need to read this unless you are cross-checking a number. It is the unit the pips columns are reported in.',
+  },
+  post_trade_r: {
+    title: 'Post-Trade Movement in R',
+    description:
+      'The same post-stop or post-target distance, converted into units of R (initial risk). R is one stop-distance. This makes GOLD and EURUSD comparable. Any single value above 20R is capped at 20R before averaging.',
+    howToRead:
+      'Read this one to compare pairs. The pips number is useful for the specific broker contract, the R number is useful for cross-pair decisions.',
+  },
+  bootstrap_monte_carlo: {
+    title: 'Bootstrap Monte Carlo',
+    description:
+      'Each of the 1,000 runs resamples the trade list with replacement, so any individual trade can appear zero, one or several times. This is the honest method. The probability reported is the honest chance that final P&L is above zero.',
+    howToRead:
+      'Read the probability as the honest one. Above 90% is comfortable. Below 70% means the edge is fragile even if the historical P&L looks fine.',
+  },
+  lab_per_quarter: {
+    title: 'Per-Quarter Stability',
+    description:
+      'Breaks the test window into four equal quarters and shows trades, PF and net P&L for each. A robust strategy profits in most quarters. A fragile one profits in one or two and bleeds in the rest.',
+    howToRead:
+      'You want at least three of four quarters above PF 1.00. Fewer than three means the strategy depends on one lucky period.',
+  },
 
   // ---------------------------------------------------------------------------
   // COMBINATION TABLE COLUMNS
@@ -202,7 +230,7 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   sec_diagnostics: {
     title: 'Blueprint Diagnostics',
     description:
-      'Post-hoc analytics on the trade list: hourly expectancy, session rollover, ATR tiers, streaks, Monte Carlo, slippage sensitivity, BE variants, parameter sweep.',
+      'Post-hoc analytics on the trade list: hourly expectancy, session rollover, ATR tiers, streaks, bootstrap Monte Carlo, slippage sensitivity, BE variants, parameter sweep.',
     howToRead:
       'Scan the four biggest cards first: hour matrix, streak analysis, Monte Carlo, slippage sensitivity. They usually drive the next change.',
   },
@@ -244,9 +272,9 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   sec_strategy_lab: {
     title: 'Strategy Lab',
     description:
-      'One button per pair. Runs the winning baseline combination plus ten single-setting variants on the 365-day window with the same TUNE/VALIDATE split, then labels each variant IMPROVES, NO or INCONCLUSIVE.',
+      'One button per pair. Runs the winning baseline combination plus single-setting variants on the 365-day window with the same TUNE/VALIDATE split, then labels each variant IMPROVES, NO or INCONCLUSIVE.',
     howToRead:
-      'Only variants tagged IMPROVES are worth promoting. IMPROVES needs PF above the baseline by at least 0.05 in both TUNE and VALIDATE with at least 30 trades in each.',
+      'Only variants tagged IMPROVES are worth promoting. IMPROVES needs PF above the baseline by at least 0.05 in both TUNE and VALIDATE with at least 30 trades in each, and at least three of four quarters above PF 1.00.',
   },
 
   // ---------------------------------------------------------------------------
@@ -359,7 +387,7 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   },
 
   // ---------------------------------------------------------------------------
-  // STRATEGY DESCRIPTIONS (taken from strategies/*.py docstrings)
+  // STRATEGY DESCRIPTIONS
   // ---------------------------------------------------------------------------
   strat_grubber_kick: {
     title: 'Grubber Kick',
@@ -471,11 +499,11 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
       'Above 50% dependency means the edge is a few lucky trades, not a repeatable pattern.',
   },
   diag_monte_carlo: {
-    title: '§37 · Monte Carlo Resampling',
+    title: '§37 · Bootstrap Monte Carlo',
     description:
-      'Shuffles the trade order 1000 times and measures the resulting drawdown distribution and probability of ending positive.',
+      'Each of the 1,000 runs resamples the trade list with replacement and reports the distribution of final P&L and max drawdown. The probability shown is the honest chance that final P&L is above zero.',
     howToRead:
-      'The P95 max drawdown is the drawdown you should plan for, not the historical one.',
+      'Read the probability as the honest one. Above 90% is comfortable, below 70% means the edge is fragile.',
   },
   diag_buy_and_hold: {
     title: '§38 · Buy-and-Hold Benchmark',
@@ -487,16 +515,16 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   diag_post_sl: {
     title: '§16 · Post-SL Continuation Distance',
     description:
-      'How far price kept moving against you after the stop loss was hit. Large numbers mean the stop is too tight for the current volatility.',
+      'How far price kept moving against you after the stop loss was hit. Reported in pips and in R units. R lets you compare GOLD and EURUSD directly. Each R value is capped at 20R.',
     howToRead:
       'If recovered-to-TP rate is high, the entry trigger is facing liquidity sweeps, not the stop itself.',
   },
   diag_post_tp: {
     title: '§17 · Post-TP Movement',
     description:
-      'How many extra pips price travelled in your favour after the take profit was hit. Large numbers mean the target is too conservative.',
+      'How many extra pips price travelled in your favour after the take profit was hit. Reported in pips and in R units. Large numbers mean the target is too conservative.',
     howToRead:
-      'High average extra pips on winners suggests testing a wider R:R.',
+      'High average extra R on winners suggests testing a wider R:R.',
   },
   diag_premature_be: {
     title: '§18 · Premature BE Exit Detection',
@@ -536,9 +564,9 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   diag_daily_caps: {
     title: '§25 · Daily Execution Cap Comparison',
     description:
-      'Slices the trades to the first 1, 2 or 4 of each day. The unlimited column is what the run actually produced.',
+      'Shows cap 1 and cap 2 only. Higher caps need a full rerun because the simulator already limited how many trades were taken. The Strategy Lab runs cap 3 and cap 4 variants.',
     howToRead:
-      'If a tighter cap keeps the profit, adopt the tighter cap. If profit collapses, the daily cap is hiding edge.',
+      'If cap 1 keeps the profit, a tighter cap is worth adopting. Cap 3, cap 4 and unlimited need the Lab.',
   },
   diag_dd_cutoff: {
     title: '§33 · Daily Max-Drawdown Cutoff Simulation',
@@ -550,7 +578,7 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   diag_slippage: {
     title: '§34 · Slippage Sensitivity Curve',
     description:
-      'Degrades every trade by 1 to 5 pips of entry and exit slippage to model realistic execution friction.',
+      'Cost is a fixed number of pips per trade (entry plus exit), converted into R using the shared pip_size and each trade’s own stop distance. A 1-pip cost is therefore comparable across GOLD, US30 and EURUSD.',
     howToRead:
       'If edge collapses at 3 pips, live broker conditions will destroy it. Aim for edge that survives 3-5 pips.',
   },

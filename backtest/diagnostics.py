@@ -15,20 +15,22 @@ Blueprint coverage:
     Section 7 item 31 - consecutive loss streak and recovery metrics
     Section 7 item 32 - circuit-breaker simulation
     Section 7 item 36 - outlier dependency removal
-    Section 7 item 37 - Monte Carlo resampling
+    Section 7 item 37 - bootstrap Monte Carlo resampling (with replacement)
     Section 7 item 38 - buy-and-hold benchmark (alpha)
   Phase 2:
-    Section 3 item 16 - post-SL continuation distance
-    Section 3 item 17 - post-TP extra pips
+    Section 3 item 16 - post-SL continuation distance (pips and R)
+    Section 3 item 17 - post-TP extra pips (pips and R)
     Section 3 item 18 - premature BE exit detection
     Section 6 item 27 - 200 EMA alignment differential
     Section 6 item 28 - confirmation type (close vs touch)
     Section 6 item 29 - news-window slippage profiling
   Phase 3 + 4:
     Section 5 item 24 - position sizing comparison (fixed vs compounding)
-    Section 5 item 25 - daily execution caps (1 / 2 / 4 / unlimited)
+    Section 5 item 25 - daily execution caps (cap 1 and cap 2 from trade list;
+                        cap 3+ requires a rerun, see Strategy Lab)
     Section 7 item 33 - daily maximum drawdown cutoff simulation
-    Section 7 item 34 - slippage sensitivity curve (1-5 pips)
+    Section 7 item 34 - slippage sensitivity curve (fixed pips per trade,
+                        fixed cash risk per trade)
     Section 5 item 22 - break-even variant estimates (A/B/C)
     Section 6 item 30 - parameter sensitivity (target R:R sweep)
 """
@@ -37,7 +39,9 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict, Any
 
-DIAGNOSTICS_VERSION = "4.0"
+from core.pip_sizes import get_pip_size
+
+DIAGNOSTICS_VERSION = "4.1"
 
 SESSION_ROLLOVER_WINDOWS = [
     ("London Open",    7, 45,  8, 15),
@@ -45,10 +49,10 @@ SESSION_ROLLOVER_WINDOWS = [
     ("Daily Rollover",20, 45, 21, 15),
 ]
 
-_PIP_SIZES = {
-    "GOLD": 0.01, "US30": 1.0, "NAS100": 0.1, "GERMAN30": 0.1,
-    "EURUSD": 0.0001, "USDJPY": 0.01, "GBPUSD": 0.0001,
-}
+# Any single post-trade movement value (in R) is capped at this before being
+# aggregated, so one outlier cannot distort the mean. The raw pip distance is
+# still reported alongside.
+MAX_R_CAP: float = 20.0
 
 
 def _kpis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -231,32 +235,47 @@ def _outlier_removal(trades, pct=0.05):
 
 
 def _monte_carlo(trades, iterations=1000, starting_equity=1000.0):
+    """
+    Bootstrap Monte Carlo: each iteration resamples the trade list WITH
+    replacement, so any individual trade can appear zero, one or many times.
+    This is the honest resampling method. Simple shuffling (permutation) would
+    only reorder the same trades and would understate the drawdown range.
+    """
     pnls = [float(t.get("money_pnl", 0.0)) for t in trades]
-    if len(pnls) < 5:
-        return {"iterations": 0, "median_max_dd": 0.0, "p5_max_dd": 0.0,
-                "p95_max_dd": 0.0, "median_final_equity": starting_equity,
-                "prob_positive": 0.0}
+    n = len(pnls)
+
+    if n < 5:
+        return {
+            "iterations": 0,
+            "median_final_pnl": 0.0, "p5_final_pnl": 0.0, "p95_final_pnl": 0.0,
+            "median_max_dd": 0.0, "p5_max_dd": 0.0, "p95_max_dd": 0.0,
+            "median_final_equity": starting_equity, "prob_positive": 0.0,
+        }
 
     rng = np.random.default_rng(42)
     arr = np.array(pnls, dtype=float)
+
+    final_pnls = np.empty(iterations)
     max_dds = np.empty(iterations)
-    finals = np.empty(iterations)
 
     for i in range(iterations):
-        shuffled = rng.permutation(arr)
-        eq = starting_equity + np.cumsum(shuffled)
+        sample = rng.choice(arr, size=n, replace=True)
+        eq = starting_equity + np.cumsum(sample)
         peaks = np.maximum.accumulate(np.concatenate([[starting_equity], eq]))
         dd = peaks[1:] - eq
         max_dds[i] = float(dd.max()) if dd.size else 0.0
-        finals[i] = float(eq[-1])
+        final_pnls[i] = float(eq[-1] - starting_equity)
 
     return {
         "iterations": iterations,
+        "median_final_pnl": round(float(np.median(final_pnls)), 2),
+        "p5_final_pnl": round(float(np.percentile(final_pnls, 5)), 2),
+        "p95_final_pnl": round(float(np.percentile(final_pnls, 95)), 2),
         "median_max_dd": round(float(np.median(max_dds)), 2),
         "p5_max_dd": round(float(np.percentile(max_dds, 5)), 2),
         "p95_max_dd": round(float(np.percentile(max_dds, 95)), 2),
-        "median_final_equity": round(float(np.median(finals)), 2),
-        "prob_positive": round(float((finals > starting_equity).mean() * 100.0), 1),
+        "median_final_equity": round(float(np.median(final_pnls)) + starting_equity, 2),
+        "prob_positive": round(float((final_pnls > 0).mean() * 100.0), 1),
     }
 
 
@@ -300,7 +319,12 @@ def _buy_and_hold(m5_df, sim_start_idx, starting_equity, strategy_net_pnl):
 # Phase-2 diagnostics
 # ==============================================================================
 
-def _post_sl_analysis(trades):
+def _post_sl_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    §16. For every stop-loss exit, measure how far price kept moving against us
+    after the stop was hit. Reported in pips (using the shared pip_size) AND in
+    R units (pips / SL pips). R values above MAX_R_CAP are clamped.
+    """
     sl_exits = [
         t for t in trades
         if isinstance(t, dict)
@@ -309,23 +333,52 @@ def _post_sl_analysis(trades):
     ]
 
     if not sl_exits:
-        return {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
-                "recovered_count": 0, "recovered_pct": 0.0}
+        return {
+            "count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
+            "mean_r": 0.0, "median_r": 0.0, "max_r": 0.0,
+            "recovered_count": 0, "recovered_pct": 0.0,
+        }
 
-    pips = np.array([float(t.get("post_sl_cont_pips", 0.0)) for t in sl_exits], dtype=float)
+    pips_list = []
+    r_list = []
+
+    for t in sl_exits:
+        pip_size = get_pip_size(str(t.get("symbol", "")))
+        entry = float(t.get("entry_price", 0.0))
+        sl = float(t.get("sl", 0.0))
+        sl_dist = abs(entry - sl)
+
+        cont_pips = float(t.get("post_sl_cont_pips", 0.0) or 0.0)
+        pips_list.append(cont_pips)
+
+        if sl_dist > 0 and pip_size > 0:
+            sl_pips = sl_dist / pip_size
+            r_val = cont_pips / sl_pips if sl_pips > 0 else 0.0
+            r_list.append(min(max(r_val, 0.0), MAX_R_CAP))
+
+    pips_arr = np.array(pips_list, dtype=float) if pips_list else np.array([0.0])
+    r_arr = np.array(r_list, dtype=float) if r_list else np.array([0.0])
+
     recovered = [t for t in sl_exits if t.get("recovered_to_tp", False)]
 
     return {
         "count": len(sl_exits),
-        "mean_pips": round(float(pips.mean()), 1),
-        "median_pips": round(float(np.median(pips)), 1),
-        "max_pips": round(float(pips.max()), 1),
+        "mean_pips": round(float(pips_arr.mean()), 1),
+        "median_pips": round(float(np.median(pips_arr)), 1),
+        "max_pips": round(float(pips_arr.max()), 1),
+        "mean_r": round(float(r_arr.mean()), 2),
+        "median_r": round(float(np.median(r_arr)), 2),
+        "max_r": round(float(r_arr.max()), 2),
         "recovered_count": len(recovered),
         "recovered_pct": round((len(recovered) / len(sl_exits)) * 100.0, 1),
     }
 
 
-def _post_tp_analysis(trades):
+def _post_tp_analysis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    §17. For every take-profit exit, measure how many extra pips price moved in
+    our favour after the TP was hit. Reported in pips and in R units.
+    """
     tp_exits = [
         t for t in trades
         if isinstance(t, dict)
@@ -334,26 +387,41 @@ def _post_tp_analysis(trades):
     ]
 
     if not tp_exits:
-        return {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
-                "avg_missed_r": 0.0}
+        return {
+            "count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
+            "mean_r": 0.0, "median_r": 0.0, "max_r": 0.0,
+            "avg_missed_r": 0.0,
+        }
 
-    pips = np.array([float(t.get("post_tp_extra_pips", 0.0)) for t in tp_exits], dtype=float)
+    pips_list = []
+    r_list = []
 
-    missed_rs = []
     for t in tp_exits:
+        pip_size = get_pip_size(str(t.get("symbol", "")))
         entry = float(t.get("entry_price", 0.0))
         sl = float(t.get("sl", 0.0))
-        sl_d = abs(entry - sl)
-        if sl_d > 0:
-            missed_rs.append(float(t.get("post_tp_extra_pips", 0.0)) / sl_d)
-    avg_missed_r = float(np.mean(missed_rs)) if missed_rs else 0.0
+        sl_dist = abs(entry - sl)
+
+        extra_pips = float(t.get("post_tp_extra_pips", 0.0) or 0.0)
+        pips_list.append(extra_pips)
+
+        if sl_dist > 0 and pip_size > 0:
+            sl_pips = sl_dist / pip_size
+            r_val = extra_pips / sl_pips if sl_pips > 0 else 0.0
+            r_list.append(min(max(r_val, 0.0), MAX_R_CAP))
+
+    pips_arr = np.array(pips_list, dtype=float) if pips_list else np.array([0.0])
+    r_arr = np.array(r_list, dtype=float) if r_list else np.array([0.0])
 
     return {
         "count": len(tp_exits),
-        "mean_pips": round(float(pips.mean()), 1),
-        "median_pips": round(float(np.median(pips)), 1),
-        "max_pips": round(float(pips.max()), 1),
-        "avg_missed_r": round(avg_missed_r, 2),
+        "mean_pips": round(float(pips_arr.mean()), 1),
+        "median_pips": round(float(np.median(pips_arr)), 1),
+        "max_pips": round(float(pips_arr.max()), 1),
+        "mean_r": round(float(r_arr.mean()), 2),
+        "median_r": round(float(np.median(r_arr)), 2),
+        "max_r": round(float(r_arr.max()), 2),
+        "avg_missed_r": round(float(r_arr.mean()), 2),
     }
 
 
@@ -441,13 +509,19 @@ def _position_sizing_comparison(trades, starting_equity=1000.0, risk_pct=1.0):
 
 
 def _daily_cap_comparison(trades):
+    """
+    §25. Only cap 1 and cap 2 can be honestly sliced from the trade list.
+    Higher caps and 'unlimited' require a full rerun (the simulator's own
+    daily cap already limited how many trades were taken), so they are not
+    produced here. The Strategy Lab runs variants with those caps.
+    """
     ordered = sorted(trades, key=lambda t: t.get("signal_time_utc", ""))
     if not ordered:
         empty = _kpis([])
-        return {"cap_1": empty, "cap_2": empty, "cap_4": empty, "unlimited": empty}
+        return {"cap_1": empty, "cap_2": empty}
 
     per_day_count = {}
-    buckets = {"cap_1": [], "cap_2": [], "cap_4": [], "unlimited": []}
+    buckets = {"cap_1": [], "cap_2": []}
 
     for t in ordered:
         day = t.get("date_sast") or t.get("date") or ""
@@ -457,9 +531,6 @@ def _daily_cap_comparison(trades):
             buckets["cap_1"].append(t)
         if cnt <= 2:
             buckets["cap_2"].append(t)
-        if cnt <= 4:
-            buckets["cap_4"].append(t)
-        buckets["unlimited"].append(t)
 
     return {k: _kpis(v) for k, v in buckets.items()}
 
@@ -518,23 +589,37 @@ def _daily_dd_cutoff(trades, starting_equity=1000.0, cutoff_pct=5.0, risk_pct=1.
 
 def _slippage_sensitivity(trades, slippage_range=(1, 2, 3, 4, 5),
                           starting_equity=1000.0, risk_pct=1.0):
+    """
+    §34. Cost is modelled as a fixed number of pips per trade (entry + exit),
+    converted into R using the shared pip_size and the trade's own stop
+    distance in pips. Cash risk per trade is a fixed baseline
+    (starting_equity * risk_pct / 100), not a value derived from
+    money_pnl / r_multiple, so tiny-R winners do not blow the numbers up.
+    """
     if not trades:
         return {}
 
     baseline_net = sum(float(t.get("money_pnl", 0.0)) for t in trades)
+    base_cash_risk = starting_equity * (risk_pct / 100.0)
+
     results = {
-        "baseline": {"slippage_pips": 0, "net_pnl": round(baseline_net, 2),
-                     "win_rate": round(_kpis(trades)["win_rate"], 1)}
+        "baseline": {
+            "slippage_pips": 0,
+            "net_pnl": round(baseline_net, 2),
+            "win_rate": round(_kpis(trades)["win_rate"], 1),
+            "per_trade_cost_r": 0.0,
+        }
     }
 
     for slip in slippage_range:
         net = 0.0
         wins = 0
         total = 0
+        total_cost_r = 0.0
 
         for t in trades:
             sym = str(t.get("symbol", ""))
-            pip_size = _PIP_SIZES.get(sym, 0.0001)
+            pip_size = get_pip_size(sym)
             entry = float(t.get("entry_price", 0.0))
             sl = float(t.get("sl", 0.0))
             sl_dist = abs(entry - sl)
@@ -548,14 +633,9 @@ def _slippage_sensitivity(trades, slippage_range=(1, 2, 3, 4, 5),
             cost_r = (2.0 * slip) / sl_pips
             new_r = old_r - cost_r
 
-            old_pnl = float(t.get("money_pnl", 0.0))
-            if abs(old_r) > 1e-6:
-                risk_cash_used = old_pnl / old_r
-            else:
-                risk_cash_used = starting_equity * (risk_pct / 100.0)
-
-            net += new_r * risk_cash_used
+            net += new_r * base_cash_risk
             total += 1
+            total_cost_r += cost_r
             if new_r > 0.1:
                 wins += 1
 
@@ -563,28 +643,13 @@ def _slippage_sensitivity(trades, slippage_range=(1, 2, 3, 4, 5),
             "slippage_pips": slip,
             "net_pnl": round(net, 2),
             "win_rate": round((wins / total * 100.0), 1) if total > 0 else 0.0,
+            "per_trade_cost_r": round((total_cost_r / total) if total > 0 else 0.0, 4),
         }
 
     return results
 
 
-# ==============================================================================
-# NEW (this pass): break-even variant estimates (A/B/C) and parameter sensitivity
-# ==============================================================================
-
 def _breakeven_variants(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Post-hoc ESTIMATE, not a re-simulation.
-
-    A_current    : what actually happened in the run.
-    B_no_be      : BE never moves. Every trade that reached MFE >= TP distance
-                   would have hit TP; others would have exited at their SL.
-    C_delayed_be : BE only moves after MFE >= 1.0R. Trades that reached at least
-                   1.0R are marked risk-free. Above 1.0R, the winner is capped
-                   at 1.0R (a conservative estimate), losers unchanged.
-
-    All three are ranked by total R contribution.
-    """
     if not trades:
         empty = _kpis([])
         return {"A_current": empty, "B_no_be": empty, "C_delayed_be": empty,
@@ -610,18 +675,16 @@ def _breakeven_variants(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         a_r += actual_r
         a_n += 1
 
-        # B: never moved to BE
         if tp_r > 0 and mfe_r >= tp_r:
             b_r += tp_r
         else:
             b_r += -1.0
         b_n += 1
 
-        # C: BE only after MFE >= 1.0R
         if mfe_r >= 1.0 and actual_r > 0.0:
             c_r += min(actual_r, 1.0)
         elif mfe_r >= 1.0 and actual_r <= 0.0:
-            c_r += 0.0  # would have been risk-free at worst
+            c_r += 0.0
         else:
             c_r += actual_r
         c_n += 1
@@ -648,13 +711,6 @@ def _parameter_sensitivity(
     starting_equity: float = 1000.0,
     risk_pct: float = 1.0,
 ) -> Dict[str, Any]:
-    """
-    Post-hoc ESTIMATE, not a re-simulation.
-
-    Winners scale linearly with the new R:R (capped by their actual MFE in R).
-    Losers keep their realised R because the stop distance is unchanged.
-    The peak of the sweep tells you where the target was best matched to MFE.
-    """
     if not trades:
         return {"sweep": [], "best_rr": 0.0, "best_net_pnl": 0.0, "verdict": "NO_DATA"}
 
@@ -666,10 +722,8 @@ def _parameter_sensitivity(
             actual_r = float(t.get("r_multiple", 0.0))
             mfe_r = float(t.get("mfe_r", 0.0))
             if actual_r > 0:
-                # Winner: capped by how far the winner actually ran.
                 net_r += min(rr, mfe_r) if mfe_r > 0 else rr
             else:
-                # Loser: unchanged.
                 net_r += actual_r
             n += 1
 
@@ -714,15 +768,20 @@ def compute_diagnostics(trades, m5_df, sim_start_idx, starting_equity=1000.0):
                                     "trades_halved": 0, "protection_delta": 0.0},
             "outlier_removal": {"full": empty_kpi, "trimmed": empty_kpi,
                                 "outlier_count": 0, "impact_pct": 0.0},
-            "monte_carlo": {"iterations": 0, "median_max_dd": 0.0, "p5_max_dd": 0.0,
-                            "p95_max_dd": 0.0, "median_final_equity": starting_equity,
-                            "prob_positive": 0.0},
+            "monte_carlo": {
+                "iterations": 0,
+                "median_final_pnl": 0.0, "p5_final_pnl": 0.0, "p95_final_pnl": 0.0,
+                "median_max_dd": 0.0, "p5_max_dd": 0.0, "p95_max_dd": 0.0,
+                "median_final_equity": starting_equity, "prob_positive": 0.0,
+            },
             "buy_and_hold": {"first_close": 0.0, "last_close": 0.0, "bh_return_pct": 0.0,
                              "bh_net_pnl": 0.0, "strategy_net_pnl": 0.0,
                              "alpha": 0.0, "verdict": "INSUFFICIENT_DATA"},
             "post_sl": {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
+                        "mean_r": 0.0, "median_r": 0.0, "max_r": 0.0,
                         "recovered_count": 0, "recovered_pct": 0.0},
             "post_tp": {"count": 0, "mean_pips": 0.0, "median_pips": 0.0, "max_pips": 0.0,
+                        "mean_r": 0.0, "median_r": 0.0, "max_r": 0.0,
                         "avg_missed_r": 0.0},
             "premature_be": {"total_be_moved": 0, "premature_count": 0, "premature_pct": 0.0,
                              "total_missed_r": 0.0, "avg_missed_r": 0.0},
@@ -734,9 +793,7 @@ def compute_diagnostics(trades, m5_df, sim_start_idx, starting_equity=1000.0):
                 "compounding": {"net_pnl": 0.0, "final_equity": starting_equity},
                 "difference": 0.0,
             },
-            "daily_cap_comparison": {
-                "cap_1": empty_kpi, "cap_2": empty_kpi, "cap_4": empty_kpi, "unlimited": empty_kpi,
-            },
+            "daily_cap_comparison": {"cap_1": empty_kpi, "cap_2": empty_kpi},
             "daily_dd_cutoff": {
                 "cutoff_pct": 5.0, "days_triggered": 0, "trades_blocked": 0,
                 "original_net_pnl": 0.0, "cutoff_net_pnl": 0.0, "protection_delta": 0.0,
@@ -775,7 +832,6 @@ def compute_diagnostics(trades, m5_df, sim_start_idx, starting_equity=1000.0):
         "daily_cap_comparison": _daily_cap_comparison(valid),
         "daily_dd_cutoff": _daily_dd_cutoff(valid, starting_equity=starting_equity),
         "slippage_sensitivity": _slippage_sensitivity(valid, starting_equity=starting_equity),
-        # NEW in this pass
         "breakeven_variants": _breakeven_variants(valid),
         "parameter_sensitivity": _parameter_sensitivity(valid, starting_equity=starting_equity),
     }
