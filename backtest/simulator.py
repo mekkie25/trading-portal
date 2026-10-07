@@ -20,6 +20,9 @@ Phase-2 Blueprint extensions (backtest-only):
 Phase-3 Blueprint extensions (backtest-only):
   Section 5 item 22 - STRUCTURAL BE variant (2 consecutive closes beyond entry)
   Section 5 item 23 - EMA_9 and EMA_25 trail variants
+
+Pip sizes now source from core/pip_sizes.py so the simulator, diagnostics and
+live bot never diverge. Values are unchanged; only the source of truth moved.
 """
 
 import sys
@@ -37,17 +40,18 @@ if PROJECT_ROOT not in sys.path:
 from core.session_config import TZ_SAST, GLOBAL_PARAMS, MarketSessionManager
 from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
+from core.pip_sizes import PIP_SIZES
 
 POST_EXIT_TRACK_BARS = 24
 
 ASSETS = {
-    "GOLD": {"pip_size": 0.01, "contract_size": 100.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
-    "US30": {"pip_size": 1.0, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 2.50},
-    "NAS100": {"pip_size": 0.1, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 1.50},
-    "GERMAN30": {"pip_size": 0.1, "contract_size": 1.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 1.80},
-    "EURUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00010},
-    "USDJPY": {"pip_size": 0.01, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
-    "GBPUSD": {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
+    "GOLD":     {"pip_size": PIP_SIZES["GOLD"],     "contract_size": 100.0,    "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
+    "US30":     {"pip_size": PIP_SIZES["US30"],     "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": 2.50},
+    "NAS100":   {"pip_size": PIP_SIZES["NAS100"],   "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": 1.50},
+    "GERMAN30": {"pip_size": PIP_SIZES["GERMAN30"], "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": 1.80},
+    "EURUSD":   {"pip_size": PIP_SIZES["EURUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00010},
+    "USDJPY":   {"pip_size": PIP_SIZES["USDJPY"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
+    "GBPUSD":   {"pip_size": PIP_SIZES["GBPUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
 }
 
 
@@ -340,8 +344,6 @@ class TradeSimulator:
                 )
 
                 if self.be_mode == "STRUCTURAL":
-                    # Section 5 item 22: only move to BE after 2 consecutive
-                    # closes beyond entry (i.e. structure has been confirmed).
                     structural_break = (
                         pos.get("consec_above_entry", 0) >= 2
                         if direction == "BUY"
