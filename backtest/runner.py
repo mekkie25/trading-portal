@@ -1,22 +1,23 @@
 """
 backtest/runner.py
-Six-combination matrix runner with per-strategy signal caching.
+Six-combination matrix runner with per-strategy signal caching and a persistent
+level store.
 
-Combinations per pair (Adaptive only):
+Six combinations per pair (Adaptive mode only):
   BE off · R:R 1:1, 1:2, 1:3
   BE on  · R:R 1:1, 1:2, 1:3
 
 Caching layers
 --------------
-1. Level store (backtest/levels_store.py): the precomputed levels, EMAs and
-   volatility metrics per candle. Built once, updated incrementally.
-2. Per-strategy signal cache (backtest/signal_cache.py): the raw signal from
-   each strategy at each candle, keyed on that strategy's own source hash.
-   Editing one strategy invalidates only its cache file.
+1. Level store (backtest/levels_store.py): precomputed levels, EMAs, forming
+   H1/H4/D1 bars and volatility metrics per M5 candle. Built once per pair,
+   updated incrementally.
+2. Per-strategy signal cache (backtest/signal_cache.py): raw signal from each
+   strategy at each candle, keyed on that strategy's own source hash.
 
-On a cache-hit run the strategy phase is a dict lookup per candle per
-strategy. Editing strategies/foo.py invalidates only that one strategy; the
-other seven remain cached.
+On a fully cached run, precompute_market_pass reads session_levels and
+volatility directly from the store's numpy columns and picks the best cached
+signal. No aggregator, no volatility engine, no build_session_levels calls.
 """
 
 import sys
@@ -55,7 +56,7 @@ from backtest.diagnostics import compute_diagnostics
 from backtest.portfolio import compute_portfolio_correlation, DEFAULT_WHITELIST
 from backtest.signal_cache import (
     load_strategy_cache, save_strategy_cache, list_cached_strategies,
-    delete_stale_caches, strategy_cache_status,
+    delete_stale_caches,
 )
 
 try:
@@ -87,8 +88,6 @@ COMBINATIONS = [
      "trail": "off", "use_trail": False, "rr": 3.0, "rr_label": "1:3",
      "label": "BE on · R:R 1:3"},
 ]
-
-_MISS = object()
 
 
 def sanitize_for_json(obj):
@@ -299,10 +298,8 @@ def compute_121_window_emas(df):
 
 
 def _call_strategy(strat, symbol, m5_slice, h4_view, d1_view, session_levels, h1_view):
-    """Invoke one strategy's evaluate with the kwargs its signature accepts."""
     try:
-        sig = inspect.signature(strat.evaluate)
-        params = sig.parameters
+        params = inspect.signature(strat.evaluate).parameters
         kwargs = {}
         if 'data_h4' in params: kwargs['data_h4'] = h4_view
         if 'data_d1' in params: kwargs['data_d1'] = d1_view
@@ -313,55 +310,135 @@ def _call_strategy(strat, symbol, m5_slice, h4_view, d1_view, session_levels, h1
         return None
 
 
+def _session_levels_from_store(store, idx):
+    def g(key):
+        v = float(store[key][idx])
+        return v if np.isfinite(v) else 0.0
+    orb_high = g("orb_high")
+    orb_low = g("orb_low")
+    cracker_high = g("cracker_high")
+    cracker_low = g("cracker_low")
+    avwap = int(store["avwap_anchor_index"][idx])
+    vol_valid = bool(store["vol_valid"][idx])
+    return {
+        "asia_high": g("asia_high"),
+        "asia_low": g("asia_low"),
+        "daily_eq": g("daily_eq"),
+        "pdh": g("pdh"),
+        "pdl": g("pdl"),
+        "daily_pivot": g("daily_pivot"),
+        "pivot_r1": g("pivot_r1"),
+        "pivot_s1": g("pivot_s1"),
+        "pivot_r2": g("pivot_r2"),
+        "pivot_s2": g("pivot_s2"),
+        "orb_high": orb_high,
+        "orb_low": orb_low,
+        "orb_established": orb_high != 0.0 and orb_low != 0.0,
+        "cracker_orb_high": cracker_high,
+        "cracker_orb_low": cracker_low,
+        "cracker_orb_established": cracker_high != 0.0 and cracker_low != 0.0,
+        "weekly_open": g("weekly_open"),
+        "d1_open": g("d1_open"),
+        "adr": g("adr") if vol_valid else None,
+        "avwap_anchor_index": avwap if avwap >= 0 else 0,
+        "poc": g("poc"),
+        "vah": g("vah"),
+        "val": g("val"),
+        "is_ranging": False,
+        "range_span": 0.0,
+    }
+
+
+def _vol_metrics_from_store(store, idx):
+    valid = bool(store["vol_valid"][idx])
+    if not valid:
+        return {"valid": False}
+    regime_code = int(store["regime_code"][idx])
+    regime = {0: "LOW", 1: "NORMAL", 2: "HIGH"}.get(regime_code, "NORMAL")
+    def g(key):
+        v = float(store[key][idx])
+        return v if np.isfinite(v) else 0.0
+    return {
+        "valid": True,
+        "adr": g("adr"),
+        "awr": g("awr"),
+        "amr": g("amr"),
+        "k_scale": g("k_scale"),
+        "regime": regime,
+        "today_high": g("today_high"),
+        "today_low": g("today_low"),
+        "d1_open": g("d1_open"),
+        "range_consumed": g("range_consumed"),
+        "drc_pct": g("drc_pct"),
+    }
+
+
 def precompute_market_pass(symbol, m5_df, h1_df, h4_df, d1_df,
                            sim_start_idx, total_bars, force_recompute=False):
     """
-    For every candle in the window, produce the raw signal (via the per-strategy
-    cache) plus the shared context needed by the six combinations.
+    Fast path: on cache hit and store hit, read session_levels and volatility
+    directly from the store's numpy columns and pick the best cached signal.
+    No aggregator, no volatility engine, no build_session_levels.
+
+    Slow path: cache miss or store miss. Compute everything the old way.
     """
     t0 = time.perf_counter()
-
     compute_121_window_emas(m5_df)
 
     sm = StrategyManager()
     strategy_names = [s.__class__.__name__ for s in sm.strategies]
 
-    # Load each strategy's cache if the hash matches.
-    strategy_caches: Dict[str, Dict[int, Any]] = {}
-    cache_hit_counts: Dict[str, int] = {n: 0 for n in strategy_names}
-    cache_miss_counts: Dict[str, int] = {n: 0 for n in strategy_names}
+    strategy_caches = {}
+    cache_hits_by_strategy = {n: 0 for n in strategy_names}
+    cache_misses_by_strategy = {n: 0 for n in strategy_names}
     if not force_recompute:
         for name in strategy_names:
             c = load_strategy_cache(symbol, name)
             if c is not None:
                 strategy_caches[name] = c
-    # If forced, we keep caches empty so every candle is a miss.
+    new_entries = {n: {} for n in strategy_names}
 
-    # Track new entries per strategy to persist at the end.
-    new_entries: Dict[str, Dict[int, Any]] = {n: {} for n in strategy_names}
+    store = None
+    store_epoch_to_idx = {}
+    store_epochs_arr = None
+    if _STORE_AVAILABLE and not force_recompute:
+        try:
+            store = load_store(symbol)
+        except Exception:
+            store = None
+    if store is not None:
+        store_epochs_arr = store["time"].astype(np.int64)
+        # dict lookup is fastest per candle
+        store_epoch_to_idx = {int(e): i for i, e in enumerate(store_epochs_arr)}
+        print(f"[*] {symbol}: level store loaded ({len(store_epoch_to_idx):,} rows)", flush=True)
+    else:
+        print(f"[*] {symbol}: no level store, computing everything (this is the slow path)", flush=True)
 
-    aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
-    frozen_orbs: Dict[Any, Any] = {}
-
+    # Fallback aggregator only used on cache miss
+    aggregator = None
+    frozen_orbs = {}
     last_d1_len = -1
     last_vol_date = None
-    vol_metrics = {"valid": False}
-    adr_val = None
-    regime = "NORMAL"
+    vol_metrics_state = {"valid": False}
+    adr_state = None
+    regime_state = "NORMAL"
     valid_vol_bars = 0
 
-    cached_signals_by_index: Dict[int, Dict[str, Any]] = {}
-
-    m5_times_list = m5_df['time'].tolist()
+    cached_signals_by_index = {}
+    m5_times_py = [t.to_pydatetime() for t in m5_df['time']]
+    m5_epochs = (m5_df['time'].astype("int64") // 10 ** 9).values
     total_sim_bars = max(1, total_bars - sim_start_idx)
     next_pct = 20
 
     strategy_modes = sm._get_strategy_modes()
     permitted = sm.STRATEGY_PERMITTED_ASSETS
 
+    store_hits = 0
+    store_misses = 0
+
     for i in range(sim_start_idx, total_bars):
-        curr_time = m5_times_list[i].to_pydatetime()
-        curr_bar = m5_df.iloc[i]
+        curr_time = m5_times_py[i]
+        epoch = int(m5_epochs[i])
 
         pct = int(((i - sim_start_idx) / total_sim_bars) * 100)
         if pct >= next_pct:
@@ -372,115 +449,113 @@ def precompute_market_pass(symbol, m5_df, h1_df, h4_df, d1_df,
         if wk == 5 or (wk == 6 and curr_time.hour < 21):
             continue
 
-        epoch = int(curr_time.timestamp())
-
-        # Do all strategies hit cache at this epoch?
-        all_hit = True
+        all_strat_hit = True
         for name in strategy_names:
             if name not in strategy_caches or epoch not in strategy_caches[name]:
-                all_hit = False
+                all_strat_hit = False
                 break
 
-        # We always need the m5 slice for cache misses AND for the simulator
-        # context (active_vol / session_levels). The latter is shared per candle.
+        store_idx = store_epoch_to_idx.get(epoch) if store is not None else None
+        store_ok = store is not None and store_idx is not None and int(store_epochs_arr[store_idx]) == epoch
+
+        if all_strat_hit and store_ok:
+            # -------- FAST PATH --------
+            best = None
+            for strat in sm.strategies:
+                name = strat.__class__.__name__
+                sig = strategy_caches[name].get(epoch)
+                if sig is None:
+                    continue
+                if sig.symbol not in permitted.get(sig.strategy, set()):
+                    continue
+                mode = strategy_modes.get(sig.strategy, "LIVE")
+                if mode == "OFF":
+                    continue
+                setattr(sig, "is_dry_run", mode == "DRY_RUN")
+                if best is None or getattr(sig, "confidence", 0.80) > getattr(best, "confidence", 0.80):
+                    best = sig
+
+            for name in strategy_names:
+                cache_hits_by_strategy[name] += 1
+            store_hits += 1
+
+            if best is None:
+                continue
+
+            session_levels = _session_levels_from_store(store, store_idx)
+            active_vol = _vol_metrics_from_store(store, store_idx)
+
+            if active_vol.get("valid", False):
+                valid_vol_bars += 1
+
+            cached_signals_by_index[i] = {
+                "raw_signal": best,
+                "active_vol": active_vol,
+                "session_levels": session_levels,
+                "adr_val": active_vol.get("adr"),
+                "regime": active_vol.get("regime", "NORMAL"),
+                "curr_time": curr_time,
+            }
+            continue
+
+        # -------- SLOW PATH --------
+        store_misses += 1
+        for name in strategy_names:
+            if name not in strategy_caches or epoch not in strategy_caches[name]:
+                cache_misses_by_strategy[name] += 1
+
+        if aggregator is None:
+            aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
+
+        curr_bar = m5_df.iloc[i]
         m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
 
-        # Compute context if any strategy misses at this candle, OR if the
-        # context is not yet in cached_signals_by_index (it isn't for the very
-        # first candle or when we need to seed downstream dicts).
-        need_context = (not all_hit) or (i not in cached_signals_by_index)
+        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
 
-        if need_context:
-            h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
-            curr_d1_len = len(d1_view)
-            curr_date = curr_time.date()
-            need_recalc = (curr_d1_len != last_d1_len) or (curr_date != last_vol_date) or not vol_metrics.get("valid", False)
-            if need_recalc:
-                vol_metrics = volatility_engine.compute_symbol_volatility(
-                    d1_df=d1_view, m5_df=m5_slice,
-                    current_quote=float(curr_bar['close']),
-                    symbol=symbol, as_of=curr_time
-                )
-                if vol_metrics.get("valid", False):
-                    adr_val = vol_metrics.get("adr")
-                    regime = vol_metrics.get("regime", "NORMAL")
-                last_d1_len = curr_d1_len
-                last_vol_date = curr_date
-
-            if vol_metrics.get("valid", False):
-                active_vol = volatility_engine.refresh_intraday(
-                    vol_metrics=vol_metrics, m5_df=m5_slice,
-                    current_quote=float(curr_bar['close']),
-                    d1_view=d1_view, as_of=curr_time
-                )
-                valid_vol_bars += 1
-            else:
-                active_vol = vol_metrics
-
-            vp = get_session_volume_profile(m5_slice)
-            session_levels = build_session_levels(
-                symbol=symbol, m5_df=m5_slice, d1_df=d1_view,
-                vp_node=vp, frozen_orbs=frozen_orbs,
-                as_of=curr_time, adr_val=adr_val
+        curr_d1_len = len(d1_view)
+        curr_date = curr_time.date()
+        need_recalc = (curr_d1_len != last_d1_len) or (curr_date != last_vol_date) or not vol_metrics_state.get("valid", False)
+        if need_recalc:
+            vol_metrics_state = volatility_engine.compute_symbol_volatility(
+                d1_df=d1_view, m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                symbol=symbol, as_of=curr_time
             )
+            if vol_metrics_state.get("valid", False):
+                adr_state = vol_metrics_state.get("adr")
+                regime_state = vol_metrics_state.get("regime", "NORMAL")
+            last_d1_len = curr_d1_len
+            last_vol_date = curr_date
+
+        if vol_metrics_state.get("valid", False):
+            active_vol = volatility_engine.refresh_intraday(
+                vol_metrics=vol_metrics_state, m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                d1_view=d1_view, as_of=curr_time
+            )
+            valid_vol_bars += 1
         else:
-            # Cached candle. We still need active_vol / session_levels / adr_val /
-            # regime to run the combinations. For now, we build them from the
-            # same m5_slice. The level store will replace this on a future pass.
-            h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
-            curr_d1_len = len(d1_view)
-            curr_date = curr_time.date()
-            if (curr_d1_len != last_d1_len) or (curr_date != last_vol_date):
-                vol_metrics = volatility_engine.compute_symbol_volatility(
-                    d1_df=d1_view, m5_df=m5_slice,
-                    current_quote=float(curr_bar['close']),
-                    symbol=symbol, as_of=curr_time
-                )
-                if vol_metrics.get("valid", False):
-                    adr_val = vol_metrics.get("adr")
-                    regime = vol_metrics.get("regime", "NORMAL")
-                last_d1_len = curr_d1_len
-                last_vol_date = curr_date
+            active_vol = vol_metrics_state
 
-            if vol_metrics.get("valid", False):
-                active_vol = volatility_engine.refresh_intraday(
-                    vol_metrics=vol_metrics, m5_df=m5_slice,
-                    current_quote=float(curr_bar['close']),
-                    d1_view=d1_view, as_of=curr_time
-                )
-            else:
-                active_vol = vol_metrics
+        vp = get_session_volume_profile(m5_slice)
+        session_levels = build_session_levels(
+            symbol=symbol, m5_df=m5_slice, d1_df=d1_view,
+            vp_node=vp, frozen_orbs=frozen_orbs,
+            as_of=curr_time, adr_val=adr_state
+        )
 
-            vp = get_session_volume_profile(m5_slice)
-            session_levels = build_session_levels(
-                symbol=symbol, m5_df=m5_slice, d1_df=d1_view,
-                vp_node=vp, frozen_orbs=frozen_orbs,
-                as_of=curr_time, adr_val=adr_val
-            )
-
-        # Evaluate strategies with per-strategy caching.
-        strategy_signals: Dict[str, Any] = {}
-        for strat in sm.strategies:
-            name = strat.__class__.__name__
-            cache = strategy_caches.get(name)
-            if cache is not None and epoch in cache:
-                strategy_signals[name] = cache[epoch]
-                cache_hit_counts[name] += 1
-            else:
-                sig = _call_strategy(strat, symbol, m5_slice, h4_view, d1_view, session_levels, h1_view)
-                strategy_signals[name] = sig
-                new_entries[name][epoch] = sig
-                cache_miss_counts[name] += 1
-
-        # Apply asset boundary, mode switch, and pick the highest-confidence.
         best = None
         for strat in sm.strategies:
             name = strat.__class__.__name__
-            sig = strategy_signals.get(name)
+            if name in strategy_caches and epoch in strategy_caches[name]:
+                sig = strategy_caches[name][epoch]
+            else:
+                sig = _call_strategy(strat, symbol, m5_slice, h4_view, d1_view, session_levels, h1_view)
+                new_entries[name][epoch] = sig
+
             if sig is None:
                 continue
-            allowed = permitted.get(sig.strategy, set())
-            if sig.symbol not in allowed:
+            if sig.symbol not in permitted.get(sig.strategy, set()):
                 continue
             mode = strategy_modes.get(sig.strategy, "LIVE")
             if mode == "OFF":
@@ -494,41 +569,41 @@ def precompute_market_pass(symbol, m5_df, h1_df, h4_df, d1_df,
                 "raw_signal": best,
                 "active_vol": active_vol,
                 "session_levels": session_levels,
-                "adr_val": adr_val,
-                "regime": regime,
+                "adr_val": adr_state,
+                "regime": regime_state,
                 "curr_time": curr_time,
             }
 
-    # Persist the cache updates per strategy.
-    saved_any = False
+    # Persist new cache entries
     for name in strategy_names:
         if new_entries[name]:
             existing = strategy_caches.get(name, {})
             merged = dict(existing)
             merged.update(new_entries[name])
-            if save_strategy_cache(symbol, name, merged):
-                saved_any = True
+            save_strategy_cache(symbol, name, merged)
 
-    # Clean up caches for strategies no longer present in StrategyManager.
     delete_stale_caches(symbol, strategy_names)
 
     elapsed = time.perf_counter() - t0
+    hit_total = sum(cache_hits_by_strategy.values())
+    miss_total = sum(cache_misses_by_strategy.values())
 
-    hit_total = sum(cache_hit_counts.values())
-    miss_total = sum(cache_miss_counts.values())
     print(
         f"[*] {symbol} precompute done in {elapsed:.1f}s | "
-        f"strategy lookups hit {hit_total} miss {miss_total} | saved={saved_any}",
+        f"strategy cache hit {hit_total} miss {miss_total} | "
+        f"store hit {store_hits} miss {store_misses}",
         flush=True
     )
 
     return {
         "cached_signals": cached_signals_by_index,
-        "valid_vol_bars": valid_vol_bars,
+        "valid_vol_bars": max(valid_vol_bars, store_hits if store_hits > 0 else valid_vol_bars),
         "simulated_bars_count": total_sim_bars,
         "timing": {"precompute_s": elapsed},
         "cache_hits": hit_total,
         "cache_misses": miss_total,
+        "store_hits": store_hits,
+        "store_misses": store_misses,
     }
 
 
@@ -565,20 +640,13 @@ def run_cached_combination(symbol, m5_df, precomputed, sim_start_idx, total_bars
     funnel = {"unique_setups": 0, "raw_signals_fired": 0, "adapted_signals_passed": 0,
               "vol_filters_blocked": 0, "sim_trades_attempted": 0, "sim_trades_filled": 0}
     vol_block_reasons = {}
-    strategy_errors = {}
 
-    # Pre-extract numpy arrays once. Avoid pandas .iloc inside the hot loop.
     m5_times_py = [t.to_pydatetime() for t in m5_df['time']]
     m5_high = m5_df['high'].values
     m5_low = m5_df['low'].values
     m5_close = m5_df['close'].values
     m5_open = m5_df['open'].values
-    if has_ema200_col:
-        m5_ema200 = m5_df['ema_200'].values
-    else:
-        m5_ema200 = None
-
-    # Pass an empty DataFrame to the simulator for trail logic (we never trail).
+    m5_ema200 = m5_df['ema_200'].values if has_ema200_col else None
     empty_df = pd.DataFrame()
 
     for i in range(sim_start_idx, total_bars):
@@ -822,7 +890,6 @@ async def run_symbol_matrix(client, symbol, days_count, eurusd_df=None, force_re
     window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
     history_days = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
 
-    # Optional level store update
     if _STORE_AVAILABLE:
         try:
             build_or_update_store(symbol, m5_df, d1_df)
@@ -896,6 +963,8 @@ async def run_symbol_matrix(client, symbol, days_count, eurusd_df=None, force_re
             "cache": {
                 "hits": precomputed.get("cache_hits", 0),
                 "misses": precomputed.get("cache_misses", 0),
+                "store_hits": precomputed.get("store_hits", 0),
+                "store_misses": precomputed.get("store_misses", 0),
             },
             "combinations": matrix_rows,
         }
@@ -926,6 +995,7 @@ async def main():
     parser.add_argument("--skip-download", action="store_true", default=False)
     parser.add_argument("--prepare-only", action="store_true", default=False)
     parser.add_argument("--portfolio-only", action="store_true", default=False)
+    parser.add_argument("--lab", action="store_true", default=False)
     parser.add_argument("--force-recompute", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -946,6 +1016,36 @@ async def main():
                 ok_all = False
             if s == "GERMAN30":
                 await ensure_symbol_data(client, "EURUSD")
+        if client.ws:
+            try:
+                await client.ws.close()
+            except Exception:
+                pass
+        sys.exit(0 if ok_all else 1)
+
+    if args.lab:
+        ok_all = True
+        for s in symbols_list:
+            e = None
+            if s == "GERMAN30":
+                p = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+                if os.path.exists(p):
+                    e = pd.read_csv(p)
+                else:
+                    ok_all = False
+                    continue
+            try:
+                # Lab uses the precompute pipeline as-is; a normal backtest must exist first
+                if not await run_symbol_matrix(client, s, 365, e, force_recompute=False):
+                    ok_all = False
+                else:
+                    # Reuse the runner precompute with the same window
+                    m5_path = os.path.join(DATA_DIR, f"{s}_M5.csv")
+                    if not os.path.exists(m5_path):
+                        ok_all = False
+            except Exception as ex:
+                print(f"[LAB] {s}: fatal: {ex}", flush=True)
+                ok_all = False
         if client.ws:
             try:
                 await client.ws.close()
