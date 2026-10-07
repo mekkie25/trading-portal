@@ -24,7 +24,7 @@ from strategies.avwap_200ema_trend_continuation import AVWAPTrendContinuation
 from strategies.pdh_pdl_failed_breakout import LiquidityTrap
 from strategies.ema_9_25_cross_trail import EMACrossTrail
 from strategies.orb_cracker_counter_sweep import ORBCracker
-from strategies.orders_4h_order_block_retest import OrderBlockRetest
+from strategies.oes_4h_order_block_retest import OrderBlockRetest
 
 try:
     from config.strategy_params import GLOBAL_PARAMS, TZ_SAST
