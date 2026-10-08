@@ -1,10 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion } from 'motion/react';
-import { createChart, IChartApi, ColorType, LineStyle, UTCTimestamp } from 'lightweight-charts';
 import {
-  Calendar, TrendingUp, RefreshCw, Play, AlertTriangle, Lightbulb, Trash2, RotateCcw,
-  Sparkles, Layers, Square, Copy, Check, Table, Database, Clock, ShieldCheck, Download, Printer,
-  FileText, Activity, Network, GitBranch, Info, FlaskConical
+  TrendingUp, RefreshCw, Play, Lightbulb, Trash2,
+  Layers, Square, Copy, Check, Database, Clock, ShieldCheck, Download, Printer,
+  FileText, Activity, Network, Info, FlaskConical
 } from 'lucide-react';
 import {
   ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip,
@@ -19,74 +18,40 @@ interface BacktestViewProps {
 }
 
 interface SummaryCombination {
-  label: string;
-  mode: string;
-  be: string;
-  trail: string;
-  rr: number;
-  rr_label: string;
-  report_file: string;
-  total_trades: number;
-  win_rate: number;
-  expectancy: number;
-  profit_factor: number;
-  max_drawdown: number;
-  net_pnl: number;
-  adaptive_effective_pct: number;
-  holdout_verdict?: string;
-  tune_validate?: any;
-  funnel?: any;
+  label: string; mode: string; be: string; trail: string;
+  rr: number; rr_label: string; report_file: string;
+  total_trades: number; win_rate: number; expectancy: number;
+  profit_factor: number; max_drawdown: number; net_pnl: number;
+  adaptive_effective_pct: number; holdout_verdict?: string;
+  tune_validate?: any; funnel?: any;
 }
 
 interface SymbolSummaryPayload {
-  symbol: string;
-  days: number;
-  target_rr?: number | null;
-  rr_values?: number[];
-  generated_at: string;
-  total_seconds?: number;
-  phase_seconds?: any;
-  cache?: any;
+  symbol: string; days: number; target_rr?: number | null;
+  rr_values?: number[]; generated_at: string;
+  total_seconds?: number; phase_seconds?: any; cache?: any;
   combinations: SummaryCombination[];
 }
 
 interface StorageInfo {
-  total_mb: number;
-  used_mb: number;
-  free_mb: number;
-  market_data_mb: number;
-  reports_mb: number;
+  total_mb: number; used_mb: number; free_mb: number;
+  market_data_mb: number; reports_mb: number;
 }
 
 interface RunResultItem {
-  symbol: string;
-  status: 'OK' | 'FAILED';
-  message: string;
-  timing?: string;
+  symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string;
 }
 
 interface LabVariantRow {
-  label: string;
-  trades: number;
-  win_rate: number;
-  profit_factor: number;
-  max_drawdown: number;
-  net_pnl: number;
-  expectancy: number;
-  tune_pf: number;
-  tune_trades: number;
-  validate_pf: number;
-  validate_trades: number;
+  label: string; trades: number; win_rate: number; profit_factor: number;
+  max_drawdown: number; net_pnl: number; expectancy: number;
+  tune_pf: number; tune_trades: number; validate_pf: number; validate_trades: number;
   verdict: 'IMPROVES' | 'NO' | 'INCONCLUSIVE';
 }
 
 interface LabPayload {
-  symbol: string;
-  days: number;
-  generated_at: string;
-  window_start: string;
-  window_end: string;
-  baseline_label: string;
+  symbol: string; days: number; generated_at: string;
+  window_start: string; window_end: string; baseline_label: string;
   variants: LabVariantRow[];
 }
 
@@ -106,20 +71,6 @@ function formatPriceBySymbol(price: any, symbol?: string): string {
   return num.toFixed(2);
 }
 
-function prettifyReportName(filename: string): string {
-  if (!filename) return 'Report';
-  if (filename.includes('_summary.json')) return `${filename.replace('_summary.json', '')} · 6-Combo Summary`;
-  const clean = filename.replace('_report.json', '');
-  const parts = clean.split('_');
-  if (parts.length >= 4) {
-    const sym = parts[0];
-    const be = parts[2].replace('be', 'BE ');
-    const rr = parts[3].replace('rr', 'R:R ').replace('.', ':');
-    return `${sym} · Adaptive · ${be} · ${rr}`;
-  }
-  return filename;
-}
-
 function corrColor(v: number): string {
   if (v >= 0.7) return 'bg-rose-500/40 text-rose-900 dark:text-rose-100 border-rose-500/50';
   if (v >= 0.4) return 'bg-amber-500/30 text-amber-900 dark:text-amber-100 border-amber-500/40';
@@ -133,20 +84,12 @@ const InfoTip: React.FC<{ metricKey: string }> = ({ metricKey }) => {
   const [open, setOpen] = useState(false);
   const d = describe(metricKey);
   return (
-    <span
-      className="relative inline-flex items-center ml-1 align-middle"
-      onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
-    >
-      <button
-        type="button"
-        aria-label={`Info: ${d.title}`}
-        tabIndex={0}
+    <span className="relative inline-flex items-center ml-1 align-middle"
+      onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <button type="button" aria-label={`Info: ${d.title}`} tabIndex={0}
         onClick={(e) => { e.stopPropagation(); setOpen(v => !v); }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
-        className="text-slate-400 hover:text-blue-500 focus:text-blue-500 cursor-help outline-none"
-      >
+        onFocus={() => setOpen(true)} onBlur={() => setOpen(false)}
+        className="text-slate-400 hover:text-blue-500 focus:text-blue-500 cursor-help outline-none">
         <Info className="w-3 h-3" />
       </button>
       {open && (
@@ -415,7 +358,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   }, [labRunning, selectedSymbols, fetchLabForSymbol]);
 
   const currentSymbolReports = useMemo(() => {
-    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && f !== 'portfolio_correlation.json' && !f.endsWith('_lab.json') && !f.endsWith('_verify.json'));
+    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && f !== 'portfolio_correlation.json' && !f.endsWith('_lab.json') && !f.endsWith('_verify.json') && !f.endsWith('_compare.json'));
   }, [reportFiles, testSymbol]);
 
   const toggleSymbol = (sym: string) => {
@@ -550,21 +493,30 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const formatVerifyResult = (r: any): string => {
     if (r.error) return `Error: ${r.error}`;
     const lines: string[] = [];
-    lines.push(`VERIFY ${r.symbol} — ${r.days} days — ${r.combination}`);
-    lines.push(`Window: ${r.window_start} → ${r.window_end}`);
-    lines.push(`Reference trades: ${r.reference_trades} | Fast trades: ${r.fast_trades}`);
-    lines.push(`Reference KPIs: WR ${r.reference_kpis?.win_rate}%, PF ${r.reference_kpis?.profit_factor}, PnL $${r.reference_kpis?.net_pnl}`);
-    lines.push(`Fast KPIs:      WR ${r.fast_kpis?.win_rate}%, PF ${r.fast_kpis?.profit_factor}, PnL $${r.fast_kpis?.net_pnl}`);
+    lines.push(`VERIFY ${r.symbol} — ${r.days} days`);
+    lines.push(`Old combo: ${r.old_combo || 'n/a'}`);
+    lines.push(`New combo: ${r.new_combo || 'n/a'}`);
+    lines.push(`Old trades: ${r.old_trades_count ?? 'n/a'} | New trades: ${r.new_trades_count ?? 'n/a'}`);
+    if (r.old_kpis) lines.push(`Old KPIs: WR ${r.old_kpis.win_rate}%, PF ${r.old_kpis.profit_factor}, PnL $${r.old_kpis.net_pnl}, Max DD $${r.old_kpis.max_dd_money}`);
+    if (r.new_kpis) lines.push(`New KPIs: WR ${r.new_kpis.win_rate}%, PF ${r.new_kpis.profit_factor}, PnL $${r.new_kpis.net_pnl}, Max DD $${r.new_kpis.max_dd_money}`);
     lines.push(`Verdict: ${r.verdict}`);
-    if (r.note) lines.push(`Note: ${r.note}`);
+    if (r.old_run && r.old_run.error) lines.push(`Old engine run: ${r.old_run.error}`);
+    if (r.new_run && r.new_run.error) lines.push(`New engine run: ${r.new_run.error}`);
+    if (r.csv_copied && r.csv_copied.length > 0) lines.push(`CSVs copied to reference: ${r.csv_copied.join(', ')}`);
     if (Array.isArray(r.divergences_sample) && r.divergences_sample.length > 0) {
       lines.push('');
       lines.push(`First ${r.divergences_sample.length} divergent trades:`);
       for (const d of r.divergences_sample) {
         lines.push(`  [${d.stage}] index ${d.index}`);
-        if (d.ref) lines.push(`    ref  : ${d.ref.signal_time_utc} ${d.ref.direction} ${d.ref.strategy} entry ${d.ref.entry_price} sl ${d.ref.sl} tp ${d.ref.tp} exit ${d.ref.exit_time} @ ${d.ref.exit_price} (${d.ref.exit_reason}) PnL $${d.ref.money_pnl}`);
-        if (d.fast) lines.push(`    fast : ${d.fast.signal_time_utc} ${d.fast.direction} ${d.fast.strategy} entry ${d.fast.entry_price} sl ${d.fast.sl} tp ${d.fast.tp} exit ${d.fast.exit_time} @ ${d.fast.exit_price} (${d.fast.exit_reason}) PnL $${d.fast.money_pnl}`);
+        if (d.old) lines.push(`    old : ${d.old.signal_time_utc} ${d.old.direction} ${d.old.strategy} entry ${d.old.entry_price} sl ${d.old.sl} tp ${d.old.tp} exit ${d.old.exit_time} @ ${d.old.exit_price} (${d.old.exit_reason}) PnL $${d.old.money_pnl}`);
+        if (d.new) lines.push(`    new : ${d.new.signal_time_utc} ${d.new.direction} ${d.new.strategy} entry ${d.new.entry_price} sl ${d.new.sl} tp ${d.new.tp} exit ${d.new.exit_time} @ ${d.new.exit_price} (${d.new.exit_reason}) PnL $${d.new.money_pnl}`);
       }
+    }
+    if (r.cost_assumptions) {
+      lines.push('');
+      lines.push('Cost assumptions:');
+      if (r.cost_assumptions.old) lines.push(`  old: ${JSON.stringify(r.cost_assumptions.old)}`);
+      if (r.cost_assumptions.new) lines.push(`  new: ${JSON.stringify(r.cost_assumptions.new)}`);
     }
     return lines.join('\n');
   };
@@ -572,35 +524,48 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const handleVerifyVsOriginal = async () => {
     setIsVerifying(true);
     setVerifyResult(null);
-    setVerifyProgress(`Starting verification for ${testSymbol}...`);
+    setVerifyProgress(`Starting comparison for ${testSymbol}...`);
     try {
-      const start = await fetch('/api/backtest/verify', {
+      const start = await fetch('/api/backtest/compare', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: testSymbol, days: 60 }),
       });
-      const startJson = await start.json().catch(() => ({}));
-      if (!start.ok) {
-        setVerifyResult(`Failed to start verification (HTTP ${start.status}): ${startJson.error || 'unknown'}`);
+      const text = await start.text();
+      let startJson: any = {};
+      try { startJson = JSON.parse(text); } catch {
+        setVerifyResult(`Non-JSON response (HTTP ${start.status}): ${text.slice(0, 200)}`);
         setIsVerifying(false);
         return;
       }
-      setVerifyProgress(startJson.message || 'Verification running...');
+      if (!start.ok) {
+        setVerifyResult(`Failed to start (HTTP ${start.status}): ${startJson.error || 'unknown'}`);
+        setIsVerifying(false);
+        return;
+      }
+      setVerifyProgress(startJson.message || 'Comparison running...');
 
       const pollId = window.setInterval(async () => {
         try {
-          const statusRes = await fetch('/api/backtest/verify/status');
-          const statusJson = await statusRes.json().catch(() => ({}));
+          const statusRes = await fetch('/api/backtest/compare/status');
+          const statusText = await statusRes.text();
+          let statusJson: any = {};
+          try { statusJson = JSON.parse(statusText); } catch {
+            window.clearInterval(pollId);
+            setIsVerifying(false);
+            setVerifyResult(`Non-JSON poll (HTTP ${statusRes.status}): ${statusText.slice(0, 200)}`);
+            return;
+          }
           if (statusJson.progress) setVerifyProgress(statusJson.progress);
           if (!statusJson.isRunning) {
             window.clearInterval(pollId);
             setIsVerifying(false);
             if (statusJson.lastError) {
-              setVerifyResult(`Verification failed: ${statusJson.lastError}`);
+              setVerifyResult(`Comparison failed: ${statusJson.lastError}`);
             } else if (statusJson.result) {
               setVerifyResult(formatVerifyResult(statusJson.result));
             } else {
-              setVerifyResult('Verification finished but no result file was produced.');
+              setVerifyResult('Comparison finished but no result file was produced.');
             }
           }
         } catch (e: any) {
@@ -846,10 +811,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </div>
           </div>
           {isVerifying && (
-            <div className="text-xs text-slate-500 font-mono">{verifyProgress || 'Verification running...'}</div>
+            <div className="text-xs text-slate-500 font-mono">{verifyProgress || 'Comparison running...'}</div>
           )}
           {verifyResult && (
-            <textarea readOnly value={verifyResult} rows={14} onFocus={(e) => e.target.select()} className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none" />
+            <textarea readOnly value={verifyResult} rows={20} onFocus={(e) => e.target.select()} className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none" />
           )}
         </div>
       )}
