@@ -335,7 +335,7 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
       const loss = Math.abs((tv.validate?.net_pnl || 0));
       suggestions.push({
         tag: `[MEASURED $${loss.toFixed(2)}]`,
-        text: `Combination '${c.label}' on ${symbol} FAILS hold-out: TUNE PF ${(tv.tune?.profit_factor || 0).toFixed(2)} -> VALIDATE PF ${(tv.validate?.profit_factor || 0).toFixed(2)} (TUNE ${tv.tune?.count || 0} trades / VALIDATE ${tv.validate?.count || 0} trades).`,
+        text: `Combination '${c.label}' on ${symbol} FAILS hold-out: TUNE PF ${(tv.tune?.profit_factor || 0).toFixed(2)} -> VALIDATE PF ${(tv.validate?.profit_factor || 0).toFixed(2)}.`,
         impact: Number(loss.toFixed(2)),
         is_measured: true,
         type: 'HOLD_OUT_FAIL'
@@ -350,7 +350,7 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
       const loss = Math.abs((tvRow?.validate?.net_pnl || 0));
       suggestions.push({
         tag: `[MEASURED $${loss.toFixed(2)}]`,
-        text: `${sName} on ${symbol} FAILS hold-out: TUNE PF ${(tvRow?.tune?.profit_factor || 0).toFixed(2)} -> VALIDATE PF ${(tvRow?.validate?.profit_factor || 0).toFixed(2)}.`,
+        text: `${sName} on ${symbol} FAILS hold-out.`,
         impact: Number(loss.toFixed(2)),
         is_measured: true,
         type: 'HOLD_OUT_FAIL'
@@ -361,29 +361,16 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
   if (totalTrades < 30) return suggestions;
 
   const stratKpis = best.strategy_kpis || {};
-  const adpCov = best.adaptive_effective_pct ?? 100;
 
   Object.entries<any>(stratKpis).forEach(([sName, s]) => {
     if ((s.count || 0) >= 30 && (s.profit_factor || 0) < 1.0 && (s.net_pnl || 0) < 0) {
       const lossAmt = Math.abs(s.net_pnl);
       suggestions.push({
         tag: `[MEASURED $${lossAmt.toFixed(2)}]`,
-        text: `Disable or retune ${sName} on ${symbol}: produced PF ${(s.profit_factor || 0).toFixed(2)} with a net loss of -$${lossAmt.toFixed(2)}.`,
+        text: `Disable or retune ${sName} on ${symbol}: PF ${(s.profit_factor || 0).toFixed(2)} with net loss -$${lossAmt.toFixed(2)}.`,
         impact: Number(lossAmt.toFixed(2)),
         is_measured: true,
         type: 'STRATEGY_RETUNE'
-      });
-    }
-  });
-
-  Object.entries<any>(stratKpis).forEach(([sName, s]) => {
-    if ((s.count || 0) >= 30 && (s.profit_factor || 0) >= 1.3 && (s.net_pnl || 0) > 0) {
-      suggestions.push({
-        tag: '[TEST NEEDED]',
-        text: `Keep ${sName} on ${symbol} as core edge (current contribution: +$${(s.net_pnl || 0).toFixed(2)}, PF ${(s.profit_factor || 0).toFixed(2)}) and test increased risk allocation.`,
-        impact: 0.0,
-        is_measured: false,
-        type: 'STRATEGY_EXPAND'
       });
     }
   });
@@ -394,7 +381,7 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
       const lossAmt = Math.abs(d.net_pnl || 0);
       suggestions.push({
         tag: `[MEASURED $${lossAmt.toFixed(2)}]`,
-        text: `Avoid entries on ${dow}s for ${symbol}: negative expectancy (${(d.expectancy || 0).toFixed(2)}R) producing -$${lossAmt.toFixed(2)} in net loss.`,
+        text: `Avoid entries on ${dow}s for ${symbol}: negative expectancy.`,
         impact: Number(lossAmt.toFixed(2)),
         is_measured: true,
         type: 'DAY_FILTER'
@@ -402,21 +389,18 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   });
 
-  // Rule 5: BE recommendation (Trail analysis removed since Trail no longer exists)
   const beOffCombos = combos.filter(c => c.be === 'off' && (c.total_trades || 0) >= 30);
   const beOnCombos = combos.filter(c => c.be === 'on' && (c.total_trades || 0) >= 30);
   if (beOffCombos.length > 0 && beOnCombos.length > 0) {
     const bestBeOff = beOffCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, beOffCombos[0]);
     const bestBeOn = beOnCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, beOnCombos[0]);
-
     if (Math.abs((bestBeOn.profit_factor || 0) - (bestBeOff.profit_factor || 0)) >= 0.15) {
       const rec = (bestBeOn.profit_factor || 0) > (bestBeOff.profit_factor || 0) ? 'Breakeven On' : 'Breakeven Off';
       const better = rec === 'Breakeven On' ? bestBeOn : bestBeOff;
-      const worse = rec === 'Breakeven On' ? bestBeOff : bestBeOn;
-      const diffPnl = Math.abs((better.net_pnl || 0) - (worse.net_pnl || 0));
+      const diffPnl = Math.abs((bestBeOn.net_pnl || 0) - (bestBeOff.net_pnl || 0));
       suggestions.push({
         tag: `[MEASURED $${diffPnl.toFixed(2)}]`,
-        text: `Recommend ${rec} for ${symbol}: better profit factor (${(better.profit_factor || 0).toFixed(2)} vs ${(worse.profit_factor || 0).toFixed(2)}) and lower drawdown (-$${(better.max_drawdown || 0).toFixed(2)}).`,
+        text: `Recommend ${rec} for ${symbol}: PF ${(better.profit_factor || 0).toFixed(2)} with $${diffPnl.toFixed(2)} P&L advantage.`,
         impact: Number(diffPnl.toFixed(2)),
         is_measured: true,
         type: 'BE_TUNING'
@@ -424,7 +408,6 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   }
 
-  // Rule 9: cost drag
   try {
     const wr = Number(best.win_rate || 0);
     const exp = Number(best.expectancy || 0);
@@ -434,7 +417,7 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     if (gapR > 0.07) {
       suggestions.push({
         tag: `[MEASURED ${gapR.toFixed(2)}R]`,
-        text: `Estimated cost drag of ${gapR.toFixed(2)}R per trade on ${symbol} at ${wr.toFixed(1)}% win rate. Add a spread filter or a minimum-stop filter on the affected strategies.`,
+        text: `Estimated cost drag of ${gapR.toFixed(2)}R per trade on ${symbol}. Add a spread or minimum-stop filter.`,
         impact: 0.0,
         is_measured: true,
         type: 'COST_DRAG'
@@ -442,13 +425,12 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
     }
   } catch {}
 
-  // Rule 11: R:R expansion on HOLDS
   const bestTv = best.tune_validate || {};
   const bestVerdict = holdoutVerdict(bestTv.tune, bestTv.validate);
   if (bestVerdict === 'HOLDS' && totalTrades >= 30) {
     suggestions.push({
       tag: '[TEST NEEDED]',
-      text: `Test larger R:R targets on ${symbol}: the best combination is HOLDS, so R:R expansion is worth testing in the Strategy Lab.`,
+      text: `Test larger R:R targets on ${symbol}: the best combination is HOLDS.`,
       impact: 0.0,
       is_measured: false,
       type: 'RR_EXPANSION'
@@ -461,22 +443,19 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
   return [...measured, ...testNeeded];
 }
 
-function computePortfolioNextTests(allSuggestions: Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }>): string[] {
+function computePortfolioNextTests(allSuggestions: Array<{ type: string; text: string }>): string[] {
   const tests: string[] = [];
   const retunes = allSuggestions.filter(s => s.type === 'STRATEGY_RETUNE');
-  if (retunes.length > 0) tests.push(`Retest matrix with underperforming setups disabled (${retunes[0].text.split(':')[0]}).`);
+  if (retunes.length > 0) tests.push(`Retest with underperforming setups disabled.`);
   const days = allSuggestions.filter(s => s.type === 'DAY_FILTER');
-  if (days.length > 0) tests.push(`Implement weekday blackout filter based on negative expectancy days.`);
+  if (days.length > 0) tests.push(`Add a weekday blackout filter.`);
   const bes = allSuggestions.filter(s => s.type === 'BE_TUNING');
-  if (bes.length > 0) tests.push(`Lock in the statistically dominant Breakeven policy across validated pairs.`);
+  if (bes.length > 0) tests.push(`Lock in the better Breakeven policy per pair.`);
   const costItems = allSuggestions.filter(s => s.type === 'COST_DRAG');
-  if (costItems.length > 0) tests.push(`Add a spread or minimum-stop filter on the pairs showing a measured cost drag above 0.07R per trade.`);
+  if (costItems.length > 0) tests.push(`Add a spread or minimum-stop filter where cost drag exceeds 0.07R.`);
   const rrItems = allSuggestions.filter(s => s.type === 'RR_EXPANSION');
-  if (rrItems.length > 0) {
-    tests.push(`Test larger R:R targets on any pair whose best combination is HOLDS.`);
-  } else {
-    tests.push(`Run the Strategy Lab on the pairs with the highest PF to find a variant that holds out.`);
-  }
+  if (rrItems.length > 0) tests.push(`Test larger R:R targets on HOLDS pairs.`);
+  else tests.push(`Run the Strategy Lab on the pairs with the highest PF.`);
   return tests.slice(0, 5);
 }
 
@@ -484,7 +463,6 @@ function generateExportDataPayload(): any {
   const result: any = {
     generated_at: new Date().toISOString(),
     days: 60,
-    target_rr: null,
     rr_values: [1.0, 2.0, 3.0],
     total_run_seconds: null,
     combinations_rollup: {},
@@ -511,30 +489,23 @@ function generateExportDataPayload(): any {
       result.pairs.push({ symbol: sym, status: "NOT TESTED", error: "No backtest summary generated yet." });
       continue;
     }
-
     try {
       const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
       result.days = summary.days || result.days;
-
       const pairSeconds = (typeof summary.total_seconds === 'number' && summary.total_seconds > 0) ? summary.total_seconds : null;
       if (pairSeconds !== null) {
         totalTime += pairSeconds;
         hasValidTimes = true;
       }
-
       const combos: any[] = summary.combinations || [];
       combos.forEach(c => {
         const tv = c.tune_validate || {};
         c.holdout_verdict = holdoutVerdict(tv.tune, tv.validate);
-
-        if (!allSummaryCombos[c.label]) {
-          allSummaryCombos[c.label] = { trades: 0, pnl: 0, win_count: 0 };
-        }
+        if (!allSummaryCombos[c.label]) allSummaryCombos[c.label] = { trades: 0, pnl: 0, win_count: 0 };
         allSummaryCombos[c.label].trades += c.total_trades || 0;
         allSummaryCombos[c.label].pnl += c.net_pnl || 0;
         allSummaryCombos[c.label].win_count += Math.round(((c.win_rate || 0) / 100) * (c.total_trades || 0));
       });
-
       let bestCombo: any = null;
       const qualifying = combos.filter(c => (c.total_trades || 0) >= 30);
       if (qualifying.length > 0) {
@@ -542,25 +513,19 @@ function generateExportDataPayload(): any {
       } else if (combos.length > 0) {
         bestCombo = combos.reduce((b, curr) => (curr.total_trades > b.total_trades ? curr : b), combos[0]);
       }
-
       let bestReportDetail: any = {};
       if (bestCombo && bestCombo.report_file) {
         const reportPath = path.resolve(BACKTEST_OUTPUT_DIR, bestCombo.report_file);
-        if (fs.existsSync(reportPath)) {
-          bestReportDetail = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-        }
+        if (fs.existsSync(reportPath)) bestReportDetail = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
       }
-
       const labFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_lab.json`);
       const labPayload = safeReadJson(labFile);
-
       const pairPayload: any = {
         symbol: sym,
         status: "OK",
         seconds_taken: pairSeconds,
         phase_seconds: (summary as any).phase_seconds || null,
         cache: (summary as any).cache || null,
-        cpu_cores: (summary as any).cpu_cores || null,
         combinations: combos,
         lab: labPayload || null,
         best_combination: {
@@ -574,15 +539,11 @@ function generateExportDataPayload(): any {
           tune_validate: bestReportDetail.tune_validate || (bestCombo ? bestCombo.tune_validate : null) || {},
           diagnostics: bestReportDetail.diagnostics || null,
           improvement_tips: bestReportDetail.improvement_tips || [],
-          run_settings: bestReportDetail.run_settings || '',
-          funnel: bestReportDetail.funnel || null,
         }
       };
-
       const suggestions = computeRuleBasedPairAdvice(pairPayload);
       pairPayload.best_combination.rule_suggestions = suggestions;
       allPortfolioSuggestions.push(...suggestions);
-
       result.pairs.push(pairPayload);
     } catch (e: any) {
       result.pairs.push({ symbol: sym, status: "NOT TESTED", error: e.message });
@@ -617,8 +578,6 @@ function fmt(v: any, decimals = 2): string {
 function buildAiBrief(data: any): string[] {
   const lines: string[] = [];
   const okPairs = (data.pairs || []).filter((p: any) => p.status === 'OK');
-  const failedPairs = (data.pairs || []).filter((p: any) => p.status !== 'OK');
-
   let bestCombo: any = null;
   for (const p of okPairs) {
     for (const c of (p.combinations || [])) {
@@ -628,7 +587,6 @@ function buildAiBrief(data: any): string[] {
       }
     }
   }
-
   const holds: string[] = [];
   const flat: string[] = [];
   const fails: string[] = [];
@@ -641,318 +599,153 @@ function buildAiBrief(data: any): string[] {
       else if (v === 'FAILS') fails.push(tag);
     }
   }
-
   lines.push(`AI BRIEF`);
-  if (bestCombo) lines.push(`Best combination: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, WR ${fmt(bestCombo.wr, 1)}%, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
-  if (failedPairs.length > 0) lines.push(`Pairs not tested: ${failedPairs.map((p: any) => p.symbol).join(', ')}.`);
-  if (holds.length > 0) lines.push(`HOLDS on hold-out (${holds.length}): ${holds.slice(0, 5).join('; ')}${holds.length > 5 ? ` (+${holds.length - 5} more)` : ''}.`);
-  if (flat.length > 0) lines.push(`FLAT (no real edge either way) on hold-out (${flat.length}): ${flat.slice(0, 4).join('; ')}${flat.length > 4 ? ` (+${flat.length - 4} more)` : ''}.`);
-  if (fails.length > 0) lines.push(`FAILS on hold-out (${fails.length}): ${fails.slice(0, 5).join('; ')}${fails.length > 5 ? ` (+${fails.length - 5} more)` : ''}.`);
-  if (data.portfolio_correlation) {
-    lines.push(`Portfolio avg daily correlation: ${fmt(data.portfolio_correlation.avg_daily_correlation, 3)}; diversification ratio ${fmt(data.portfolio_correlation.diversification_ratio, 2)}x.`);
-  }
+  if (bestCombo) lines.push(`Best: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
+  if (holds.length > 0) lines.push(`HOLDS (${holds.length}): ${holds.slice(0, 5).join('; ')}.`);
+  if (flat.length > 0) lines.push(`FLAT (${flat.length}): ${flat.slice(0, 4).join('; ')}.`);
+  if (fails.length > 0) lines.push(`FAILS (${fails.length}): ${fails.slice(0, 5).join('; ')}.`);
+  if (data.portfolio_correlation) lines.push(`Portfolio corr: ${fmt(data.portfolio_correlation.avg_daily_correlation, 3)}; div ratio ${fmt(data.portfolio_correlation.diversification_ratio, 2)}x.`);
   lines.push('');
-  lines.push('STANDING INSTRUCTION TO THE AI READING THIS FILE:');
-  lines.push('Review this backtest. Suggest concrete improvements to the strategies and to how the bot uses trends,');
-  lines.push('session hours, stops and breakeven. Use only numbers in this file. Treat anything under 30 trades');
-  lines.push('as inconclusive. Prefer changes that hold on the VALIDATE data. HOLDS is the only verdict worth');
-  lines.push('promoting. FLAT means no real edge either way. FAILS means do not promote.');
+  lines.push('STANDING INSTRUCTION: Review this backtest. Use only numbers in this file. Treat <30 trades as inconclusive. Only HOLDS is promotable.');
   lines.push('');
-  return lines;
-}
-
-function buildToc(data: any): string[] {
-  const lines: string[] = [];
-  lines.push('TABLE OF CONTENTS');
-  lines.push('  AI BRIEF');
-  lines.push('  LEGEND');
-  lines.push('  CROSS-PAIR ROLLUP');
-  for (const p of data.pairs || []) {
-    lines.push(`  ASSET ${p.symbol} — six combinations, per-strategy, per-weekday, hour matrix, rollover, ATR tiers, trade-path §16-18, BE variants §22, sizing §24, caps §25, streak §31, breaker §32, DD cutoff §33, slippage §34, param sweep §35, outliers §36, MC §37, alpha §38, skipped signals`);
-  }
-  lines.push('  PORTFOLIO CORRELATION');
-  lines.push('  RANKED SUGGESTIONS');
-  lines.push('  NOT IMPLEMENTED');
-  lines.push('');
-  return lines;
-}
-
-function summarizeHourMatrix(hourKpis: any): string {
-  if (!hourKpis) return 'n/a';
-  const parts: string[] = [];
-  for (let h = 0; h < 24; h++) {
-    const k = hourKpis[String(h)];
-    if (!k || k.count === 0) continue;
-    parts.push(`${String(h).padStart(2, '0')}:n=${k.count} wr=${fmt(k.win_rate, 1)} pf=${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`);
-  }
-  return parts.length > 0 ? parts.join(' | ') : 'no trades in any hour';
-}
-
-function renderStrategyLab(lab: any): string[] {
-  if (!lab || !Array.isArray(lab.variants) || lab.variants.length === 0) return [];
-  const lines: string[] = [];
-  lines.push('');
-  lines.push(`--- STRATEGY LAB (${lab.variants.length} variants, ${lab.days}-day window) ---`);
-  const sorted = [...lab.variants].sort((a: any, b: any) => {
-    const rank = (v: string) => v === 'IMPROVES' ? 0 : v === 'NO' ? 1 : 2;
-    return rank(a.verdict) - rank(b.verdict);
-  });
-  for (const v of sorted) {
-    lines.push(`  ${String(v.label).padEnd(28)} | TR ${String(v.trades).padStart(4)} | WR ${fmt(v.win_rate, 1)}% | PF ${fmt(v.profit_factor)} | DD -$${fmt(v.max_drawdown)} | PNL $${fmt(v.net_pnl)} | TUNE PF ${fmt(v.tune_pf)} (${v.tune_trades}tr) | VALIDATE PF ${fmt(v.validate_pf)} (${v.validate_trades}tr) | ${v.verdict}`);
-  }
   return lines;
 }
 
 function renderTxtContent(data: any, options: { maxSuggestionsPerPair?: number; minDowTrades?: number } = {}): string {
   const maxSugg = options.maxSuggestionsPerPair ?? 999;
   const minDow = options.minDowTrades ?? 0;
-
   const totalTimeStr = (typeof data.total_run_seconds === 'number' && data.total_run_seconds > 0) ? `${data.total_run_seconds}s` : 'n/a';
   const lines: string[] = [];
-
   lines.push(...buildAiBrief(data));
-  lines.push(...buildToc(data));
-
   lines.push('LEGEND');
-  lines.push('  Six combinations per pair: Adaptive mode only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
-  lines.push('  TR=Trades, WR=WinRate%, EXP=Expectancy(R), PF=ProfitFactor, DD=MaxDrawdown$');
-  lines.push('  PNL=Net Realised $, COV=AdaptiveCover%, TUNE=first 70% window, VALIDATE=last 30% window');
-  lines.push('  HOLDS = VALIDATE PF >= 1.10 and >= 70% of TUNE. FLAT = VALIDATE PF 0.95-1.10 (no real edge either way).');
-  lines.push('  FAILS = VALIDATE PF < 0.95 or < 70% of TUNE. INCONCLUSIVE = fewer than 30 trades in TUNE or VALIDATE.');
-  lines.push(`RUN: Date ${data.generated_at.slice(0, 10)} | Days ${data.days} | R:R values ${(data.rr_values || []).join(', ')} | Total Run Time ${totalTimeStr}`);
+  lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
+  lines.push('  HOLDS = VALIDATE PF >= 1.10 and >= 70% of TUNE. FLAT = VALIDATE PF 0.95-1.10. FAILS = VALIDATE PF < 0.95.');
+  lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | R:R values ${(data.rr_values || []).join(', ')} | Time ${totalTimeStr}`);
   lines.push('');
-
   lines.push('CROSS-PAIR ROLLUP');
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
-    lines.push(`  ${combo.padEnd(34)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1).padStart(5)}% | PNL $${fmt(r.total_pnl)}`);
+    lines.push(`  ${combo.padEnd(24)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1)}% | PNL $${fmt(r.total_pnl)}`);
   });
   lines.push('');
 
   for (const p of data.pairs || []) {
     if (p.status !== 'OK') {
-      lines.push(`ASSET ${p.symbol} — NOT TESTED — ${p.error || 'unknown error'}`);
+      lines.push(`ASSET ${p.symbol} — NOT TESTED`);
       lines.push('');
       continue;
     }
-
-    const runTimeStr = (typeof p.seconds_taken === 'number' && p.seconds_taken > 0) ? `${p.seconds_taken}s` : 'n/a';
     const ps = p.phase_seconds || {};
     const cache = p.cache || {};
-    const phaseStr = `precompute ${ps.precompute_s ?? 'n/a'}s | vol ${ps.volatility_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s | report ${ps.report_writing_s ?? 'n/a'}s | cache hit ${cache.hits ?? 'n/a'} miss ${cache.misses ?? 'n/a'}`;
-
     lines.push('================================================================================');
-    lines.push(`ASSET ${p.symbol} | Run Time ${runTimeStr} | ${phaseStr}`);
+    lines.push(`ASSET ${p.symbol} | Run Time ${p.seconds_taken || 'n/a'}s | precompute ${ps.precompute_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s | cache hit ${cache.hits ?? 'n/a'}`);
     lines.push('--- Six Combinations ---');
-
     for (const c of p.combinations || []) {
-      const incon = (c.total_trades || 0) < 30 ? ' [INCONCLUSIVE]' : '';
       const tv = c.tune_validate || {};
-      const tune = tv.tune || {};
-      const val = tv.validate || {};
-      lines.push(
-        `  ${String(c.label).padEnd(24)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | EXP ${fmt(c.expectancy)}R | PF ${fmt(c.profit_factor)} | DD -$${fmt(c.max_drawdown)} | PNL $${fmt(c.net_pnl)} | COV ${fmt(c.adaptive_effective_pct, 0)}% | TUNE[TR ${tune.count ?? 0} PF ${fmt(tune.profit_factor)} WR ${fmt(tune.win_rate, 1)}%] | VALIDATE[TR ${val.count ?? 0} PF ${fmt(val.profit_factor)} WR ${fmt(val.win_rate, 1)}%] | ${c.holdout_verdict || 'INCONCLUSIVE'}${incon}`
-      );
+      lines.push(`  ${String(c.label).padEnd(18)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | EXP ${fmt(c.expectancy)}R | PF ${fmt(c.profit_factor)} | DD -$${fmt(c.max_drawdown)} | PNL $${fmt(c.net_pnl)} | TUNE[${tv.tune?.count ?? 0}t PF ${fmt(tv.tune?.profit_factor)}] | VALIDATE[${tv.validate?.count ?? 0}t PF ${fmt(tv.validate?.profit_factor)}] | ${c.holdout_verdict}`);
     }
-
     const b = p.best_combination || {};
     lines.push('');
-    lines.push(`--- Best Combination: ${b.label || 'N/A'} (${b.total_trades || 0} trades) ---`);
-
+    lines.push(`--- Best: ${b.label || 'N/A'} ---`);
     lines.push('Per-strategy:');
-    const bStv: Record<string, any> = b.strategy_tune_validate || {};
-    const stratEntries = Object.entries(b.strategy_kpis || {});
-    if (stratEntries.length === 0) {
-      lines.push('  (n/a - rerun to generate)');
-    } else {
-      stratEntries.forEach(([sName, s]: any) => {
-        const stv = bStv[sName] || {};
-        const tune = stv.tune || {};
-        const val = stv.validate || {};
-        lines.push(`  ${sName.padEnd(28)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)} | TUNE[TR ${tune.count ?? 0} PF ${fmt(tune.profit_factor)}] | VALIDATE[TR ${val.count ?? 0} PF ${fmt(val.profit_factor)}] | ${holdoutVerdict(tune, val)}`);
-      });
-    }
-
+    Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
+      lines.push(`  ${sName.padEnd(28)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)}`);
+    });
     lines.push(`Per-weekday (>= ${minDow} trades):`);
-    const dowEntries = Object.entries(b.dow_kpis || {});
-    if (dowEntries.length === 0) {
-      lines.push('  (n/a - rerun to generate)');
-    } else {
-      let printed = 0;
-      dowEntries.forEach(([dow, s]: any) => {
-        if ((s.count || 0) < minDow) return;
-        printed++;
-        lines.push(`  ${dow.padEnd(12)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | EXP ${fmt(s.expectancy)}R | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)}`);
-      });
-      if (printed === 0) lines.push('  (no weekday rows met the trade threshold)');
-    }
-
+    Object.entries(b.dow_kpis || {}).forEach(([dow, s]: any) => {
+      if ((s.count || 0) < minDow) return;
+      lines.push(`  ${dow.padEnd(12)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)}`);
+    });
     const skipSummary = b.skipped_summary || {};
     const skipEntries = Object.entries(skipSummary);
     if (skipEntries.length > 0) {
       const parts = skipEntries.map(([reason, val]: [string, any]) => {
-        if (typeof val === 'object' && val !== null) {
-          return `${reason}: ${val.candle_skips ?? 0} candles / ${val.unique_setups ?? 0} unique setups`;
-        }
-        return `${reason}: ${val} candles`;
+        if (typeof val === 'object' && val !== null) return `${reason}: ${val.candle_skips ?? 0}/${val.unique_setups ?? 0}`;
+        return `${reason}: ${val}`;
       });
-      lines.push(`Skipped signals: ${parts.join(' | ')}`);
-    } else {
-      lines.push(`Skipped signals: n/a - rerun to generate`);
+      lines.push(`Skipped: ${parts.join(' | ')}`);
     }
-
-    if (b.warnings && b.warnings.length > 0) {
-      lines.push(`Warnings: ${b.warnings.join(' | ')}`);
-    }
-
     const diag = b.diagnostics;
     if (diag) {
       lines.push('');
-      lines.push(`--- Diagnostics (${diag.version || 'n/a'}) ---`);
-      lines.push(`§19 Hour matrix: ${summarizeHourMatrix(diag.hour_kpis)}`);
-
-      if (diag.session_rollover) {
-        const it = diag.session_rollover.in_transition || {};
-        const ot = diag.session_rollover.out_of_transition || {};
-        lines.push(`§21 Rollover: in TR ${it.count ?? 0} PF ${fmt(it.profit_factor)} $${fmt(it.net_pnl)} | out TR ${ot.count ?? 0} PF ${fmt(ot.profit_factor)} $${fmt(ot.net_pnl)}`);
+      lines.push(`--- Diagnostics ---`);
+      if (diag.hour_kpis) {
+        const hourParts: string[] = [];
+        for (let h = 0; h < 24; h++) {
+          const k = diag.hour_kpis[String(h)];
+          if (!k || k.count === 0) continue;
+          hourParts.push(`${String(h).padStart(2, '0')}:n=${k.count} wr=${fmt(k.win_rate, 1)} pf=${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`);
+        }
+        lines.push(`§19 Hour matrix: ${hourParts.join(' | ')}`);
       }
-
-      if (diag.atr_tier_kpis) {
-        const tierStr = ['LOW', 'NORMAL', 'HIGH', 'UNKNOWN'].map(t => {
-          const k = diag.atr_tier_kpis[t];
-          if (!k || k.count === 0) return `${t}: none`;
-          return `${t}: TR ${k.count} WR ${fmt(k.win_rate, 1)}% PF ${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`;
-        }).join(' | ');
-        lines.push(`§26 ATR tiers: ${tierStr}`);
-      }
-
       const st = diag.streak_analysis || {};
-      lines.push(`§31 Streaks: max ${st.max_consecutive_losses ?? 0} | avg ${fmt(st.average_streak)} | peak DD -$${fmt(st.peak_drawdown)}`);
-
+      lines.push(`§31 Streaks: max ${st.max_consecutive_losses ?? 0} | peak DD -$${fmt(st.peak_drawdown)}`);
       const cb = diag.circuit_breaker_sim || {};
-      lines.push(`§32 Breaker sim: orig $${fmt(cb.original_net_pnl)} -> sim $${fmt(cb.simulated_net_pnl)} | protection $${fmt(cb.protection_delta)}`);
-
+      lines.push(`§32 Breaker: protection $${fmt(cb.protection_delta)}`);
       const orr = diag.outlier_removal || {};
-      lines.push(`§36 Outliers: drop ${orr.outlier_count ?? 0} top trades | impact ${fmt(orr.impact_pct, 1)}%`);
-
+      lines.push(`§36 Outliers: impact ${fmt(orr.impact_pct, 1)}%`);
       const mc = diag.monte_carlo || {};
-      lines.push(`§37 Bootstrap MC: median final PNL $${fmt(mc.median_final_pnl)} | median DD -$${fmt(mc.median_max_dd)} | P95 DD -$${fmt(mc.p95_max_dd)} | prob positive ${fmt(mc.prob_positive, 1)}%`);
-
+      lines.push(`§37 Bootstrap MC: median final $${fmt(mc.median_final_pnl)} | median DD -$${fmt(mc.median_max_dd)} | P95 DD -$${fmt(mc.p95_max_dd)} | prob pos ${fmt(mc.prob_positive, 1)}%`);
       const bh = diag.buy_and_hold || {};
-      lines.push(`§38 Alpha: hold ${fmt(bh.bh_return_pct)}% $${fmt(bh.bh_net_pnl)} | strat $${fmt(bh.strategy_net_pnl)} | alpha $${fmt(bh.alpha)} | verdict ${bh.verdict}`);
-
+      lines.push(`§38 Alpha: $${fmt(bh.alpha)} (${bh.verdict})`);
       const ps16 = diag.post_sl || {};
-      if (ps16.count > 0) {
-        lines.push(`§16 Post-SL: n=${ps16.count} mean ${fmt(ps16.mean_pips, 1)} pips / ${fmt(ps16.mean_r)}R | max ${fmt(ps16.max_pips, 1)} pips / ${fmt(ps16.max_r)}R`);
-      }
+      if (ps16.count > 0) lines.push(`§16 Post-SL: mean ${fmt(ps16.mean_pips, 1)}p / ${fmt(ps16.mean_r)}R`);
       const pt = diag.post_tp || {};
-      if (pt.count > 0) {
-        lines.push(`§17 Post-TP: n=${pt.count} mean ${fmt(pt.mean_pips, 1)} pips / ${fmt(pt.mean_r)}R`);
-      }
-      const pbe = diag.premature_be || {};
-      if (pbe.total_be_moved > 0) {
-        lines.push(`§18 Premature BE: moved ${pbe.total_be_moved} | premature ${pbe.premature_count} (${fmt(pbe.premature_pct, 1)}%)`);
-      }
-
-      const ema = diag.ema_200_alignment || {};
-      if (ema.aligned || ema.counter_trend) {
-        lines.push(`§27 EMA-200 alignment: aligned TR ${ema.aligned?.count ?? 0} PF ${fmt(ema.aligned?.profit_factor)} | counter TR ${ema.counter_trend?.count ?? 0} PF ${fmt(ema.counter_trend?.profit_factor)}`);
-      }
-
-      const ct = diag.confirmation_type || {};
-      lines.push(`§28 Confirmation: close TR ${ct.close?.count ?? 0} PF ${fmt(ct.close?.profit_factor)} | touch TR ${ct.touch?.count ?? 0}`);
-
-      const nw = diag.news_window || {};
-      lines.push(`§29 News: inside TR ${nw.in_news?.count ?? 0} | outside TR ${nw.out_of_news?.count ?? 0}`);
-
-      const sz = diag.sizing_comparison || {};
-      lines.push(`§24 Sizing: fixed $${fmt(sz.fixed?.net_pnl)} | compounding $${fmt(sz.compounding?.net_pnl)} | diff $${fmt(sz.difference)}`);
-
-      const dc = diag.daily_cap_comparison || {};
-      lines.push(`§25 Daily caps: cap1 TR ${dc.cap_1?.count ?? 0} PNL $${fmt(dc.cap_1?.net_pnl)} | cap2 $${fmt(dc.cap_2?.net_pnl)} | cap3, cap4, unlimited: see Strategy Lab`);
-
-      const dd = diag.daily_dd_cutoff || {};
-      lines.push(`§33 DD cutoff: triggered ${dd.days_triggered ?? 0} days | blocked ${dd.trades_blocked ?? 0} trades | protection $${fmt(dd.protection_delta)}`);
-
+      if (pt.count > 0) lines.push(`§17 Post-TP: mean ${fmt(pt.mean_pips, 1)}p / ${fmt(pt.mean_r)}R`);
       const slip = diag.slippage_sensitivity || {};
       const slipParts = Object.values(slip).map((pt: any) => `${pt.slippage_pips}p $${fmt(pt.net_pnl)}`).join(' | ');
       if (slipParts) lines.push(`§34 Slippage: ${slipParts}`);
-
+      const sz = diag.sizing_comparison || {};
+      lines.push(`§24 Sizing: fixed $${fmt(sz.fixed?.net_pnl)} | compound $${fmt(sz.compounding?.net_pnl)}`);
+      const dc = diag.daily_cap_comparison || {};
+      lines.push(`§25 Caps: cap1 $${fmt(dc.cap_1?.net_pnl)} | cap2 $${fmt(dc.cap_2?.net_pnl)} | cap3+ see Strategy Lab`);
+      const dd = diag.daily_dd_cutoff || {};
+      lines.push(`§33 DD cutoff: protection $${fmt(dd.protection_delta)}`);
       const bv = diag.breakeven_variants || {};
-      if (bv.A_current) {
-        lines.push(`§22 BE variants: A(current) ${fmt(bv.A_current.total_r)}R | B(no BE) ${fmt(bv.B_no_be.total_r)}R | C(delayed) ${fmt(bv.C_delayed_be.total_r)}R | best ${bv.best_variant}`);
-      }
-
+      if (bv.A_current) lines.push(`§22 BE variants: A ${fmt(bv.A_current.total_r)}R | B ${fmt(bv.B_no_be.total_r)}R | C ${fmt(bv.C_delayed_be.total_r)}R | best ${bv.best_variant}`);
       const param = diag.parameter_sensitivity || {};
       if (Array.isArray(param.sweep) && param.sweep.length > 0) {
-        const sweepStr = param.sweep.map((row: any) => `R:R ${fmt(row.rr, 2)} $${fmt(row.net_pnl)}`).join(' | ');
-        lines.push(`§35 Parameter sweep: ${sweepStr} | best ${fmt(param.best_rr, 2)}`);
+        const sw = param.sweep.map((r: any) => `R:R ${fmt(r.rr, 2)} $${fmt(r.net_pnl)}`).join(' | ');
+        lines.push(`§35 Parameter sweep: ${sw}`);
       }
     }
-
-    const tips: any[] = b.improvement_tips || [];
-    if (tips.length > 0) {
-      lines.push('');
-      lines.push('Improvement tips (from trade list):');
-      tips.forEach((tip: any) => {
-        lines.push(`  [${tip.severity}] ${tip.strategy} — ${tip.title} | Action: ${tip.action}`);
-      });
-    }
-
     const suggestions: any[] = b.rule_suggestions || [];
     if (suggestions.length > 0) {
       lines.push('');
-      lines.push(`Rule-based suggestions for ${p.symbol} (ranked, impact first):`);
-      suggestions.slice(0, maxSugg).forEach((s: any) => {
-        lines.push(`  ${s.tag} ${s.text}`);
-      });
+      lines.push(`Rule-based suggestions for ${p.symbol}:`);
+      suggestions.slice(0, maxSugg).forEach((s: any) => lines.push(`  ${s.tag} ${s.text}`));
     }
-
-    const labLines = renderStrategyLab(p.lab);
-    if (labLines.length > 0) {
-      lines.push(...labLines);
+    const lab = p.lab;
+    if (lab && Array.isArray(lab.variants)) {
+      lines.push('');
+      lines.push(`--- STRATEGY LAB (${lab.days}-day, ${lab.variants.length} variants) ---`);
+      for (const v of lab.variants) {
+        lines.push(`  ${String(v.label).padEnd(28)} | TR ${v.trades} | PF ${fmt(v.profit_factor)} | PNL $${fmt(v.net_pnl)} | TUNE ${fmt(v.tune_pf)} | VALIDATE ${fmt(v.validate_pf)} | ${v.verdict}`);
+      }
     }
-
     lines.push('');
   }
 
   if (data.portfolio_correlation) {
-    lines.push('================================================================================');
     lines.push('PORTFOLIO CORRELATION');
     const pc = data.portfolio_correlation;
     lines.push(`Symbols: ${(pc.symbols || []).join(', ')}`);
-    lines.push(`Portfolio max DD $${fmt(pc.portfolio_drawdown)} | Sum of individual DDs $${fmt(pc.sum_of_individual_drawdowns)} | Diversification ratio ${fmt(pc.diversification_ratio)}x | avg daily correlation ${fmt(pc.avg_daily_correlation, 3)} | days ${pc.days}`);
+    lines.push(`Portfolio DD $${fmt(pc.portfolio_drawdown)} | Sum ind DD $${fmt(pc.sum_of_individual_drawdowns)} | Div ratio ${fmt(pc.diversification_ratio)}x | avg corr ${fmt(pc.avg_daily_correlation, 3)}`);
     lines.push('');
   }
-
-  if (data.portfolio_suggestions && data.portfolio_suggestions.length > 0) {
-    lines.push('================================================================================');
+  if (data.portfolio_suggestions?.length > 0) {
     lines.push('RANKED PORTFOLIO SUGGESTIONS');
-    data.portfolio_suggestions.forEach((s: any) => {
-      lines.push(`  ${s.tag} ${s.text}`);
-    });
+    data.portfolio_suggestions.forEach((s: any) => lines.push(`  ${s.tag} ${s.text}`));
     lines.push('');
   }
-
-  if (data.what_to_test_next && data.what_to_test_next.length > 0) {
-    lines.push('================================================================================');
+  if (data.what_to_test_next?.length > 0) {
     lines.push('WHAT TO TEST NEXT:');
-    data.what_to_test_next.forEach((item: string, idx: number) => {
-      lines.push(`  ${idx + 1}. ${item}`);
-    });
+    data.what_to_test_next.forEach((item: string, idx: number) => lines.push(`  ${idx + 1}. ${item}`));
     lines.push('');
   }
-
-  lines.push('================================================================================');
-  lines.push('NOT IMPLEMENTED IN THE BACKTESTER');
+  lines.push('NOT IMPLEMENTED:');
   const notImpl = (data.spec_coverage || []).filter((row: any) => !(row.panel && row.txt && row.pdf));
-  if (notImpl.length === 0) {
-    lines.push('  (none)');
-  } else {
-    notImpl.forEach((row: any) => {
-      lines.push(`  #${row.id} ${row.label} — ${row.note || 'not produced'}`);
-    });
-  }
-  lines.push('================================================================================');
+  if (notImpl.length === 0) lines.push('  (none)');
+  else notImpl.forEach((row: any) => lines.push(`  #${row.id} ${row.label} — ${row.note || 'not produced'}`));
   return lines.join('\n');
 }
 
@@ -960,29 +753,21 @@ function formatExportTxtWithLengthRule(data: any): string {
   let text = renderTxtContent(data);
   if (text.length <= 45000) return text;
   text = renderTxtContent(data, { maxSuggestionsPerPair: 3, minDowTrades: 30 });
-  if (text.length <= 45000) return text;
-  text = renderTxtContent(data, { maxSuggestionsPerPair: 2, minDowTrades: 30 });
   return text;
 }
 
-function checkContainerMemory(): { ok: boolean; reason?: string; warning?: string } {
-  if (process.platform !== 'linux') {
-    return { ok: true, warning: 'Memory guard skipped (non-Linux platform).' };
-  }
+function checkContainerMemory(): { ok: boolean; reason?: string } {
+  if (process.platform !== 'linux') return { ok: true };
   try {
     const currentRaw = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
     const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
     if (maxRaw === 'max') return { ok: true };
     const currentBytes = parseInt(currentRaw, 10);
     const maxBytes = parseInt(maxRaw, 10);
-    if (!Number.isFinite(currentBytes) || !Number.isFinite(maxBytes) || maxBytes <= 0) {
-      return { ok: true };
-    }
+    if (!Number.isFinite(currentBytes) || !Number.isFinite(maxBytes) || maxBytes <= 0) return { ok: true };
     const ratio = currentBytes / maxBytes;
     if (ratio > 0.70) {
-      const pct = (ratio * 100).toFixed(1);
-      const maxMb = Math.round(maxBytes / (1024 * 1024));
-      return { ok: false, reason: `Container memory is at ${pct}% of its ${maxMb} MB limit.` };
+      return { ok: false, reason: `Memory at ${(ratio * 100).toFixed(1)}%` };
     }
     return { ok: true };
   } catch {
@@ -1008,9 +793,7 @@ async function startServer() {
       const symbol = String(req.query.symbol || 'US30').toUpperCase();
       if (fs.existsSync(CANDLES_CACHE_FILE)) {
         const cache = JSON.parse(fs.readFileSync(CANDLES_CACHE_FILE, 'utf8'));
-        if (cache && cache[symbol]) {
-          return res.status(200).json({ status: 'success', symbol, data: cache[symbol] });
-        }
+        if (cache && cache[symbol]) return res.status(200).json({ status: 'success', symbol, data: cache[symbol] });
       }
       return res.status(200).json({ status: 'success', symbol, data: [] });
     } catch (err: any) {
@@ -1020,9 +803,8 @@ async function startServer() {
 
   app.post('/api/positions/close/:id', (req, res) => {
     try {
-      const positionId = req.params.id;
-      fs.writeFileSync(CLOSE_COMMAND_FILE, JSON.stringify({ positionId, requestedAt: new Date().toISOString() }));
-      res.status(200).json({ status: 'success', message: `Close command queued for position #${positionId}` });
+      fs.writeFileSync(CLOSE_COMMAND_FILE, JSON.stringify({ positionId: req.params.id, requestedAt: new Date().toISOString() }));
+      res.status(200).json({ status: 'success' });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
@@ -1056,11 +838,8 @@ async function startServer() {
 
   app.get('/api/backtest/reports', (_req, res) => {
     try {
-      if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) {
-        return res.status(200).json({ status: 'success', reports: [] });
-      }
-      const files = fs.readdirSync(BACKTEST_OUTPUT_DIR)
-        .filter(f => f.endsWith('.json') && !f.startsWith('.'));
+      if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) return res.status(200).json({ status: 'success', reports: [] });
+      const files = fs.readdirSync(BACKTEST_OUTPUT_DIR).filter(f => f.endsWith('.json') && !f.startsWith('.'));
       res.status(200).json({ status: 'success', reports: files });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
@@ -1071,10 +850,7 @@ async function startServer() {
     try {
       const sym = req.params.symbol.toUpperCase();
       const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
-      if (fs.existsSync(summaryFile)) {
-        const data = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
-        return res.status(200).json({ status: 'success', data });
-      }
+      if (fs.existsSync(summaryFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(summaryFile, 'utf8')) });
       return res.status(404).json({ status: 'error', message: 'Summary not found' });
     } catch (err: any) {
       return res.status(500).json({ status: 'error', message: err?.message });
@@ -1084,31 +860,23 @@ async function startServer() {
   app.get('/api/backtest/report/:filename', (req, res) => {
     try {
       const safeFilename = path.basename(req.params.filename);
-      if (!safeFilename.endsWith('.json')) {
-        return res.status(400).json({ status: 'error', message: 'Invalid file format' });
-      }
+      if (!safeFilename.endsWith('.json')) return res.status(400).json({ status: 'error', message: 'Invalid file format' });
       const targetPath = path.resolve(BACKTEST_OUTPUT_DIR, safeFilename);
       if (!targetPath.startsWith(path.resolve(BACKTEST_OUTPUT_DIR)) || !fs.existsSync(targetPath)) {
         return res.status(404).json({ status: 'error', message: 'Report not found' });
       }
       const data = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
-
       if (data && data.day_data && data.symbol) {
         const daycandlesPath = path.resolve(BACKTEST_OUTPUT_DIR, `${data.symbol}_daycandles.json`);
         if (fs.existsSync(daycandlesPath)) {
           try {
             const dayCandles = JSON.parse(fs.readFileSync(daycandlesPath, 'utf8'));
             for (const [dateKey, dayObj] of Object.entries<any>(data.day_data)) {
-              if ((!dayObj.candles || dayObj.candles.length === 0) && dayCandles[dateKey]) {
-                dayObj.candles = dayCandles[dateKey];
-              }
+              if ((!dayObj.candles || dayObj.candles.length === 0) && dayCandles[dateKey]) dayObj.candles = dayCandles[dateKey];
             }
-          } catch (e) {
-            console.warn(`Could not load shared daycandles for ${data.symbol}:`, e);
-          }
+          } catch (e) { console.warn('daycandles load failed:', e); }
         }
       }
-
       res.status(200).json({ status: 'success', data });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
@@ -1118,11 +886,8 @@ async function startServer() {
   app.get('/api/backtest/portfolio', (_req, res) => {
     try {
       const portfolioFile = path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_correlation.json');
-      if (fs.existsSync(portfolioFile)) {
-        const data = JSON.parse(fs.readFileSync(portfolioFile, 'utf8'));
-        return res.status(200).json({ status: 'success', data });
-      }
-      return res.status(404).json({ status: 'error', message: 'Portfolio correlation not yet generated. Run a pair backtest first.' });
+      if (fs.existsSync(portfolioFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(portfolioFile, 'utf8')) });
+      return res.status(404).json({ status: 'error', message: 'Portfolio correlation not yet generated.' });
     } catch (err: any) {
       return res.status(500).json({ status: 'error', message: err?.message });
     }
@@ -1132,42 +897,26 @@ async function startServer() {
     try {
       const sym = String(req.params.symbol || '').toUpperCase();
       const labFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_lab.json`);
-      if (fs.existsSync(labFile)) {
-        const data = JSON.parse(fs.readFileSync(labFile, 'utf8'));
-        return res.status(200).json({ status: 'success', data });
-      }
-      return res.status(404).json({ status: 'error', message: `No Strategy Lab file for ${sym}. Click Strategy Lab to generate it.` });
+      if (fs.existsSync(labFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(labFile, 'utf8')) });
+      return res.status(404).json({ status: 'error', message: `No Strategy Lab file for ${sym}.` });
     } catch (err: any) {
       return res.status(500).json({ status: 'error', message: err?.message });
     }
   });
 
   app.post('/api/backtest/lab', (req, res) => {
-    if (backtestRunning) {
-      return res.status(409).json({ status: 'error', message: 'A backtest is running. Wait for it to finish before starting the Strategy Lab.' });
-    }
-
+    if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is running.' });
     const requested: any = req.body?.symbols ?? req.body?.symbol ?? 'US30';
     const symbolsArray: string[] = Array.isArray(requested)
       ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean)
-      : String(requested).toUpperCase() === 'ALL'
-        ? [...WHITELIST_ASSETS]
-        : [String(requested).toUpperCase()];
-
-    if (symbolsArray.length === 0) {
-      return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
-    }
-
+      : String(requested).toUpperCase() === 'ALL' ? [...WHITELIST_ASSETS] : [String(requested).toUpperCase()];
+    if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
     backtestResults = [];
     backtestRunning = true;
     backtestProgress = `Strategy Lab for ${symbolsArray.join(', ')}...`;
-
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const proc = spawn(pythonCmd, ['backtest/runner.py', '--symbols', symbolsArray.join(','), '--lab'], {
-      env: { ...process.env, PYTHONPATH: process.cwd() },
-    });
+    const proc = spawn(pythonCmd, ['backtest/runner.py', '--symbols', symbolsArray.join(','), '--lab'], { env: { ...process.env, PYTHONPATH: process.cwd() } });
     activeBacktestProcesses.push(proc);
-
     let stdoutBuf = '';
     proc.stdout.on('data', data => {
       stdoutBuf += data.toString();
@@ -1175,57 +924,41 @@ async function startServer() {
       stdoutBuf = lines.pop() ?? '';
       for (const l of lines) {
         const trimmed = l.trim();
-        if (trimmed.startsWith('[LAB]')) {
-          backtestProgress = trimmed;
-        }
+        if (trimmed.startsWith('[LAB]')) backtestProgress = trimmed;
       }
     });
-
     let stderrBuf = '';
     proc.stderr.on('data', data => {
       stderrBuf += data.toString();
       const lines = stderrBuf.split('\n');
       stderrBuf = lines.pop() ?? '';
-      for (const l of lines) {
-        if (l.trim()) console.error(`[LAB:ERR] ${l.trimEnd()}`);
-      }
+      for (const l of lines) if (l.trim()) console.error(`[LAB:ERR] ${l.trimEnd()}`);
     });
-
     proc.on('exit', code => {
       backtestRunning = false;
       activeBacktestProcesses = activeBacktestProcesses.filter(p => p !== proc);
-      if (code === 0) {
-        backtestProgress = `Strategy Lab complete.`;
-      } else {
-        backtestLastError = `Exited with code ${code}`;
-        backtestProgress = `Strategy Lab failed.`;
-      }
+      if (code === 0) backtestProgress = `Strategy Lab complete.`;
+      else { backtestLastError = `Exited with code ${code}`; backtestProgress = `Strategy Lab failed.`; }
     });
-
-    res.status(200).json({ status: 'success', message: `Strategy Lab started for ${symbolsArray.join(', ')}.` });
+    res.status(200).json({ status: 'success', message: `Strategy Lab started.` });
   });
 
+  // ---------------------------------------------------------------------------
+  // /api/backtest/run
+  // No more phase-1 prepare pass. Each run process does its own data check.
+  // Pairs run in parallel, 2 at a time, to halve the wall clock.
+  // ---------------------------------------------------------------------------
   app.post('/api/backtest/run', (req, res) => {
-    if (backtestRunning) {
-      return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
-    }
+    if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
 
     const memCheck = checkContainerMemory();
-    if (!memCheck.ok) {
-      console.warn(`[BT] ${memCheck.reason}`);
-      return res.status(503).json({ status: 'error', message: memCheck.reason });
-    }
+    if (!memCheck.ok) return res.status(503).json({ status: 'error', message: memCheck.reason });
 
     const requested: any = req.body?.symbol ?? 'US30';
     const symbolsArray: string[] = Array.isArray(requested)
       ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean)
-      : String(requested).toUpperCase() === 'ALL'
-        ? [...WHITELIST_ASSETS]
-        : [String(requested).toUpperCase()];
-
-    if (symbolsArray.length === 0) {
-      return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
-    }
+      : String(requested).toUpperCase() === 'ALL' ? [...WHITELIST_ASSETS] : [String(requested).toUpperCase()];
+    if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
 
     const days = parseInt(req.body?.days || '60', 10);
 
@@ -1237,24 +970,9 @@ async function startServer() {
     backtestExitCode = null;
 
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const CONCURRENT_PAIRS = 2;
 
     async function executeMatrix() {
-      if (symbolsArray.length > 1) {
-        for (let idx = 0; idx < symbolsArray.length; idx++) {
-          if (!backtestRunning) return;
-          const sym = symbolsArray[idx];
-          backtestProgress = `[Phase 1/2: Preparing Data ${idx + 1}/${symbolsArray.length}] ${sym}...`;
-
-          await new Promise<void>((resolve) => {
-            const prepProc = spawn(pythonCmd, ['backtest/runner.py', '--symbol', sym, '--prepare-only'], {
-              env: { ...process.env, PYTHONPATH: process.cwd() }
-            });
-            prepProc.on('exit', () => resolve());
-            prepProc.on('error', () => resolve());
-          });
-        }
-      }
-
       let activeIndex = 0;
       let completedCount = 0;
 
@@ -1262,14 +980,11 @@ async function startServer() {
         let symTiming = '';
         const stderrTail: string[] = [];
 
-        // Six-combination matrix: no --rr, no --variants. R:R is per-combination in the runner.
+        // No --skip-download: each run does its own data check inline.
         const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
-        if (symbolsArray.length > 1) args.push('--skip-download');
 
         await new Promise<void>((resolve) => {
-          const proc = spawn(pythonCmd, args, {
-            env: { ...process.env, PYTHONPATH: process.cwd() }
-          });
+          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd() } });
           activeBacktestProcesses.push(proc);
 
           proc.stdout.on('data', data => {
@@ -1292,19 +1007,12 @@ async function startServer() {
 
           proc.on('exit', (code, signal) => {
             completedCount++;
-            backtestProgress = `[Phase 2/2] ${completedCount}/${symbolsArray.length} assets completed.`;
-
-            const tailText = stderrTail.length > 0
-              ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}`
-              : '';
-            const reason = signal
-              ? `Killed by ${signal}`
-              : `Exited with code ${code}`;
-
+            backtestProgress = `[Running] ${completedCount}/${symbolsArray.length} completed.`;
+            const tailText = stderrTail.length > 0 ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}` : '';
+            const reason = signal ? `Killed by ${signal}` : `Exited with code ${code}`;
             if (!signal && code === 0) {
               backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 6/6 matrix', timing: symTiming });
             } else {
-              console.error(`[BT] ${sym}: ${reason}${tailText}`);
               backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}`, timing: symTiming });
             }
             resolve();
@@ -1312,21 +1020,26 @@ async function startServer() {
 
           proc.on('error', err => {
             completedCount++;
-            const reason = `spawn error: ${err.message}`;
-            const tailText = stderrTail.length > 0
-              ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}`
-              : '';
-            console.error(`[BT] ${sym}: ${reason}${tailText}`);
-            backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}` });
+            const tailText = stderrTail.length > 0 ? `\n--- stderr ---\n${stderrTail.join('\n')}` : '';
+            backtestResults.push({ symbol: sym, status: 'FAILED', message: `spawn error: ${err.message}${tailText}` });
             resolve();
           });
         });
       }
 
-      // Sequential — one pair at a time. Parallel execution is not enabled in this version.
-      for (let i = 0; i < symbolsArray.length && backtestRunning; i++) {
-        await runWorker(symbolsArray[i]);
+      const activePool: Promise<void>[] = [];
+      while (activeIndex < symbolsArray.length && backtestRunning) {
+        while (activePool.length < CONCURRENT_PAIRS && activeIndex < symbolsArray.length) {
+          const nextSym = symbolsArray[activeIndex++];
+          const p = runWorker(nextSym).then(() => {
+            const idx = activePool.indexOf(p);
+            if (idx >= 0) activePool.splice(idx, 1);
+          });
+          activePool.push(p);
+        }
+        if (activePool.length > 0) await Promise.race(activePool);
       }
+      await Promise.all(activePool);
 
       backtestRunning = false;
       backtestProgress = `Finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} assets completed.`;
@@ -1352,9 +1065,7 @@ async function startServer() {
   });
 
   app.post('/api/backtest/stop', (_req, res) => {
-    activeBacktestProcesses.forEach(p => {
-      try { p.kill(); } catch {}
-    });
+    activeBacktestProcesses.forEach(p => { try { p.kill(); } catch {} });
     activeBacktestProcesses = [];
     backtestRunning = false;
     backtestProgress = 'Backtest canceled by user.';
@@ -1372,7 +1083,6 @@ async function startServer() {
         free_mb = Math.round((stats.bsize * stats.bfree) / (1024 * 1024));
         used_mb = total_mb - free_mb;
       } catch {}
-
       let market_data_bytes = 0;
       if (fs.existsSync(BACKTEST_DATA_DIR)) {
         for (const f of fs.readdirSync(BACKTEST_DATA_DIR)) {
@@ -1382,7 +1092,6 @@ async function startServer() {
           } catch {}
         }
       }
-
       let reports_bytes = 0;
       if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
         for (const f of fs.readdirSync(BACKTEST_OUTPUT_DIR)) {
@@ -1392,7 +1101,6 @@ async function startServer() {
           } catch {}
         }
       }
-
       res.status(200).json({
         status: 'success',
         data: {
@@ -1411,18 +1119,14 @@ async function startServer() {
       const scope = req.body?.scope || 'all_reports';
       const targetSym = (req.body?.symbol || '').toUpperCase().trim();
       let deletedCount = 0;
-
       if (fs.existsSync(BACKTEST_OUTPUT_DIR)) {
         for (const f of fs.readdirSync(BACKTEST_OUTPUT_DIR)) {
           if (!f.endsWith('.json')) continue;
-          let shouldDelete = (scope === 'all_reports') || (scope === 'symbol' && targetSym && f.startsWith(`${targetSym}_`));
-          if (shouldDelete) {
-            try { fs.unlinkSync(path.join(BACKTEST_OUTPUT_DIR, f)); deletedCount++; } catch {}
-          }
+          const shouldDelete = (scope === 'all_reports') || (scope === 'symbol' && targetSym && f.startsWith(`${targetSym}_`));
+          if (shouldDelete) { try { fs.unlinkSync(path.join(BACKTEST_OUTPUT_DIR, f)); deletedCount++; } catch {} }
         }
       }
-
-      res.status(200).json({ status: 'success', message: `Cleanup completed. Deleted ${deletedCount} file(s).`, deletedCount });
+      res.status(200).json({ status: 'success', message: `Deleted ${deletedCount} file(s).`, deletedCount });
     } catch (err: any) {
       res.status(500).json({ status: 'error', message: err?.message });
     }
@@ -1433,23 +1137,18 @@ async function startServer() {
       const diskTrades = loadTradesFromDisk();
       activeBrokerTelemetry.trades = diskTrades;
       res.status(200).json(diskTrades);
-    } catch {
-      res.status(500).json({ error: "Failed to fetch journal entries" });
-    }
+    } catch { res.status(500).json({ error: "Failed to fetch journal entries" }); }
   });
 
   app.post('/api/journal', (req, res) => {
     try {
-      const newTrade = req.body;
       const trades = loadTradesFromDisk();
-      trades.unshift(newTrade);
+      trades.unshift(req.body);
       saveTradesToDisk(trades);
       activeBrokerTelemetry.trades = trades;
       recomputeRiskState();
-      res.status(200).json({ status: "success", trade: newTrade });
-    } catch {
-      res.status(500).json({ error: "Failed to save journal entry" });
-    }
+      res.status(200).json({ status: "success", trade: req.body });
+    } catch { res.status(500).json({ error: "Failed to save journal entry" }); }
   });
 
   app.delete('/api/journal/:id', (req, res) => {
@@ -1459,29 +1158,24 @@ async function startServer() {
     saveTradesToDisk(trades);
     activeBrokerTelemetry.trades = trades;
     recomputeRiskState();
-    res.json({ status: 'success', message: `Trade ${tradeId} deleted.` });
+    res.json({ status: 'success' });
   });
 
   app.post('/api/journal/reset', (_req, res) => {
     saveTradesToDisk([]);
     activeBrokerTelemetry.trades = [];
     recomputeRiskState();
-    res.json({ status: 'success', message: 'Journal reset.' });
+    res.json({ status: 'success' });
   });
 
-  app.get('/api/bot/config', (_req, res) => {
-    res.json({ status: 'success', data: activeBotConfig });
-  });
+  app.get('/api/bot/config', (_req, res) => res.json({ status: 'success', data: activeBotConfig }));
 
   app.post('/api/bot/config', (req, res) => {
     try {
-      const config = req.body;
-      activeBotConfig = { ...activeBotConfig, ...config, updatedAt: new Date().toISOString() };
+      activeBotConfig = { ...activeBotConfig, ...req.body, updatedAt: new Date().toISOString() };
       saveBotConfigAtomically(activeBotConfig);
       res.json({ status: 'success', config: activeBotConfig });
-    } catch (error: any) {
-      res.status(500).json({ status: 'error', message: error?.message });
-    }
+    } catch (error: any) { res.status(500).json({ status: 'error', message: error?.message }); }
   });
 
   app.get('/api/limits', (_req, res) => {
@@ -1498,19 +1192,15 @@ async function startServer() {
       if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
       if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
       if (typeof useProfileDrawdownPct === 'boolean') riskLimits.useProfileDrawdownPct = useProfileDrawdownPct;
-
       if (resetBreaker) {
         riskState.breakerTriggered = false;
         riskState.activeTripScope = 'NONE';
         riskState.lastTriggerReason = undefined;
         activeBotConfig.masterExecution = true;
       }
-
       saveBotConfigAtomically({ ...activeBotConfig, ...riskLimits, limitsConfirmedAt: new Date().toISOString() });
       res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
-    } catch (error: any) {
-      res.status(500).json({ status: 'error', message: error?.message });
-    }
+    } catch (error: any) { res.status(500).json({ status: 'error', message: error?.message }); }
   });
 
   app.get('/api/broker/telemetry', (_req, res) => {
@@ -1529,29 +1219,23 @@ async function startServer() {
       env: { ...process.env, PYTHONPATH: process.cwd() },
       stdio: ['ignore', 'pipe', 'pipe']
     });
-
     let restartScheduled = false;
     let stdoutBuffer = '';
     let stderrBuffer = '';
-
     const scheduleRestart = (reason: string) => {
       if (restartScheduled) return;
       restartScheduled = true;
-
       const now = Date.now();
       botRestartTimestamps.push(now);
       botRestartTimestamps = botRestartTimestamps.filter(t => now - t <= 120000);
       const count = botRestartTimestamps.length;
-
       if (count <= 1) botCrashLoopWarned = false;
       if (!botCrashLoopWarned && count > 5) {
         botCrashLoopWarned = true;
         console.error(`[BOT] CRASH LOOP — ${count} restarts within 2 minutes.`);
       }
-      console.log(`[BOT] Restarting in 5s (${reason}).`);
       setTimeout(() => launchPythonBot(), 5000);
     };
-
     bot.stdout.on('data', chunk => {
       stdoutBuffer += chunk.toString();
       const lines = stdoutBuffer.split('\n');
@@ -1579,26 +1263,14 @@ async function startServer() {
         console.log(`[BOT] ${line}`);
       }
     });
-
     bot.stderr.on('data', chunk => {
       stderrBuffer += chunk.toString();
       const lines = stderrBuffer.split('\n');
       stderrBuffer = lines.pop() ?? '';
-      for (const rawLine of lines) {
-        const line = rawLine.trimEnd();
-        if (line) console.error(`[BOT:ERR] ${line}`);
-      }
+      for (const rawLine of lines) if (rawLine.trimEnd()) console.error(`[BOT:ERR] ${rawLine.trimEnd()}`);
     });
-
-    bot.on('error', err => {
-      console.error(`[BOT] spawn error: ${err.message}`);
-      scheduleRestart(`spawn error: ${err.message}`);
-    });
-
-    bot.on('exit', (code, signal) => {
-      console.log(`[BOT] exited code=${code} signal=${signal ?? 'null'}`);
-      scheduleRestart(`exit code=${code} signal=${signal ?? 'null'}`);
-    });
+    bot.on('error', err => { console.error(`[BOT] spawn error: ${err.message}`); scheduleRestart(`spawn error`); });
+    bot.on('exit', (code, signal) => { scheduleRestart(`exit code=${code} signal=${signal ?? 'null'}`); });
   }
 
   launchPythonBot();
