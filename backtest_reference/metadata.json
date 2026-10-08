@@ -1,0 +1,6 @@
+{
+  "name": "Trading Portal",
+  "description": "Institutional trading portal featuring live session clocks, performance analytics, trade journal, risk limits, interactive macro economic calendar, and real-time charting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
