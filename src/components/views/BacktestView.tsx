@@ -673,20 +673,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setSelectedSymbols([...WHITELIST_ASSETS])}
-              className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#08090d] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] hover:border-blue-400 cursor-pointer"
-            >
-              All
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedSymbols([])}
-              className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#08090d] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] hover:border-rose-400 cursor-pointer"
-            >
-              None
-            </button>
+            <button type="button" onClick={() => setSelectedSymbols([...WHITELIST_ASSETS])} className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#08090d] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] hover:border-blue-400 cursor-pointer">All</button>
+            <button type="button" onClick={() => setSelectedSymbols([])} className="text-[11px] font-mono font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#08090d] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] hover:border-rose-400 cursor-pointer">None</button>
           </div>
         </div>
 
@@ -695,16 +683,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             const checked = selectedSymbols.includes(sym);
             const focused = testSymbol === sym;
             return (
-              <button
-                key={sym}
-                type="button"
-                onClick={() => toggleSymbol(sym)}
-                className={`px-3 py-2 rounded-xl text-xs font-mono font-bold transition-colors cursor-pointer border ${
-                  checked
-                    ? 'bg-blue-600/15 border-blue-500/40 text-blue-700 dark:text-blue-300'
-                    : 'bg-slate-50 dark:bg-[#08090d] border-slate-300 dark:border-[#1a2030] text-slate-600 dark:text-slate-400 hover:border-slate-400'
-                }`}
-              >
+              <button key={sym} type="button" onClick={() => toggleSymbol(sym)}
+                className={`px-3 py-2 rounded-xl text-xs font-mono font-bold transition-colors cursor-pointer border ${checked ? 'bg-blue-600/15 border-blue-500/40 text-blue-700 dark:text-blue-300' : 'bg-slate-50 dark:bg-[#08090d] border-slate-300 dark:border-[#1a2030] text-slate-600 dark:text-slate-400 hover:border-slate-400'}`}>
                 {sym}
                 {focused && <span className="ml-1 text-[8px] opacity-60">•</span>}
               </button>
@@ -722,30 +702,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
           {!isRunning ? (
             <>
-              <button
-                type="button"
-                onClick={handleRunSelected}
-                disabled={selectedSymbols.length === 0 || labRunning}
-                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50"
-              >
+              <button type="button" onClick={handleRunSelected} disabled={selectedSymbols.length === 0 || labRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50">
                 <Play className="w-3.5 h-3.5" />
                 <span>Run Selected ({selectedSymbols.length})</span>
               </button>
-              <button
-                type="button"
-                onClick={handleRunAll}
-                disabled={labRunning}
-                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50"
-              >
+              <button type="button" onClick={handleRunAll} disabled={labRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50">
                 <Layers className="w-3.5 h-3.5" />
                 <span>Run All</span>
               </button>
-              <button
-                type="button"
-                onClick={handleRunStrategyLab}
-                disabled={selectedSymbols.length === 0}
-                className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50"
-              >
+              <button type="button" onClick={handleRunStrategyLab} disabled={selectedSymbols.length === 0} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50">
                 <FlaskConical className="w-3.5 h-3.5" />
                 <span>Strategy Lab</span>
               </button>
@@ -796,11 +761,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </div>
             <div className="flex items-center gap-2">
               {verifyResult && !isVerifying && (
-                <button
-                  type="button"
+                <button type="button"
                   onClick={() => { navigator.clipboard.writeText(verifyResult); setVerifyCopyStatus('copied'); setTimeout(() => setVerifyCopyStatus('idle'), 2000); }}
-                  className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
-                >
+                  className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer">
                   {verifyCopyStatus === 'copied' ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
                   <span>{verifyCopyStatus === 'copied' ? 'Copied' : 'Copy Result'}</span>
                 </button>
@@ -1221,11 +1184,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                 <h3 className="text-sm font-bold text-black dark:text-white">
                   Strategy Lab — {testSymbol} · Baseline: {labPayloadBySymbol[testSymbol]!.baseline_label}
                 </h3>
-                <button
-                  type="button"
-                  onClick={() => handleCopyLabForAI(testSymbol)}
-                  className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
-                >
+                <button type="button" onClick={() => handleCopyLabForAI(testSymbol)} className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer">
                   {labCopyStatus[testSymbol] === 'copied' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                   <span>{labCopyStatus[testSymbol] === 'copied' ? 'Copied' : 'Copy for AI'}</span>
                 </button>
