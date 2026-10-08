@@ -207,13 +207,12 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
   const [summaryData, setSummaryData] = useState<SymbolSummaryPayload | null>(null);
-  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'diagnostics' | 'portfolio' | 'lab' | 'chart' | 'ledger' | 'tips'>('summary');
+  const [activeSubTab, setActiveSubTab] = useState<'summary' | 'diagnostics' | 'portfolio' | 'lab' | 'tips' | 'ledger'>('summary');
   const [selectedDay, setSelectedDay] = useState<string>('');
 
   const [testSymbol, setTestSymbol] = useState<string>('US30');
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>(['US30']);
-
-  const [testDays, setTestDays] = useState<number>(60);
+  const [testDays, setTestDays] = useState<number>(365);
 
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
@@ -224,6 +223,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [isVerifying, setIsVerifying] = useState<boolean>(false);
   const [verifyResult, setVerifyResult] = useState<string | null>(null);
   const [verifyCopyStatus, setVerifyCopyStatus] = useState<'idle' | 'copied'>('idle');
+  const [verifyProgress, setVerifyProgress] = useState<string>('');
   const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
 
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL');
@@ -415,7 +415,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   }, [labRunning, selectedSymbols, fetchLabForSymbol]);
 
   const currentSymbolReports = useMemo(() => {
-    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && f !== 'portfolio_correlation.json' && !f.endsWith('_lab.json'));
+    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && f !== 'portfolio_correlation.json' && !f.endsWith('_lab.json') && !f.endsWith('_verify.json'));
   }, [reportFiles, testSymbol]);
 
   const toggleSymbol = (sym: string) => {
@@ -465,7 +465,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         }),
       });
       if (!res.ok) {
-        const err = await res.json();
+        const err = await res.json().catch(() => ({}));
         setRunResults(selectedSymbols.map(s => ({ symbol: s, status: 'FAILED' as const, message: err.message || 'Run failed' })));
         setIsRunning(false);
       }
@@ -487,7 +487,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         body: JSON.stringify({ symbol: 'ALL', days: testDays }),
       });
       if (!res.ok) {
-        const err = await res.json();
+        const err = await res.json().catch(() => ({}));
         setRunResults([{ symbol: 'ALL', status: 'FAILED', message: err.message || 'Run failed' }]);
         setIsRunning(false);
       }
@@ -547,20 +547,72 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     setTimeout(() => setLabCopyStatus(prev => ({ ...prev, [sym]: 'idle' })), 2500);
   };
 
+  const formatVerifyResult = (r: any): string => {
+    if (r.error) return `Error: ${r.error}`;
+    const lines: string[] = [];
+    lines.push(`VERIFY ${r.symbol} — ${r.days} days — ${r.combination}`);
+    lines.push(`Window: ${r.window_start} → ${r.window_end}`);
+    lines.push(`Reference trades: ${r.reference_trades} | Fast trades: ${r.fast_trades}`);
+    lines.push(`Reference KPIs: WR ${r.reference_kpis?.win_rate}%, PF ${r.reference_kpis?.profit_factor}, PnL $${r.reference_kpis?.net_pnl}`);
+    lines.push(`Fast KPIs:      WR ${r.fast_kpis?.win_rate}%, PF ${r.fast_kpis?.profit_factor}, PnL $${r.fast_kpis?.net_pnl}`);
+    lines.push(`Verdict: ${r.verdict}`);
+    if (r.note) lines.push(`Note: ${r.note}`);
+    if (Array.isArray(r.divergences_sample) && r.divergences_sample.length > 0) {
+      lines.push('');
+      lines.push(`First ${r.divergences_sample.length} divergent trades:`);
+      for (const d of r.divergences_sample) {
+        lines.push(`  [${d.stage}] index ${d.index}`);
+        if (d.ref) lines.push(`    ref  : ${d.ref.signal_time_utc} ${d.ref.direction} ${d.ref.strategy} entry ${d.ref.entry_price} sl ${d.ref.sl} tp ${d.ref.tp} exit ${d.ref.exit_time} @ ${d.ref.exit_price} (${d.ref.exit_reason}) PnL $${d.ref.money_pnl}`);
+        if (d.fast) lines.push(`    fast : ${d.fast.signal_time_utc} ${d.fast.direction} ${d.fast.strategy} entry ${d.fast.entry_price} sl ${d.fast.sl} tp ${d.fast.tp} exit ${d.fast.exit_time} @ ${d.fast.exit_price} (${d.fast.exit_reason}) PnL $${d.fast.money_pnl}`);
+      }
+    }
+    return lines.join('\n');
+  };
+
   const handleVerifyVsOriginal = async () => {
     setIsVerifying(true);
     setVerifyResult(null);
+    setVerifyProgress(`Starting verification for ${testSymbol}...`);
     try {
-      const res = await fetch('/api/backtest/compare', {
+      const start = await fetch('/api/backtest/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: testSymbol, days: 30 })
+        body: JSON.stringify({ symbol: testSymbol, days: 60 }),
       });
-      const json = await res.json();
-      setVerifyResult(res.ok && json.diff ? json.diff : (json.message || 'Verification failed.'));
+      const startJson = await start.json().catch(() => ({}));
+      if (!start.ok) {
+        setVerifyResult(`Failed to start verification (HTTP ${start.status}): ${startJson.error || 'unknown'}`);
+        setIsVerifying(false);
+        return;
+      }
+      setVerifyProgress(startJson.message || 'Verification running...');
+
+      const pollId = window.setInterval(async () => {
+        try {
+          const statusRes = await fetch('/api/backtest/verify/status');
+          const statusJson = await statusRes.json().catch(() => ({}));
+          if (statusJson.progress) setVerifyProgress(statusJson.progress);
+          if (!statusJson.isRunning) {
+            window.clearInterval(pollId);
+            setIsVerifying(false);
+            if (statusJson.lastError) {
+              setVerifyResult(`Verification failed: ${statusJson.lastError}`);
+            } else if (statusJson.result) {
+              setVerifyResult(formatVerifyResult(statusJson.result));
+            } else {
+              setVerifyResult('Verification finished but no result file was produced.');
+            }
+          }
+        } catch (e: any) {
+          window.clearInterval(pollId);
+          setIsVerifying(false);
+          setVerifyResult(`Poll error: ${e.message}`);
+        }
+      }, 3000);
     } catch (e: any) {
-      setVerifyResult(`Verification network error: ${e.message}`);
-    } finally { setIsVerifying(false); }
+      setVerifyResult(`Network error: ${e.message}`);
+      setIsVerifying(false);
+    }
   };
 
   const handleExportPDF = async () => {
@@ -762,21 +814,43 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           </button>
           <button type="button" disabled={isVerifying || isRunning || labRunning} onClick={handleVerifyVsOriginal} className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors">
             <ShieldCheck className="w-3.5 h-3.5" />
-            <span>{isVerifying ? 'Verifying...' : 'Verify vs original (60 days)'}</span>
+            <span>{isVerifying ? 'Verifying...' : 'Verify vs Reference (60 days)'}</span>
           </button>
         </div>
       </motion.div>
 
-      {verifyResult && (
+      {(isVerifying || verifyResult) && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-purple-500" />
-              <span className="text-xs font-bold text-black dark:text-white">Verification Difference Report</span>
+              <span className="text-xs font-bold text-black dark:text-white">
+                Verify vs Reference ({testSymbol} · 60 days)
+              </span>
+              {isVerifying && <RefreshCw className="w-3.5 h-3.5 text-purple-500 animate-spin" />}
             </div>
-            <button type="button" onClick={() => setVerifyResult(null)} className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer">Dismiss</button>
+            <div className="flex items-center gap-2">
+              {verifyResult && !isVerifying && (
+                <button
+                  type="button"
+                  onClick={() => { navigator.clipboard.writeText(verifyResult); setVerifyCopyStatus('copied'); setTimeout(() => setVerifyCopyStatus('idle'), 2000); }}
+                  className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                >
+                  {verifyCopyStatus === 'copied' ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{verifyCopyStatus === 'copied' ? 'Copied' : 'Copy Result'}</span>
+                </button>
+              )}
+              {!isVerifying && (
+                <button type="button" onClick={() => { setVerifyResult(null); setVerifyProgress(''); }} className="text-xs text-slate-400 hover:text-black dark:hover:text-white cursor-pointer ml-1">Dismiss</button>
+              )}
+            </div>
           </div>
-          <textarea readOnly value={verifyResult} rows={14} className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none" />
+          {isVerifying && (
+            <div className="text-xs text-slate-500 font-mono">{verifyProgress || 'Verification running...'}</div>
+          )}
+          {verifyResult && (
+            <textarea readOnly value={verifyResult} rows={14} onFocus={(e) => e.target.select()} className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-xs text-black dark:text-slate-200 focus:outline-none" />
+          )}
         </div>
       )}
 
@@ -864,6 +938,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           <h3 className="text-sm font-bold text-black dark:text-white">
             Results by Combination ({summaryData.symbol} · {summaryData.days} Days)
           </h3>
+          <HowToRead metricKey="sec_combinations" />
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs font-mono">
               <thead>
@@ -937,30 +1012,194 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Total Trades <InfoTip metricKey="total_trades" /></div>
+              <div className="text-[10px] uppercase font-bold text-slate-500 flex items-center">Total Trades <InfoTip metricKey="total_trades" /></div>
               <div className="text-2xl font-bold font-mono text-blue-600 dark:text-blue-400 mt-1">{kpis.count}</div>
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Win Rate <InfoTip metricKey="win_rate" /></div>
+              <div className="text-[10px] uppercase font-bold text-slate-500 flex items-center">Win Rate <InfoTip metricKey="win_rate" /></div>
               <div className={`text-2xl font-bold font-mono mt-1 ${kpis.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{kpis.win_rate}%</div>
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Expectancy <InfoTip metricKey="expectancy" /></div>
+              <div className="text-[10px] uppercase font-bold text-slate-500 flex items-center">Expectancy <InfoTip metricKey="expectancy" /></div>
               <div className={`text-2xl font-bold font-mono mt-1 ${kpis.expectancy > 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{kpis.expectancy}R</div>
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Profit Factor <InfoTip metricKey="profit_factor" /></div>
+              <div className="text-[10px] uppercase font-bold text-slate-500 flex items-center">Profit Factor <InfoTip metricKey="profit_factor" /></div>
               <div className="text-2xl font-bold font-mono text-black dark:text-white mt-1">{kpis.profit_factor}</div>
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Max DD <InfoTip metricKey="max_drawdown" /></div>
+              <div className="text-[10px] uppercase font-bold text-slate-500 flex items-center">Max DD <InfoTip metricKey="max_drawdown" /></div>
               <div className="text-2xl font-bold font-mono text-rose-600 mt-1">-${kpis.max_dd_money}</div>
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
-              <div className="text-[10px] uppercase font-bold text-slate-500">Net P&L <InfoTip metricKey="net_pnl" /></div>
+              <div className="text-[10px] uppercase font-bold text-slate-500 flex items-center">Net P&L <InfoTip metricKey="net_pnl" /></div>
               <div className={`text-2xl font-bold font-mono mt-1 ${kpis.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>{formatCurrency(kpis.net_pnl, brokerCurrency)}</div>
             </div>
           </div>
+
+          {reportData?.strategy_kpis && Object.keys(reportData.strategy_kpis).length > 0 && (
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3">Per-Strategy</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2.5 px-3">Strategy</th>
+                      <th className="py-2.5 px-3 text-center">Trades</th>
+                      <th className="py-2.5 px-3 text-center">Win Rate</th>
+                      <th className="py-2.5 px-3 text-center">PF</th>
+                      <th className="py-2.5 px-3 text-right">Net P&L</th>
+                      <th className="py-2.5 px-3 text-center">Verdict</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    {Object.entries(reportData.strategy_kpis).map(([sName, sKpi]: any) => {
+                      const tv = (reportData as any)?.strategy_tune_validate?.[sName] || {};
+                      const verdict = holdoutVerdictLocal(tv.tune, tv.validate);
+                      return (
+                        <tr key={sName} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
+                          <td className="py-3 px-3 font-bold text-black dark:text-white">{sName}</td>
+                          <td className="py-3 px-3 text-center font-bold">{sKpi.count}</td>
+                          <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{sKpi.win_rate}%</td>
+                          <td className="py-3 px-3 text-center">{sKpi.profit_factor}</td>
+                          <td className={`py-3 px-3 text-right font-bold ${sKpi.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${sKpi.net_pnl}</td>
+                          <td className="py-3 px-3 text-center"><VerdictPill verdict={verdict} /></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {reportData?.dow_kpis && Object.keys(reportData.dow_kpis).length > 0 && (
+            <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3">Per-Weekday</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2.5 px-3">Weekday</th>
+                      <th className="py-2.5 px-3 text-center">Trades</th>
+                      <th className="py-2.5 px-3 text-center">Win Rate</th>
+                      <th className="py-2.5 px-3 text-center">PF</th>
+                      <th className="py-2.5 px-3 text-right">Net P&L</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    {Object.entries(reportData.dow_kpis).map(([dow, sKpi]: any) => (
+                      <tr key={dow} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
+                        <td className="py-3 px-3 font-bold text-black dark:text-white">{dow}</td>
+                        <td className="py-3 px-3 text-center font-bold">{sKpi.count}</td>
+                        <td className={`py-3 px-3 text-center font-bold ${sKpi.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{sKpi.win_rate}%</td>
+                        <td className="py-3 px-3 text-center">{sKpi.profit_factor}</td>
+                        <td className={`py-3 px-3 text-right font-bold ${sKpi.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${sKpi.net_pnl}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeSubTab === 'diagnostics' && reportData?.diagnostics && (
+        <div className="space-y-4">
+          <HowToRead metricKey="sec_diagnostics" />
+          <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
+            <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§19 Hour Matrix <InfoTip metricKey="diag_hour_matrix" /></h3>
+            <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-12 gap-2">
+              {Array.from({ length: 24 }, (_, h) => {
+                const k = reportData.diagnostics?.hour_kpis?.[String(h)];
+                const hasData = k && k.count > 0;
+                const isWin = hasData && k.net_pnl >= 0;
+                return (
+                  <div key={h} className={`p-2 rounded-xl border text-[10px] font-mono ${!hasData ? 'bg-slate-50 dark:bg-[#08090d] border-slate-200 dark:border-[#1a2030] text-slate-400' : isWin ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600' : 'bg-rose-500/10 border-rose-500/30 text-rose-600'}`}>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-bold">{String(h).padStart(2, '0')}</span>
+                    </div>
+                    {hasData ? (
+                      <>
+                        <div className="truncate">n={k.count}</div>
+                        <div className="truncate font-bold">{k.win_rate}%</div>
+                        <div className="truncate">{k.net_pnl >= 0 ? '+' : ''}${k.net_pnl}</div>
+                      </>
+                    ) : <div className="text-center text-slate-300 dark:text-slate-600">—</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§31 Streaks <InfoTip metricKey="diag_streak" /></h3>
+              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Max Streak</div>
+                  <div className="text-lg font-bold text-rose-500">{reportData.diagnostics.streak_analysis.max_consecutive_losses}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Peak DD</div>
+                  <div className="text-lg font-bold text-rose-500">-${reportData.diagnostics.streak_analysis.peak_drawdown}</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§37 Bootstrap Monte Carlo <InfoTip metricKey="diag_monte_carlo" /></h3>
+              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Median Final P&L</div>
+                  <div className={`text-lg font-bold ${(reportData.diagnostics.monte_carlo.median_final_pnl ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${reportData.diagnostics.monte_carlo.median_final_pnl}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-200 dark:border-[#1a2030]">
+                  <div className="text-[10px] text-slate-500 uppercase">Prob Positive</div>
+                  <div className={`text-lg font-bold ${(reportData.diagnostics.monte_carlo.prob_positive ?? 0) >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>{reportData.diagnostics.monte_carlo.prob_positive}%</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
+            <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§38 Alpha <InfoTip metricKey="diag_buy_and_hold" /></h3>
+            <div className="text-xs font-mono">
+              <div>Strategy P&L: <span className={`font-bold ${(reportData.diagnostics.buy_and_hold.strategy_net_pnl ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${reportData.diagnostics.buy_and_hold.strategy_net_pnl}</span></div>
+              <div>Hold P&L: <span className="font-bold">${reportData.diagnostics.buy_and_hold.bh_net_pnl}</span></div>
+              <div>Alpha: <span className={`font-bold ${(reportData.diagnostics.buy_and_hold.alpha ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${reportData.diagnostics.buy_and_hold.alpha}</span></div>
+              <div className="mt-2 text-[11px] text-slate-500">Verdict: {reportData.diagnostics.buy_and_hold.verdict}</div>
+            </div>
+          </div>
+
+          {reportData.diagnostics.slippage_sensitivity && Object.keys(reportData.diagnostics.slippage_sensitivity).length > 0 && (
+            <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030]">
+              <h3 className="text-sm font-bold text-black dark:text-white mb-3 flex items-center">§34 Slippage <InfoTip metricKey="diag_slippage" /></h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[10px] uppercase font-bold text-slate-500">
+                      <th className="py-2 px-3">Slippage</th>
+                      <th className="py-2 px-3 text-right">Net P&L</th>
+                      <th className="py-2 px-3 text-center">Win Rate</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                    {Object.values(reportData.diagnostics.slippage_sensitivity).map((pt: any, i: number) => (
+                      <tr key={i}>
+                        <td className="py-2.5 px-3 font-bold text-black dark:text-white">
+                          {pt.slippage_pips === 0 ? 'Baseline' : `${pt.slippage_pips} pip${pt.slippage_pips > 1 ? 's' : ''}`}
+                        </td>
+                        <td className={`py-2.5 px-3 text-right font-bold ${pt.net_pnl >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>${pt.net_pnl}</td>
+                        <td className="py-2.5 px-3 text-center">{pt.win_rate}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1100,7 +1339,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                {filteredTrades.map((t: any, idx: number) => (
+                {filteredTrades.slice(0, 500).map((t: any, idx: number) => (
                   <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-[#121520]">
                     <td className="py-2.5 px-3 text-slate-400">{t.date_sast || t.date}</td>
                     <td className="py-2.5 px-3 font-bold text-black dark:text-white">{t.strategy}</td>
