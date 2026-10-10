@@ -9,17 +9,26 @@ M5 series (m5_df_full=...), every closed trade gets four additional fields
 PROPOSED: post-exit tracking replaces the old fixed 24-candle window with
 two clean rules:
   - After a SL exit: track until price reaches the original TP (recovered),
-    OR until price has moved 2x the original SL distance further past the SL
-    (a total 3x SL from entry), OR the end of the data.
+    OR until price has moved 2x the original SL distance further past the SL,
+    OR the end of the data.
   - After a TP exit: track until price returns to entry (invalid),
     OR until price has moved 3x the original TP distance past the TP,
     OR the end of the data.
+
+PROPOSED (2026-10-10): the alt-target replay now uses `pos["open_time"]`
+converted to epoch seconds via datetime.timestamp(). It no longer reads
+record["signal_time_utc"] and parses it. The previous version was silently
+returning early on pandas versions where the datetime column conversion
+raised inside a broad except, which produced null alt_r_* fields on
+every trade. On any failure, the init path now prints a visible traceback
+so a silent failure cannot happen again.
 """
 
 import sys
 import os
 import math
 import bisect
+import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -50,29 +59,6 @@ ASSETS = {
     "USDJPY":   {"pip_size": PIP_SIZES["USDJPY"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
     "GBPUSD":   {"pip_size": PIP_SIZES["GBPUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
 }
-
-
-def _series_to_epoch_seconds(time_series) -> np.ndarray:
-    """
-    Robust timezone-aware conversion of a pandas datetime series to int64
-    epoch seconds. This was the cause of the null alt_r fields: the previous
-    version used df['time'].astype('int64'), which raises a TypeError on
-    pandas 2.x for timezone-aware columns. The exception was swallowed by a
-    broad except, so _m5_epochs silently stayed None and the replay never ran.
-
-    The slow path (Python loop over timestamps) only runs once per simulator
-    instance, so it is not a performance concern.
-    """
-    try:
-        # Fast path.
-        return time_series.astype('int64').to_numpy() // 10 ** 9
-    except Exception:
-        pass
-    # Slow but reliable path.
-    try:
-        return np.array([int(pd.Timestamp(t).timestamp()) for t in time_series], dtype=np.int64)
-    except Exception:
-        return np.array([], dtype=np.int64)
 
 
 class TradeSimulator:
@@ -119,15 +105,32 @@ class TradeSimulator:
                 if not pd.api.types.is_datetime64_any_dtype(df['time']):
                     df['time'] = pd.to_datetime(df['time'], utc=True)
                 df = df.sort_values('time').reset_index(drop=True)
-                self._m5_epochs = _series_to_epoch_seconds(df['time'])
+                # Robust epoch conversion: never rely on pandas .astype(int64)
+                # on a tz-aware column. Use .value (nanoseconds since epoch)
+                # and integer-divide.
+                epochs = np.empty(len(df), dtype=np.int64)
+                for i, t in enumerate(df['time']):
+                    try:
+                        epochs[i] = int(getattr(t, "value", 0)) // 10 ** 9
+                    except Exception:
+                        epochs[i] = 0
+                self._m5_epochs = epochs
                 self._m5_highs = df['high'].astype(float).to_numpy()
                 self._m5_lows = df['low'].astype(float).to_numpy()
                 self._m5_closes = df['close'].astype(float).to_numpy()
-                # PROPOSED: one-shot log so a silent failure cannot happen again.
-                if self._m5_epochs is None or self._m5_epochs.size == 0:
-                    print("[simulator] WARNING: alt-target replay disabled (empty epoch array).", flush=True)
+                # One-shot visible log. The user can see this in the deploy
+                # logs and it proves the arrays were built.
+                print(
+                    f"[simulator] alt replay ready: {len(epochs)} candles, "
+                    f"first={epochs[0] if len(epochs) > 0 else 'n/a'}, "
+                    f"last={epochs[-1] if len(epochs) > 0 else 'n/a'}",
+                    flush=True,
+                )
+                if self._m5_epochs.size == 0:
+                    print("[simulator] WARNING: alt replay disabled (empty epoch array).", flush=True)
             except Exception as e:
-                print(f"[simulator] WARNING: alt-target replay disabled ({e}).", flush=True)
+                print(f"[simulator] WARNING: alt replay disabled ({e}).", flush=True)
+                traceback.print_exc()
                 self._m5_epochs = None
                 self._m5_highs = None
                 self._m5_lows = None
@@ -279,6 +282,14 @@ class TradeSimulator:
         except Exception:
             is_in_news = False
 
+        # PROPOSED: entry_epoch is captured here as a plain integer number of
+        # seconds. The alt-target replay uses this directly, so no string
+        # parsing and no timezone conversion is done at replay time.
+        try:
+            entry_epoch = int(current_time.timestamp())
+        except Exception:
+            entry_epoch = 0
+
         position = {
             "trade_id": trade_id,
             "symbol": symbol,
@@ -290,6 +301,7 @@ class TradeSimulator:
             "take_profit": fixed_tp,
             "initial_sl_dist": sl_dist,
             "open_time": current_time,
+            "entry_epoch": entry_epoch,
             "contract_size": contract_size,
             "pip_size": pip_size,
             "spread_pts": spread_pts,
@@ -580,6 +592,11 @@ class TradeSimulator:
         self.pending_sl_evaluations = []
 
     def _replay_alt_targets(self, record: Dict[str, Any]) -> None:
+        """
+        PROPOSED: writes the four alt_r_* fields and the alt_timeout flag.
+        Uses record["entry_epoch"] (an int) set by _close_position, so no
+        string parsing and no timezone conversion happens here.
+        """
         for k in ALT_TARGET_KEYS:
             record[k] = None
         record[ALT_TIMEOUT_FLAG_KEY] = False
@@ -592,7 +609,11 @@ class TradeSimulator:
             sl = float(record["sl"])
             direction = str(record["direction"]).upper()
             spread_pts = float(record.get("spread_paid", 0.0) or 0.0)
+            entry_epoch = int(record.get("entry_epoch", 0))
         except Exception:
+            return
+
+        if entry_epoch <= 0:
             return
 
         sl_dist = abs(entry - sl)
@@ -600,11 +621,6 @@ class TradeSimulator:
             return
 
         sign = 1.0 if direction == "BUY" else -1.0
-
-        try:
-            entry_epoch = int(pd.Timestamp(record["signal_time_utc"]).value // 10 ** 9)
-        except Exception:
-            return
 
         start = int(np.searchsorted(self._m5_epochs, entry_epoch, side="right"))
         if start >= self._m5_epochs.size:
@@ -724,6 +740,7 @@ class TradeSimulator:
             "direction": direction,
             "signal_time_utc": pos["open_time"].strftime("%Y-%m-%d %H:%M:%S"),
             "signal_time_sast": pos["open_time"].astimezone(TZ_SAST).strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_epoch": int(pos.get("entry_epoch", 0)),
             "entry_price": round(entry, 5),
             "exit_price": round(actual_exit, 5),
             "sl": round(pos["stop_loss"], 5),
@@ -763,13 +780,11 @@ class TradeSimulator:
             "post_tp_invalid": False,
         }
 
-        # Copy features onto the record AFTER building the base fields, but
-        # do not let a feature overwrite a reserved key. With the direction
-        # feature now returning a string, this is belt-and-braces.
         _RESERVED = {
             "trade_id", "date", "date_sast", "symbol", "strategy", "direction",
-            "signal_time_utc", "signal_time_sast", "entry_price", "exit_price",
-            "sl", "tp", "lots", "exit_time", "exit_reason", "duration_minutes",
+            "signal_time_utc", "signal_time_sast", "entry_epoch",
+            "entry_price", "exit_price", "sl", "tp", "lots",
+            "exit_time", "exit_reason", "duration_minutes",
             "result", "r_multiple", "money_pnl",
         }
         feats = pos.get("entry_features")
@@ -779,8 +794,8 @@ class TradeSimulator:
                     continue
                 record[k] = v
 
-        # Alt-target replay runs BEFORE the post-exit tracker registration,
-        # so the record has direction as a string at this point.
+        # Alt-target replay runs first so the four fields exist before
+        # the post-exit tracker potentially rewrites other fields.
         self._replay_alt_targets(record)
 
         if result == "LOSS" and "SL" in reason:
