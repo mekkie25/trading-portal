@@ -2,8 +2,12 @@
 backtest/entry_analysis.py
 Pool the trades from the "Adaptive · BE off · Trail off" report of every
 pair that has a saved result and report which entry features separate
-winners from losers. Adds alt-target R statistics and per-pair breakdown
-for the starred buckets.
+winners from losers.
+
+PROPOSED: alt-target R statistics are computed from alt_r_1, alt_r_15,
+alt_r_2 and alt_r_3, written by the simulator's post-trade replay. When
+those fields are missing (an older run, or a pair that was not part of the
+analysis combo), the related bucket columns print as 0.00 / n/a.
 
 Writes: backtest/output/entry_analysis.json
 
@@ -44,11 +48,13 @@ DISCRETE_FEATURES = {
     "session",
     "hour_sast",
     "weekday",
-    "direction",
+    # NOTE: `direction` is intentionally NOT here. The feature returns the
+    # string "BUY"/"SELL", not an integer, so it is handled by STRING_FEATURES.
 }
 STRING_FEATURES = {
-    # PROPOSED: read-only string sub-type label from the strategy signal.
+    # PROPOSED: read-only string features.
     "setup_tag",
+    "direction",
 }
 
 MIN_BUCKET_TRADES = 60
@@ -106,10 +112,9 @@ def _kpis(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _pf_at_1r(trades: List[Dict[str, Any]]) -> float:
     """
-    PROPOSED. Profit factor computed on the alt_r_1 values (in R). Wins are
-    positive alt_r_1, losses are negative alt_r_1. Returns 0.0 when no
-    usable alt_r_1 exists, and 99.0 when there are no losses but there is
-    at least one win.
+    Profit factor computed on the alt_r_1 values (in R). Wins are positive
+    alt_r_1, losses are negative alt_r_1. Returns 0.0 when no usable
+    alt_r_1 exists, and 99.0 when there are no losses but at least one win.
     """
     gains = 0.0
     losses = 0.0
@@ -131,7 +136,7 @@ def _pf_at_1r(trades: List[Dict[str, Any]]) -> float:
 
 
 def _mean_alt_r(trades: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    """PROPOSED. Mean alt-target R across a bucket. None when no data."""
+    """Mean alt-target R across a bucket. None when no data."""
     out: Dict[str, Optional[float]] = {}
     for key in ALT_KEYS:
         vals = [_safe_float(t.get(key)) for t in trades]
@@ -140,7 +145,10 @@ def _mean_alt_r(trades: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
     return out
 
 
-def _quarters_above_pf1(trades: List[Dict[str, Any]], quarter_edges: List[Tuple[datetime, datetime]]) -> int:
+def _quarters_above_pf1(
+    trades: List[Dict[str, Any]],
+    quarter_edges: List[Tuple[datetime, datetime]],
+) -> int:
     """
     Number of the 4 date quarters where PF at 1R is strictly > 1.0.
     Quarters with fewer than 3 usable trades are skipped.
@@ -470,7 +478,6 @@ def _select_bucket(
         edges = pooled_edges.get(feature)
         if edges is None:
             return []
-        # Parse bucket index from the label prefix Q1/Q2/Q3/Q4
         if label.startswith("Q1"):
             idx = 0
         elif label.startswith("Q2"):
@@ -545,15 +552,12 @@ def run_entry_analysis(
     baselines: List[Dict[str, Any]] = []
     pooled_edges: Dict[str, Any] = {}
 
-    # First pass: compute the pooled edges from the full pool.
     a_buckets, a_baseline, a_edges = _analyze_group("ALL", pooled, q_edges)
     all_buckets.extend(a_buckets)
     if a_baseline:
         baselines.append(a_baseline)
     pooled_edges.update(a_edges)
 
-    # Per-strategy with at least MIN_STRATEGY_TRADES trades. These use the
-    # same pooled edges so buckets are comparable across groups.
     enough: List[str] = []
     for s, ts in per_strategy.items():
         if len(ts) < MIN_STRATEGY_TRADES:
@@ -564,7 +568,6 @@ def run_entry_analysis(
         if s_baseline:
             baselines.append(s_baseline)
 
-    # Sort: stars first, then highest PF@1R, then highest n.
     all_buckets.sort(
         key=lambda b: (
             0 if b.get("is_star") else 1,
