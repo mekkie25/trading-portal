@@ -78,6 +78,8 @@ const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boo
   { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
   { id: 37, label: 'Bootstrap Monte Carlo resampling',           panel: true,  txt: true,  pdf: true },
   { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
+  // PROPOSED: entry-condition analysis is a TXT-only addition per the prompt.
+  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false, note: 'TXT-only, follows the portfolio section.' },
 ];
 
 const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
@@ -403,6 +405,119 @@ function fmt(v: any, decimals = 2): string {
   return n.toFixed(decimals);
 }
 
+// ---------------------------------------------------------------------------
+// PROPOSED: ENTRY CONDITION ANALYSIS (TXT-only section).
+// Reads backtest/output/entry_analysis.json, produces a compact block with
+// a hard 8,000 character cap and a "n/a - rerun to generate" fallback.
+// ---------------------------------------------------------------------------
+function renderEntryConditionAnalysis(): string[] {
+  const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
+  const header = 'ENTRY CONDITION ANALYSIS (pooled, R:R 1:1, BE off)';
+
+  if (!fs.existsSync(analysisFile)) {
+    return [header, '  n/a - rerun to generate'];
+  }
+  let payload: any;
+  try {
+    payload = JSON.parse(fs.readFileSync(analysisFile, 'utf8'));
+  } catch {
+    return [header, '  n/a - rerun to generate'];
+  }
+
+  const baselines: any[] = Array.isArray(payload.baselines) ? payload.baselines : [];
+  const buckets: any[] = Array.isArray(payload.buckets) ? payload.buckets : [];
+  const starPairs: any[] = Array.isArray(payload.star_pair_breakdown) ? payload.star_pair_breakdown : [];
+  const SECTION_CAP = 8000;
+
+  const fmtR = (v: any): string => (v === null || v === undefined) ? 'n/a' : fmt(v, 2);
+
+  const formatBucketLine = (b: any): string => {
+    const star = b.is_star ? '*' : ' ';
+    return `${star}[${b.group}] ${b.feature} ${b.bucket}: n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor_1r)} R@1/1.5/2/3=${fmtR(b.avg_r_1)}/${fmtR(b.avg_r_15)}/${fmtR(b.avg_r_2)}/${fmtR(b.avg_r_3)} q>1=${b.quarters_above_1 ?? 0}/4`;
+  };
+
+  const buildSection = (includeStarPairs: boolean, restrictBuckets: boolean): string[] => {
+    const out: string[] = [];
+    out.push(header);
+    out.push(`Pooled: ${payload.total_trades ?? 0} trades | Window: ${payload.window_start ?? 'n/a'} to ${payload.window_end ?? 'n/a'}`);
+
+    if (baselines.length > 0) {
+      out.push('Baselines:');
+      for (const b of baselines) {
+        out.push(`  [${b.group}] n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor)} pf@1R=${fmt(b.profit_factor_1r)} q>1=${b.quarters_above_1 ?? 0}/4`);
+      }
+    }
+
+    if (buckets.length === 0) {
+      out.push('  (no buckets meet the minimum trade count)');
+      return out;
+    }
+
+    let rows: any[] = buckets;
+    let truncatedNote = '';
+    if (restrictBuckets) {
+      const stars = buckets.filter(b => b.is_star);
+      const nonStars = buckets.filter(b => !b.is_star);
+      const byGroup: Record<string, any[]> = {};
+      for (const b of nonStars) {
+        const g = b.group || 'ALL';
+        if (!byGroup[g]) byGroup[g] = [];
+        byGroup[g].push(b);
+      }
+      const keepNon: any[] = [];
+      for (const g of Object.keys(byGroup)) {
+        const base = baselines.find(x => x.group === g);
+        const bpf = base ? (base.profit_factor_1r ?? 0) : 0;
+        const sorted = [...byGroup[g]].sort((a, b) =>
+          Math.abs((b.profit_factor_1r ?? 0) - bpf) - Math.abs((a.profit_factor_1r ?? 0) - bpf));
+        keepNon.push(...sorted.slice(0, 3));
+      }
+      rows = [...stars, ...keepNon];
+      rows.sort((a, b) => {
+        if (a.is_star !== b.is_star) return a.is_star ? -1 : 1;
+        return (b.profit_factor_1r ?? 0) - (a.profit_factor_1r ?? 0);
+      });
+      const omitted = buckets.length - rows.length;
+      if (omitted > 0) {
+        truncatedNote = `  (truncated to fit the ${SECTION_CAP}-char budget: ${omitted} bucket rows omitted)`;
+      }
+    }
+
+    out.push('Buckets:');
+    for (const r of rows) out.push(formatBucketLine(r));
+    if (truncatedNote) out.push(truncatedNote);
+
+    if (includeStarPairs && starPairs.length > 0) {
+      out.push('');
+      out.push('Star bucket cross-pair check:');
+      for (const sp of starPairs.slice(0, 20)) {
+        const pp: Record<string, any> = sp.per_pair || {};
+        const parts: string[] = [];
+        for (const sym of Object.keys(pp)) {
+          const row = pp[sym];
+          if (!row || !row.trades) continue;
+          parts.push(`${sym} n=${row.trades} pf=${fmt(row.profit_factor_1r)} q=${row.quarters_above_1 ?? 0}/4`);
+        }
+        out.push(`  [${sp.group}] ${sp.feature} ${sp.bucket} (pooled n=${sp.pooled?.trades ?? 0}) -> ${parts.join(' | ')}`);
+      }
+    }
+
+    return out;
+  };
+
+  // Attempt 1: full section.
+  let section = buildSection(true, false);
+  if (section.join('\n').length <= SECTION_CAP) return section;
+
+  // Attempt 2: restrict buckets to stars + 3 largest deviations per group.
+  section = buildSection(true, true);
+  if (section.join('\n').length <= SECTION_CAP) return section;
+
+  // Attempt 3: also drop the star cross-pair check.
+  section = buildSection(false, true);
+  return section;
+}
+
 function renderTxtContent(data: any): string {
   const totalTimeStr = (typeof data.total_run_seconds === 'number' && data.total_run_seconds > 0) ? `${data.total_run_seconds}s` : 'n/a';
   const lines: string[] = [];
@@ -417,6 +532,7 @@ function renderTxtContent(data: any): string {
   lines.push('');
   lines.push('LEGEND');
   lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
+  lines.push('  ENTRY CONDITION ANALYSIS marks a bucket with * when PF@1R is >= baseline + 0.20 AND PF@1R > 1.0 AND it holds in at least 3 of 4 date quarters.');
   lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Time ${totalTimeStr}`);
   lines.push('');
   lines.push('CROSS-PAIR ROLLUP');
@@ -480,6 +596,13 @@ function renderTxtContent(data: any): string {
     lines.push(`Portfolio DD $${fmt(pc.portfolio_drawdown)} | Div ratio ${fmt(pc.diversification_ratio)}x | avg corr ${fmt(pc.avg_daily_correlation, 3)}`);
     lines.push('');
   }
+
+  // PROPOSED: entry condition analysis block, after the portfolio section.
+  lines.push('================================================================================');
+  lines.push(...renderEntryConditionAnalysis());
+  lines.push('================================================================================');
+  lines.push('');
+
   lines.push('NOT IMPLEMENTED:');
   const notImpl = (data.spec_coverage || []).filter((row: any) => !(row.panel && row.txt && row.pdf));
   if (notImpl.length === 0) lines.push('  (none)');
@@ -545,6 +668,16 @@ async function startServer() {
       res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.txt"`);
       res.status(200).send(txt);
     } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
+  });
+  // PROPOSED: expose the raw entry_analysis.json so the panel or a curl can verify it.
+  app.get('/api/backtest/entry-analysis', (_req, res) => {
+    try {
+      const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
+      if (fs.existsSync(analysisFile)) {
+        return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(analysisFile, 'utf8')) });
+      }
+      return res.status(404).json({ status: 'error', message: 'entry_analysis.json not yet generated. Run a backtest first.' });
+    } catch (err: any) { return res.status(500).json({ status: 'error', message: err?.message }); }
   });
   app.get('/api/backtest/reports', (_req, res) => {
     try {
@@ -807,7 +940,7 @@ async function startServer() {
     } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
-  // ---- journal, bot config, limits, telemetry (unchanged) ----
+  // ---- journal, bot config, limits, telemetry ----
   app.get('/api/journal', async (_req, res) => {
     try { const diskTrades = loadTradesFromDisk(); activeBrokerTelemetry.trades = diskTrades; res.status(200).json(diskTrades); }
     catch { res.status(500).json({ error: "Failed to fetch journal entries" }); }
