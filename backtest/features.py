@@ -6,26 +6,14 @@ value uses only data available at the entry candle.
 Called by runner.py right before sim.open_trade. The returned dict is stored
 with the trade and later pooled by backtest/entry_analysis.py.
 
-PROPOSED: backtest-only. No effect on live trading.
-
 PROPOSED: 17 features. The original 12 from the earlier pass plus five
-requested by the entry-condition prompt:
-  - session        : session in force on the SAST clock
-  - hour_sast      : SAST hour grouped into 3-hour blocks (0..7)
-  - weekday        : SAST weekday 0=Mon..6=Sun
-  - direction      : +1 for BUY, -1 for SELL, 0 otherwise
-  - setup_tag      : string sub-type read from the strategy's own signal,
-                     or "none" if nothing is present. Read-only.
+requested by the entry-condition prompt.
 
-PROPOSED: _last_closed_context accepts a min_bars argument. This matters
-because the H4 buffer in the aggregator is 30 rows, but the intended H4
-filter uses a 50-period EMA. Requiring 51 closed bars would make htf_h4
-default to 0 for every single trade, which is exactly what the previous
-run showed. With min_bars we allow an under-warmed but still directional
-50-period EMA on the 29 closed bars we actually have. The value is honest
-(a 50-period EMA seeded with 29 bars is less precise but its sign matches
-the trend), and it is the same computation the live bot would produce if
-it only had 30 H4 bars.
+PROPOSED: `direction` feature returns the string "BUY"/"SELL"/"none", not
+an integer. This matters because the trade record already has a field called
+`direction` whose value is "BUY"/"SELL". If the feature returned an integer
+it would overwrite the string when features are copied onto the record, and
+corrupt every downstream reader that expects a string.
 """
 from __future__ import annotations
 
@@ -94,8 +82,6 @@ def _last_closed_context(
 
     min_bars: minimum number of closed bars required. Defaults to ema_span.
     Pass a smaller value when the source buffer is smaller than the span.
-    The EMA is still computed with the requested ema_span, it is simply
-    under-warmed at the start of the buffer.
     """
     if view_df is None or not hasattr(view_df, "columns"):
         return None
@@ -107,7 +93,6 @@ def _last_closed_context(
         return None
     if df is None or len(df) < 2:
         return None
-    # Drop the currently forming bar (the last row of the aggregator view).
     closed = df.iloc[:-1]
     if len(closed) < 2:
         return None
@@ -146,12 +131,6 @@ def _eff_ratio(m5_slice: pd.DataFrame, window: int = 30) -> float:
 
 
 def _mins_since_session_open(curr_time_utc: Optional[datetime]) -> int:
-    """
-    60-minute bucket since the most recent of:
-      - London 08:00 local
-      - New York 09:30 local
-    Returns -1 if neither has opened yet for the current UTC day.
-    """
     if curr_time_utc is None:
         return -1
     if curr_time_utc.tzinfo is None:
@@ -182,7 +161,6 @@ def _room_atr(
     direction: str,
     atr: float,
 ) -> float:
-    """Distance in ATR to the nearest key level beyond the entry."""
     if atr <= 0 or not session_levels:
         return 0.0
     candidates = []
@@ -207,7 +185,6 @@ def _room_atr(
 
 
 def _atr_pctile(m5_df: pd.DataFrame, idx: int, lookback_bars: int = 20 * 288) -> float:
-    """Percentile rank of ATR14 at idx against the last 20 M5-day window."""
     if m5_df is None or "atr_14" not in m5_df.columns:
         return 0.0
     series = m5_df["atr_14"]
@@ -272,7 +249,6 @@ def _session_code(curr_time_utc: Optional[datetime]) -> int:
 
 
 def _hour_sast_block(curr_time_utc: Optional[datetime]) -> int:
-    """SAST hour grouped into 3-hour blocks (0..7). -1 if unknown."""
     if curr_time_utc is None:
         return -1
     if curr_time_utc.tzinfo is None:
@@ -284,7 +260,6 @@ def _hour_sast_block(curr_time_utc: Optional[datetime]) -> int:
 
 
 def _weekday_code(curr_time_utc: Optional[datetime]) -> int:
-    """SAST weekday: 0=Monday .. 6=Sunday. -1 if unknown."""
     if curr_time_utc is None:
         return -1
     if curr_time_utc.tzinfo is None:
@@ -295,25 +270,19 @@ def _weekday_code(curr_time_utc: Optional[datetime]) -> int:
         return -1
 
 
-def _direction_code(direction: str) -> int:
+def _direction_code(direction: str) -> str:
     """
-    Strict: +1 only for the exact string BUY, -1 only for SELL, 0 otherwise.
-    A bad input becomes a visible 0 instead of being silently mapped.
+    PROPOSED: return the string "BUY", "SELL" or "none". This matches the
+    trade record's own `direction` field so the feature-copy step cannot
+    corrupt it with an integer.
     """
     d = str(direction or "").strip().upper()
-    if d == "BUY":
-        return 1
-    if d == "SELL":
-        return -1
-    return 0
+    if d in ("BUY", "SELL"):
+        return d
+    return "none"
 
 
 def _setup_tag(signal: Any) -> str:
-    """
-    Read a sub-type label already present on the signal, if any.
-    Does not add, change or compute anything on the strategies. Falls back
-    to the literal string 'none' when nothing is present.
-    """
     if signal is None:
         return "none"
     try:
@@ -341,11 +310,12 @@ def compute_entry_features(
     trade_of_day: int,
 ) -> Dict[str, Any]:
     """
-    Compute the features for one trade. Never raises; returns zeros/none on
-    any internal failure so the run continues.
+    Compute the features for one trade. Never raises; returns defaults on any
+    internal failure so the run continues.
     """
     out: Dict[str, Any] = {k: 0 for k in FEATURE_NAMES}
-    out["setup_tag"] = "none"  # string feature, safe default
+    out["setup_tag"] = "none"
+    out["direction"] = "none"
     try:
         if signal is None or m5_df is None or idx < 0 or idx >= len(m5_df):
             return out
@@ -361,17 +331,12 @@ def compute_entry_features(
         if atr <= 0:
             atr = _atr_fallback(m5_slice)
 
-        # (a) D1 alignment. The D1 buffer in the aggregator is 150 rows, so
-        # a 20-period EMA on the ~149 closed bars is fully warmed. min_bars
-        # of 10 is a floor for safety.
+        # (a) D1 alignment.
         ctx = _last_closed_context(d1_view, 20, min_bars=10)
         if ctx is not None:
             out["htf_d1"] = _align(direction, ctx[0], ctx[1])
 
-        # (b) H4 alignment. The H4 buffer in the aggregator is 30 rows, so
-        # a 50-period EMA is under-warmed at the start but still directional
-        # on the ~29 closed bars we actually have. min_bars of 20 keeps it
-        # honest without defaulting every trade to 0.
+        # (b) H4 alignment.
         ctx = _last_closed_context(h4_view, 50, min_bars=20)
         if ctx is not None:
             out["htf_h4"] = _align(direction, ctx[0], ctx[1])
@@ -390,10 +355,10 @@ def compute_entry_features(
             if e5 is not None and e13 is not None:
                 out["ema_spread_atr"] = float(abs(e5 - e13) / atr)
 
-        # (e) Efficiency ratio over the last 30 M5 candles
+        # (e) Efficiency ratio
         out["eff_ratio_30"] = _eff_ratio(m5_slice, window=30)
 
-        # (f) ATR14 percentile within the last 20 days
+        # (f) ATR14 percentile
         out["atr_pctile"] = _atr_pctile(m5_df, idx)
 
         # (g) ADR used today
@@ -403,10 +368,10 @@ def compute_entry_features(
             if adr and adr > 0 and consumed is not None:
                 out["adr_used"] = float(consumed / adr)
 
-        # (h) Minutes since most recent session open, in 60-min buckets
+        # (h) Minutes since session open
         out["mins_since_open"] = _mins_since_session_open(curr_time)
 
-        # (i) Room to nearest key level beyond entry, in ATR
+        # (i) Room to nearest level
         out["room_atr"] = _room_atr(session_levels, entry, direction, atr)
 
         # (j) Stop distance in ATR
@@ -418,7 +383,7 @@ def compute_entry_features(
         if sl_dist > 0 and spread and spread > 0:
             out["spread_r"] = float(spread / sl_dist)
 
-        # (l) Trade of day (1-indexed)
+        # (l) Trade of day
         try:
             tod = int(trade_of_day)
         except (TypeError, ValueError):
@@ -426,15 +391,14 @@ def compute_entry_features(
         out["trade_of_day"] = tod if tod > 0 else 1
 
         # ------------------------------------------------------------------
-        # PROPOSED: five additional features.
+        # Five additional features.
         # ------------------------------------------------------------------
         out["session"] = int(_session_code(curr_time))
         out["hour_sast"] = int(_hour_sast_block(curr_time))
         out["weekday"] = int(_weekday_code(curr_time))
-        out["direction"] = int(_direction_code(direction))
+        out["direction"] = _direction_code(direction)
         out["setup_tag"] = _setup_tag(signal)
 
     except Exception:
-        # Feature computation must never break a backtest run.
         pass
     return out

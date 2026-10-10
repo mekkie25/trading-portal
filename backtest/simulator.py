@@ -1,35 +1,10 @@
 """
 backtest/simulator.py
-Replicates the exact single-order live position management of engine/matrix.py:
-- Single market order with full lot size
-- Fixed R:R target via compute_fixed_target
-- 80% R:R Break-Even trigger (or STRUCTURAL variant) gated by GLOBAL_PARAMS.use_breakeven
-- Trail exits: SuperTrend 5M, EMA_9, EMA_25
-- Daily trade cap tracked per SAST calendar date (max_daily_trades)
-- Minimum-lot risk tolerance check matching live bot
-- Skip logging with candle_skips and unique_setups (strategy, direction, day)
-
-Phase-2 Blueprint extensions (backtest-only):
-  Section 3 item 16 - post-SL continuation distance ("bad stop")
-  Section 3 item 17 - post-TP extra pips ("money left on table")
-  Section 3 item 18 - premature BE exit detection
-  Section 6 item 27 - 200 EMA alignment at entry
-  Section 6 item 28 - confirmation type (close vs touch)
-  Section 6 item 29 - news-window flag at entry
-
-Phase-3 Blueprint extensions (backtest-only):
-  Section 5 item 22 - STRUCTURAL BE variant (2 consecutive closes beyond entry)
-  Section 5 item 23 - EMA_9 and EMA_25 trail variants
-
-PROPOSED: entry-feature capture. open_trade accepts an optional entry_features
-dict (built by backtest/features.py) which is stored on the position and
-copied into the trade record on close.
+Replicates the exact single-order live position management of engine/matrix.py.
 
 PROPOSED: alt-target replay. When the simulator is constructed with the full
 M5 series (m5_df_full=...), every closed trade gets four additional fields
-(alt_r_1, alt_r_15, alt_r_2, alt_r_3) plus a boolean alt_timeout. These are
-forward-looking post-hoc measurements only. They never influence execution,
-lot size, entry, stop, exit or P&L.
+(alt_r_1, alt_r_15, alt_r_2, alt_r_3) plus a boolean alt_timeout.
 
 PROPOSED: post-exit tracking replaces the old fixed 24-candle window with
 two clean rules:
@@ -39,22 +14,6 @@ two clean rules:
   - After a TP exit: track until price returns to entry (invalid),
     OR until price has moved 3x the original TP distance past the TP,
     OR the end of the data.
-
-New fields on every trade record:
-  post_sl_max_pips      : worst excursion past the SL, in pips
-  post_sl_max_ratio     : that excursion divided by the SL distance in pips
-  post_sl_recovered     : True if the trade came back to the original TP
-  post_sl_candles       : M5 candles from the SL exit to the recovery (0 if
-                          not recovered)
-  post_tp_max_pips      : best excursion past the TP, in pips
-  post_tp_max_ratio     : that excursion divided by the TP distance in pips
-  post_tp_invalid       : True if price came back to entry before the 3x cap
-  recovered_to_tp       : kept for backwards compatibility (same as
-                          post_sl_recovered for SL exits)
-  post_sl_cont_pips     : kept for backwards compatibility (same as
-                          post_sl_max_pips)
-  post_tp_extra_pips    : kept for backwards compatibility (same as
-                          post_tp_max_pips)
 """
 
 import sys
@@ -75,11 +34,9 @@ from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
 
-# PROPOSED: post-exit caps, replacing the old POST_EXIT_TRACK_BARS = 24.
-POST_SL_CAP_MULTIPLE = 2.0   # 2x the original SL distance past the SL
-POST_TP_CAP_MULTIPLE = 3.0   # 3x the original TP distance past the TP
+POST_SL_CAP_MULTIPLE = 2.0
+POST_TP_CAP_MULTIPLE = 3.0
 
-# PROPOSED: alt-target replay constants.
 ALT_MAX_HOLD_CANDLES = 5 * 288
 ALT_TIMEOUT_FLAG_KEY = "alt_timeout"
 ALT_TARGET_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
@@ -93,6 +50,29 @@ ASSETS = {
     "USDJPY":   {"pip_size": PIP_SIZES["USDJPY"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
     "GBPUSD":   {"pip_size": PIP_SIZES["GBPUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
 }
+
+
+def _series_to_epoch_seconds(time_series) -> np.ndarray:
+    """
+    Robust timezone-aware conversion of a pandas datetime series to int64
+    epoch seconds. This was the cause of the null alt_r fields: the previous
+    version used df['time'].astype('int64'), which raises a TypeError on
+    pandas 2.x for timezone-aware columns. The exception was swallowed by a
+    broad except, so _m5_epochs silently stayed None and the replay never ran.
+
+    The slow path (Python loop over timestamps) only runs once per simulator
+    instance, so it is not a performance concern.
+    """
+    try:
+        # Fast path.
+        return time_series.astype('int64').to_numpy() // 10 ** 9
+    except Exception:
+        pass
+    # Slow but reliable path.
+    try:
+        return np.array([int(pd.Timestamp(t).timestamp()) for t in time_series], dtype=np.int64)
+    except Exception:
+        return np.array([], dtype=np.int64)
 
 
 class TradeSimulator:
@@ -110,7 +90,7 @@ class TradeSimulator:
         self.equity = starting_balance
         self.risk_pct = risk_pct
         self.account_currency = account_currency
-        self.be_mode = be_mode  # "FIXED_80" or "STRUCTURAL"
+        self.be_mode = be_mode
         self.open_positions: List[Dict[str, Any]] = []
         self.completed_trades: List[Dict[str, Any]] = []
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
@@ -128,22 +108,26 @@ class TradeSimulator:
             self._eurusd_times = [t.timestamp() for t in df_e['time']]
             self._eurusd_prices = [float(p) for p in df_e['close']]
 
-        # PROPOSED: full M5 series for forward alt-target replay.
         self._m5_epochs: Optional[np.ndarray] = None
         self._m5_highs: Optional[np.ndarray] = None
         self._m5_lows: Optional[np.ndarray] = None
         self._m5_closes: Optional[np.ndarray] = None
+
         if m5_df_full is not None and not m5_df_full.empty:
             try:
                 df = m5_df_full.copy()
                 if not pd.api.types.is_datetime64_any_dtype(df['time']):
                     df['time'] = pd.to_datetime(df['time'], utc=True)
                 df = df.sort_values('time').reset_index(drop=True)
-                self._m5_epochs = (df['time'].astype('int64') // 10 ** 9).to_numpy()
+                self._m5_epochs = _series_to_epoch_seconds(df['time'])
                 self._m5_highs = df['high'].astype(float).to_numpy()
                 self._m5_lows = df['low'].astype(float).to_numpy()
                 self._m5_closes = df['close'].astype(float).to_numpy()
-            except Exception:
+                # PROPOSED: one-shot log so a silent failure cannot happen again.
+                if self._m5_epochs is None or self._m5_epochs.size == 0:
+                    print("[simulator] WARNING: alt-target replay disabled (empty epoch array).", flush=True)
+            except Exception as e:
+                print(f"[simulator] WARNING: alt-target replay disabled ({e}).", flush=True)
                 self._m5_epochs = None
                 self._m5_highs = None
                 self._m5_lows = None
@@ -395,7 +379,6 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            # ---- Break-Even logic ----
             if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
@@ -418,7 +401,6 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            # ---- Trail exits (SuperTrend / EMA_9 / EMA_25) ----
             if GLOBAL_PARAMS.use_supertrend_trail and len(m5_slice) >= 15:
                 exited = False
                 if pos["trail_mode"] == "SUPERTREND":
@@ -455,14 +437,6 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
-        # ------------------------------------------------------------------
-        # PROPOSED: post-exit tracking.
-        # Two rules replace the old fixed 24-candle window:
-        #   SL side: stop at the original TP (recovered), or at 2x SL past
-        #            the SL, or end of data.
-        #   TP side: stop at entry (invalid), or at 3x TP past the TP, or
-        #            end of data.
-        # ------------------------------------------------------------------
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
@@ -486,7 +460,6 @@ class TradeSimulator:
                 target_tp = pending["target_tp"]
                 cap_price = pending["cap_price"]
 
-                # Recovery check first: it is the point of the question.
                 reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
                 if reached_tp:
                     pending["reached_original_tp"] = True
@@ -516,7 +489,6 @@ class TradeSimulator:
                 entry_price = pending["entry_price"]
                 cap_price = pending["cap_price"]
 
-                # Invalid check first: back to entry means the reading is bad.
                 invalid = (c_low <= entry_price) if direction == "BUY" else (c_high >= entry_price)
                 if invalid:
                     pending["invalid"] = True
@@ -534,11 +506,6 @@ class TradeSimulator:
         self.pending_sl_evaluations = active_pending
 
     def _finalize_post_exit(self, pending: Dict[str, Any]) -> None:
-        """
-        PROPOSED. Writes the post-exit tracking fields on the record.
-        Kept the two legacy fields (post_sl_cont_pips, post_tp_extra_pips)
-        for anything that still reads them.
-        """
         record = pending["record"]
         kind = pending.get("kind", "SL")
         exit_price = pending["exit_price"]
@@ -546,7 +513,6 @@ class TradeSimulator:
         direction = pending["direction"]
 
         if kind == "SL":
-            # Worst excursion past the SL, in pips.
             if direction == "BUY":
                 worst = pending.get("min_low_after_exit", exit_price)
                 max_pips = max(0.0, (exit_price - worst) / pip_size) if pip_size > 0 else 0.0
@@ -560,12 +526,10 @@ class TradeSimulator:
             record["post_sl_recovered"] = bool(pending.get("reached_original_tp", False))
             record["post_sl_candles"] = int(pending.get("candles_to_recovery", 0))
 
-            # Legacy fields.
             record["post_sl_cont_pips"] = round(max_pips, 1)
             if not pending.get("reached_original_tp", False):
                 record["recovered_to_tp"] = False
 
-            # Pre-existing premature BE logic.
             original_tp = pending.get("target_tp", 0.0)
             is_be = bool(pending.get("is_be_moved", False))
             reached_tp = bool(pending.get("reached_original_tp", False))
@@ -597,7 +561,6 @@ class TradeSimulator:
             record["post_tp_max_ratio"] = round((max_pips / tp_pips), 2) if tp_pips > 0 else 0.0
             record["post_tp_invalid"] = bool(pending.get("invalid", False))
 
-            # Legacy field.
             record["post_tp_extra_pips"] = round(max_pips, 1)
 
     def close_all(self, symbol: str, last_candle: pd.Series):
@@ -616,10 +579,6 @@ class TradeSimulator:
             self._finalize_post_exit(pending)
         self.pending_sl_evaluations = []
 
-    # ------------------------------------------------------------------
-    # PROPOSED: alt-target forward replay. Read-only; adds fields to the
-    # closed trade record. Never touches execution.
-    # ------------------------------------------------------------------
     def _replay_alt_targets(self, record: Dict[str, Any]) -> None:
         for k in ALT_TARGET_KEYS:
             record[k] = None
@@ -791,12 +750,10 @@ class TradeSimulator:
             "alignment_200ema": pos.get("alignment_200ema", "UNKNOWN"),
             "confirmation_type": pos.get("confirmation_type", "CLOSE"),
             "is_in_news_window": bool(pos.get("is_in_news_window", False)),
-            # Legacy post-exit fields (kept for anything that reads them).
             "post_sl_cont_pips": None,
             "post_tp_extra_pips": None,
             "premature_be_exit": False,
             "missed_r_at_tp": 0.0,
-            # PROPOSED: new post-exit tracking fields.
             "post_sl_max_pips": None,
             "post_sl_max_ratio": None,
             "post_sl_recovered": False,
@@ -806,18 +763,26 @@ class TradeSimulator:
             "post_tp_invalid": False,
         }
 
+        # Copy features onto the record AFTER building the base fields, but
+        # do not let a feature overwrite a reserved key. With the direction
+        # feature now returning a string, this is belt-and-braces.
+        _RESERVED = {
+            "trade_id", "date", "date_sast", "symbol", "strategy", "direction",
+            "signal_time_utc", "signal_time_sast", "entry_price", "exit_price",
+            "sl", "tp", "lots", "exit_time", "exit_reason", "duration_minutes",
+            "result", "r_multiple", "money_pnl",
+        }
         feats = pos.get("entry_features")
         if isinstance(feats, dict):
             for k, v in feats.items():
+                if k in _RESERVED:
+                    continue
                 record[k] = v
 
-        # PROPOSED: alt-target forward replay. Adds fields only.
+        # Alt-target replay runs BEFORE the post-exit tracker registration,
+        # so the record has direction as a string at this point.
         self._replay_alt_targets(record)
 
-        # ------------------------------------------------------------------
-        # PROPOSED: register a post-exit tracker.
-        # SL exits track on the SL side; TP exits track on the TP side.
-        # ------------------------------------------------------------------
         if result == "LOSS" and "SL" in reason:
             sl_pips = (sl_dist / pip_size) if pip_size > 0 else 0.0
             cap_past_sl = POST_SL_CAP_MULTIPLE * sl_dist
