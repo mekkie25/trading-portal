@@ -21,14 +21,24 @@ Phase-3 Blueprint extensions (backtest-only):
   Section 5 item 22 - STRUCTURAL BE variant (2 consecutive closes beyond entry)
   Section 5 item 23 - EMA_9 and EMA_25 trail variants
 
-Pip sizes now source from core/pip_sizes.py so the simulator, diagnostics and
-live bot never diverge. Values are unchanged; only the source of truth moved.
+PROPOSED: entry-feature capture. open_trade accepts an optional entry_features
+dict (built by backtest/features.py) which is stored on the position and
+copied into the trade record on close.
+
+PROPOSED: alt-target replay. When the simulator is constructed with the full
+M5 series (m5_df_full=...), every closed trade gets four additional fields
+(alt_r_1, alt_r_15, alt_r_2, alt_r_3) plus a boolean alt_timeout. These are
+forward-looking post-hoc measurements only. They never influence execution,
+lot size, entry, stop, exit or P&L. If m5_df_full is not supplied, the four
+fields are written as None and alt_timeout as False, so the runner and the
+analyser can always read them.
 """
 
 import sys
 import os
 import math
 import bisect
+import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
@@ -43,6 +53,11 @@ from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
 
 POST_EXIT_TRACK_BARS = 24
+
+# PROPOSED: 5 trading days at M5 = 5 * 288 = 1440 candles.
+ALT_MAX_HOLD_CANDLES = 5 * 288
+ALT_TIMEOUT_FLAG_KEY = "alt_timeout"
+ALT_TARGET_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
 
 ASSETS = {
     "GOLD":     {"pip_size": PIP_SIZES["GOLD"],     "contract_size": 100.0,    "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
@@ -63,6 +78,7 @@ class TradeSimulator:
         account_currency: str = "USD",
         eurusd_df: Optional[pd.DataFrame] = None,
         be_mode: str = "FIXED_80",
+        m5_df_full: Optional[pd.DataFrame] = None,
     ):
         self.starting_balance = starting_balance
         self.balance = starting_balance
@@ -86,6 +102,28 @@ class TradeSimulator:
             df_e.sort_values('time', inplace=True)
             self._eurusd_times = [t.timestamp() for t in df_e['time']]
             self._eurusd_prices = [float(p) for p in df_e['close']]
+
+        # PROPOSED: full M5 series for forward alt-target replay.
+        # Never influences execution; used only after a trade closes.
+        self._m5_epochs: Optional[np.ndarray] = None
+        self._m5_highs: Optional[np.ndarray] = None
+        self._m5_lows: Optional[np.ndarray] = None
+        self._m5_closes: Optional[np.ndarray] = None
+        if m5_df_full is not None and not m5_df_full.empty:
+            try:
+                df = m5_df_full.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df['time']):
+                    df['time'] = pd.to_datetime(df['time'], utc=True)
+                df = df.sort_values('time').reset_index(drop=True)
+                self._m5_epochs = (df['time'].astype('int64') // 10 ** 9).to_numpy()
+                self._m5_highs = df['high'].astype(float).to_numpy()
+                self._m5_lows = df['low'].astype(float).to_numpy()
+                self._m5_closes = df['close'].astype(float).to_numpy()
+            except Exception:
+                self._m5_epochs = None
+                self._m5_highs = None
+                self._m5_lows = None
+                self._m5_closes = None
 
     def _get_eurusd_rate_at_or_before(self, dt: datetime) -> Optional[float]:
         if not self._eurusd_times:
@@ -153,6 +191,7 @@ class TradeSimulator:
         regime: str,
         ref_levels: dict,
         ema_200_value: Optional[float] = None,
+        entry_features: Optional[Dict[str, Any]] = None,
     ) -> bool:
         symbol = signal.symbol
         direction = signal.direction.upper()
@@ -261,9 +300,9 @@ class TradeSimulator:
             "alignment_200ema": alignment,
             "confirmation_type": confirmation_type,
             "is_in_news_window": bool(is_in_news),
-            # Phase-3 structural BE counters
             "consec_above_entry": 0,
             "consec_below_entry": 0,
+            "entry_features": dict(entry_features) if entry_features else None,
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
@@ -299,7 +338,6 @@ class TradeSimulator:
                     pos["profit_seen"] = True
                 if c_low < entry:
                     pos["loss_seen"] = True
-                # Phase-3 structural BE counters
                 if c_close > entry:
                     pos["consec_above_entry"] = pos.get("consec_above_entry", 0) + 1
                 else:
@@ -333,7 +371,6 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            # ---- Break-Even logic ----
             if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
@@ -356,7 +393,6 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            # ---- Trail exits (SuperTrend / EMA_9 / EMA_25) ----
             if GLOBAL_PARAMS.use_supertrend_trail and len(m5_slice) >= 15:
                 exited = False
                 if pos["trail_mode"] == "SUPERTREND":
@@ -393,7 +429,6 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
-        # ---- Post-exit tracker processing ----
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
@@ -510,6 +545,110 @@ class TradeSimulator:
             self._finalize_post_exit(pending)
         self.pending_sl_evaluations = []
 
+    # ------------------------------------------------------------------
+    # PROPOSED: alt-target forward replay. Read-only; adds fields to the
+    # closed trade record. Never touches execution.
+    # ------------------------------------------------------------------
+    def _replay_alt_targets(self, record: Dict[str, Any]) -> None:
+        """
+        For a just-closed trade, replay forward candles from the entry and
+        record the R-multiple that would have been obtained at 1.0R, 1.5R,
+        2.0R and 3.0R. Same conservative stop-first rule, same half-spread
+        exit adjustment, same direction handling as the simulator.
+        Caps the search at ALT_MAX_HOLD_CANDLES M5 candles (~5 trading days).
+        If a target's stop is never hit and its target is never hit in the
+        window, the exit is the last close in the window and the flag
+        alt_timeout is set True for the trade.
+        """
+        # Default the fields up-front so the analysis always finds them.
+        for k in ALT_TARGET_KEYS:
+            record[k] = None
+        record[ALT_TIMEOUT_FLAG_KEY] = False
+
+        if self._m5_epochs is None or self._m5_epochs.size == 0:
+            return
+
+        try:
+            entry = float(record["entry_price"])
+            sl = float(record["sl"])
+            direction = str(record["direction"]).upper()
+            spread_pts = float(record.get("spread_paid", 0.0) or 0.0)
+        except Exception:
+            return
+
+        sl_dist = abs(entry - sl)
+        if sl_dist <= 0:
+            return
+
+        sign = 1.0 if direction == "BUY" else -1.0
+
+        try:
+            entry_epoch = int(pd.Timestamp(record["signal_time_utc"]).value // 10 ** 9)
+        except Exception:
+            return
+
+        start = int(np.searchsorted(self._m5_epochs, entry_epoch, side="right"))
+        if start >= self._m5_epochs.size:
+            return
+
+        end = min(self._m5_epochs.size, start + ALT_MAX_HOLD_CANDLES)
+        highs = self._m5_highs[start:end]
+        lows = self._m5_lows[start:end]
+        closes = self._m5_closes[start:end]
+        if highs.size == 0:
+            return
+
+        # Stop hit index shared across all four targets (same stop distance).
+        if direction == "BUY":
+            sh = np.where(lows <= sl)[0]
+        else:
+            sh = np.where(highs >= sl)[0]
+        stop_hit_idx = int(sh[0]) if sh.size > 0 else None
+
+        # Per-target exit price in R.
+        for key, mult in zip(ALT_TARGET_KEYS, (1.0, 1.5, 2.0, 3.0)):
+            target = entry + sign * mult * sl_dist
+
+            if direction == "BUY":
+                th = np.where(highs >= target)[0]
+            else:
+                th = np.where(lows <= target)[0]
+            tgt_hit_idx = int(th[0]) if th.size > 0 else None
+
+            # Stop-first conservative rule when both hit in the same candle.
+            if stop_hit_idx is not None and tgt_hit_idx is not None:
+                exit_raw = sl if stop_hit_idx <= tgt_hit_idx else target
+            elif stop_hit_idx is not None:
+                exit_raw = sl
+            elif tgt_hit_idx is not None:
+                exit_raw = target
+            else:
+                # Timeout: use last close in the window.
+                exit_raw = float(closes[-1]) if closes.size > 0 else entry
+
+            # Same half-spread handling as the live simulator.
+            if direction == "BUY":
+                actual_exit = exit_raw - (spread_pts / 2.0)
+            else:
+                actual_exit = exit_raw + (spread_pts / 2.0)
+
+            price_diff = (actual_exit - entry) if direction == "BUY" else (entry - actual_exit)
+            record[key] = round(price_diff / sl_dist, 2)
+
+        # Timeout means: the stop was never hit AND the 3R target was never hit.
+        # That is the longest-hold case; if it timed out, the shortest holds
+        # also ended via the last-close fallback.
+        timeout = (stop_hit_idx is None)
+        if timeout:
+            # If 3R was hit, we did not time out.
+            if direction == "BUY":
+                th3 = np.where(highs >= (entry + 3.0 * sl_dist))[0]
+            else:
+                th3 = np.where(lows <= (entry - 3.0 * sl_dist))[0]
+            if th3.size > 0:
+                timeout = False
+        record[ALT_TIMEOUT_FLAG_KEY] = bool(timeout)
+
     def _close_position(self, pos: Dict[str, Any], exit_price: float, exit_time: datetime, reason: str):
         direction = pos["direction"]
         entry = pos["entry_price"]
@@ -606,6 +745,14 @@ class TradeSimulator:
             "premature_be_exit": False,
             "missed_r_at_tp": 0.0,
         }
+
+        feats = pos.get("entry_features")
+        if isinstance(feats, dict):
+            for k, v in feats.items():
+                record[k] = v
+
+        # PROPOSED: alt-target forward replay. Adds fields only.
+        self._replay_alt_targets(record)
 
         if result == "LOSS" and "SL" in reason:
             max_adverse = (pos["stop_loss"] - (0.50 * sl_dist)) if direction == "BUY" else (pos["stop_loss"] + (0.50 * sl_dist))

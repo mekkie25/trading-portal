@@ -1,962 +1,1941 @@
-import 'dotenv/config';
-import express from 'express';
-import path from 'path';
-import fs from 'fs';
-import { createServer as createViteServer } from 'vite';
-import { spawn, ChildProcess } from 'child_process';
-import { METRIC_DESCRIPTIONS, describe } from './shared/metricDescriptions';
+"""
+backtest/runner.py
+High-Performance Automated End-to-End Backtest Matrix Runner.
 
-interface BotGatewayConfig {
-  masterExecution: boolean; riskPerTradePct: number; minRr: number; adaptiveMode: boolean;
-  stopOnDailyGoalReached: boolean; dailyGoalTarget: number; weeklyGoalTarget: number;
-  monthlyGoalTarget: number; weeklyDepositBaseline: number; maxDailyTrades: number;
-  trailingStopActive: boolean; autoBreakevenPips: number; currency: string;
-  updatedAt: string; version: number;
-  strategyModes?: Record<string, string>; limitsConfirmedAt?: string;
-  riskProfile?: 'Steady' | 'Balanced' | 'Aggressive' | 'Max Growth' | null;
-}
-interface RiskLimitsConfig {
-  maxDailyLossUsd: number; maxWeeklyLossUsd: number; maxMonthlyLossUsd: number;
-  maxDailyDrawdownPct?: number; autoLiquidateAllOnTrip?: boolean;
-  breakerAction: 'HALT_PREVENT_NEW'; useProfileDrawdownPct?: boolean;
-}
-interface RiskState {
-  currentDailyLossUsd: number; currentWeeklyLossUsd: number; currentMonthlyLossUsd: number;
-  breakerTriggered: boolean; activeTripScope: 'NONE' | 'DAY' | 'WEEK' | 'MONTH' | 'CURRENCY';
-  lastTriggerReason?: string;
-}
-interface BrokerTelemetry {
-  connected: boolean; provider: string; trades: any[]; accountNumber: string; server: string;
-  currency: string; balance: number; equity: number; floatingPnL: number; netProfit: number;
-  totalDeposits: number; winRate: number; totalTrades: number; winningTrades: number;
-  losingTrades: number; lastPingMs: number; lastSyncTime: string; lastHeartbeat: string;
-  openPositions: Array<{
-    id: string; ticket: string; symbol: string; strategy: string;
-    direction: 'BUY' | 'SELL'; lots: number; entry: number; currentPrice: number;
-    sl?: number; tp?: number; floatingPnL: number; isRiskFree: boolean;
-  }>;
-}
+PROPOSED: entry-feature capture. Each opened trade now stores the 12 market
+condition features from backtest/features.py (see that module for the
+definitions). At the end of main() the pooled analysis is written to
+backtest/output/entry_analysis.json by backtest/entry_analysis.py. Both are
+backtest-only; the live bot is untouched.
+"""
 
-const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
+import sys
+import os
+import glob
+import shutil
+import json
+import time
+import copy
+import math
+import random
+import asyncio
+import argparse
+import tempfile
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List
 
-const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boolean; pdf: boolean; note?: string }> = [
-  { id: 1,  label: 'Warm-up and history window',                panel: true,  txt: true,  pdf: true },
-  { id: 2,  label: 'Zero-lookahead bar reconstruction',         panel: true,  txt: true,  pdf: true },
-  { id: 3,  label: 'MFE / MAE per trade',                       panel: true,  txt: true,  pdf: true },
-  { id: 4,  label: 'Profit-first flag',                         panel: false, txt: true,  pdf: true,  note: 'Field exists in trade list, not shown in panel.' },
-  { id: 5,  label: 'Post-SL noise recovery',                    panel: true,  txt: true,  pdf: true },
-  { id: 6,  label: 'Post-TP extra movement',                    panel: true,  txt: true,  pdf: true },
-  { id: 7,  label: 'Premature BE detection',                    panel: true,  txt: true,  pdf: true },
-  { id: 8,  label: 'Structural BE variant',                     panel: false, txt: false, pdf: false, note: 'Removed with Trail simplification.' },
-  { id: 9,  label: 'EMA-9 / EMA-25 trail variants',             panel: false, txt: false, pdf: false, note: 'Trail removed.' },
-  { id: 10, label: 'Fixed R:R target with structural room',      panel: true,  txt: true,  pdf: true },
-  { id: 11, label: 'Twin-lot vs single-lot execution',          panel: false, txt: true,  pdf: false, note: 'Simulator uses single order only.' },
-  { id: 12, label: 'Adaptive ADR stop clamping',                panel: true,  txt: true,  pdf: true },
-  { id: 13, label: 'Structural target capping',                 panel: true,  txt: true,  pdf: true },
-  { id: 14, label: 'Min R:R filter',                            panel: true,  txt: true,  pdf: true },
-  { id: 15, label: 'Monotonic TP ordering',                     panel: true,  txt: true,  pdf: true },
-  { id: 16, label: 'Post-SL continuation distance',             panel: true,  txt: true,  pdf: true },
-  { id: 17, label: 'Post-TP extra pips',                        panel: true,  txt: true,  pdf: true },
-  { id: 18, label: 'Premature BE exit rate',                    panel: true,  txt: true,  pdf: true },
-  { id: 19, label: '24-hour hourly expectancy matrix',           panel: true,  txt: true,  pdf: true },
-  { id: 20, label: 'Day-of-week performance table',              panel: true,  txt: true,  pdf: true },
-  { id: 21, label: 'Session-rollover friction',                  panel: true,  txt: true,  pdf: true },
-  { id: 22, label: 'Break-even variant comparison (A/B/C)',      panel: true,  txt: true,  pdf: true },
-  { id: 23, label: 'Trail variant comparison',                   panel: false, txt: false, pdf: false, note: 'Trail removed.' },
-  { id: 24, label: 'Position sizing comparison',                 panel: true,  txt: true,  pdf: true },
-  { id: 25, label: 'Daily execution cap comparison',             panel: true,  txt: true,  pdf: true,  note: 'Cap 1 and 2 only; higher caps need Strategy Lab.' },
-  { id: 26, label: 'ATR volatility tiering',                     panel: true,  txt: true,  pdf: true },
-  { id: 27, label: '200 EMA alignment differential',             panel: true,  txt: true,  pdf: true },
-  { id: 28, label: 'Confirmation type (close vs touch)',         panel: true,  txt: true,  pdf: true },
-  { id: 29, label: 'News-window slippage profiling',             panel: true,  txt: true,  pdf: true },
-  { id: 30, label: 'Portfolio correlation matrix',               panel: true,  txt: true,  pdf: true },
-  { id: 31, label: 'Consecutive loss streak & recovery',         panel: true,  txt: true,  pdf: true },
-  { id: 32, label: 'Circuit-breaker simulation',                 panel: true,  txt: true,  pdf: true },
-  { id: 33, label: 'Daily max-drawdown cutoff simulation',       panel: true,  txt: true,  pdf: true },
-  { id: 34, label: 'Slippage sensitivity curve',                 panel: true,  txt: true,  pdf: true },
-  { id: 35, label: 'Parameter sensitivity sweep',                panel: true,  txt: true,  pdf: true },
-  { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
-  { id: 37, label: 'Bootstrap Monte Carlo resampling',           panel: true,  txt: true,  pdf: true },
-  { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
-];
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
-if (!fs.existsSync(DATA_DIR)) { try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {} }
+import core.session_config
+from strategies.strategy_manager import StrategyManager
+from core.session_levels import build_session_levels
+from core.indicators import get_session_volume_profile
+from core.volatility_engine import volatility_engine
+from core.session_config import GLOBAL_PARAMS, TZ_SAST
+from backtest.bar_aggregator import ZeroLookAheadAggregator
+from backtest.simulator import TradeSimulator, ASSETS
+from backtest.report import calculate_kpis
+from backtest.downloader import fetch_chunked_bars, build_higher_timeframes_from_m5, CTraderTrendbarPeriod, CTraderClient
+from backtest.advisor import generate_improvement_tips
+from backtest.export_advice import generate_pair_advice
+from backtest.paths import DATA_DIR, OUTPUT_DIR
+from backtest.diagnostics import compute_diagnostics
+from backtest.portfolio import compute_portfolio_correlation, DEFAULT_WHITELIST
 
-const BOT_CONFIG_FILE = path.join(DATA_DIR, 'bot_config.json');
-const TRADES_DB_FILE = path.join(DATA_DIR, 'trades_db.json');
-const CANDLES_CACHE_FILE = path.join(DATA_DIR, 'candles_cache.json');
-const CLOSE_COMMAND_FILE = path.join(DATA_DIR, 'close_command.json');
-const RISK_STATE_FILE = process.env.RISK_STATE_FILE || path.join(DATA_DIR, 'risk_state.json');
-const storageBase = (process.env.BACKTEST_STORAGE_DIR || '').trim();
-const BACKTEST_OUTPUT_DIR = storageBase ? path.join(storageBase, 'output') : path.join(process.cwd(), 'backtest', 'output');
-const BACKTEST_DATA_DIR = storageBase ? path.join(storageBase, 'data') : path.join(process.cwd(), 'backtest', 'data');
+# PROPOSED: entry-feature capture pipeline.
+from backtest.features import compute_entry_features
+from backtest.entry_analysis import write_entry_analysis
 
-let backtestRunning = false;
-let backtestProgress = '';
-let backtestLastError: string | null = null;
-let backtestExitCode: number | null = null;
-let activeBacktestProcesses: ChildProcess[] = [];
-let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string }> = [];
+STORE_TARGET_DAYS = 500
+STORE_MAX_DAYS = 550
 
-let verifyRunning = false;
-let verifyProgress = '';
-let verifySymbol = '';
-let verifyLastError: string | null = null;
-let verifyProcess: ChildProcess | null = null;
+COMBINATIONS = [
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Adaptive · BE off · Trail off"},
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "on",  "use_trail": True,  "label": "Adaptive · BE off · Trail on"},
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "on",  "use_be": True,  "trail": "off", "use_trail": False, "label": "Adaptive · BE on · Trail off"},
+    {"mode": "adaptive", "adaptive_mode": True,  "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Adaptive · BE on · Trail on"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Legacy · BE off · Trail off"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "off", "use_be": False, "trail": "on",  "use_trail": True,  "label": "Legacy · BE off · Trail on"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "off", "use_trail": False, "label": "Legacy · BE on · Trail off"},
+    {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Legacy · BE on · Trail on"},
+]
 
-let activeBotConfig: BotGatewayConfig = {
-  masterExecution: true, riskPerTradePct: 1.0, minRr: 1.0, adaptiveMode: false,
-  stopOnDailyGoalReached: false, dailyGoalTarget: 5.0, weeklyGoalTarget: 20.0,
-  monthlyGoalTarget: 50.0, weeklyDepositBaseline: 10.0, maxDailyTrades: 4,
-  trailingStopActive: true, autoBreakevenPips: 15, currency: 'USD',
-  updatedAt: new Date().toISOString(), version: 1,
-};
+# Phase-3 Blueprint variants (Section 5 items 22 / 23 / 25).
+VARIANT_COMBINATIONS = [
+    {
+        "label": "BE Structural (2-close break)",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "on", "use_be": True,
+        "be_mode": "STRUCTURAL",
+        "trail": "off", "use_trail": False,
+        "trail_override": None,
+        "max_daily_override": None,
+        "report_file": "variant_be_structural_report.json",
+    },
+    {
+        "label": "Trail EMA_9 (no BE)",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "on", "use_trail": True,
+        "trail_override": "EMA_9",
+        "max_daily_override": None,
+        "report_file": "variant_trail_ema9_report.json",
+    },
+    {
+        "label": "Trail EMA_25 (no BE)",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "on", "use_trail": True,
+        "trail_override": "EMA_25",
+        "max_daily_override": None,
+        "report_file": "variant_trail_ema25_report.json",
+    },
+    {
+        "label": "Daily Cap 1",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "off", "use_trail": False,
+        "trail_override": None,
+        "max_daily_override": 1,
+        "report_file": "variant_dailycap1_report.json",
+    },
+    {
+        "label": "Daily Cap 4",
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "off", "use_be": False,
+        "be_mode": "FIXED_80",
+        "trail": "off", "use_trail": False,
+        "trail_override": None,
+        "max_daily_override": 4,
+        "report_file": "variant_dailycap4_report.json",
+    },
+]
 
-let riskLimits: RiskLimitsConfig = {
-  maxDailyLossUsd: 0.0, maxWeeklyLossUsd: 0.0, maxMonthlyLossUsd: 0.0,
-  maxDailyDrawdownPct: 5.0, autoLiquidateAllOnTrip: false,
-  breakerAction: 'HALT_PREVENT_NEW', useProfileDrawdownPct: true,
-};
+# -----------------------------------------------------------------------------
+# Strategy Lab: 12 single-setting variants on the 365-day window.
+# Baseline is Adaptive · BE on · Trail off. Each other variant changes ONE setting.
+# -----------------------------------------------------------------------------
+LAB_VARIANTS: List[Dict[str, Any]] = [
+    {"label": "Baseline",                 "overrides": {}},
+    {"label": "Max spread-in-R 0.10",     "overrides": {"strat_max_spread_in_r": 0.10}},
+    {"label": "Max spread-in-R 0.05",     "overrides": {"strat_max_spread_in_r": 0.05}},
+    {"label": "Min stop ATR 1.0",         "overrides": {"strat_min_stop_atr": 1.0}},
+    {"label": "Min stop ATR 1.5",         "overrides": {"strat_min_stop_atr": 1.5}},
+    {"label": "Session 09-22 SAST",       "overrides": {"strat_session_window_sast": (9, 22)}},
+    {"label": "Session 15-22 SAST",       "overrides": {"strat_session_window_sast": (15, 22)}},
+    {"label": "HTF trend filter ON",      "overrides": {"strat_htf_trend_filter": True}},
+    {"label": "Disable AVWAP",            "overrides": {"strat_disabled": ["AVWAP_200EMA_CONTINUATION"]}},
+    {"label": "Disable STRATEGY_513",     "overrides": {"strat_disabled": ["STRATEGY_513"]}},
+    {"label": "Target R:R 1.5",           "overrides": {"target_rr": 1.5}},
+    {"label": "Target R:R 2.0",           "overrides": {"target_rr": 2.0}},
+]
 
-if (fs.existsSync(BOT_CONFIG_FILE)) {
-  try {
-    const content = fs.readFileSync(BOT_CONFIG_FILE, 'utf8').trim();
-    if (content) {
-      const saved = JSON.parse(content);
-      activeBotConfig = { ...activeBotConfig, ...saved };
-      if (saved.maxDailyLoss !== undefined || saved.maxDailyLossUsd !== undefined) riskLimits.maxDailyLossUsd = saved.maxDailyLoss ?? saved.maxDailyLossUsd;
-      if (saved.maxWeeklyLoss !== undefined || saved.maxWeeklyLossUsd !== undefined) riskLimits.maxWeeklyLossUsd = saved.maxWeeklyLoss ?? saved.maxWeeklyLossUsd;
-      if (saved.maxMonthlyLoss !== undefined || saved.maxMonthlyLossUsd !== undefined) riskLimits.maxMonthlyLossUsd = saved.maxMonthlyLoss ?? saved.maxMonthlyLossUsd;
-      if (saved.useProfileDrawdownPct !== undefined) riskLimits.useProfileDrawdownPct = Boolean(saved.useProfileDrawdownPct);
+
+def sanitize_for_json(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [sanitize_for_json(v) for v in obj.tolist()]
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return sanitize_for_json(float(obj))
+    except Exception:
+        return str(obj)
+
+
+def _parse_window_time(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        cleaned = str(s).replace("UTC", "").strip()
+        return datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _trade_time_utc(t: Dict[str, Any]) -> Optional[datetime]:
+    ts = t.get("signal_time_utc")
+    if ts:
+        try:
+            return datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    d = t.get("date")
+    if d:
+        try:
+            return datetime.strptime(str(d), "%Y-%m-%d")
+        except Exception:
+            pass
+    return None
+
+
+def compute_tune_validate_kpis(trades: List[Dict[str, Any]], window_start_str: str, window_end_str: str) -> Dict[str, Any]:
+    empty = {"count": 0, "win_rate": 0.0, "avg_r": 0.0, "expectancy": 0.0,
+             "profit_factor": 0.0, "max_dd_money": 0.0, "net_pnl": 0.0,
+             "is_inconclusive": True}
+    if not trades:
+        return {"tune": dict(empty), "validate": dict(empty), "tune_days": 0.0, "validate_days": 0.0}
+
+    start = _parse_window_time(window_start_str)
+    end = _parse_window_time(window_end_str)
+    if start is None or end is None or end <= start:
+        k = calculate_kpis(list(trades))
+        return {"tune": k, "validate": dict(empty), "tune_days": 0.0, "validate_days": 0.0}
+
+    total_days = (end - start).total_seconds() / 86400.0
+    tune_days = total_days * 0.70
+    cutoff = start + timedelta(days=tune_days)
+
+    tune_trades: List[Dict[str, Any]] = []
+    val_trades: List[Dict[str, Any]] = []
+    for t in trades:
+        tt = _trade_time_utc(t)
+        if tt is None or tt < cutoff:
+            tune_trades.append(t)
+        else:
+            val_trades.append(t)
+
+    return {
+        "tune": calculate_kpis(tune_trades),
+        "validate": calculate_kpis(val_trades),
+        "tune_days": round(tune_days, 1),
+        "validate_days": round(total_days - tune_days, 1),
     }
-  } catch (e) { console.error('CRITICAL: Failed to load bot_config.json:', e); }
-}
 
-let riskState: RiskState = {
-  currentDailyLossUsd: 0, currentWeeklyLossUsd: 0, currentMonthlyLossUsd: 0,
-  breakerTriggered: false, activeTripScope: 'NONE', lastTriggerReason: undefined,
-};
 
-function saveTradesToDisk(tradesList: any[]) {
-  try {
-    const tempPath = path.join(DATA_DIR, `.tmp_trades_${Date.now()}.json`);
-    fs.writeFileSync(tempPath, JSON.stringify(tradesList, null, 2), 'utf8');
-    fs.renameSync(tempPath, TRADES_DB_FILE);
-  } catch (e) { console.error('CRITICAL: Failed to save trades atomically:', e); }
-}
+def _atomic_write_csv(df: pd.DataFrame, target_path: str) -> None:
+    dirname = os.path.dirname(target_path)
+    fd, tmp_path = tempfile.mkstemp(dir=dirname, prefix="tmp_", suffix=".csv")
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            df.to_csv(f, index=False)
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
-function loadTradesFromDisk(): any[] {
-  try {
-    if (fs.existsSync(TRADES_DB_FILE)) {
-      const content = fs.readFileSync(TRADES_DB_FILE, 'utf8').trim();
-      if (content) {
-        const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) return parsed;
-      }
+
+async def ensure_symbol_data(client: CTraderClient, symbol: str) -> bool:
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    now_utc = datetime.now(timezone.utc)
+    target_start = now_utc - timedelta(days=STORE_TARGET_DAYS)
+    max_history_start = now_utc - timedelta(days=STORE_MAX_DAYS)
+
+    existing_df = pd.DataFrame()
+    old_count = 0
+    if os.path.exists(m5_path) and os.path.getsize(m5_path) > 100:
+        try:
+            existing_df = pd.read_csv(m5_path)
+            if not existing_df.empty:
+                existing_df['dt'] = pd.to_datetime(existing_df['time'], utc=True)
+                existing_df.sort_values('dt', inplace=True)
+                old_count = len(existing_df)
+        except Exception as e:
+            print(f"ERROR: Could not read existing {symbol}_M5.csv ({e}). Keeping old file.", flush=True)
+            existing_df = pd.DataFrame()
+
+    chunks_to_merge = []
+    if not existing_df.empty:
+        chunks_to_merge.append(existing_df)
+
+    try:
+        if existing_df.empty:
+            print(f"[*] Initial download for {symbol}: fetching last {STORE_TARGET_DAYS} days...", flush=True)
+            if not client.is_authorized:
+                if not await client.connect():
+                    print(f"ERROR: Could not connect to cTrader for {symbol}.", flush=True)
+                    return False
+
+            new_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, target_start, now_utc)
+            if new_df.empty:
+                print(f"ERROR: No candle data returned from broker for {symbol}.", flush=True)
+                return False
+            new_df['dt'] = pd.to_datetime(new_df['time'], utc=True)
+            chunks_to_merge.append(new_df)
+        else:
+            last_bar_time = existing_df['dt'].iloc[-1].to_pydatetime()
+            first_bar_time = existing_df['dt'].iloc[0].to_pydatetime()
+
+            forward_start = max(target_start, last_bar_time - timedelta(days=1))
+            if forward_start < now_utc:
+                if not client.is_authorized:
+                    if not await client.connect():
+                        last_d = existing_df['dt'].iloc[-1].strftime('%Y-%m-%d')
+                        print(f"WARNING: broker unavailable, using stored data up to {last_d}", flush=True)
+                        return True
+
+                forward_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, forward_start, now_utc)
+                if not forward_df.empty:
+                    forward_df['dt'] = pd.to_datetime(forward_df['time'], utc=True)
+                    chunks_to_merge.append(forward_df)
+
+            if first_bar_time > (target_start + timedelta(days=2)):
+                if not client.is_authorized:
+                    if not await client.connect():
+                        last_d = existing_df['dt'].iloc[-1].strftime('%Y-%m-%d')
+                        print(f"WARNING: broker unavailable, using stored data up to {last_d}", flush=True)
+                        return True
+
+                backfill_end = first_bar_time + timedelta(days=1)
+                print(f"[*] Backfilling older history for {symbol} from {target_start.strftime('%Y-%m-%d')} to {backfill_end.strftime('%Y-%m-%d')}...", flush=True)
+                backfill_df = await fetch_chunked_bars(client, symbol, CTraderTrendbarPeriod.M5, target_start, backfill_end)
+                if not backfill_df.empty:
+                    backfill_df['dt'] = pd.to_datetime(backfill_df['time'], utc=True)
+                    chunks_to_merge.append(backfill_df)
+
+        combined = pd.concat(chunks_to_merge, ignore_index=True)
+        combined.drop_duplicates(subset=['time'], keep='last', inplace=True)
+        combined.sort_values('dt', inplace=True)
+
+        combined = combined[combined['dt'] >= max_history_start].copy()
+        combined.reset_index(drop=True, inplace=True)
+
+        new_count = len(combined)
+        added_bars = max(0, new_count - old_count)
+        first_date = combined['dt'].iloc[0].strftime('%Y-%m-%d')
+        last_date = combined['dt'].iloc[-1].strftime('%Y-%m-%d')
+
+        out_df = combined[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
+        _atomic_write_csv(out_df, m5_path)
+
+        build_higher_timeframes_from_m5(out_df, symbol)
+
+        print(f"[{symbol} Store]: {added_bars:,} new bars added | Total: {new_count:,} bars | Span: {first_date} to {last_date}", flush=True)
+        return True
+
+    except Exception as e:
+        if not existing_df.empty:
+            last_d = existing_df['dt'].iloc[-1].strftime('%Y-%m-%d')
+            print(f"WARNING: broker unavailable, using stored data up to {last_d}", flush=True)
+            return True
+        print(f"ERROR: Failed updating data store for {symbol} ({e}). Preserving existing files.", flush=True)
+        return False
+
+
+def compute_121_window_emas(df: pd.DataFrame) -> None:
+    close = df['close'].values.astype(np.float64)
+    n = len(close)
+    window_size = 121
+
+    for span in [5, 9, 13, 25, 200]:
+        col_name = f"ema_{span}"
+        if col_name in df.columns:
+            continue
+
+        alpha = 2.0 / (span + 1.0)
+        weights = np.empty(window_size, dtype=np.float64)
+        weights[0] = (1.0 - alpha) ** (window_size - 1)
+        for k in range(1, window_size):
+            weights[k] = alpha * ((1.0 - alpha) ** (window_size - 1 - k))
+
+        valid_vals = np.convolve(close, weights[::-1], mode='valid')
+        col_arr = np.empty(n, dtype=np.float64)
+        col_arr[:window_size - 1] = np.nan
+        col_arr[window_size - 1:] = valid_vals
+        df[col_name] = col_arr
+
+
+def compute_atr14_series(df: pd.DataFrame) -> None:
+    """
+    PROPOSED: in-place add column `atr_14` on the M5 DataFrame.
+    Simple 14-period rolling mean of true range (Wilder is close enough for
+    percentile ranking; the exact construction does not matter, only that
+    it is comparable candle to candle).
+    """
+    if df is None or df.empty:
+        return
+    try:
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        df["atr_14"] = tr.rolling(14).mean()
+    except Exception as e:
+        print(f"[atr14] failed: {e}", flush=True)
+
+
+def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
+    total = len(df)
+    if total < 130:
+        return
+
+    sample_indices = random.sample(range(120, total), min(n_samples, total - 120))
+    max_diff = 0.0
+
+    for idx in sample_indices:
+        slice_close = df['close'].iloc[idx - 120:idx + 1]
+        for span in [5, 9, 13, 25, 200]:
+            ref_val = float(slice_close.ewm(span=span, adjust=False).mean().iloc[-1])
+            pre_val = float(df[f"ema_{span}"].iloc[idx])
+            diff = abs(ref_val - pre_val)
+            if diff > max_diff:
+                max_diff = diff
+
+    if max_diff < 1e-6:
+        print(f"[check] indicators match (max diff: {max_diff:.2e})", flush=True)
+    else:
+        print(f"[check] indicator discrepancy: {max_diff:.6f}", flush=True)
+
+
+def run_backtest_reference(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    h1_df: pd.DataFrame,
+    h4_df: pd.DataFrame,
+    d1_df: pd.DataFrame,
+    sim_start_idx: int,
+    total_bars: int,
+    adaptive_mode: bool = True,
+    use_be: bool = False,
+    use_trail: bool = False,
+    balance: float = 1000.0,
+    risk_pct: float = 1.0,
+    eurusd_df: Optional[pd.DataFrame] = None
+) -> Dict[str, Any]:
+    volatility_engine.reset_rejection_stats()
+
+    GLOBAL_PARAMS.adaptive_mode = adaptive_mode
+    GLOBAL_PARAMS.use_breakeven = use_be
+    GLOBAL_PARAMS.use_supertrend_trail = use_trail
+
+    aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
+    sm = StrategyManager()
+    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct, eurusd_df=eurusd_df)
+
+    frozen_orbs: Dict[Any, Any] = {}
+    last_vol_date = None
+    last_vol_retry_hour = None
+    vol_metrics = {"valid": False}
+    adr_val = None
+    regime = "NORMAL"
+
+    for i in range(sim_start_idx, total_bars):
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1].copy().reset_index(drop=True)
+        curr_bar = m5_slice.iloc[-1]
+        curr_time = curr_bar['time'].to_pydatetime()
+        curr_date = curr_time.date()
+        sast_dt = curr_time.astimezone(TZ_SAST)
+        sast_hour_key = (sast_dt.date(), sast_dt.hour)
+
+        sim.process_candle(symbol, curr_bar, m5_slice)
+
+        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
+
+        need_full_recalc = (curr_date != last_vol_date)
+        if not vol_metrics.get("valid", False) and sast_hour_key != last_vol_retry_hour:
+            need_full_recalc = True
+
+        if need_full_recalc:
+            vol_metrics = volatility_engine.compute_symbol_volatility(
+                d1_df=d1_view,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                symbol=symbol,
+                as_of=curr_time
+            )
+            if vol_metrics.get("valid", False):
+                adr_val = vol_metrics.get("adr")
+                regime = vol_metrics.get("regime", "NORMAL")
+            last_vol_date = curr_date
+            last_vol_retry_hour = sast_hour_key
+
+        if vol_metrics.get("valid", False):
+            active_vol = volatility_engine.refresh_intraday(
+                vol_metrics=vol_metrics,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                d1_view=d1_view,
+                as_of=curr_time
+            )
+        else:
+            active_vol = vol_metrics
+
+        vp = get_session_volume_profile(m5_slice)
+        session_levels = build_session_levels(
+            symbol=symbol,
+            m5_df=m5_slice,
+            d1_df=d1_view,
+            vp_node=vp,
+            frozen_orbs=frozen_orbs,
+            as_of=curr_time,
+            adr_val=adr_val
+        )
+
+        signal = sm.evaluate_all(
+            symbol=symbol,
+            data_5m=m5_slice,
+            data_h4=h4_view,
+            data_d1=d1_view,
+            session_levels=session_levels,
+            data_h1=h1_view
+        )
+
+        if signal and adaptive_mode:
+            if active_vol.get("valid", False):
+                adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+                if adapted:
+                    spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+                    sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                    tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                    vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+                        active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                    )
+                    signal = adapted if vol_ok else None
+                else:
+                    signal = None
+            else:
+                signal = None
+
+        if signal:
+            has_open = any(p["symbol"] == symbol for p in sim.open_positions)
+            if not has_open:
+                sim.open_trade(signal, curr_time, adr_val, regime, session_levels, ema_200_value=None)
+
+    if len(m5_df) > 0 and len(sim.open_positions) > 0:
+        sim.close_all(symbol, m5_df.iloc[-1])
+
+    kpis = calculate_kpis(sim.completed_trades)
+    return {
+        "trades": sim.completed_trades,
+        "kpis": kpis
     }
-  } catch (e) {}
-  return [];
-}
 
-function saveBotConfigAtomically(cfg: any) {
-  try {
-    const tempPath = path.join(DATA_DIR, `.tmp_bot_config_${Date.now()}.json`);
-    fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), 'utf8');
-    fs.renameSync(tempPath, BOT_CONFIG_FILE);
-  } catch (e) { console.error('CRITICAL: Failed to write bot_config.json:', e); }
-}
 
-function recomputeRiskState() {
-  try {
-    if (fs.existsSync(RISK_STATE_FILE)) {
-      const st = JSON.parse(fs.readFileSync(RISK_STATE_FILE, 'utf8'));
-      riskState.currentDailyLossUsd = st.current_daily_loss || 0;
-      riskState.currentWeeklyLossUsd = st.current_weekly_loss || 0;
-      riskState.currentMonthlyLossUsd = st.current_monthly_loss || 0;
-      riskState.breakerTriggered = Boolean(st.breaker_triggered);
-      riskState.activeTripScope = st.active_trip_scope || 'NONE';
-      riskState.lastTriggerReason = st.last_trigger_reason;
-    }
-  } catch (e) {}
-}
+def precompute_market_pass(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    h1_df: pd.DataFrame,
+    h4_df: pd.DataFrame,
+    d1_df: pd.DataFrame,
+    sim_start_idx: int,
+    total_bars: int
+) -> Dict[str, Any]:
+    t_agg = 0.0
+    t_vol = 0.0
+    t_lvl = 0.0
+    t_strat = 0.0
 
-let activeBrokerTelemetry: BrokerTelemetry = {
-  connected: true, provider: 'Fusion Markets cTrader', accountNumber: '48868725',
-  server: 'cTrader Open API', currency: 'USD', balance: 14.62, equity: 14.62,
-  floatingPnL: 0.00, netProfit: 4.62, totalDeposits: 10.00, winRate: 75.0,
-  totalTrades: 4, winningTrades: 3, losingTrades: 1, lastPingMs: 12,
-  lastSyncTime: new Date().toISOString(), lastHeartbeat: new Date().toISOString(),
-  openPositions: [], trades: [],
-};
+    compute_121_window_emas(m5_df)
+    verify_precomputed_emas(m5_df, 300)
+    # PROPOSED: add atr_14 column for entry-feature analysis.
+    compute_atr14_series(m5_df)
 
-let botRestartTimestamps: number[] = [];
-let botCrashLoopWarned = false;
+    aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
+    sm = StrategyManager()
+    frozen_orbs: Dict[Any, Any] = {}
 
-function safeReadJson(filePath: string): any | null {
-  try {
-    if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, 'utf8').trim();
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch { return null; }
-}
+    last_d1_bar_count = -1
+    last_vol_date = None
+    vol_metrics = {"valid": False}
+    adr_val = None
+    regime = "NORMAL"
 
-function holdoutVerdict(tune: any, val: any): string {
-  const tCount = tune?.count ?? 0;
-  const vCount = val?.count ?? 0;
-  if (tCount < 30 || vCount < 30) return 'INCONCLUSIVE';
-  const tPf = tune?.profit_factor ?? 0;
-  const vPf = val?.profit_factor ?? 0;
-  if (vPf < 0.95 || vPf < 0.70 * tPf) return 'FAILS';
-  if (vPf < 1.10) return 'FLAT';
-  return 'HOLDS';
-}
+    valid_vol_bars = 0
+    cached_signals_by_index: Dict[int, Dict[str, Any]] = {}
 
-function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> {
-  const suggestions: any[] = [];
-  const combos: any[] = pairPayload.combinations || [];
-  const best = pairPayload.best_combination || {};
-  const symbol = pairPayload.symbol;
-  const totalTrades = best.total_trades || 0;
+    m5_times_list = m5_df['time'].tolist()
+    total_sim_bars = max(1, total_bars - sim_start_idx)
+    next_progress_pct = 20
 
-  const validCombos30 = combos.filter(c => (c.total_trades || 0) >= 30);
-  if (validCombos30.length >= 4 && validCombos30.every(c => (c.profit_factor || 0) < 1.0)) {
-    const totalLoss = validCombos30.reduce((acc, c) => acc + (c.net_pnl < 0 ? Math.abs(c.net_pnl) : 0), 0);
-    const avgLoss = totalLoss / validCombos30.length;
-    suggestions.push({
-      tag: `[MEASURED $${avgLoss.toFixed(2)}]`,
-      text: `Do not trade ${symbol} with current strategies. Average net loss: -$${avgLoss.toFixed(2)}.`,
-      impact: Number(avgLoss.toFixed(2)), is_measured: true, type: 'PAIR_VIABILITY'
-    });
-  }
-  combos.forEach((c: any) => {
-    const tv = c.tune_validate || {};
-    if (holdoutVerdict(tv.tune, tv.validate) === 'FAILS') {
-      const loss = Math.abs((tv.validate?.net_pnl || 0));
-      suggestions.push({
-        tag: `[MEASURED $${loss.toFixed(2)}]`,
-        text: `Combination '${c.label}' on ${symbol} FAILS hold-out.`,
-        impact: Number(loss.toFixed(2)), is_measured: true, type: 'HOLD_OUT_FAIL'
-      });
-    }
-  });
-  if (totalTrades < 30) return suggestions;
-  const stratKpis = best.strategy_kpis || {};
-  Object.entries<any>(stratKpis).forEach(([sName, s]) => {
-    if ((s.count || 0) >= 30 && (s.profit_factor || 0) < 1.0 && (s.net_pnl || 0) < 0) {
-      suggestions.push({
-        tag: `[MEASURED $${Math.abs(s.net_pnl).toFixed(2)}]`,
-        text: `Disable or retune ${sName} on ${symbol}: PF ${(s.profit_factor || 0).toFixed(2)}, net -$${Math.abs(s.net_pnl).toFixed(2)}.`,
-        impact: Number(Math.abs(s.net_pnl).toFixed(2)), is_measured: true, type: 'STRATEGY_RETUNE'
-      });
-    }
-  });
-  const dowKpis = best.dow_kpis || {};
-  Object.entries<any>(dowKpis).forEach(([dow, d]) => {
-    if ((d.count || 0) >= 30 && (d.net_pnl || 0) < 0) {
-      suggestions.push({
-        tag: `[MEASURED $${Math.abs(d.net_pnl).toFixed(2)}]`,
-        text: `Avoid ${dow}s on ${symbol}: net -$${Math.abs(d.net_pnl).toFixed(2)}.`,
-        impact: Number(Math.abs(d.net_pnl).toFixed(2)), is_measured: true, type: 'DAY_FILTER'
-      });
-    }
-  });
-  const beOffCombos = combos.filter(c => c.be === 'off' && (c.total_trades || 0) >= 30);
-  const beOnCombos = combos.filter(c => c.be === 'on' && (c.total_trades || 0) >= 30);
-  if (beOffCombos.length > 0 && beOnCombos.length > 0) {
-    const bestBeOff = beOffCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, beOffCombos[0]);
-    const bestBeOn = beOnCombos.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, beOnCombos[0]);
-    if (Math.abs((bestBeOn.profit_factor || 0) - (bestBeOff.profit_factor || 0)) >= 0.15) {
-      const rec = (bestBeOn.profit_factor || 0) > (bestBeOff.profit_factor || 0) ? 'Breakeven On' : 'Breakeven Off';
-      const diffPnl = Math.abs((bestBeOn.net_pnl || 0) - (bestBeOff.net_pnl || 0));
-      suggestions.push({
-        tag: `[MEASURED $${diffPnl.toFixed(2)}]`,
-        text: `Recommend ${rec} for ${symbol}: $${diffPnl.toFixed(2)} P&L advantage.`,
-        impact: Number(diffPnl.toFixed(2)), is_measured: true, type: 'BE_TUNING'
-      });
-    }
-  }
-  try {
-    const wr = Number(best.win_rate || 0);
-    const exp = Number(best.expectancy || 0);
-    const w = Math.max(0.0, Math.min(100.0, wr)) / 100.0;
-    const gapR = (w * 1.0) - ((1.0 - w) * 1.0) - exp;
-    if (gapR > 0.07) {
-      suggestions.push({
-        tag: `[MEASURED ${gapR.toFixed(2)}R]`,
-        text: `Estimated cost drag of ${gapR.toFixed(2)}R per trade on ${symbol}. Add a spread or minimum-stop filter.`,
-        impact: 0.0, is_measured: true, type: 'COST_DRAG'
-      });
-    }
-  } catch {}
-  const bestTv = best.tune_validate || {};
-  if (holdoutVerdict(bestTv.tune, bestTv.validate) === 'HOLDS' && totalTrades >= 30) {
-    suggestions.push({
-      tag: '[TEST NEEDED]',
-      text: `Test larger R:R targets on ${symbol}: best combination is HOLDS.`,
-      impact: 0.0, is_measured: false, type: 'RR_EXPANSION'
-    });
-  }
-  const measured = suggestions.filter(s => s.is_measured);
-  const testNeeded = suggestions.filter(s => !s.is_measured);
-  measured.sort((a, b) => b.impact - a.impact);
-  return [...measured, ...testNeeded];
-}
+    for i in range(sim_start_idx, total_bars):
+        curr_time = m5_times_list[i].to_pydatetime()
+        curr_bar = m5_df.iloc[i]
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
 
-function computePortfolioNextTests(all: Array<{ type: string }>): string[] {
-  const tests: string[] = [];
-  if (all.some(s => s.type === 'STRATEGY_RETUNE')) tests.push('Retest with underperforming setups disabled.');
-  if (all.some(s => s.type === 'DAY_FILTER')) tests.push('Add a weekday blackout filter.');
-  if (all.some(s => s.type === 'BE_TUNING')) tests.push('Lock in the better Breakeven policy per pair.');
-  if (all.some(s => s.type === 'COST_DRAG')) tests.push('Add a spread or minimum-stop filter where cost drag exceeds 0.07R.');
-  if (all.some(s => s.type === 'RR_EXPANSION')) tests.push('Test larger R:R targets on HOLDS pairs.');
-  else tests.push('Run the Strategy Lab on the pairs with the highest PF.');
-  return tests.slice(0, 5);
-}
+        current_pct = int(((i - sim_start_idx) / total_sim_bars) * 100)
+        if current_pct >= next_progress_pct:
+            print(f"[*] {symbol} precompute {next_progress_pct}% ...", flush=True)
+            next_progress_pct += 20
 
-function generateExportDataPayload(): any {
-  const result: any = {
-    generated_at: new Date().toISOString(), days: 60, rr_values: [1.0, 2.0, 3.0],
-    total_run_seconds: null, combinations_rollup: {}, pairs: [],
-    portfolio_suggestions: [], what_to_test_next: [], portfolio_correlation: null,
-    spec_coverage: SPEC_COVERAGE, descriptions: METRIC_DESCRIPTIONS,
-  };
-  const allSummaryCombos: Record<string, { trades: number; pnl: number; win_count: number }> = {};
-  let totalTime = 0.0; let hasValidTimes = false;
-  const allPortfolioSuggestions: any[] = [];
-  const portfolio = safeReadJson(path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_correlation.json'));
-  if (portfolio) result.portfolio_correlation = portfolio;
+        wkday = curr_time.weekday()
+        if wkday == 5 or (wkday == 6 and curr_time.hour < 21):
+            continue
 
-  for (const sym of WHITELIST_ASSETS) {
-    const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
-    if (!fs.existsSync(summaryFile)) {
-      result.pairs.push({ symbol: sym, status: "NOT TESTED", error: "No backtest summary generated yet." });
-      continue;
-    }
-    try {
-      const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
-      result.days = summary.days || result.days;
-      const pairSeconds = typeof summary.total_seconds === 'number' && summary.total_seconds > 0 ? summary.total_seconds : null;
-      if (pairSeconds !== null) { totalTime += pairSeconds; hasValidTimes = true; }
-      const combos: any[] = summary.combinations || [];
-      combos.forEach(c => {
-        const tv = c.tune_validate || {};
-        c.holdout_verdict = holdoutVerdict(tv.tune, tv.validate);
-        if (!allSummaryCombos[c.label]) allSummaryCombos[c.label] = { trades: 0, pnl: 0, win_count: 0 };
-        allSummaryCombos[c.label].trades += c.total_trades || 0;
-        allSummaryCombos[c.label].pnl += c.net_pnl || 0;
-        allSummaryCombos[c.label].win_count += Math.round(((c.win_rate || 0) / 100) * (c.total_trades || 0));
-      });
-      let bestCombo: any = null;
-      const qualifying = combos.filter(c => (c.total_trades || 0) >= 30);
-      if (qualifying.length > 0) bestCombo = qualifying.reduce((b, curr) => curr.profit_factor > b.profit_factor ? curr : b, qualifying[0]);
-      else if (combos.length > 0) bestCombo = combos.reduce((b, curr) => curr.total_trades > b.total_trades ? curr : b, combos[0]);
-      let bestReportDetail: any = {};
-      if (bestCombo && bestCombo.report_file) {
-        const reportPath = path.resolve(BACKTEST_OUTPUT_DIR, bestCombo.report_file);
-        if (fs.existsSync(reportPath)) bestReportDetail = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-      }
-      const labPayload = safeReadJson(path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_lab.json`));
-      const pairPayload: any = {
-        symbol: sym, status: "OK", seconds_taken: pairSeconds,
-        phase_seconds: summary.phase_seconds || null, cache: summary.cache || null,
-        combinations: combos, lab: labPayload || null,
-        best_combination: {
-          ...(bestCombo || {}),
-          strategy_kpis: bestReportDetail.strategy_kpis || {},
-          dow_kpis: bestReportDetail.dow_kpis || {},
-          skipped_summary: bestReportDetail.skipped_summary || {},
-          warnings: bestReportDetail.warnings || [],
-          adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100,
-          strategy_tune_validate: bestReportDetail.strategy_tune_validate || {},
-          tune_validate: bestReportDetail.tune_validate || (bestCombo ? bestCombo.tune_validate : null) || {},
-          diagnostics: bestReportDetail.diagnostics || null,
-          improvement_tips: bestReportDetail.improvement_tips || [],
-        }
-      };
-      const suggestions = computeRuleBasedPairAdvice(pairPayload);
-      pairPayload.best_combination.rule_suggestions = suggestions;
-      allPortfolioSuggestions.push(...suggestions);
-      result.pairs.push(pairPayload);
-    } catch (e: any) {
-      result.pairs.push({ symbol: sym, status: "NOT TESTED", error: e.message });
-    }
-  }
-  const measuredPort = allPortfolioSuggestions.filter(s => s.is_measured);
-  const testNeededPort = allPortfolioSuggestions.filter(s => !s.is_measured);
-  measuredPort.sort((a, b) => b.impact - a.impact);
-  result.portfolio_suggestions = [...measuredPort, ...testNeededPort].slice(0, 10);
-  result.what_to_test_next = computePortfolioNextTests(allPortfolioSuggestions);
-  result.total_run_seconds = hasValidTimes ? Number(totalTime.toFixed(1)) : null;
-  const rollup: Record<string, any> = {};
-  Object.entries(allSummaryCombos).forEach(([label, s]) => {
-    rollup[label] = {
-      total_trades: s.trades, total_pnl: Number(s.pnl.toFixed(2)),
-      weighted_win_rate: s.trades > 0 ? Number(((s.win_count / s.trades) * 100).toFixed(1)) : 0
-    };
-  });
-  result.combinations_rollup = rollup;
-  return result;
-}
+        _t0 = time.perf_counter()
+        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
+        t_agg += time.perf_counter() - _t0
 
-function fmt(v: any, decimals = 2): string {
-  const n = typeof v === 'number' ? v : parseFloat(v);
-  if (!Number.isFinite(n)) return 'n/a';
-  return n.toFixed(decimals);
-}
+        _t0 = time.perf_counter()
+        curr_d1_len = len(d1_view)
+        curr_date = curr_time.date()
 
-function renderTxtContent(data: any): string {
-  const totalTimeStr = (typeof data.total_run_seconds === 'number' && data.total_run_seconds > 0) ? `${data.total_run_seconds}s` : 'n/a';
-  const lines: string[] = [];
-  const okPairs = (data.pairs || []).filter((p: any) => p.status === 'OK');
-  let bestCombo: any = null;
-  for (const p of okPairs) for (const c of (p.combinations || [])) {
-    if ((c.total_trades || 0) < 30) continue;
-    if (!bestCombo || c.profit_factor > bestCombo.pf) bestCombo = { symbol: p.symbol, label: c.label, pf: c.profit_factor, net: c.net_pnl, trades: c.total_trades, verdict: c.holdout_verdict };
-  }
-  lines.push('AI BRIEF');
-  if (bestCombo) lines.push(`Best: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
-  lines.push('');
-  lines.push('LEGEND');
-  lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
-  lines.push('  HOLDS = VALIDATE PF >= 1.10 and >= 70% of TUNE.');
-  lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Time ${totalTimeStr}`);
-  lines.push('');
-  lines.push('CROSS-PAIR ROLLUP');
-  Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
-    lines.push(`  ${combo.padEnd(24)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1)}% | PNL $${fmt(r.total_pnl)}`);
-  });
-  lines.push('');
-  for (const p of data.pairs || []) {
-    if (p.status !== 'OK') { lines.push(`ASSET ${p.symbol} — NOT TESTED`); lines.push(''); continue; }
-    const ps = p.phase_seconds || {}; const cache = p.cache || {};
-    lines.push('================================================================================');
-    lines.push(`ASSET ${p.symbol} | Run Time ${p.seconds_taken || 'n/a'}s | precompute ${ps.precompute_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s | cache hit ${cache.hits ?? 'n/a'}`);
-    lines.push('--- Six Combinations ---');
-    for (const c of p.combinations || []) {
-      const tv = c.tune_validate || {};
-      lines.push(`  ${String(c.label).padEnd(18)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | PF ${fmt(c.profit_factor)} | PNL $${fmt(c.net_pnl)} | TUNE[${tv.tune?.count ?? 0}t PF ${fmt(tv.tune?.profit_factor)}] | VALIDATE[${tv.validate?.count ?? 0}t PF ${fmt(tv.validate?.profit_factor)}] | ${c.holdout_verdict}`);
-    }
-    const b = p.best_combination || {};
-    lines.push('');
-    lines.push(`--- Best: ${b.label || 'N/A'} ---`);
-    lines.push('Per-strategy:');
-    Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
-      lines.push(`  ${sName.padEnd(28)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)}`);
-    });
-    const skipSummary = b.skipped_summary || {};
-    const skipEntries = Object.entries(skipSummary);
-    if (skipEntries.length > 0) {
-      const parts = skipEntries.map(([reason, val]: [string, any]) => typeof val === 'object' && val !== null ? `${reason}: ${val.candle_skips ?? 0}/${val.unique_setups ?? 0}` : `${reason}: ${val}`);
-      lines.push(`Skipped: ${parts.join(' | ')}`);
-    }
-    const diag = b.diagnostics;
-    if (diag) {
-      lines.push('');
-      lines.push('--- Diagnostics ---');
-      if (diag.hour_kpis) {
-        const hp: string[] = [];
-        for (let h = 0; h < 24; h++) { const k = diag.hour_kpis[String(h)]; if (!k || k.count === 0) continue; hp.push(`${String(h).padStart(2, '0')}:n=${k.count} wr=${fmt(k.win_rate, 1)} pf=${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`); }
-        lines.push(`§19 Hour matrix: ${hp.join(' | ')}`);
-      }
-      const st = diag.streak_analysis || {};
-      lines.push(`§31 Streaks: max ${st.max_consecutive_losses ?? 0} | peak DD -$${fmt(st.peak_drawdown)}`);
-      const mc = diag.monte_carlo || {};
-      lines.push(`§37 Bootstrap MC: median final $${fmt(mc.median_final_pnl)} | median DD -$${fmt(mc.median_max_dd)} | prob pos ${fmt(mc.prob_positive, 1)}%`);
-      const bh = diag.buy_and_hold || {};
-      lines.push(`§38 Alpha: $${fmt(bh.alpha)} (${bh.verdict})`);
-      const slip = diag.slippage_sensitivity || {};
-      const slipParts = Object.values(slip).map((pt: any) => `${pt.slippage_pips}p $${fmt(pt.net_pnl)}`).join(' | ');
-      if (slipParts) lines.push(`§34 Slippage: ${slipParts}`);
-    }
-    const suggestions: any[] = b.rule_suggestions || [];
-    if (suggestions.length > 0) {
-      lines.push('');
-      lines.push(`Suggestions for ${p.symbol}:`);
-      suggestions.forEach((s: any) => lines.push(`  ${s.tag} ${s.text}`));
-    }
-    lines.push('');
-  }
-  if (data.portfolio_correlation) {
-    lines.push('PORTFOLIO CORRELATION');
-    const pc = data.portfolio_correlation;
-    lines.push(`Portfolio DD $${fmt(pc.portfolio_drawdown)} | Div ratio ${fmt(pc.diversification_ratio)}x | avg corr ${fmt(pc.avg_daily_correlation, 3)}`);
-    lines.push('');
-  }
-  lines.push('NOT IMPLEMENTED:');
-  const notImpl = (data.spec_coverage || []).filter((row: any) => !(row.panel && row.txt && row.pdf));
-  if (notImpl.length === 0) lines.push('  (none)');
-  else notImpl.forEach((row: any) => lines.push(`  #${row.id} ${row.label} — ${row.note || 'not produced'}`));
-  return lines.join('\n');
-}
+        need_full_recalc = (curr_d1_len != last_d1_bar_count) or (curr_date != last_vol_date) or not vol_metrics.get("valid", False)
 
-function checkContainerMemory(): { ok: boolean; reason?: string } {
-  if (process.platform !== 'linux') return { ok: true };
-  try {
-    const currentRaw = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
-    const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
-    if (maxRaw === 'max') return { ok: true };
-    const currentBytes = parseInt(currentRaw, 10);
-    const maxBytes = parseInt(maxRaw, 10);
-    if (!Number.isFinite(currentBytes) || !Number.isFinite(maxBytes) || maxBytes <= 0) return { ok: true };
-    const ratio = currentBytes / maxBytes;
-    if (ratio > 0.70) return { ok: false, reason: `Memory at ${(ratio * 100).toFixed(1)}%` };
-    return { ok: true };
-  } catch { return { ok: true }; }
-}
+        if need_full_recalc:
+            vol_metrics = volatility_engine.compute_symbol_volatility(
+                d1_df=d1_view,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                symbol=symbol,
+                as_of=curr_time
+            )
+            if vol_metrics.get("valid", False):
+                adr_val = vol_metrics.get("adr")
+                regime = vol_metrics.get("regime", "NORMAL")
+            last_d1_bar_count = curr_d1_len
+            last_vol_date = curr_date
 
-async function startServer() {
-  const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+        if vol_metrics.get("valid", False):
+            active_vol = volatility_engine.refresh_intraday(
+                vol_metrics=vol_metrics,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                d1_view=d1_view,
+                as_of=curr_time
+            )
+            valid_vol_bars += 1
+        else:
+            active_vol = vol_metrics
+        t_vol += time.perf_counter() - _t0
 
-  app.use(express.json());
+        _t0 = time.perf_counter()
+        vp = get_session_volume_profile(m5_slice)
+        session_levels = build_session_levels(
+            symbol=symbol,
+            m5_df=m5_slice,
+            d1_df=d1_view,
+            vp_node=vp,
+            frozen_orbs=frozen_orbs,
+            as_of=curr_time,
+            adr_val=adr_val
+        )
+        t_lvl += time.perf_counter() - _t0
 
-  // ---------------------------------------------------------------------------
-  // JSON-only error guard for /api/*
-  // ---------------------------------------------------------------------------
-  app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-  });
+        _t0 = time.perf_counter()
+        raw_signal = sm.evaluate_all(
+            symbol=symbol,
+            data_5m=m5_slice,
+            data_h4=h4_view,
+            data_d1=d1_view,
+            session_levels=session_levels,
+            data_h1=h1_view
+        )
+        t_strat += time.perf_counter() - _t0
 
-  // --------------------------------------------------------------------------
-  // Bot config, journal, limits, telemetry (unchanged)
-  // --------------------------------------------------------------------------
-
-  app.get('/api/market/candles', (req, res) => {
-    try {
-      const symbol = String(req.query.symbol || 'US30').toUpperCase();
-      if (fs.existsSync(CANDLES_CACHE_FILE)) {
-        const cache = JSON.parse(fs.readFileSync(CANDLES_CACHE_FILE, 'utf8'));
-        if (cache && cache[symbol]) return res.status(200).json({ status: 'success', symbol, data: cache[symbol] });
-      }
-      return res.status(200).json({ status: 'success', symbol, data: [] });
-    } catch (err: any) { return res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.post('/api/positions/close/:id', (req, res) => {
-    try { fs.writeFileSync(CLOSE_COMMAND_FILE, JSON.stringify({ positionId: req.params.id, requestedAt: new Date().toISOString() })); res.status(200).json({ status: 'success' }); }
-    catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.get('/api/backtest/descriptions', (_req, res) => res.status(200).json({ status: 'success', data: METRIC_DESCRIPTIONS }));
-
-  app.get('/api/backtest/export-data', (_req, res) => {
-    try { res.status(200).json({ status: 'success', data: generateExportDataPayload() }); }
-    catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.get('/api/backtest/export.txt', (_req, res) => {
-    try {
-      const txt = renderTxtContent(generateExportDataPayload());
-      const dateStr = new Date().toISOString().slice(0, 10);
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.txt"`);
-      res.status(200).send(txt);
-    } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
-  });
-
-  app.get('/api/backtest/reports', (_req, res) => {
-    try {
-      if (!fs.existsSync(BACKTEST_OUTPUT_DIR)) return res.status(200).json({ status: 'success', reports: [] });
-      const files = fs.readdirSync(BACKTEST_OUTPUT_DIR).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-      res.status(200).json({ status: 'success', reports: files });
-    } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.get('/api/backtest/summary/:symbol', (req, res) => {
-    try {
-      const sym = req.params.symbol.toUpperCase();
-      const summaryFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_summary.json`);
-      if (fs.existsSync(summaryFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(summaryFile, 'utf8')) });
-      return res.status(404).json({ status: 'error', message: 'Summary not found' });
-    } catch (err: any) { return res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.get('/api/backtest/report/:filename', (req, res) => {
-    try {
-      const safeFilename = path.basename(req.params.filename);
-      if (!safeFilename.endsWith('.json')) return res.status(400).json({ status: 'error', message: 'Invalid file format' });
-      const targetPath = path.resolve(BACKTEST_OUTPUT_DIR, safeFilename);
-      if (!targetPath.startsWith(path.resolve(BACKTEST_OUTPUT_DIR)) || !fs.existsSync(targetPath)) return res.status(404).json({ status: 'error', message: 'Report not found' });
-      const data = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
-      if (data && data.day_data && data.symbol) {
-        const daycandlesPath = path.resolve(BACKTEST_OUTPUT_DIR, `${data.symbol}_daycandles.json`);
-        if (fs.existsSync(daycandlesPath)) {
-          try {
-            const dayCandles = JSON.parse(fs.readFileSync(daycandlesPath, 'utf8'));
-            for (const [dateKey, dayObj] of Object.entries<any>(data.day_data)) {
-              if ((!dayObj.candles || dayObj.candles.length === 0) && dayCandles[dateKey]) dayObj.candles = dayCandles[dateKey];
+        if raw_signal is not None:
+            cached_signals_by_index[i] = {
+                "raw_signal": raw_signal,
+                "active_vol": active_vol,
+                "session_levels": session_levels,
+                "adr_val": adr_val,
+                "regime": regime,
+                "curr_time": curr_time,
+                # d1_view cached so lab-mode filters can read the last closed D1
+                # close and its 20 EMA without re-running the aggregator.
+                "d1_view": d1_view,
+                # PROPOSED: h4_view cached for the same reason - the entry
+                # feature builder reads the last closed H4 close and its
+                # 50-period EMA.
+                "h4_view": h4_view,
             }
-          } catch {}
+
+    print(f"[*] {symbol} precompute 100% complete.", flush=True)
+
+    return {
+        "cached_signals": cached_signals_by_index,
+        "valid_vol_bars": valid_vol_bars,
+        "simulated_bars_count": total_sim_bars,
+        "timing": {
+            "aggregator_s": t_agg,
+            "volatility_s": t_vol,
+            "session_levels_s": t_lvl,
+            "strategies_s": t_strat
         }
-      }
-      res.status(200).json({ status: 'success', data });
-    } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.get('/api/backtest/portfolio', (_req, res) => {
-    try {
-      const portfolioFile = path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_correlation.json');
-      if (fs.existsSync(portfolioFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(portfolioFile, 'utf8')) });
-      return res.status(404).json({ status: 'error', message: 'Portfolio correlation not yet generated.' });
-    } catch (err: any) { return res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.get('/api/backtest/lab/:symbol', (req, res) => {
-    try {
-      const sym = String(req.params.symbol || '').toUpperCase();
-      const labFile = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_lab.json`);
-      if (fs.existsSync(labFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(labFile, 'utf8')) });
-      return res.status(404).json({ status: 'error', message: `No Strategy Lab file for ${sym}.` });
-    } catch (err: any) { return res.status(500).json({ status: 'error', message: err?.message }); }
-  });
-
-  app.post('/api/backtest/lab', (req, res) => {
-    if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is running.' });
-    const requested: any = req.body?.symbols ?? req.body?.symbol ?? 'US30';
-    const symbolsArray: string[] = Array.isArray(requested) ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean) : String(requested).toUpperCase() === 'ALL' ? [...WHITELIST_ASSETS] : [String(requested).toUpperCase()];
-    if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
-    backtestResults = []; backtestRunning = true; backtestProgress = `Strategy Lab for ${symbolsArray.join(', ')}...`;
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const proc = spawn(pythonCmd, ['backtest/runner.py', '--symbols', symbolsArray.join(','), '--lab'], { env: { ...process.env, PYTHONPATH: process.cwd() } });
-    activeBacktestProcesses.push(proc);
-    let stdoutBuf = '';
-    proc.stdout.on('data', data => {
-      stdoutBuf += data.toString();
-      const lines = stdoutBuf.split('\n');
-      stdoutBuf = lines.pop() ?? '';
-      for (const l of lines) if (l.trim().startsWith('[LAB]')) backtestProgress = l.trim();
-    });
-    let stderrBuf = '';
-    proc.stderr.on('data', data => {
-      stderrBuf += data.toString();
-      const lines = stderrBuf.split('\n');
-      stderrBuf = lines.pop() ?? '';
-      for (const l of lines) if (l.trim()) console.error(`[LAB:ERR] ${l.trimEnd()}`);
-    });
-    proc.on('exit', code => {
-      backtestRunning = false;
-      activeBacktestProcesses = activeBacktestProcesses.filter(p => p !== proc);
-      backtestProgress = code === 0 ? 'Strategy Lab complete.' : 'Strategy Lab failed.';
-      if (code !== 0) backtestLastError = `Exited with code ${code}`;
-    });
-    res.status(200).json({ status: 'success', message: 'Strategy Lab started.' });
-  });
-
-  // --------------------------------------------------------------------------
-  // Verify job: POST to start, GET to poll. JSON in, JSON out, always.
-  // --------------------------------------------------------------------------
-  app.post('/api/backtest/verify', (req, res) => {
-    if (verifyRunning) return res.status(409).json({ error: 'Verification already running.' });
-    if (backtestRunning) return res.status(409).json({ error: 'A backtest is running. Wait for it to finish.' });
-    const symbol = String(req.body?.symbol || 'US30').toUpperCase();
-    const days = parseInt(req.body?.days || '60', 10);
-    verifyRunning = true;
-    verifyProgress = `Starting verify for ${symbol} (${days} days)...`;
-    verifySymbol = symbol;
-    verifyLastError = null;
-    // Remove stale result so polling only sees fresh data
-    const oldFile = path.resolve(BACKTEST_OUTPUT_DIR, `${symbol}_verify.json`);
-    if (fs.existsSync(oldFile)) { try { fs.unlinkSync(oldFile); } catch {} }
-
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const proc = spawn(pythonCmd, ['backtest/runner.py', '--verify', '--symbol', symbol, '--days', String(days)], {
-      env: { ...process.env, PYTHONPATH: process.cwd() },
-    });
-    verifyProcess = proc;
-
-    let stdoutBuf = '';
-    proc.stdout.on('data', data => {
-      stdoutBuf += data.toString();
-      const lines = stdoutBuf.split('\n');
-      stdoutBuf = lines.pop() ?? '';
-      for (const raw of lines) {
-        const l = raw.trim();
-        if (!l) continue;
-        if (l.startsWith('[VERIFY]') || l.startsWith('[*]')) {
-          verifyProgress = l;
-          console.log(`[VERIFY] ${l}`);
-        }
-      }
-    });
-    let stderrBuf = '';
-    proc.stderr.on('data', data => {
-      stderrBuf += data.toString();
-      const lines = stderrBuf.split('\n');
-      stderrBuf = lines.pop() ?? '';
-      for (const raw of lines) if (raw.trimEnd()) console.error(`[VERIFY:ERR] ${raw.trimEnd()}`);
-    });
-    proc.on('exit', code => {
-      verifyRunning = false;
-      verifyProcess = null;
-      if (code !== 0) {
-        verifyLastError = `Exited with code ${code}`;
-        verifyProgress = `Verify failed.`;
-      } else {
-        verifyProgress = `Verify complete.`;
-      }
-    });
-    proc.on('error', err => {
-      verifyRunning = false;
-      verifyProcess = null;
-      verifyLastError = `spawn error: ${err.message}`;
-      verifyProgress = `Verify failed.`;
-    });
-
-    res.status(200).json({ status: 'success', message: `Verify started for ${symbol}.`, symbol, days });
-  });
-
-  app.get('/api/backtest/verify/status', (_req, res) => {
-    let result: any = null;
-    if (verifySymbol) {
-      const verifyFile = path.resolve(BACKTEST_OUTPUT_DIR, `${verifySymbol}_verify.json`);
-      if (fs.existsSync(verifyFile)) {
-        try { result = JSON.parse(fs.readFileSync(verifyFile, 'utf8')); } catch {}
-      }
     }
-    res.status(200).json({
-      status: 'success',
-      isRunning: verifyRunning,
-      progress: verifyProgress,
-      symbol: verifySymbol,
-      lastError: verifyLastError,
-      result,
-    });
-  });
 
-  app.post('/api/backtest/verify/stop', (_req, res) => {
-    if (verifyProcess) { try { verifyProcess.kill(); } catch {} }
-    verifyProcess = null;
-    verifyRunning = false;
-    verifyProgress = 'Verify cancelled.';
-    res.status(200).json({ status: 'success' });
-  });
 
-  // Run / status / stop
-  app.post('/api/backtest/run', (req, res) => {
-    if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
-    const memCheck = checkContainerMemory();
-    if (!memCheck.ok) return res.status(503).json({ status: 'error', message: memCheck.reason });
-    const requested: any = req.body?.symbol ?? 'US30';
-    const symbolsArray: string[] = Array.isArray(requested) ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean) : String(requested).toUpperCase() === 'ALL' ? [...WHITELIST_ASSETS] : [String(requested).toUpperCase()];
-    if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
-    const days = parseInt(req.body?.days || '60', 10);
-    backtestResults = []; activeBacktestProcesses = []; backtestRunning = true;
-    backtestProgress = `Initiating backtest matrix for ${symbolsArray.join(', ')}...`;
-    backtestLastError = null; backtestExitCode = null;
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const CONCURRENT_PAIRS = 2;
+def run_cached_combination(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    precomputed: Dict[str, Any],
+    sim_start_idx: int,
+    total_bars: int,
+    combo: Dict[str, Any],
+    days_count: int,
+    window_start_str: str,
+    window_end_str: str,
+    history_days_before_window: float,
+    balance: float = 1000.0,
+    risk_pct: float = 1.0,
+    eurusd_df: Optional[pd.DataFrame] = None,
+    be_mode: str = "FIXED_80",
+    trail_override: Optional[str] = None,
+    max_daily_override: Optional[int] = None,
+    report_file_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    t_vol = 0.0
+    t_strat = 0.0
+    t_sim = 0.0
+    t_rep = 0.0
 
-    async function executeMatrix() {
-      let activeIndex = 0; let completedCount = 0;
-      async function runWorker(sym: string): Promise<void> {
-        let symTiming = ''; const stderrTail: string[] = [];
-        const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
-        await new Promise<void>((resolve) => {
-          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd() } });
-          activeBacktestProcesses.push(proc);
-          proc.stdout.on('data', data => {
-            const lines = data.toString().split('\n');
-            for (const l of lines) { const t = l.trim(); if (t.startsWith('[time]')) symTiming = t.replace('[time]', '').trim(); }
-          });
-          proc.stderr.on('data', data => {
-            const lines = data.toString().split('\n');
-            for (const raw of lines) { const line = raw.trimEnd(); if (!line) continue; stderrTail.push(line); if (stderrTail.length > 20) stderrTail.shift(); }
-          });
-          proc.on('exit', (code, signal) => {
-            completedCount++;
-            backtestProgress = `[Running] ${completedCount}/${symbolsArray.length} completed.`;
-            const tailText = stderrTail.length > 0 ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}` : '';
-            const reason = signal ? `Killed by ${signal}` : `Exited with code ${code}`;
-            if (!signal && code === 0) backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 6/6 matrix', timing: symTiming });
-            else backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}`, timing: symTiming });
-            resolve();
-          });
-          proc.on('error', err => {
-            completedCount++;
-            backtestResults.push({ symbol: sym, status: 'FAILED', message: `spawn error: ${err.message}` });
-            resolve();
-          });
-        });
-      }
-      const activePool: Promise<void>[] = [];
-      while (activeIndex < symbolsArray.length && backtestRunning) {
-        while (activePool.length < CONCURRENT_PAIRS && activeIndex < symbolsArray.length) {
-          const nextSym = symbolsArray[activeIndex++];
-          const p = runWorker(nextSym).then(() => { const idx = activePool.indexOf(p); if (idx >= 0) activePool.splice(idx, 1); });
-          activePool.push(p);
-        }
-        if (activePool.length > 0) await Promise.race(activePool);
-      }
-      await Promise.all(activePool);
-      backtestRunning = false;
-      backtestProgress = `Finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} assets completed.`;
+    volatility_engine.reset_rejection_stats()
+
+    adaptive_mode = combo["adaptive_mode"]
+    use_be = combo["use_be"]
+    use_trail = combo["use_trail"]
+    be_label = combo["be"]
+    trail_label = combo["trail"]
+    mode_str = combo["mode"]
+
+    GLOBAL_PARAMS.adaptive_mode = adaptive_mode
+    GLOBAL_PARAMS.use_breakeven = use_be
+    GLOBAL_PARAMS.use_supertrend_trail = use_trail
+
+    orig_max_daily = getattr(GLOBAL_PARAMS, 'max_daily_trades', 2)
+    if max_daily_override is not None:
+        GLOBAL_PARAMS.max_daily_trades = max_daily_override
+
+    sim = TradeSimulator(
+    starting_balance=balance,
+    risk_pct=risk_pct,
+    eurusd_df=eurusd_df,
+    be_mode=be_mode,
+    m5_df_full=m5_df,   # PROPOSED: enable alt-target replay
+    )
+    
+    cached_signals = precomputed["cached_signals"]
+    m5_times_list = m5_df['time'].tolist()
+    has_ema200_col = 'ema_200' in m5_df.columns
+
+    unique_setups = 0
+    prev_signal_key = None
+    funnel = {
+        "unique_setups": 0,
+        "raw_signals_fired": 0,
+        "adapted_signals_passed": 0,
+        "vol_filters_blocked": 0,
+        "sim_trades_attempted": 0,
+        "sim_trades_filled": 0
     }
-    executeMatrix().catch(e => { backtestRunning = false; backtestLastError = e.message; });
-    res.status(200).json({ status: 'success', message: `Execution initiated for ${symbolsArray.join(', ')}` });
-  });
+    vol_block_reasons: Dict[str, int] = {}
+    strategy_errors: Dict[str, int] = {}
 
-  app.get('/api/backtest/status', (_req, res) => {
-    res.status(200).json({ status: 'success', isRunning: backtestRunning, progress: backtestProgress, lastError: backtestLastError, exitCode: backtestExitCode, results: backtestResults });
-  });
+    for i in range(sim_start_idx, total_bars):
+        curr_bar = m5_df.iloc[i]
+        curr_time = m5_times_list[i].to_pydatetime()
 
-  app.post('/api/backtest/stop', (_req, res) => {
-    activeBacktestProcesses.forEach(p => { try { p.kill(); } catch {} });
-    activeBacktestProcesses = []; backtestRunning = false; backtestProgress = 'Backtest canceled by user.'; backtestLastError = null;
-    res.status(200).json({ status: 'success' });
-  });
+        _t0 = time.perf_counter()
+        if sim.open_positions or sim.pending_sl_evaluations:
+            m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+            sim.process_candle(symbol, curr_bar, m5_slice)
+        t_sim += time.perf_counter() - _t0
 
-  app.get('/api/backtest/storage', (_req, res) => {
-    try {
-      const volPath = storageBase || process.cwd();
-      let total_mb = 0, free_mb = 0, used_mb = 0;
-      try { const stats = fs.statfsSync(volPath); total_mb = Math.round((stats.bsize * stats.blocks) / (1024 * 1024)); free_mb = Math.round((stats.bsize * stats.bfree) / (1024 * 1024)); used_mb = total_mb - free_mb; } catch {}
-      let market_data_bytes = 0;
-      if (fs.existsSync(BACKTEST_DATA_DIR)) for (const f of fs.readdirSync(BACKTEST_DATA_DIR)) { try { const s = fs.statSync(path.join(BACKTEST_DATA_DIR, f)); if (s.isFile() && f.endsWith('.csv')) market_data_bytes += s.size; } catch {} }
-      let reports_bytes = 0;
-      if (fs.existsSync(BACKTEST_OUTPUT_DIR)) for (const f of fs.readdirSync(BACKTEST_OUTPUT_DIR)) { try { const s = fs.statSync(path.join(BACKTEST_OUTPUT_DIR, f)); if (s.isFile()) reports_bytes += s.size; } catch {} }
-      res.status(200).json({ status: 'success', data: { total_mb, used_mb, free_mb, market_data_mb: Number((market_data_bytes / (1024 * 1024)).toFixed(2)), reports_mb: Number((reports_bytes / (1024 * 1024)).toFixed(2)) } });
-    } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
-  });
+        if i not in cached_signals:
+            continue
 
-  app.post('/api/backtest/storage/cleanup', (req, res) => {
-    try {
-      const scope = req.body?.scope || 'all_reports';
-      const targetSym = (req.body?.symbol || '').toUpperCase().trim();
-      let deletedCount = 0;
-      if (fs.existsSync(BACKTEST_OUTPUT_DIR)) for (const f of fs.readdirSync(BACKTEST_OUTPUT_DIR)) {
-        if (!f.endsWith('.json')) continue;
-        const shouldDelete = scope === 'all_reports' || (scope === 'symbol' && targetSym && f.startsWith(`${targetSym}_`));
-        if (shouldDelete) { try { fs.unlinkSync(path.join(BACKTEST_OUTPUT_DIR, f)); deletedCount++; } catch {} }
-      }
-      res.status(200).json({ status: 'success', message: `Deleted ${deletedCount} file(s).`, deletedCount });
-    } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
-  });
+        item = cached_signals[i]
+        signal = copy.deepcopy(item["raw_signal"])
+        active_vol = item["active_vol"]
+        session_levels = item["session_levels"]
+        adr_val = item["adr_val"]
+        regime = item["regime"]
+        # PROPOSED: pull the cached HTF views for the entry-feature builder.
+        d1_view_cached = item.get("d1_view")
+        h4_view_cached = item.get("h4_view")
 
-  app.get('/api/journal', async (_req, res) => {
-    try { const diskTrades = loadTradesFromDisk(); activeBrokerTelemetry.trades = diskTrades; res.status(200).json(diskTrades); }
-    catch { res.status(500).json({ error: "Failed to fetch journal entries" }); }
-  });
-  app.post('/api/journal', (req, res) => {
-    try { const trades = loadTradesFromDisk(); trades.unshift(req.body); saveTradesToDisk(trades); activeBrokerTelemetry.trades = trades; recomputeRiskState(); res.status(200).json({ status: "success", trade: req.body }); }
-    catch { res.status(500).json({ error: "Failed to save journal entry" }); }
-  });
-  app.delete('/api/journal/:id', (req, res) => {
-    const tradeId = req.params.id;
-    let trades = loadTradesFromDisk();
-    trades = trades.filter(t => t.id !== tradeId && t.ticket !== tradeId);
-    saveTradesToDisk(trades); activeBrokerTelemetry.trades = trades; recomputeRiskState();
-    res.json({ status: 'success' });
-  });
-  app.post('/api/journal/reset', (_req, res) => { saveTradesToDisk([]); activeBrokerTelemetry.trades = []; recomputeRiskState(); res.json({ status: 'success' }); });
-  app.get('/api/bot/config', (_req, res) => res.json({ status: 'success', data: activeBotConfig }));
-  app.post('/api/bot/config', (req, res) => {
-    try { activeBotConfig = { ...activeBotConfig, ...req.body, updatedAt: new Date().toISOString() }; saveBotConfigAtomically(activeBotConfig); res.json({ status: 'success', config: activeBotConfig }); }
-    catch (error: any) { res.status(500).json({ status: 'error', message: error?.message }); }
-  });
-  app.get('/api/limits', (_req, res) => { recomputeRiskState(); res.json({ status: 'success', data: { ...riskLimits, ...riskState } }); });
-  app.post('/api/limits', (req, res) => {
-    try {
-      const { maxDailyLossUsd, maxWeeklyLossUsd, maxMonthlyLossUsd, maxDailyDrawdownPct, autoLiquidateAllOnTrip, resetBreaker, useProfileDrawdownPct } = req.body;
-      if (typeof maxDailyLossUsd === 'number') riskLimits.maxDailyLossUsd = maxDailyLossUsd;
-      if (typeof maxWeeklyLossUsd === 'number') riskLimits.maxWeeklyLossUsd = maxWeeklyLossUsd;
-      if (typeof maxMonthlyLossUsd === 'number') riskLimits.maxMonthlyLossUsd = maxMonthlyLossUsd;
-      if (typeof maxDailyDrawdownPct === 'number') riskLimits.maxDailyDrawdownPct = maxDailyDrawdownPct;
-      if (typeof autoLiquidateAllOnTrip === 'boolean') riskLimits.autoLiquidateAllOnTrip = autoLiquidateAllOnTrip;
-      if (typeof useProfileDrawdownPct === 'boolean') riskLimits.useProfileDrawdownPct = useProfileDrawdownPct;
-      if (resetBreaker) { riskState.breakerTriggered = false; riskState.activeTripScope = 'NONE'; riskState.lastTriggerReason = undefined; activeBotConfig.masterExecution = true; }
-      saveBotConfigAtomically({ ...activeBotConfig, ...riskLimits, limitsConfirmedAt: new Date().toISOString() });
-      res.json({ status: 'success', data: { ...riskLimits, ...riskState } });
-    } catch (error: any) { res.status(500).json({ status: 'error', message: error?.message }); }
-  });
-  app.get('/api/broker/telemetry', (_req, res) => { recomputeRiskState(); res.json({ status: 'success', data: activeBrokerTelemetry }); });
-  app.post('/api/broker/telemetry', (req, res) => { activeBrokerTelemetry = { ...activeBrokerTelemetry, ...req.body, lastHeartbeat: new Date().toISOString() }; res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig }); });
+        if trail_override:
+            signal.trail_mode = trail_override
 
-  function launchPythonBot() {
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const bot = spawn(pythonCmd, ['engine/matrix.py'], { env: { ...process.env, PYTHONPATH: process.cwd() }, stdio: ['ignore', 'pipe', 'pipe'] });
-    let restartScheduled = false; let stdoutBuffer = ''; let stderrBuffer = '';
-    const scheduleRestart = (reason: string) => {
-      if (restartScheduled) return; restartScheduled = true;
-      const now = Date.now(); botRestartTimestamps.push(now); botRestartTimestamps = botRestartTimestamps.filter(t => now - t <= 120000);
-      const count = botRestartTimestamps.length;
-      if (count <= 1) botCrashLoopWarned = false;
-      if (!botCrashLoopWarned && count > 5) { botCrashLoopWarned = true; console.error(`[BOT] CRASH LOOP — ${count} restarts within 2 minutes.`); }
-      setTimeout(() => launchPythonBot(), 5000);
-    };
-    bot.stdout.on('data', chunk => {
-      stdoutBuffer += chunk.toString();
-      const lines = stdoutBuffer.split('\n'); stdoutBuffer = lines.pop() ?? '';
-      for (const rawLine of lines) {
-        const line = rawLine.trim(); if (!line) continue;
-        if (line.includes('[MATRIX_TELEMETRY]')) {
-          try {
-            const telem = JSON.parse(line.split('[MATRIX_TELEMETRY]')[1].trim());
-            activeBrokerTelemetry.balance = telem.balance; activeBrokerTelemetry.equity = telem.equity;
-            if (telem.currency) activeBrokerTelemetry.currency = telem.currency;
-            if (telem.netProfit !== undefined) activeBrokerTelemetry.netProfit = telem.netProfit;
-            if (telem.winRate !== undefined) activeBrokerTelemetry.winRate = telem.winRate;
-            if (telem.totalTrades !== undefined) activeBrokerTelemetry.totalTrades = telem.totalTrades;
-            if (telem.winningTrades !== undefined) activeBrokerTelemetry.winningTrades = telem.winningTrades;
-            if (telem.losingTrades !== undefined) activeBrokerTelemetry.losingTrades = telem.losingTrades;
-            if (Array.isArray(telem.openPositions)) activeBrokerTelemetry.openPositions = telem.openPositions;
-            activeBrokerTelemetry.connected = true; activeBrokerTelemetry.lastHeartbeat = new Date().toISOString();
-          } catch {}
-          continue;
+        current_signal_key = (signal.strategy, signal.direction)
+        if current_signal_key != prev_signal_key:
+            unique_setups += 1
+        prev_signal_key = current_signal_key
+        funnel["raw_signals_fired"] += 1
+
+        _t0 = time.perf_counter()
+        if adaptive_mode:
+            if active_vol.get("valid", False):
+                adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+                if adapted:
+                    funnel["adapted_signals_passed"] += 1
+                    spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+                    sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+                    tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+                    vol_ok, vol_msg = volatility_engine.evaluate_volatility_filters(
+                        active_vol, spread, sl_dist, tp_dist, adapted.direction, adapted.entry_price, adapted.strategy
+                    )
+                    if vol_ok:
+                        signal = adapted
+                        if trail_override:
+                            signal.trail_mode = trail_override
+                    else:
+                        funnel["vol_filters_blocked"] += 1
+                        reason_clean = vol_msg.split(":")[0].strip() if ":" in vol_msg else vol_msg[:30]
+                        vol_block_reasons[reason_clean] = vol_block_reasons.get(reason_clean, 0) + 1
+                        signal = None
+                else:
+                    funnel["vol_filters_blocked"] += 1
+                    vol_block_reasons["ADR Stop Clamping / Min RR"] = vol_block_reasons.get("ADR Stop Clamping / Min RR", 0) + 1
+                    signal = None
+            else:
+                funnel["vol_filters_blocked"] += 1
+                vol_block_reasons["Invalid Volatility Metrics"] = vol_block_reasons.get("Invalid Volatility Metrics", 0) + 1
+                signal = None
+        else:
+            funnel["adapted_signals_passed"] += 1
+        t_vol += time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
+        if signal:
+            funnel["sim_trades_attempted"] += 1
+            has_open = any(p["symbol"] == symbol for p in sim.open_positions)
+            if not has_open:
+                ema_200_val: Optional[float] = None
+                if has_ema200_col:
+                    try:
+                        v = float(m5_df.iloc[i]['ema_200'])
+                        if not math.isnan(v):
+                            ema_200_val = v
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        ema_200_val = None
+
+                # PROPOSED: build the 12 entry features for this trade.
+                # trade_of_day = the ordinal this trade would be for the
+                # current SAST day if it is filled. Read-only; the simulator
+                # still owns the counter.
+                try:
+                    sast_dt = curr_time.astimezone(TZ_SAST)
+                    sast_date_str = sast_dt.strftime("%Y-%m-%d")
+                    trade_of_day = sim.daily_trade_counts.get(sast_date_str, 0) + 1
+                except Exception:
+                    trade_of_day = 1
+
+                spread_for_feat = ASSETS.get(symbol, {}).get("spread", 0.0)
+                try:
+                    entry_feats = compute_entry_features(
+                        signal=signal,
+                        curr_time=curr_time,
+                        m5_df=m5_df,
+                        idx=i,
+                        session_levels=session_levels,
+                        active_vol=active_vol,
+                        d1_view=d1_view_cached,
+                        h4_view=h4_view_cached,
+                        spread=spread_for_feat,
+                        trade_of_day=trade_of_day,
+                    )
+                except Exception:
+                    entry_feats = None
+
+                opened = sim.open_trade(
+                    signal, curr_time, adr_val, regime, session_levels,
+                    ema_200_value=ema_200_val,
+                    entry_features=entry_feats,
+                )
+                if opened:
+                    funnel["sim_trades_filled"] += 1
+        t_sim += time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
+    if len(m5_df) > 0 and len(sim.open_positions) > 0:
+        sim.close_all(symbol, m5_df.iloc[-1])
+
+    GLOBAL_PARAMS.max_daily_trades = orig_max_daily
+
+    funnel["unique_setups"] = unique_setups
+    simulated_bars_count = precomputed["simulated_bars_count"]
+    valid_vol_bars = precomputed["valid_vol_bars"]
+    adaptive_pct = round((valid_vol_bars / max(1, simulated_bars_count)) * 100.0, 1)
+
+    report_warnings = []
+    if adaptive_mode and adaptive_pct < 90.0:
+        warn_msg = f"WARNING: ADAPTIVE only active on {adaptive_pct:.1f}% of bars (needs 120 D1 bars of history before the window)"
+        report_warnings.append(warn_msg)
+
+    all_trades = sim.completed_trades
+    df_trades = pd.DataFrame(all_trades)
+    global_kpis = calculate_kpis(all_trades)
+
+    if not df_trades.empty:
+        df_trades["display_date"] = df_trades["date_sast"].fillna(df_trades["date"]) if "date_sast" in df_trades.columns else df_trades["date"]
+    else:
+        df_trades["display_date"] = []
+
+    strat_kpis = {}
+    dow_kpis = {}
+    strat_tune_validate: Dict[str, Any] = {}
+    if not df_trades.empty:
+        for s_name, s_group in df_trades.groupby("strategy"):
+            strat_kpis[s_name] = calculate_kpis(s_group.to_dict("records"))
+            strat_tune_validate[s_name] = compute_tune_validate_kpis(
+                s_group.to_dict("records"), window_start_str, window_end_str
+            )
+
+        df_trades["weekday"] = pd.to_datetime(df_trades["display_date"]).dt.day_name()
+        for dow, dow_group in df_trades.groupby("weekday"):
+            dow_kpis[dow] = calculate_kpis(dow_group.to_dict("records"))
+
+    combo_tune_validate = compute_tune_validate_kpis(all_trades, window_start_str, window_end_str)
+
+    m5_df["dt"] = m5_df["time"]
+    m5_df["date_sast_str"] = m5_df["dt"].dt.tz_convert(TZ_SAST).dt.strftime("%Y-%m-%d")
+    trading_dates = sorted(df_trades["display_date"].unique().tolist()) if not df_trades.empty else []
+
+    day_charts_data = {}
+    day_candles_by_date = {}
+
+    for d_str in trading_dates:
+        sub_m5 = m5_df[m5_df["date_sast_str"] == d_str]
+        candles_list = [
+            {"time": int(r["dt"].timestamp()), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
+            for _, r in sub_m5.iterrows()
+        ]
+        day_candles_by_date[d_str] = candles_list
+
+        day_t = df_trades[df_trades["display_date"] == d_str].to_dict("records")
+        first_t = day_t[0] if day_t else {}
+        ref_levels = first_t.get("ref_levels", {})
+
+        day_charts_data[d_str] = {
+            "candles": [],
+            "trades": day_t,
+            "levels": {
+                "asia_high": ref_levels.get("asia_high"),
+                "asia_low": ref_levels.get("asia_low"),
+                "daily_eq": ref_levels.get("daily_eq"),
+                "daily_pivot": ref_levels.get("daily_pivot"),
+                "pdh": ref_levels.get("pdh"),
+                "pdl": ref_levels.get("pdl"),
+                "orb_high": ref_levels.get("orb_high"),
+                "orb_low": ref_levels.get("orb_low")
+            }
         }
-        console.log(`[BOT] ${line}`);
-      }
-    });
-    bot.stderr.on('data', chunk => {
-      stderrBuffer += chunk.toString();
-      const lines = stderrBuffer.split('\n'); stderrBuffer = lines.pop() ?? '';
-      for (const rawLine of lines) if (rawLine.trimEnd()) console.error(`[BOT:ERR] ${rawLine.trimEnd()}`);
-    });
-    bot.on('error', err => { console.error(`[BOT] spawn error: ${err.message}`); scheduleRestart(`spawn error`); });
-    bot.on('exit', (code, signal) => { scheduleRestart(`exit code=${code} signal=${signal ?? 'null'}`); });
-  }
 
-  launchPythonBot();
+    improvement_tips = generate_improvement_tips(all_trades, symbol, mode_str)
 
-  // ---------------------------------------------------------------------------
-  // /api/* not matched above -> JSON 404, never HTML
-  // ---------------------------------------------------------------------------
-  app.use('/api', (req, res) => {
-    res.status(404).json({ error: `Unknown API route: ${req.method} ${req.originalUrl}` });
-  });
+    diag_payload = compute_diagnostics(
+        trades=all_trades,
+        m5_df=m5_df,
+        sim_start_idx=sim_start_idx,
+        starting_equity=balance,
+    )
 
-  const distPath = path.join(process.cwd(), 'dist');
-  if (fs.existsSync(path.join(distPath, 'index.html'))) {
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
-  } else {
-    const vite = await createViteServer({ server: { middlewareMode: true, host: '0.0.0.0' }, appType: 'spa' });
-    app.use(vite.middlewares);
-  }
+    run_settings_text = (
+        f"mode: {mode_str}, target_rr: {GLOBAL_PARAMS.target_rr}, "
+        f"use_breakeven: {GLOBAL_PARAMS.use_breakeven}, "
+        f"use_supertrend_trail: {GLOBAL_PARAMS.use_supertrend_trail}, days: {days_count}, "
+        f"adaptive_effective_pct: {adaptive_pct}%, "
+        f"be_mode: {be_mode}, trail_override: {trail_override}, max_daily_override: {max_daily_override}, "
+        f"funnel: {json.dumps(funnel)}, "
+        f"vol_block_reasons: {json.dumps(vol_block_reasons)}, "
+        f"strategy_errors: {json.dumps(strategy_errors)}, "
+        f"rejection_stats: {json.dumps(volatility_engine.get_rejection_stats())}"
+    )
 
-  // ---------------------------------------------------------------------------
-  // Global error handler -> JSON for /api/*, plain text otherwise
-  // ---------------------------------------------------------------------------
-  app.use((err: any, req: any, res: any, _next: any) => {
-    const message = err?.message || 'Server error';
-    if (req.path && String(req.path).startsWith('/api/')) {
-      res.status(500).json({ error: message });
-    } else {
-      res.status(500).send(message);
+    full_skip_summary = sim.skip_summary()
+
+    report_payload = {
+        "symbol": symbol,
+        "mode": mode_str,
+        "be": be_label,
+        "trail": trail_label,
+        "window_start": window_start_str,
+        "window_end": window_end_str,
+        "history_days_before_window": history_days_before_window,
+        "adaptive_effective_pct": adaptive_pct,
+        "run_settings": run_settings_text,
+        "warnings": report_warnings,
+        "funnel": funnel,
+        "vol_block_reasons": vol_block_reasons,
+        "strategy_errors": strategy_errors,
+        "rejection_stats": volatility_engine.get_rejection_stats(),
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "global_kpis": global_kpis,
+        "strategy_kpis": strat_kpis,
+        "dow_kpis": dow_kpis,
+        "trading_dates": trading_dates,
+        "day_data": day_charts_data,
+        "all_trades": all_trades,
+        "skipped_summary": full_skip_summary.get("by_reason", {}),
+        "skipped_detail": full_skip_summary,
+        "improvement_tips": improvement_tips,
+        "tune_validate": combo_tune_validate,
+        "strategy_tune_validate": strat_tune_validate,
+        "diagnostics": diag_payload,
     }
-  });
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Trading Portal & API Gateway active on port ${PORT}`);
-  });
-}
+    if report_file_override:
+        report_filename = report_file_override
+    else:
+        report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_report.json"
+    out_file = os.path.join(OUTPUT_DIR, report_filename)
+    safe_payload = sanitize_for_json(report_payload)
+    with open(out_file, "w") as f:
+        json.dump(safe_payload, f, separators=(",", ":"), allow_nan=False)
+    t_rep += time.perf_counter() - _t0
 
-startServer().catch(err => {
-  console.error('Server startup error:', err);
-  process.exit(1);
-});
+    return {
+        "report_file": report_filename,
+        "payload": report_payload,
+        "trades": all_trades,
+        "kpis": global_kpis,
+        "funnel": funnel,
+        "adaptive_pct": adaptive_pct,
+        "day_candles": day_candles_by_date,
+        "tune_validate": combo_tune_validate,
+        "strategy_tune_validate": strat_tune_validate,
+        "timing": {
+            "volatility_s": t_vol,
+            "strategies_s": t_strat,
+            "simulator_s": t_sim,
+            "report_writing_s": t_rep,
+        }
+    }
+
+
+def write_portfolio_correlation() -> bool:
+    """Read every <symbol>_*_report.json in OUTPUT_DIR and write portfolio_correlation.json."""
+    try:
+        payload = compute_portfolio_correlation(OUTPUT_DIR, DEFAULT_WHITELIST)
+        out_file = os.path.join(OUTPUT_DIR, "portfolio_correlation.json")
+        safe = sanitize_for_json(payload)
+        with open(out_file, "w") as f:
+            json.dump(safe, f, separators=(",", ":"), allow_nan=False)
+        print(f"[✓] Portfolio correlation saved to {out_file}", flush=True)
+        return True
+    except Exception as e:
+        print(f"ERROR: Portfolio correlation failed: {e}", flush=True)
+        return False
+
+
+def compare_runs(
+    symbol: str = "US30",
+    days_count: int = 30,
+    eurusd_df: Optional[pd.DataFrame] = None
+) -> str:
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        return f"ERROR: Missing market data files for {symbol} in {DATA_DIR}."
+
+    m5_df_full = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
+    m5_df_full['time'] = pd.to_datetime(m5_df_full['time'], utc=True)
+
+    latest_bar_time = m5_df_full['time'].iloc[-1]
+    fixed_end_utc = latest_bar_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    if latest_bar_time < fixed_end_utc:
+        fixed_end_utc -= timedelta(days=1)
+
+    m5_df = m5_df_full[m5_df_full['time'] <= fixed_end_utc].copy().reset_index(drop=True)
+    total_bars = len(m5_df)
+
+    window_cutoff = fixed_end_utc - timedelta(days=days_count)
+    matching = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching[0]) if matching else max(120, total_bars - 1)
+
+    window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
+    window_end_str = fixed_end_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    diff_lines = []
+    diff_lines.append("=" * 80)
+    diff_lines.append("NEXUS MATRIX VERIFICATION HARNESS (PROMPT F: 4 COMBINATIONS · 30 DAYS)")
+    diff_lines.append("=" * 80)
+    diff_lines.append(f"• Asset Under Test  : {symbol}")
+    diff_lines.append(f"• Fixed End Time    : {window_end_str} (Frozen at 00:00 UTC boundary)")
+    diff_lines.append(f"• Fixed Start Time  : {window_start_str}")
+    diff_lines.append(f"• In-Window Bars    : {total_bars - sim_start_idx:,} M5 candles")
+    diff_lines.append(f"• Market Data Used  : Local CSV cache only (Zero network download)")
+    diff_lines.append("-" * 80)
+
+    precomputed = precompute_market_pass(
+        symbol=symbol,
+        m5_df=m5_df,
+        h1_df=h1_df,
+        h4_df=h4_df,
+        d1_df=d1_df,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars
+    )
+
+    test_combos = [
+        {"mode": "adaptive", "adaptive_mode": True,  "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Adaptive · BE off · Trail off"},
+        {"mode": "adaptive", "adaptive_mode": True,  "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Adaptive · BE on · Trail on"},
+        {"mode": "legacy",   "adaptive_mode": False, "be": "off", "use_be": False, "trail": "off", "use_trail": False, "label": "Legacy · BE off · Trail off"},
+        {"mode": "legacy",   "adaptive_mode": False, "be": "on",  "use_be": True,  "trail": "on",  "use_trail": True,  "label": "Legacy · BE on · Trail on"},
+    ]
+
+    all_verdicts = []
+
+    for c_idx, combo in enumerate(test_combos):
+        combo_label = combo["label"]
+        print(f"[*] Verifying combo {c_idx + 1}/4: {combo_label}...", flush=True)
+
+        t0 = time.perf_counter()
+        ref_res = run_backtest_reference(
+            symbol=symbol,
+            m5_df=m5_df,
+            h1_df=h1_df,
+            h4_df=h4_df,
+            d1_df=d1_df,
+            sim_start_idx=sim_start_idx,
+            total_bars=total_bars,
+            adaptive_mode=combo["adaptive_mode"],
+            use_be=combo["use_be"],
+            use_trail=combo["use_trail"],
+            eurusd_df=eurusd_df
+        )
+        t_ref = time.perf_counter() - t0
+        ref_trades = ref_res["trades"]
+        ref_kpis = ref_res["kpis"]
+
+        t0 = time.perf_counter()
+        fast_res = run_cached_combination(
+            symbol=symbol,
+            m5_df=m5_df,
+            precomputed=precomputed,
+            sim_start_idx=sim_start_idx,
+            total_bars=total_bars,
+            combo=combo,
+            days_count=days_count,
+            window_start_str=window_start_str,
+            window_end_str=window_end_str,
+            history_days_before_window=0.0,
+            eurusd_df=eurusd_df
+        )
+        t_fast = time.perf_counter() - t0
+        fast_trades = fast_res["trades"]
+        fast_kpis = fast_res["kpis"]
+
+        divergences = []
+        n_compare = max(len(ref_trades), len(fast_trades))
+
+        for idx in range(n_compare):
+            if idx >= len(ref_trades):
+                divergences.append({"trade_num": idx + 1, "stage": "EXTRA_IN_OPTIMIZED", "ref": None, "fast": fast_trades[idx]})
+                continue
+            if idx >= len(fast_trades):
+                divergences.append({"trade_num": idx + 1, "stage": "MISSING_IN_OPTIMIZED", "ref": ref_trades[idx], "fast": None})
+                continue
+
+            r = ref_trades[idx]
+            f = fast_trades[idx]
+
+            diff_stage = None
+            if r['signal_time_utc'] != f['signal_time_utc'] or r['direction'] != f['direction'] or r['strategy'] != f['strategy']:
+                diff_stage = "SIGNAL"
+            elif abs(r['entry_price'] - f['entry_price']) > 1e-4:
+                diff_stage = "ENTRY_FILL"
+            elif abs(r['sl'] - f['sl']) > 1e-4 or abs(r['tp'] - f['tp']) > 1e-4:
+                diff_stage = "ADAPTED_SL_TP"
+            elif r['exit_time'] != f['exit_time'] or abs(r['exit_price'] - f['exit_price']) > 1e-4 or r['exit_reason'] != f['exit_reason']:
+                diff_stage = "EXIT"
+            elif abs(r['money_pnl'] - f['money_pnl']) > 1e-2:
+                diff_stage = "PNL"
+
+            if diff_stage is not None:
+                divergences.append({"trade_num": idx + 1, "stage": diff_stage, "ref": r, "fast": f})
+
+        diff_lines.append(f"\n[COMBO {c_idx + 1}/4] {combo_label}")
+        diff_lines.append(f"  • Reference (Per-Candle) : {len(ref_trades)} trades | Net P&L: ${ref_kpis['net_pnl']} | WR: {ref_kpis['win_rate']}% | Time: {t_ref:.2f}s")
+        diff_lines.append(f"  • Optimized (Precompute) : {len(fast_trades)} trades | Net P&L: ${fast_kpis['net_pnl']} | WR: {fast_kpis['win_rate']}% | Time: {t_fast:.2f}s")
+        diff_lines.append(f"  • Compared Trades Count  : {n_compare} total executions analyzed")
+
+        if not divergences:
+            diff_lines.append("  • Match Status           : 100% IDENTICAL across all fields")
+            all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): VERIFIED IDENTICAL ({len(ref_trades)} trades, 0 differences)")
+        else:
+            diff_lines.append(f"  • Divergent Trades Found : {len(divergences)} trade(s) differed")
+            all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): DIVERGENCE DETECTED ({len(divergences)} trades differ)")
+            diff_lines.append(f"  --- First {min(5, len(divergences))} Divergent Trades ---")
+            for d_item in divergences[:5]:
+                t_num = d_item["trade_num"]
+                stage = d_item["stage"]
+                r = d_item["ref"]
+                f = d_item["fast"]
+                diff_lines.append(f"  [Trade #{t_num} Diverged First At: {stage}]")
+                if r:
+                    diff_lines.append(f"    • Ref  : {r['signal_time_utc']} {r['direction']} {r['strategy']} | Entry: {r['entry_price']} | SL: {r['sl']} | TP: {r['tp']} | Exit: {r['exit_time']} @ {r['exit_price']} ({r['exit_reason']}) | Net: ${r['money_pnl']}")
+                if f:
+                    diff_lines.append(f"    • Fast : {f['signal_time_utc']} {f['direction']} {f['strategy']} | Entry: {f['entry_price']} | SL: {f['sl']} | TP: {f['tp']} | Exit: {f['exit_time']} @ {f['exit_price']} ({f['exit_reason']}) | Net: ${f['money_pnl']}")
+
+    diff_lines.append("\n" + "=" * 80)
+    diff_lines.append("FOUR-COMBINATION VERDICT SUMMARY:")
+    for v_line in all_verdicts:
+        diff_lines.append(f"  ✓ {v_line}")
+
+    final_report = "\n".join(diff_lines)
+    print(final_report, flush=True)
+    return final_report
+
+
+async def run_symbol_matrix(
+    client: CTraderClient,
+    symbol: str,
+    days_count: int,
+    eurusd_df: Optional[pd.DataFrame] = None,
+    variants: bool = False,
+) -> bool:
+    orig_adaptive = GLOBAL_PARAMS.adaptive_mode
+    orig_be = GLOBAL_PARAMS.use_breakeven
+    orig_trail = GLOBAL_PARAMS.use_supertrend_trail
+
+    for pattern in [f"{symbol}_*_report.json", f"{symbol}_summary.json", f"{symbol}_daycandles.json",
+                    f"{symbol}_adaptive_report.json", f"{symbol}_legacy_report.json", f"{symbol}_variants.json"]:
+        for fpath in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+
+    for pattern in [f"{symbol}_*_trades.csv", f"{symbol}_*_trades.json", f"{symbol}_*_skipped_signals.csv"]:
+        for fpath in glob.glob(os.path.join(DATA_DIR, pattern)):
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+
+    report_html = os.path.join(DATA_DIR, "report.html")
+    if os.path.exists(report_html):
+        try:
+            os.remove(report_html)
+        except OSError:
+            pass
+
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        print(f"ERROR: Incomplete data files for {symbol} in {DATA_DIR}.", flush=True)
+        return False
+
+    m5_df = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
+
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    total_bars = len(m5_df)
+
+    if total_bars < 130:
+        print(f"ERROR: Insufficient data bars for {symbol} ({total_bars} bars).", flush=True)
+        return False
+
+    last_bar_time = m5_df['time'].iloc[-1]
+    window_cutoff = last_bar_time - timedelta(days=days_count)
+    matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
+
+    window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
+    window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+    history_days_before_window = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
+
+    print(f"[*] {symbol}: Running shared precompute pass across {total_bars - sim_start_idx:,} candles...", flush=True)
+    precomputed = precompute_market_pass(
+        symbol=symbol,
+        m5_df=m5_df,
+        h1_df=h1_df,
+        h4_df=h4_df,
+        d1_df=d1_df,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars
+    )
+
+    matrix_rows = []
+    all_day_candles: Dict[str, Any] = {}
+
+    pre_timing = precomputed["timing"]
+    tot_agg = pre_timing["aggregator_s"]
+    tot_vol = pre_timing["volatility_s"]
+    tot_lvl = pre_timing["session_levels_s"]
+    tot_strat = pre_timing["strategies_s"]
+    tot_sim = 0.0
+    tot_rep = 0.0
+
+    try:
+        for idx, combo in enumerate(COMBINATIONS):
+            res = run_cached_combination(
+                symbol=symbol,
+                m5_df=m5_df,
+                precomputed=precomputed,
+                sim_start_idx=sim_start_idx,
+                total_bars=total_bars,
+                combo=combo,
+                days_count=days_count,
+                window_start_str=window_start_str,
+                window_end_str=window_end_str,
+                history_days_before_window=history_days_before_window,
+                eurusd_df=eurusd_df
+            )
+
+            k = res["kpis"]
+            timing = res.get("timing", {})
+            tot_vol += timing.get("volatility_s", 0.0)
+            tot_strat += timing.get("strategies_s", 0.0)
+            tot_sim += timing.get("simulator_s", 0.0)
+            tot_rep += timing.get("report_writing_s", 0.0)
+
+            matrix_rows.append({
+                "label": combo["label"],
+                "mode": combo["mode"],
+                "be": combo["be"],
+                "trail": combo["trail"],
+                "report_file": res["report_file"],
+                "total_trades": k["count"],
+                "win_rate": k["win_rate"],
+                "expectancy": k["expectancy"],
+                "profit_factor": k["profit_factor"],
+                "max_drawdown": k["max_dd_money"],
+                "net_pnl": k["net_pnl"],
+                "adaptive_effective_pct": res["adaptive_pct"],
+                "funnel": res["funnel"],
+                "tune_validate": res["tune_validate"],
+            })
+
+            day_candles = res.get("day_candles", {})
+            for d_str, c_list in day_candles.items():
+                if d_str not in all_day_candles:
+                    all_day_candles[d_str] = c_list
+
+            print(f"[*] {symbol} combo {idx + 1}/8 done", flush=True)
+
+        # ---- Phase-3 variant matrix (Section 5 items 22 / 23 / 25) ----
+        variant_rows: List[Dict[str, Any]] = []
+        if variants:
+            print(f"[*] {symbol}: running {len(VARIANT_COMBINATIONS)} variant combos...", flush=True)
+            for v_idx, vcombo in enumerate(VARIANT_COMBINATIONS):
+                try:
+                    v_res = run_cached_combination(
+                        symbol=symbol,
+                        m5_df=m5_df,
+                        precomputed=precomputed,
+                        sim_start_idx=sim_start_idx,
+                        total_bars=total_bars,
+                        combo=vcombo,
+                        days_count=days_count,
+                        window_start_str=window_start_str,
+                        window_end_str=window_end_str,
+                        history_days_before_window=history_days_before_window,
+                        eurusd_df=eurusd_df,
+                        be_mode=vcombo.get("be_mode", "FIXED_80"),
+                        trail_override=vcombo.get("trail_override"),
+                        max_daily_override=vcombo.get("max_daily_override"),
+                        report_file_override=vcombo.get("report_file"),
+                    )
+
+                    v_k = v_res["kpis"]
+                    v_timing = v_res.get("timing", {})
+                    tot_vol += v_timing.get("volatility_s", 0.0)
+                    tot_strat += v_timing.get("strategies_s", 0.0)
+                    tot_sim += v_timing.get("simulator_s", 0.0)
+                    tot_rep += v_timing.get("report_writing_s", 0.0)
+
+                    variant_rows.append({
+                        "label": vcombo["label"],
+                        "mode": vcombo["mode"],
+                        "be": vcombo["be"],
+                        "trail": vcombo["trail"],
+                        "be_mode": vcombo.get("be_mode", "FIXED_80"),
+                        "trail_override": vcombo.get("trail_override"),
+                        "max_daily_override": vcombo.get("max_daily_override"),
+                        "report_file": v_res["report_file"],
+                        "total_trades": v_k["count"],
+                        "win_rate": v_k["win_rate"],
+                        "expectancy": v_k["expectancy"],
+                        "profit_factor": v_k["profit_factor"],
+                        "max_drawdown": v_k["max_dd_money"],
+                        "net_pnl": v_k["net_pnl"],
+                        "adaptive_effective_pct": v_res["adaptive_pct"],
+                        "funnel": v_res["funnel"],
+                        "tune_validate": v_res["tune_validate"],
+                    })
+
+                    v_day_candles = v_res.get("day_candles", {})
+                    for d_str, c_list in v_day_candles.items():
+                        if d_str not in all_day_candles:
+                            all_day_candles[d_str] = c_list
+
+                except Exception as ve:
+                    print(f"ERROR: variant '{vcombo.get('label', '?')}' failed on {symbol}: {ve}", flush=True)
+                    variant_rows.append({
+                        "label": vcombo.get("label", "UNKNOWN"),
+                        "error": str(ve),
+                        "total_trades": 0,
+                        "win_rate": 0.0,
+                        "expectancy": 0.0,
+                        "profit_factor": 0.0,
+                        "max_drawdown": 0.0,
+                        "net_pnl": 0.0,
+                    })
+
+                print(f"[*] {symbol} variant {v_idx + 1}/{len(VARIANT_COMBINATIONS)} done", flush=True)
+
+        _t0 = time.perf_counter()
+        if all_day_candles:
+            candles_file = os.path.join(OUTPUT_DIR, f"{symbol}_daycandles.json")
+            safe_candles = sanitize_for_json(all_day_candles)
+            with open(candles_file, "w") as f:
+                json.dump(safe_candles, f, separators=(",", ":"), allow_nan=False)
+
+        total_pair_seconds = round(tot_agg + tot_vol + tot_lvl + tot_strat + tot_sim + tot_rep, 1)
+
+        summary_payload = {
+            "symbol": symbol,
+            "days": days_count,
+            "target_rr": GLOBAL_PARAMS.target_rr,
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "total_seconds": total_pair_seconds,
+            "phase_seconds": {
+                "aggregator_s": round(tot_agg, 1),
+                "volatility_s": round(tot_vol, 1),
+                "session_levels_s": round(tot_lvl, 1),
+                "strategies_s": round(tot_strat, 1),
+                "simulator_s": round(tot_sim, 1),
+                "report_writing_s": round(tot_rep, 1),
+            },
+            "cpu_cores": os.cpu_count() or 1,
+            "concurrent_processes": int(os.getenv("BACKTEST_CONCURRENT_WORKERS", "1")),
+            "combinations": matrix_rows,
+        }
+
+        summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
+        safe_summary = sanitize_for_json(summary_payload)
+        with open(summary_file, "w") as f:
+            json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
+        tot_rep += time.perf_counter() - _t0
+
+        # ---- Phase-3 variants summary file ----
+        if variants and variant_rows:
+            try:
+                variants_payload = {
+                    "symbol": symbol,
+                    "days": days_count,
+                    "target_rr": GLOBAL_PARAMS.target_rr,
+                    "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "variants": variant_rows,
+                }
+                variants_file = os.path.join(OUTPUT_DIR, f"{symbol}_variants.json")
+                safe_variants = sanitize_for_json(variants_payload)
+                with open(variants_file, "w") as f:
+                    json.dump(safe_variants, f, separators=(",", ":"), allow_nan=False)
+                print(f"[✓] {symbol} Variants saved to {variants_file}", flush=True)
+            except Exception as ve:
+                print(f"ERROR: saving variants file for {symbol} failed: {ve}", flush=True)
+
+        print(
+            f"[time] {symbol} aggregator {tot_agg:.1f}s, volatility {tot_vol:.1f}s, "
+            f"session_levels {tot_lvl:.1f}s, strategies {tot_strat:.1f}s, "
+            f"simulator {tot_sim:.1f}s, report_writing {tot_rep:.1f}s | Total: {total_pair_seconds:.1f}s",
+            flush=True
+        )
+
+        print(f"[✓] {symbol} Matrix Complete: 8/8 combinations saved to {summary_file}", flush=True)
+        return len(matrix_rows) > 0
+
+    finally:
+        GLOBAL_PARAMS.adaptive_mode = orig_adaptive
+        GLOBAL_PARAMS.use_breakeven = orig_be
+        GLOBAL_PARAMS.use_supertrend_trail = orig_trail
+
+
+# -----------------------------------------------------------------------------
+# Strategy Lab
+# -----------------------------------------------------------------------------
+
+def _lab_kpis_and_split(trades: List[Dict[str, Any]], window_start_str: str, window_end_str: str) -> Dict[str, Any]:
+    kpis = calculate_kpis(trades)
+    tv = compute_tune_validate_kpis(trades, window_start_str, window_end_str)
+    return {
+        "trades": kpis["count"],
+        "win_rate": kpis["win_rate"],
+        "profit_factor": kpis["profit_factor"],
+        "max_drawdown": kpis["max_dd_money"],
+        "net_pnl": kpis["net_pnl"],
+        "expectancy": kpis["expectancy"],
+        "tune_pf": tv["tune"]["profit_factor"],
+        "tune_trades": tv["tune"]["count"],
+        "validate_pf": tv["validate"]["profit_factor"],
+        "validate_trades": tv["validate"]["count"],
+    }
+
+
+def _lab_verdict(baseline: Optional[Dict[str, Any]], variant: Dict[str, Any]) -> str:
+    """
+    Verdict for a lab variant relative to the baseline:
+      IMPROVES      PF above baseline by >= 0.05 in BOTH TUNE and VALIDATE,
+                    with >= 30 trades in each window.
+      INCONCLUSIVE  Fewer than 30 trades in either window.
+      NO            Anything else.
+    """
+    if baseline is None:
+        return "INCONCLUSIVE"
+    if variant["tune_trades"] < 30 or variant["validate_trades"] < 30:
+        return "INCONCLUSIVE"
+    if (variant["tune_pf"] >= baseline["tune_pf"] + 0.05
+            and variant["validate_pf"] >= baseline["validate_pf"] + 0.05):
+        return "IMPROVES"
+    return "NO"
+
+
+def run_lab_combination(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    precomputed: Dict[str, Any],
+    sim_start_idx: int,
+    total_bars: int,
+    filter_overrides: Dict[str, Any],
+    target_rr_value: float,
+    sm_for_filters: StrategyManager,
+    balance: float = 1000.0,
+    risk_pct: float = 1.0,
+    eurusd_df: Optional[pd.DataFrame] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Runs ONE lab variant. Always uses Adaptive · BE on · Trail off. Applies the
+    per-variant filter overrides via the strategy manager's _apply_post_filters
+    hook (which reads from GLOBAL_PARAMS). Restores GLOBAL_PARAMS on exit.
+    """
+    saved = {
+        'adaptive_mode': GLOBAL_PARAMS.adaptive_mode,
+        'use_breakeven': GLOBAL_PARAMS.use_breakeven,
+        'use_supertrend_trail': GLOBAL_PARAMS.use_supertrend_trail,
+        'target_rr': GLOBAL_PARAMS.target_rr,
+        'strat_disabled': list(getattr(GLOBAL_PARAMS, 'strat_disabled', []) or []),
+        'strat_session_window_sast': getattr(GLOBAL_PARAMS, 'strat_session_window_sast', None),
+        'strat_htf_trend_filter': getattr(GLOBAL_PARAMS, 'strat_htf_trend_filter', False),
+        'strat_min_stop_atr': getattr(GLOBAL_PARAMS, 'strat_min_stop_atr', 0.0),
+        'strat_max_spread_in_r': getattr(GLOBAL_PARAMS, 'strat_max_spread_in_r', 0.0),
+    }
+    try:
+        GLOBAL_PARAMS.adaptive_mode = True
+        GLOBAL_PARAMS.use_breakeven = True
+        GLOBAL_PARAMS.use_supertrend_trail = False
+        GLOBAL_PARAMS.target_rr = float(target_rr_value)
+
+        if 'strat_disabled' in filter_overrides:
+            GLOBAL_PARAMS.strat_disabled = list(filter_overrides['strat_disabled'])
+        if 'strat_session_window_sast' in filter_overrides:
+            GLOBAL_PARAMS.strat_session_window_sast = filter_overrides['strat_session_window_sast']
+        if 'strat_htf_trend_filter' in filter_overrides:
+            GLOBAL_PARAMS.strat_htf_trend_filter = bool(filter_overrides['strat_htf_trend_filter'])
+        if 'strat_min_stop_atr' in filter_overrides:
+            GLOBAL_PARAMS.strat_min_stop_atr = float(filter_overrides['strat_min_stop_atr'])
+        if 'strat_max_spread_in_r' in filter_overrides:
+            GLOBAL_PARAMS.strat_max_spread_in_r = float(filter_overrides['strat_max_spread_in_r'])
+
+        sim = TradeSimulator(
+            starting_balance=balance,
+            risk_pct=risk_pct,
+            eurusd_df=eurusd_df,
+            be_mode="FIXED_80",
+        )
+        cached_signals = precomputed["cached_signals"]
+        m5_times_list = m5_df['time'].tolist()
+        has_ema200_col = 'ema_200' in m5_df.columns
+
+        for i in range(sim_start_idx, total_bars):
+            curr_bar = m5_df.iloc[i]
+            curr_time = m5_times_list[i].to_pydatetime()
+
+            if sim.open_positions or sim.pending_sl_evaluations:
+                m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+                sim.process_candle(symbol, curr_bar, m5_slice)
+
+            if i not in cached_signals:
+                continue
+
+            item = cached_signals[i]
+            signal = copy.deepcopy(item["raw_signal"])
+            active_vol = item["active_vol"]
+            session_levels = item["session_levels"]
+            adr_val = item["adr_val"]
+            regime = item["regime"]
+            d1_view = item.get("d1_view")
+
+            m5_slice_for_filter = m5_df.iloc[max(0, i - 120):i + 1]
+
+            # Reuse the strategy manager's filter method.
+            reason = sm_for_filters._apply_post_filters(signal, m5_slice_for_filter, d1_view, curr_time)
+            if reason is not None:
+                continue
+
+            if not active_vol.get("valid", False):
+                continue
+
+            adapted = volatility_engine.adapt_signal(
+                signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels
+            )
+            if not adapted:
+                continue
+
+            spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
+            sl_dist = abs(adapted.entry_price - adapted.stop_loss)
+            tp_dist = abs(adapted.take_profit_2 - adapted.entry_price)
+            vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+                active_vol, spread, sl_dist, tp_dist,
+                adapted.direction, adapted.entry_price, adapted.strategy
+            )
+            if not vol_ok:
+                continue
+
+            signal = adapted
+
+            has_open = any(p["symbol"] == symbol for p in sim.open_positions)
+            if not has_open:
+                ema_200_val: Optional[float] = None
+                if has_ema200_col:
+                    try:
+                        v = float(m5_df.iloc[i]['ema_200'])
+                        if not math.isnan(v):
+                            ema_200_val = v
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        ema_200_val = None
+                sim.open_trade(
+                    signal, curr_time, adr_val, regime, session_levels,
+                    ema_200_value=ema_200_val,
+                )
+
+        if len(m5_df) > 0 and len(sim.open_positions) > 0:
+            sim.close_all(symbol, m5_df.iloc[-1])
+
+        return sim.completed_trades
+    finally:
+        for k, v in saved.items():
+            setattr(GLOBAL_PARAMS, k, v)
+
+
+async def run_strategy_lab(
+    client: CTraderClient,
+    symbol: str,
+    days_count: int = 365,
+    eurusd_df: Optional[pd.DataFrame] = None,
+) -> bool:
+    """
+    Runs all 12 lab variants on the 365-day window (Adaptive · BE on · Trail off),
+    writes {SYMBOL}_lab.json to OUTPUT_DIR, and returns True on success.
+    Reuses the precompute pass across all variants.
+    """
+    print(f"[LAB] {symbol}: starting Strategy Lab on {days_count}-day window...", flush=True)
+
+    m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{symbol}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        print(f"[LAB] ERROR: Incomplete data files for {symbol}. Run a normal backtest first.", flush=True)
+        return False
+
+    m5_df = pd.read_csv(m5_path)
+    h1_df = pd.read_csv(h1_path)
+    h4_df = pd.read_csv(h4_path)
+    d1_df = pd.read_csv(d1_path)
+    m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    total_bars = len(m5_df)
+
+    if total_bars < 130:
+        print(f"[LAB] ERROR: Insufficient bars for {symbol} ({total_bars} < 130).", flush=True)
+        return False
+
+    last_bar_time = m5_df['time'].iloc[-1]
+    window_cutoff = last_bar_time - timedelta(days=days_count)
+    matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+    sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
+    window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
+    window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    print(f"[LAB] {symbol}: precomputing once over {total_bars - sim_start_idx:,} candles...", flush=True)
+    precomputed = precompute_market_pass(
+        symbol=symbol,
+        m5_df=m5_df,
+        h1_df=h1_df,
+        h4_df=h4_df,
+        d1_df=d1_df,
+        sim_start_idx=sim_start_idx,
+        total_bars=total_bars,
+    )
+
+    lab_file = os.path.join(OUTPUT_DIR, f"{symbol}_lab.json")
+    if os.path.exists(lab_file):
+        try:
+            os.remove(lab_file)
+        except OSError:
+            pass
+
+    sm_for_filters = StrategyManager()
+    results: List[Dict[str, Any]] = []
+    baseline_kpis: Optional[Dict[str, Any]] = None
+
+    for idx, variant in enumerate(LAB_VARIANTS):
+        label = variant["label"]
+        overrides = dict(variant["overrides"])
+        target_rr_value = float(overrides.pop("target_rr", 1.0))
+
+        print(f"[LAB] {symbol}: variant {idx + 1}/{len(LAB_VARIANTS)} — {label}", flush=True)
+        try:
+            trades = run_lab_combination(
+                symbol=symbol,
+                m5_df=m5_df,
+                precomputed=precomputed,
+                sim_start_idx=sim_start_idx,
+                total_bars=total_bars,
+                filter_overrides=overrides,
+                target_rr_value=target_rr_value,
+                sm_for_filters=sm_for_filters,
+                eurusd_df=eurusd_df,
+            )
+            kpi = _lab_kpis_and_split(trades, window_start_str, window_end_str)
+        except Exception as e:
+            print(f"[LAB] {symbol}: variant '{label}' failed: {e}", flush=True)
+            kpi = {
+                "trades": 0, "win_rate": 0.0, "profit_factor": 0.0,
+                "max_drawdown": 0.0, "net_pnl": 0.0, "expectancy": 0.0,
+                "tune_pf": 0.0, "tune_trades": 0,
+                "validate_pf": 0.0, "validate_trades": 0,
+            }
+
+        row = {"label": label, **kpi}
+        if label == "Baseline":
+            baseline_kpis = kpi
+        results.append(row)
+
+    for row in results:
+        row["verdict"] = _lab_verdict(baseline_kpis, row)
+
+    payload = {
+        "symbol": symbol,
+        "days": days_count,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "window_start": window_start_str,
+        "window_end": window_end_str,
+        "baseline_label": "Baseline",
+        "variants": results,
+    }
+    safe = sanitize_for_json(payload)
+    with open(lab_file, "w") as f:
+        json.dump(safe, f, separators=(",", ":"), allow_nan=False)
+
+    print(f"[LAB] {symbol}: saved lab results to {lab_file}", flush=True)
+    return True
+
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", type=str, default="US30")
+    parser.add_argument("--symbols", type=str, default=None,
+                        help="Comma-separated list of symbols (overrides --symbol)")
+    parser.add_argument("--days", type=int, default=60)
+    parser.add_argument("--rr", type=float, default=1.0, help="Target R:R multiplier")
+    parser.add_argument("--mode", type=str, default=None)
+    parser.add_argument("--adaptive", action="store_true", default=True)
+    parser.add_argument("--breakeven", type=str, default="off")
+    parser.add_argument("--supertrend", type=str, default="on")
+    parser.add_argument("--compare", action="store_true", default=False,
+                        help="Run 4-combination verification vs reference engine")
+    parser.add_argument("--prepare-only", action="store_true", default=False,
+                        help="Prepare and update market data only, then exit")
+    parser.add_argument("--skip-download", action="store_true", default=False,
+                        help="Skip downloading data and run matrix from local cache")
+    parser.add_argument("--variants", action="store_true", default=False,
+                        help="Also run Phase-3 variant combos and save <symbol>_variants.json")
+    parser.add_argument("--portfolio-only", action="store_true", default=False,
+                        help="Only compute the cross-pair correlation matrix and exit")
+    parser.add_argument("--lab", action="store_true", default=False,
+                        help="Run Strategy Lab on the given symbol(s) and write <symbol>_lab.json")
+    args = parser.parse_args()
+
+    # Resolve symbol list
+    if args.symbols:
+        symbols_list = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols_list = [args.symbol.upper()]
+
+    client = CTraderClient()
+
+    if args.portfolio_only:
+        ok = write_portfolio_correlation()
+        sys.exit(0 if ok else 1)
+
+    if args.prepare_only:
+        overall_ok = True
+        for sym in symbols_list:
+            ok = await ensure_symbol_data(client, sym)
+            if not ok:
+                overall_ok = False
+            if sym == "GERMAN30":
+                await ensure_symbol_data(client, "EURUSD")
+        if client.ws:
+            try:
+                await client.ws.close()
+            except Exception:
+                pass
+        sys.exit(0 if overall_ok else 1)
+
+    if args.compare:
+        sym = symbols_list[0]
+        eurusd_df: Optional[pd.DataFrame] = None
+        if sym == "GERMAN30":
+            eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+            if os.path.exists(eurusd_path):
+                eurusd_df = pd.read_csv(eurusd_path)
+        res_text = compare_runs(symbol=sym, days_count=30, eurusd_df=eurusd_df)
+        return
+
+    if args.lab:
+        overall_ok = True
+        for sym in symbols_list:
+            eurusd_df: Optional[pd.DataFrame] = None
+            if sym == "GERMAN30":
+                eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+                if os.path.exists(eurusd_path):
+                    try:
+                        eurusd_df = pd.read_csv(eurusd_path)
+                    except Exception as e:
+                        print(f"[LAB] {sym}: could not load EURUSD history: {e}", flush=True)
+                        overall_ok = False
+                        continue
+                else:
+                    print(f"[LAB] {sym}: EURUSD history missing (required for GERMAN30)", flush=True)
+                    overall_ok = False
+                    continue
+            try:
+                ok = await run_strategy_lab(client, sym, days_count=365, eurusd_df=eurusd_df)
+                if not ok:
+                    overall_ok = False
+            except Exception as e:
+                print(f"[LAB] {sym}: fatal error: {e}", flush=True)
+                overall_ok = False
+
+        if client.ws:
+            try:
+                await client.ws.close()
+            except Exception:
+                pass
+        sys.exit(0 if overall_ok else 1)
+
+    # Normal backtest path (single or multi-symbol)
+    usage = shutil.disk_usage(OUTPUT_DIR)
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb < 80.0:
+        print(f"ERROR: Low disk space on storage volume ({int(free_mb)} MB free). Clear old reports from the Storage panel.", flush=True)
+        sys.exit(1)
+
+    GLOBAL_PARAMS.target_rr = args.rr
+
+    all_ok = True
+    for sym in symbols_list:
+        if not args.skip_download:
+            ok = await ensure_symbol_data(client, sym)
+        else:
+            ok = True
+
+        eurusd_df: Optional[pd.DataFrame] = None
+        if sym == "GERMAN30":
+            if not args.skip_download:
+                eurusd_ok = await ensure_symbol_data(client, "EURUSD")
+            else:
+                eurusd_ok = True
+            eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+            if not eurusd_ok or not os.path.exists(eurusd_path):
+                print(f"ERROR: GERMAN30 needs EURUSD history", flush=True)
+                all_ok = False
+                continue
+            try:
+                eurusd_df = pd.read_csv(eurusd_path)
+            except Exception:
+                print(f"ERROR: GERMAN30 needs EURUSD history", flush=True)
+                all_ok = False
+                continue
+
+        success = False
+        if ok:
+            success = await run_symbol_matrix(
+                client, sym, args.days,
+                eurusd_df=eurusd_df,
+                variants=args.variants,
+            )
+        if not success:
+            all_ok = False
+
+    # Refresh the portfolio correlation once at the end
+    try:
+        write_portfolio_correlation()
+    except Exception as pe:
+        print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
+
+    # PROPOSED: refresh the pooled entry-feature analysis. Pooled over every
+    # pair's Adaptive · BE off · Trail off report written during this run.
+    try:
+        write_entry_analysis(OUTPUT_DIR)
+    except Exception as ea:
+        print(f"WARNING: entry analysis refresh failed: {ea}", flush=True)
+
+    if client.ws:
+        try:
+            await client.ws.close()
+        except Exception:
+            pass
+
+    sys.exit(0 if all_ok else 1)
+
+
+def print_startup_diagnostics() -> None:
+    print("=" * 60, flush=True)
+    print("BACKTEST STARTUP DIAGNOSTICS", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Python version: {sys.version.split()[0]}", flush=True)
+
+    env_checks = [
+        "CTRADER_CLIENT_ID",
+        "CTRADER_CLIENT_SECRET",
+        "CTRADER_ACCESS_TOKEN",
+        "CTRADER_ACCOUNT_ID",
+    ]
+    for key in env_checks:
+        value = os.environ.get(key, "").strip()
+        status = "SET" if value else "MISSING"
+        print(f"{key}: {status}", flush=True)
+    print("=" * 60, flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        from dotenv import load_dotenv
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        load_dotenv(os.path.join(project_root, '.env'))
+    except ImportError:
+        pass
+
+    print_startup_diagnostics()
+    asyncio.run(main())
