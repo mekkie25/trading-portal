@@ -7,6 +7,25 @@ Called by runner.py right before sim.open_trade. The returned dict is stored
 with the trade and later pooled by backtest/entry_analysis.py.
 
 PROPOSED: backtest-only. No effect on live trading.
+
+PROPOSED: 17 features. The original 12 from the earlier pass plus five
+requested by the entry-condition prompt:
+  - session        : session in force on the SAST clock
+  - hour_sast      : SAST hour grouped into 3-hour blocks (0..7)
+  - weekday        : SAST weekday 0=Mon..6=Sun
+  - direction      : +1 for BUY, -1 for SELL, 0 otherwise
+  - setup_tag      : string sub-type read from the strategy's own signal,
+                     or "none" if nothing is present. Read-only.
+
+PROPOSED: _last_closed_context accepts a min_bars argument. This matters
+because the H4 buffer in the aggregator is 30 rows, but the intended H4
+filter uses a 50-period EMA. Requiring 51 closed bars would make htf_h4
+default to 0 for every single trade, which is exactly what the previous
+run showed. With min_bars we allow an under-warmed but still directional
+50-period EMA on the 29 closed bars we actually have. The value is honest
+(a 50-period EMA seeded with 29 bars is less precise but its sign matches
+the trend), and it is the same computation the live bot would produce if
+it only had 30 H4 bars.
 """
 from __future__ import annotations
 
@@ -26,7 +45,7 @@ except ImportError:
 
 
 FEATURE_NAMES = [
-    # Existing 12
+    # Original 12
     "htf_d1",
     "htf_h4",
     "ema200_dist_atr",
@@ -39,7 +58,7 @@ FEATURE_NAMES = [
     "stop_atr",
     "spread_r",
     "trade_of_day",
-    # PROPOSED: five additional features requested by the entry-condition prompt
+    # PROPOSED: five additional features
     "session",
     "hour_sast",
     "weekday",
@@ -65,15 +84,35 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
-def _last_closed_context(view_df: pd.DataFrame, ema_span: int):
-    """Return (last_close, ema_value) using only closed bars, or None."""
-    if view_df is None or len(view_df) == 0:
+def _last_closed_context(
+    view_df: Optional[pd.DataFrame],
+    ema_span: int,
+    min_bars: Optional[int] = None,
+):
+    """
+    Return (last_close, ema_value) using only closed bars, or None.
+
+    min_bars: minimum number of closed bars required. Defaults to ema_span.
+    Pass a smaller value when the source buffer is smaller than the span.
+    The EMA is still computed with the requested ema_span, it is simply
+    under-warmed at the start of the buffer.
+    """
+    if view_df is None or not hasattr(view_df, "columns"):
         return None
-    df = view_df.dropna(subset=["close"]) if "close" in view_df.columns else view_df
-    if df is None or len(df) < ema_span + 1:
+    if "close" not in view_df.columns:
         return None
+    try:
+        df = view_df.dropna(subset=["close"])
+    except Exception:
+        return None
+    if df is None or len(df) < 2:
+        return None
+    # Drop the currently forming bar (the last row of the aggregator view).
     closed = df.iloc[:-1]
-    if len(closed) < ema_span:
+    if len(closed) < 2:
+        return None
+    required = min_bars if min_bars is not None else ema_span
+    if len(closed) < required:
         return None
     try:
         ema = float(closed["close"].ewm(span=ema_span, adjust=False).mean().iloc[-1])
@@ -106,7 +145,7 @@ def _eff_ratio(m5_slice: pd.DataFrame, window: int = 30) -> float:
     return (net / path) if path > 0 else 0.0
 
 
-def _mins_since_session_open(curr_time_utc: datetime) -> int:
+def _mins_since_session_open(curr_time_utc: Optional[datetime]) -> int:
     """
     60-minute bucket since the most recent of:
       - London 08:00 local
@@ -137,7 +176,12 @@ def _mins_since_session_open(curr_time_utc: datetime) -> int:
     return mins // 60
 
 
-def _room_atr(session_levels: Optional[Dict[str, Any]], entry: float, direction: str, atr: float) -> float:
+def _room_atr(
+    session_levels: Optional[Dict[str, Any]],
+    entry: float,
+    direction: str,
+    atr: float,
+) -> float:
     """Distance in ATR to the nearest key level beyond the entry."""
     if atr <= 0 or not session_levels:
         return 0.0
@@ -195,56 +239,68 @@ def _atr_fallback(m5_slice: pd.DataFrame) -> float:
 
 
 # ---------------------------------------------------------------------------
-# PROPOSED: five new features. All read-only, all zero look-ahead.
+# PROPOSED: five new features.
 # ---------------------------------------------------------------------------
 
-def _session_code(curr_time_utc: datetime) -> int:
+def _session_code(curr_time_utc: Optional[datetime]) -> int:
     """
-    PROPOSED. Session in force on the SAST wall clock:
-      0 = Asia         (01:00 - 06:00 SAST)
-      1 = London only  (08:00 - 15:30 SAST)
+    Session in force on the SAST wall clock:
+      0 = Asia          (01:00 - 06:00 SAST)
+      1 = London only   (08:00 - 15:30 SAST)
       2 = New York only (17:00 - 23:00 SAST)
-      3 = Overlap      (15:30 - 17:00 SAST)
+      3 = Overlap       (15:30 - 17:00 SAST)
       4 = Off-hours
     """
     if curr_time_utc is None:
         return 4
     if curr_time_utc.tzinfo is None:
         curr_time_utc = curr_time_utc.replace(tzinfo=timezone.utc)
-    t = curr_time_utc.astimezone(TZ_SAST)
+    try:
+        t = curr_time_utc.astimezone(TZ_SAST)
+    except Exception:
+        return 4
     mins = t.hour * 60 + t.minute
     if 60 <= mins < 360:
         return 0
-    if 930 <= mins < 1020:
-        return 3
     if 480 <= mins < 930:
         return 1
+    if 930 <= mins < 1020:
+        return 3
     if 1020 <= mins < 1380:
         return 2
     return 4
 
 
-def _hour_sast_block(curr_time_utc: datetime) -> int:
-    """PROPOSED. SAST hour grouped into 3-hour blocks (0..7). -1 if unknown."""
+def _hour_sast_block(curr_time_utc: Optional[datetime]) -> int:
+    """SAST hour grouped into 3-hour blocks (0..7). -1 if unknown."""
     if curr_time_utc is None:
         return -1
     if curr_time_utc.tzinfo is None:
         curr_time_utc = curr_time_utc.replace(tzinfo=timezone.utc)
-    return int(curr_time_utc.astimezone(TZ_SAST).hour // 3)
+    try:
+        return int(curr_time_utc.astimezone(TZ_SAST).hour // 3)
+    except Exception:
+        return -1
 
 
-def _weekday_code(curr_time_utc: datetime) -> int:
-    """PROPOSED. SAST weekday: 0=Monday .. 6=Sunday. -1 if unknown."""
+def _weekday_code(curr_time_utc: Optional[datetime]) -> int:
+    """SAST weekday: 0=Monday .. 6=Sunday. -1 if unknown."""
     if curr_time_utc is None:
         return -1
     if curr_time_utc.tzinfo is None:
         curr_time_utc = curr_time_utc.replace(tzinfo=timezone.utc)
-    return int(curr_time_utc.astimezone(TZ_SAST).weekday())
+    try:
+        return int(curr_time_utc.astimezone(TZ_SAST).weekday())
+    except Exception:
+        return -1
 
 
 def _direction_code(direction: str) -> int:
-    """PROPOSED. +1 for BUY, -1 for SELL, 0 for unknown."""
-    d = (direction or "").upper()
+    """
+    Strict: +1 only for the exact string BUY, -1 only for SELL, 0 otherwise.
+    A bad input becomes a visible 0 instead of being silently mapped.
+    """
+    d = str(direction or "").strip().upper()
     if d == "BUY":
         return 1
     if d == "SELL":
@@ -254,16 +310,22 @@ def _direction_code(direction: str) -> int:
 
 def _setup_tag(signal: Any) -> str:
     """
-    PROPOSED. Reads a sub-type label already present on the signal, if any.
-    Does not add, change or compute anything on the strategies. Falls back to
-    the literal string 'none' when nothing is present.
+    Read a sub-type label already present on the signal, if any.
+    Does not add, change or compute anything on the strategies. Falls back
+    to the literal string 'none' when nothing is present.
     """
     if signal is None:
         return "none"
-    tag = getattr(signal, "setup_tag", None)
+    try:
+        tag = getattr(signal, "setup_tag", None)
+    except Exception:
+        return "none"
     if tag is None or tag == "":
         return "none"
-    return str(tag)
+    try:
+        return str(tag)
+    except Exception:
+        return "none"
 
 
 def compute_entry_features(
@@ -283,7 +345,7 @@ def compute_entry_features(
     any internal failure so the run continues.
     """
     out: Dict[str, Any] = {k: 0 for k in FEATURE_NAMES}
-    out["setup_tag"] = "none"  # PROPOSED: string feature, default safe value
+    out["setup_tag"] = "none"  # string feature, safe default
     try:
         if signal is None or m5_df is None or idx < 0 or idx >= len(m5_df):
             return out
@@ -299,13 +361,18 @@ def compute_entry_features(
         if atr <= 0:
             atr = _atr_fallback(m5_slice)
 
-        # (a) D1 alignment
-        ctx = _last_closed_context(d1_view, 20)
+        # (a) D1 alignment. The D1 buffer in the aggregator is 150 rows, so
+        # a 20-period EMA on the ~149 closed bars is fully warmed. min_bars
+        # of 10 is a floor for safety.
+        ctx = _last_closed_context(d1_view, 20, min_bars=10)
         if ctx is not None:
             out["htf_d1"] = _align(direction, ctx[0], ctx[1])
 
-        # (b) H4 alignment
-        ctx = _last_closed_context(h4_view, 50)
+        # (b) H4 alignment. The H4 buffer in the aggregator is 30 rows, so
+        # a 50-period EMA is under-warmed at the start but still directional
+        # on the ~29 closed bars we actually have. min_bars of 20 keeps it
+        # honest without defaulting every trade to 0.
+        ctx = _last_closed_context(h4_view, 50, min_bars=20)
         if ctx is not None:
             out["htf_h4"] = _align(direction, ctx[0], ctx[1])
 
@@ -323,7 +390,7 @@ def compute_entry_features(
             if e5 is not None and e13 is not None:
                 out["ema_spread_atr"] = float(abs(e5 - e13) / atr)
 
-        # (e) Efficiency ratio over last 30 M5 candles
+        # (e) Efficiency ratio over the last 30 M5 candles
         out["eff_ratio_30"] = _eff_ratio(m5_slice, window=30)
 
         # (f) ATR14 percentile within the last 20 days

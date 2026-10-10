@@ -78,7 +78,6 @@ const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boo
   { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
   { id: 37, label: 'Bootstrap Monte Carlo resampling',           panel: true,  txt: true,  pdf: true },
   { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
-  // PROPOSED: entry-condition analysis is a TXT-only addition per the prompt.
   { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false, note: 'TXT-only, follows the portfolio section.' },
 ];
 
@@ -99,7 +98,12 @@ let backtestProgress = '';
 let backtestLastError: string | null = null;
 let backtestExitCode: number | null = null;
 let activeBacktestProcesses: ChildProcess[] = [];
-let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string }> = [];
+let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string; engine_line?: string; wrong_engine?: boolean }> = [];
+
+// PROPOSED: wall-clock tracking for the whole run. Filled from the runner's
+// [TOTAL] wall_clock_seconds=N line and from the server-side start/stop timers.
+let lastRunWallClockSeconds: number | null = null;
+let lastRunConcurrentProcesses: number | null = null;
 
 let compareRunning = false;
 let compareProgress = '';
@@ -317,7 +321,11 @@ function computePortfolioNextTests(all: Array<{ type: string }>): string[] {
 function generateExportDataPayload(): any {
   const result: any = {
     generated_at: new Date().toISOString(), days: 60, rr_values: [1.0, 2.0, 3.0],
-    total_run_seconds: null, combinations_rollup: {}, pairs: [],
+    total_run_seconds: null,
+    // PROPOSED: real wall-clock and concurrency
+    wall_clock_seconds: lastRunWallClockSeconds,
+    concurrent_processes: lastRunConcurrentProcesses,
+    combinations_rollup: {}, pairs: [],
     portfolio_suggestions: [], what_to_test_next: [], portfolio_correlation: null,
     spec_coverage: SPEC_COVERAGE, descriptions: METRIC_DESCRIPTIONS,
   };
@@ -360,6 +368,11 @@ function generateExportDataPayload(): any {
       const pairPayload: any = {
         symbol: sym, status: "OK", seconds_taken: pairSeconds,
         phase_seconds: summary.phase_seconds || null, cache: summary.cache || null,
+        // PROPOSED: engine line and wrong-engine flag from the summary.
+        engine_line: summary.engine_line || null,
+        wrong_engine: Boolean(summary.wrong_engine),
+        engine_cache_hit: Boolean(summary.engine_cache_hit),
+        precompute_s: typeof summary.precompute_s === 'number' ? summary.precompute_s : null,
         combinations: combos, lab: labPayload || null,
         best_combination: {
           ...(bestCombo || {}),
@@ -407,8 +420,8 @@ function fmt(v: any, decimals = 2): string {
 
 // ---------------------------------------------------------------------------
 // PROPOSED: ENTRY CONDITION ANALYSIS (TXT-only section).
-// Reads backtest/output/entry_analysis.json, produces a compact block with
-// a hard 8,000 character cap and a "n/a - rerun to generate" fallback.
+// Reads backtest/output/entry_analysis.json. 8,000-character cap. Falls back
+// to "n/a - rerun to generate" when the file is missing or unreadable.
 // ---------------------------------------------------------------------------
 function renderEntryConditionAnalysis(): string[] {
   const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
@@ -505,21 +518,22 @@ function renderEntryConditionAnalysis(): string[] {
     return out;
   };
 
-  // Attempt 1: full section.
   let section = buildSection(true, false);
   if (section.join('\n').length <= SECTION_CAP) return section;
 
-  // Attempt 2: restrict buckets to stars + 3 largest deviations per group.
   section = buildSection(true, true);
   if (section.join('\n').length <= SECTION_CAP) return section;
 
-  // Attempt 3: also drop the star cross-pair check.
   section = buildSection(false, true);
   return section;
 }
 
 function renderTxtContent(data: any): string {
   const totalTimeStr = (typeof data.total_run_seconds === 'number' && data.total_run_seconds > 0) ? `${data.total_run_seconds}s` : 'n/a';
+  const wallSeconds = (typeof data.wall_clock_seconds === 'number' && data.wall_clock_seconds > 0) ? data.wall_clock_seconds : null;
+  const wallStr = wallSeconds !== null ? `${wallSeconds}s` : 'n/a';
+  const concurrentStr = (typeof data.concurrent_processes === 'number' && data.concurrent_processes > 0) ? data.concurrent_processes : 'n/a';
+
   const lines: string[] = [];
   const okPairs = (data.pairs || []).filter((p: any) => p.status === 'OK');
   let bestCombo: any = null;
@@ -529,26 +543,35 @@ function renderTxtContent(data: any): string {
   }
   lines.push('AI BRIEF');
   if (bestCombo) lines.push(`Best: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
+
+  // PROPOSED: flag any pair whose engine was not the fast one, at the top.
+  const wrongEnginePairs = (data.pairs || []).filter((p: any) => p.wrong_engine);
+  if (wrongEnginePairs.length > 0) {
+    lines.push(`WARN: WRONG ENGINE on: ${wrongEnginePairs.map((p: any) => p.symbol).join(', ')} — results unreliable.`);
+  }
   lines.push('');
   lines.push('LEGEND');
   lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
   lines.push('  ENTRY CONDITION ANALYSIS marks a bucket with * when PF@1R is >= baseline + 0.20 AND PF@1R > 1.0 AND it holds in at least 3 of 4 date quarters.');
-  lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Time ${totalTimeStr}`);
+  lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of pair times ${totalTimeStr}`);
   lines.push('');
   lines.push('CROSS-PAIR ROLLUP');
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
-    lines.push(`  ${combo.padEnd(24)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1)}% | PNL $${fmt(r.total_pnl)}`);
+    lines.push(`  ${combo.padEnd(32)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1)}% | PNL $${fmt(r.total_pnl)}`);
   });
   lines.push('');
   for (const p of data.pairs || []) {
     if (p.status !== 'OK') { lines.push(`ASSET ${p.symbol} — NOT TESTED`); lines.push(''); continue; }
-    const ps = p.phase_seconds || {}; const cache = p.cache || {};
+    const ps = p.phase_seconds || {};
     lines.push('================================================================================');
-    lines.push(`ASSET ${p.symbol} | Run Time ${p.seconds_taken || 'n/a'}s | precompute ${ps.precompute_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s | cache hit ${cache.hits ?? 'n/a'}`);
+    lines.push(`ASSET ${p.symbol} | Run Time ${p.seconds_taken || 'n/a'}s | precompute ${p.precompute_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s`);
+    // PROPOSED: engine line and warning per pair.
+    if (p.engine_line) lines.push(`  ${p.engine_line}`);
+    if (p.wrong_engine) lines.push(`  WARN: WRONG ENGINE detected for ${p.symbol}`);
     lines.push('--- Six Combinations ---');
     for (const c of p.combinations || []) {
       const tv = c.tune_validate || {};
-      lines.push(`  ${String(c.label).padEnd(18)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | PF ${fmt(c.profit_factor)} | PNL $${fmt(c.net_pnl)} | TUNE[${tv.tune?.count ?? 0}t PF ${fmt(tv.tune?.profit_factor)}] | VALIDATE[${tv.validate?.count ?? 0}t PF ${fmt(tv.validate?.profit_factor)}] | ${c.holdout_verdict}`);
+      lines.push(`  ${String(c.label).padEnd(28)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | PF ${fmt(c.profit_factor)} | PNL $${fmt(c.net_pnl)} | TUNE[${tv.tune?.count ?? 0}t PF ${fmt(tv.tune?.profit_factor)}] | VALIDATE[${tv.validate?.count ?? 0}t PF ${fmt(tv.validate?.profit_factor)}] | ${c.holdout_verdict}`);
     }
     const b = p.best_combination || {};
     lines.push('');
@@ -597,7 +620,6 @@ function renderTxtContent(data: any): string {
     lines.push('');
   }
 
-  // PROPOSED: entry condition analysis block, after the portfolio section.
   lines.push('================================================================================');
   lines.push(...renderEntryConditionAnalysis());
   lines.push('================================================================================');
@@ -669,7 +691,6 @@ async function startServer() {
       res.status(200).send(txt);
     } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
   });
-  // PROPOSED: expose the raw entry_analysis.json so the panel or a curl can verify it.
   app.get('/api/backtest/entry-analysis', (_req, res) => {
     try {
       const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
@@ -762,7 +783,7 @@ async function startServer() {
     res.status(200).json({ status: 'success', message: 'Strategy Lab started.' });
   });
 
-  // ---- compare vs reference (frozen old engine in backtest_reference/) ----
+  // ---- compare vs reference ----
   app.post('/api/backtest/compare', (req, res) => {
     if (compareRunning) return res.status(409).json({ error: 'Comparison already running.' });
     if (backtestRunning) return res.status(409).json({ error: 'A backtest is running. Wait for it to finish.' });
@@ -853,20 +874,46 @@ async function startServer() {
     backtestResults = []; activeBacktestProcesses = []; backtestRunning = true;
     backtestProgress = `Initiating backtest matrix for ${symbolsArray.join(', ')}...`;
     backtestLastError = null; backtestExitCode = null;
+
+    // PROPOSED: wall-clock start.
+    const runStartedAt = Date.now();
+    lastRunWallClockSeconds = null;
+
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
     const CONCURRENT_PAIRS = 2;
+    lastRunConcurrentProcesses = CONCURRENT_PAIRS;
 
     async function executeMatrix() {
       let activeIndex = 0; let completedCount = 0;
       async function runWorker(sym: string): Promise<void> {
         let symTiming = ''; const stderrTail: string[] = [];
+        let engineLine = ''; let wrongEngine = false;
         const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
         await new Promise<void>((resolve) => {
-          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd() } });
+          const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd(), BACKTEST_CONCURRENT_WORKERS: String(CONCURRENT_PAIRS) } });
           activeBacktestProcesses.push(proc);
+          let stdoutBuffer = '';
           proc.stdout.on('data', data => {
-            const lines = data.toString().split('\n');
-            for (const l of lines) { const t = l.trim(); if (t.startsWith('[time]')) symTiming = t.replace('[time]', '').trim(); }
+            stdoutBuffer += data.toString();
+            const lines = stdoutBuffer.split('\n');
+            stdoutBuffer = lines.pop() ?? '';
+            for (const rawLine of lines) {
+              const t = rawLine.trim();
+              if (!t) continue;
+              if (t.startsWith('[time]')) symTiming = t.replace('[time]', '').trim();
+              // PROPOSED: capture the per-pair engine line printed by the runner.
+              if (t.startsWith(`[${sym}]`)) {
+                if (t.includes('engine:')) engineLine = t.replace(`[${sym}]`, '').trim();
+                if (t.includes('WRONG ENGINE')) wrongEngine = true;
+              }
+              if (t.startsWith('[TOTAL]') && t.includes('wall_clock_seconds=')) {
+                const m = t.match(/wall_clock_seconds=([0-9.]+)/);
+                if (m) {
+                  const v = parseFloat(m[1]);
+                  if (Number.isFinite(v)) lastRunWallClockSeconds = Math.round(v);
+                }
+              }
+            }
           });
           proc.stderr.on('data', data => {
             const lines = data.toString().split('\n');
@@ -877,13 +924,13 @@ async function startServer() {
             backtestProgress = `[Running] ${completedCount}/${symbolsArray.length} completed.`;
             const tailText = stderrTail.length > 0 ? `\n--- stderr (last ${stderrTail.length} lines) ---\n${stderrTail.join('\n')}` : '';
             const reason = signal ? `Killed by ${signal}` : `Exited with code ${code}`;
-            if (!signal && code === 0) backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 6/6 matrix', timing: symTiming });
-            else backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}`, timing: symTiming });
+            if (!signal && code === 0) backtestResults.push({ symbol: sym, status: 'OK', message: 'Completed 6/6 matrix', timing: symTiming, engine_line: engineLine, wrong_engine: wrongEngine });
+            else backtestResults.push({ symbol: sym, status: 'FAILED', message: `${reason}${tailText}`, timing: symTiming, engine_line: engineLine, wrong_engine: wrongEngine });
             resolve();
           });
           proc.on('error', err => {
             completedCount++;
-            backtestResults.push({ symbol: sym, status: 'FAILED', message: `spawn error: ${err.message}` });
+            backtestResults.push({ symbol: sym, status: 'FAILED', message: `spawn error: ${err.message}`, engine_line: engineLine, wrong_engine: wrongEngine });
             resolve();
           });
         });
@@ -899,13 +946,26 @@ async function startServer() {
       }
       await Promise.all(activePool);
       backtestRunning = false;
-      backtestProgress = `Finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} assets completed.`;
+      const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
+      // Prefer the runner's own [TOTAL] reading if it was printed; otherwise
+      // use the server-side wall clock.
+      if (lastRunWallClockSeconds === null) lastRunWallClockSeconds = elapsed;
+      backtestProgress = `Finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} assets completed. Wall clock ${elapsed}s.`;
     }
     executeMatrix().catch(e => { backtestRunning = false; backtestLastError = e.message; });
     res.status(200).json({ status: 'success', message: `Execution initiated for ${symbolsArray.join(', ')}` });
   });
   app.get('/api/backtest/status', (_req, res) => {
-    res.status(200).json({ status: 'success', isRunning: backtestRunning, progress: backtestProgress, lastError: backtestLastError, exitCode: backtestExitCode, results: backtestResults });
+    res.status(200).json({
+      status: 'success',
+      isRunning: backtestRunning,
+      progress: backtestProgress,
+      lastError: backtestLastError,
+      exitCode: backtestExitCode,
+      results: backtestResults,
+      wall_clock_seconds: lastRunWallClockSeconds,
+      concurrent_processes: lastRunConcurrentProcesses,
+    });
   });
   app.post('/api/backtest/stop', (_req, res) => {
     activeBacktestProcesses.forEach(p => { try { p.kill(); } catch {} });
