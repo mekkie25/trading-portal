@@ -29,9 +29,32 @@ PROPOSED: alt-target replay. When the simulator is constructed with the full
 M5 series (m5_df_full=...), every closed trade gets four additional fields
 (alt_r_1, alt_r_15, alt_r_2, alt_r_3) plus a boolean alt_timeout. These are
 forward-looking post-hoc measurements only. They never influence execution,
-lot size, entry, stop, exit or P&L. If m5_df_full is not supplied, the four
-fields are written as None and alt_timeout as False, so the runner and the
-analyser can always read them.
+lot size, entry, stop, exit or P&L.
+
+PROPOSED: post-exit tracking replaces the old fixed 24-candle window with
+two clean rules:
+  - After a SL exit: track until price reaches the original TP (recovered),
+    OR until price has moved 2x the original SL distance further past the SL
+    (a total 3x SL from entry), OR the end of the data.
+  - After a TP exit: track until price returns to entry (invalid),
+    OR until price has moved 3x the original TP distance past the TP,
+    OR the end of the data.
+
+New fields on every trade record:
+  post_sl_max_pips      : worst excursion past the SL, in pips
+  post_sl_max_ratio     : that excursion divided by the SL distance in pips
+  post_sl_recovered     : True if the trade came back to the original TP
+  post_sl_candles       : M5 candles from the SL exit to the recovery (0 if
+                          not recovered)
+  post_tp_max_pips      : best excursion past the TP, in pips
+  post_tp_max_ratio     : that excursion divided by the TP distance in pips
+  post_tp_invalid       : True if price came back to entry before the 3x cap
+  recovered_to_tp       : kept for backwards compatibility (same as
+                          post_sl_recovered for SL exits)
+  post_sl_cont_pips     : kept for backwards compatibility (same as
+                          post_sl_max_pips)
+  post_tp_extra_pips    : kept for backwards compatibility (same as
+                          post_tp_max_pips)
 """
 
 import sys
@@ -52,9 +75,11 @@ from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
 
-POST_EXIT_TRACK_BARS = 24
+# PROPOSED: post-exit caps, replacing the old POST_EXIT_TRACK_BARS = 24.
+POST_SL_CAP_MULTIPLE = 2.0   # 2x the original SL distance past the SL
+POST_TP_CAP_MULTIPLE = 3.0   # 3x the original TP distance past the TP
 
-# PROPOSED: 5 trading days at M5 = 5 * 288 = 1440 candles.
+# PROPOSED: alt-target replay constants.
 ALT_MAX_HOLD_CANDLES = 5 * 288
 ALT_TIMEOUT_FLAG_KEY = "alt_timeout"
 ALT_TARGET_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
@@ -104,7 +129,6 @@ class TradeSimulator:
             self._eurusd_prices = [float(p) for p in df_e['close']]
 
         # PROPOSED: full M5 series for forward alt-target replay.
-        # Never influences execution; used only after a trade closes.
         self._m5_epochs: Optional[np.ndarray] = None
         self._m5_highs: Optional[np.ndarray] = None
         self._m5_lows: Optional[np.ndarray] = None
@@ -371,6 +395,7 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
+            # ---- Break-Even logic ----
             if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
@@ -393,6 +418,7 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
+            # ---- Trail exits (SuperTrend / EMA_9 / EMA_25) ----
             if GLOBAL_PARAMS.use_supertrend_trail and len(m5_slice) >= 15:
                 exited = False
                 if pos["trail_mode"] == "SUPERTREND":
@@ -429,6 +455,14 @@ class TradeSimulator:
 
         self.open_positions = remaining_positions
 
+        # ------------------------------------------------------------------
+        # PROPOSED: post-exit tracking.
+        # Two rules replace the old fixed 24-candle window:
+        #   SL side: stop at the original TP (recovered), or at 2x SL past
+        #            the SL, or end of data.
+        #   TP side: stop at entry (invalid), or at 3x TP past the TP, or
+        #            end of data.
+        # ------------------------------------------------------------------
         active_pending = []
         for pending in self.pending_sl_evaluations:
             if pending["symbol"] != symbol:
@@ -441,6 +475,7 @@ class TradeSimulator:
 
             direction = pending["direction"]
             kind = pending.get("kind", "SL")
+            pending["candles_since_exit"] = pending.get("candles_since_exit", 0) + 1
 
             if kind == "SL":
                 if direction == "BUY":
@@ -449,21 +484,24 @@ class TradeSimulator:
                     pending["max_high_after_exit"] = max(pending.get("max_high_after_exit", c_high), c_high)
 
                 target_tp = pending["target_tp"]
-                max_adverse = pending["max_adverse_allowed"]
+                cap_price = pending["cap_price"]
 
-                if not pending["adverse_blown"]:
-                    if direction == "BUY" and c_low <= max_adverse:
-                        pending["adverse_blown"] = True
-                    elif direction == "SELL" and c_high >= max_adverse:
-                        pending["adverse_blown"] = True
+                # Recovery check first: it is the point of the question.
+                reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
+                if reached_tp:
+                    pending["reached_original_tp"] = True
+                    pending["candles_to_recovery"] = pending["candles_since_exit"]
+                    pending["record"]["recovered_to_tp"] = True
+                    self._finalize_post_exit(pending)
+                    continue
 
-                if not pending["adverse_blown"]:
-                    reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
-                    if reached_tp:
-                        pending["record"]["failure_reason"] = "NOISE_STOPOUT_RECOVERED"
-                        pending["record"]["recovered_to_tp"] = True
-                        pending["reached_original_tp"] = True
-                        pending["bars_remaining"] = 0
+                cap_hit = (c_low <= cap_price) if direction == "BUY" else (c_high >= cap_price)
+                if cap_hit:
+                    pending["cap_hit"] = True
+                    self._finalize_post_exit(pending)
+                    continue
+
+                active_pending.append(pending)
 
             elif kind == "TP":
                 if direction == "BUY":
@@ -475,16 +513,32 @@ class TradeSimulator:
                         pending.get("min_favorable_after_tp", c_low), c_low
                     )
 
-            pending["bars_remaining"] -= 1
+                entry_price = pending["entry_price"]
+                cap_price = pending["cap_price"]
 
-            if pending["bars_remaining"] > 0 and sast_time < pending.get("eod_deadline_sast", pending["created_candle_time"]):
+                # Invalid check first: back to entry means the reading is bad.
+                invalid = (c_low <= entry_price) if direction == "BUY" else (c_high >= entry_price)
+                if invalid:
+                    pending["invalid"] = True
+                    self._finalize_post_exit(pending)
+                    continue
+
+                cap_hit = (c_high >= cap_price) if direction == "BUY" else (c_low <= cap_price)
+                if cap_hit:
+                    pending["cap_hit"] = True
+                    self._finalize_post_exit(pending)
+                    continue
+
                 active_pending.append(pending)
-            else:
-                self._finalize_post_exit(pending)
 
         self.pending_sl_evaluations = active_pending
 
     def _finalize_post_exit(self, pending: Dict[str, Any]) -> None:
+        """
+        PROPOSED. Writes the post-exit tracking fields on the record.
+        Kept the two legacy fields (post_sl_cont_pips, post_tp_extra_pips)
+        for anything that still reads them.
+        """
         record = pending["record"]
         kind = pending.get("kind", "SL")
         exit_price = pending["exit_price"]
@@ -492,15 +546,26 @@ class TradeSimulator:
         direction = pending["direction"]
 
         if kind == "SL":
+            # Worst excursion past the SL, in pips.
             if direction == "BUY":
                 worst = pending.get("min_low_after_exit", exit_price)
-                cont_pips = max(0.0, (exit_price - worst) / pip_size) if pip_size > 0 else 0.0
+                max_pips = max(0.0, (exit_price - worst) / pip_size) if pip_size > 0 else 0.0
             else:
                 worst = pending.get("max_high_after_exit", exit_price)
-                cont_pips = max(0.0, (worst - exit_price) / pip_size) if pip_size > 0 else 0.0
+                max_pips = max(0.0, (worst - exit_price) / pip_size) if pip_size > 0 else 0.0
 
-            record["post_sl_cont_pips"] = round(cont_pips, 1)
+            sl_pips = pending.get("sl_pips", 0.0)
+            record["post_sl_max_pips"] = round(max_pips, 1)
+            record["post_sl_max_ratio"] = round((max_pips / sl_pips), 2) if sl_pips > 0 else 0.0
+            record["post_sl_recovered"] = bool(pending.get("reached_original_tp", False))
+            record["post_sl_candles"] = int(pending.get("candles_to_recovery", 0))
 
+            # Legacy fields.
+            record["post_sl_cont_pips"] = round(max_pips, 1)
+            if not pending.get("reached_original_tp", False):
+                record["recovered_to_tp"] = False
+
+            # Pre-existing premature BE logic.
             original_tp = pending.get("target_tp", 0.0)
             is_be = bool(pending.get("is_be_moved", False))
             reached_tp = bool(pending.get("reached_original_tp", False))
@@ -522,12 +587,18 @@ class TradeSimulator:
         elif kind == "TP":
             if direction == "BUY":
                 best = pending.get("max_favorable_after_tp", exit_price)
-                extra_pips = max(0.0, (best - exit_price) / pip_size) if pip_size > 0 else 0.0
+                max_pips = max(0.0, (best - exit_price) / pip_size) if pip_size > 0 else 0.0
             else:
                 best = pending.get("min_favorable_after_tp", exit_price)
-                extra_pips = max(0.0, (exit_price - best) / pip_size) if pip_size > 0 else 0.0
+                max_pips = max(0.0, (exit_price - best) / pip_size) if pip_size > 0 else 0.0
 
-            record["post_tp_extra_pips"] = round(extra_pips, 1)
+            tp_pips = pending.get("tp_pips", 0.0)
+            record["post_tp_max_pips"] = round(max_pips, 1)
+            record["post_tp_max_ratio"] = round((max_pips / tp_pips), 2) if tp_pips > 0 else 0.0
+            record["post_tp_invalid"] = bool(pending.get("invalid", False))
+
+            # Legacy field.
+            record["post_tp_extra_pips"] = round(max_pips, 1)
 
     def close_all(self, symbol: str, last_candle: pd.Series):
         c_close = float(last_candle['close'])
@@ -550,17 +621,6 @@ class TradeSimulator:
     # closed trade record. Never touches execution.
     # ------------------------------------------------------------------
     def _replay_alt_targets(self, record: Dict[str, Any]) -> None:
-        """
-        For a just-closed trade, replay forward candles from the entry and
-        record the R-multiple that would have been obtained at 1.0R, 1.5R,
-        2.0R and 3.0R. Same conservative stop-first rule, same half-spread
-        exit adjustment, same direction handling as the simulator.
-        Caps the search at ALT_MAX_HOLD_CANDLES M5 candles (~5 trading days).
-        If a target's stop is never hit and its target is never hit in the
-        window, the exit is the last close in the window and the flag
-        alt_timeout is set True for the trade.
-        """
-        # Default the fields up-front so the analysis always finds them.
         for k in ALT_TARGET_KEYS:
             record[k] = None
         record[ALT_TIMEOUT_FLAG_KEY] = False
@@ -598,14 +658,12 @@ class TradeSimulator:
         if highs.size == 0:
             return
 
-        # Stop hit index shared across all four targets (same stop distance).
         if direction == "BUY":
             sh = np.where(lows <= sl)[0]
         else:
             sh = np.where(highs >= sl)[0]
         stop_hit_idx = int(sh[0]) if sh.size > 0 else None
 
-        # Per-target exit price in R.
         for key, mult in zip(ALT_TARGET_KEYS, (1.0, 1.5, 2.0, 3.0)):
             target = entry + sign * mult * sl_dist
 
@@ -615,7 +673,6 @@ class TradeSimulator:
                 th = np.where(lows <= target)[0]
             tgt_hit_idx = int(th[0]) if th.size > 0 else None
 
-            # Stop-first conservative rule when both hit in the same candle.
             if stop_hit_idx is not None and tgt_hit_idx is not None:
                 exit_raw = sl if stop_hit_idx <= tgt_hit_idx else target
             elif stop_hit_idx is not None:
@@ -623,10 +680,8 @@ class TradeSimulator:
             elif tgt_hit_idx is not None:
                 exit_raw = target
             else:
-                # Timeout: use last close in the window.
                 exit_raw = float(closes[-1]) if closes.size > 0 else entry
 
-            # Same half-spread handling as the live simulator.
             if direction == "BUY":
                 actual_exit = exit_raw - (spread_pts / 2.0)
             else:
@@ -635,12 +690,8 @@ class TradeSimulator:
             price_diff = (actual_exit - entry) if direction == "BUY" else (entry - actual_exit)
             record[key] = round(price_diff / sl_dist, 2)
 
-        # Timeout means: the stop was never hit AND the 3R target was never hit.
-        # That is the longest-hold case; if it timed out, the shortest holds
-        # also ended via the last-close fallback.
         timeout = (stop_hit_idx is None)
         if timeout:
-            # If 3R was hit, we did not time out.
             if direction == "BUY":
                 th3 = np.where(highs >= (entry + 3.0 * sl_dist))[0]
             else:
@@ -740,10 +791,19 @@ class TradeSimulator:
             "alignment_200ema": pos.get("alignment_200ema", "UNKNOWN"),
             "confirmation_type": pos.get("confirmation_type", "CLOSE"),
             "is_in_news_window": bool(pos.get("is_in_news_window", False)),
+            # Legacy post-exit fields (kept for anything that reads them).
             "post_sl_cont_pips": None,
             "post_tp_extra_pips": None,
             "premature_be_exit": False,
             "missed_r_at_tp": 0.0,
+            # PROPOSED: new post-exit tracking fields.
+            "post_sl_max_pips": None,
+            "post_sl_max_ratio": None,
+            "post_sl_recovered": False,
+            "post_sl_candles": 0,
+            "post_tp_max_pips": None,
+            "post_tp_max_ratio": None,
+            "post_tp_invalid": False,
         }
 
         feats = pos.get("entry_features")
@@ -754,40 +814,62 @@ class TradeSimulator:
         # PROPOSED: alt-target forward replay. Adds fields only.
         self._replay_alt_targets(record)
 
+        # ------------------------------------------------------------------
+        # PROPOSED: register a post-exit tracker.
+        # SL exits track on the SL side; TP exits track on the TP side.
+        # ------------------------------------------------------------------
         if result == "LOSS" and "SL" in reason:
-            max_adverse = (pos["stop_loss"] - (0.50 * sl_dist)) if direction == "BUY" else (pos["stop_loss"] + (0.50 * sl_dist))
+            sl_pips = (sl_dist / pip_size) if pip_size > 0 else 0.0
+            cap_past_sl = POST_SL_CAP_MULTIPLE * sl_dist
+            if direction == "BUY":
+                cap_price = actual_exit - cap_past_sl
+            else:
+                cap_price = actual_exit + cap_past_sl
             self.pending_sl_evaluations.append({
                 "kind": "SL",
                 "record": record,
                 "symbol": pos["symbol"],
                 "direction": direction,
                 "target_tp": pos["take_profit"],
-                "max_adverse_allowed": max_adverse,
-                "adverse_blown": False,
-                "bars_remaining": POST_EXIT_TRACK_BARS,
+                "cap_price": cap_price,
+                "sl_pips": sl_pips,
                 "pip_size": pip_size,
                 "exit_price": actual_exit,
                 "is_be_moved": bool(pos.get("is_be_moved", False)),
                 "created_candle_time": exit_time,
-                "eod_deadline_sast": pos.get("eod_deadline_sast", exit_time + timedelta(hours=4)),
                 "min_low_after_exit": actual_exit,
                 "max_high_after_exit": actual_exit,
                 "reached_original_tp": False,
+                "cap_hit": False,
+                "candles_since_exit": 0,
+                "candles_to_recovery": 0,
             })
 
         elif result == "WIN" and reason == "TP":
+            entry_price = pos["entry_price"]
+            tp_dist = abs(pos["take_profit"] - entry_price)
+            tp_pips = (tp_dist / pip_size) if pip_size > 0 else 0.0
+            cap_past_tp = POST_TP_CAP_MULTIPLE * tp_dist
+            if direction == "BUY":
+                cap_price = pos["take_profit"] + cap_past_tp
+            else:
+                cap_price = pos["take_profit"] - cap_past_tp
             self.pending_sl_evaluations.append({
                 "kind": "TP",
                 "record": record,
                 "symbol": pos["symbol"],
                 "direction": direction,
-                "bars_remaining": POST_EXIT_TRACK_BARS,
+                "entry_price": entry_price,
+                "cap_price": cap_price,
+                "tp_pips": tp_pips,
                 "pip_size": pip_size,
                 "exit_price": actual_exit,
                 "created_candle_time": exit_time,
-                "eod_deadline_sast": pos.get("eod_deadline_sast", exit_time + timedelta(hours=4)),
                 "max_favorable_after_tp": actual_exit,
                 "min_favorable_after_tp": actual_exit,
+                "cap_hit": False,
+                "invalid": False,
+                "candles_since_exit": 0,
             })
 
         self.balance += money_pnl
