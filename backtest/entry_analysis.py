@@ -5,9 +5,16 @@ pair that has a saved result and report which entry features separate
 winners from losers.
 
 PROPOSED: alt-target R statistics are computed from alt_r_1, alt_r_15,
-alt_r_2 and alt_r_3, written by the simulator's post-trade replay. When
-those fields are missing (an older run, or a pair that was not part of the
-analysis combo), the related bucket columns print as 0.00 / n/a.
+alt_r_2 and alt_r_3, written by the simulator's post-trade replay.
+
+PROPOSED (this version): two changes.
+  1. The star bucket cross-pair check now counts only the strategy that
+     the star belongs to on each pair. Before, a star like
+     "[STRATEGY_513] htf_h4 =1" would report every strategy's htf_h4=1
+     trades on each pair, which is why the per-pair counts exceeded the
+     pooled count.
+  2. The output now carries total_buckets_tested and star_buckets_count
+     so the TXT can print the chance check.
 
 Writes: backtest/output/entry_analysis.json
 
@@ -48,8 +55,7 @@ DISCRETE_FEATURES = {
     "session",
     "hour_sast",
     "weekday",
-    # NOTE: `direction` is intentionally NOT here. The feature returns the
-    # string "BUY"/"SELL", not an integer, so it is handled by STRING_FEATURES.
+    # NOTE: `direction` is handled by STRING_FEATURES below.
 }
 STRING_FEATURES = {
     # PROPOSED: read-only string features.
@@ -64,9 +70,7 @@ QUARTERS = 4
 DEFAULT_WHITELIST = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"]
 RESULT_VALUES = ("WIN", "LOSS", "BREAKEVEN")
 
-# PROPOSED: four alt-target keys and their multipliers.
 ALT_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
-ALT_MULTIPLIERS = {"alt_r_1": 1.0, "alt_r_15": 1.5, "alt_r_2": 2.0, "alt_r_3": 3.0}
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +140,6 @@ def _pf_at_1r(trades: List[Dict[str, Any]]) -> float:
 
 
 def _mean_alt_r(trades: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    """Mean alt-target R across a bucket. None when no data."""
     out: Dict[str, Optional[float]] = {}
     for key in ALT_KEYS:
         vals = [_safe_float(t.get(key)) for t in trades]
@@ -149,10 +152,6 @@ def _quarters_above_pf1(
     trades: List[Dict[str, Any]],
     quarter_edges: List[Tuple[datetime, datetime]],
 ) -> int:
-    """
-    Number of the 4 date quarters where PF at 1R is strictly > 1.0.
-    Quarters with fewer than 3 usable trades are skipped.
-    """
     if not quarter_edges:
         return 0
     buckets: List[List[Dict[str, Any]]] = [[] for _ in quarter_edges]
@@ -174,10 +173,6 @@ def _quarters_above_pf1(
 # ---------------------------------------------------------------------------
 
 def _load_pair_trades(symbol: str, output_dir: str) -> List[Dict[str, Any]]:
-    """
-    Return the trades from the Adaptive · BE off · Trail off report for a
-    single pair. Empty list on any failure.
-    """
     summary_path = os.path.join(output_dir, f"{symbol}_summary.json")
     if not os.path.exists(summary_path):
         return []
@@ -295,12 +290,6 @@ def _analyze_group(
     quarter_edges: List[Tuple[datetime, datetime]],
     pooled_edges: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Returns (buckets, baseline, edge_map).
-    When pooled_edges is provided, that mapping is used instead of recomputing
-    per-group edges. This is how the per-pair breakdown reuses the pooled
-    boundaries.
-    """
     if not trades:
         return [], None, {}
 
@@ -418,9 +407,14 @@ def _per_pair_breakdown_of_stars(
     quarter_edges: List[Tuple[datetime, datetime]],
 ) -> List[Dict[str, Any]]:
     """
-    For each starred bucket, re-apply the same bucket definition to each
-    pair's own trades, so the analyst can see whether the pattern holds on
-    each pair.
+    PROPOSED fix. For a strategy-specific star like
+    "[STRATEGY_513] htf_h4 =1", each pair's count now uses only that
+    strategy's trades. Before, it counted every strategy's htf_h4=1
+    trades on the pair, which is why the per-pair trade counts did not
+    sum to the pooled count.
+
+    For a star with group "ALL", the entire pair's trades are used, which
+    is correct.
     """
     out: List[Dict[str, Any]] = []
     if not stars:
@@ -434,8 +428,10 @@ def _per_pair_breakdown_of_stars(
     for star in stars:
         feature = star["feature"]
         label = star["bucket"]
+        star_group = star.get("group") or "ALL"
+
         row: Dict[str, Any] = {
-            "group": star["group"],
+            "group": star_group,
             "feature": feature,
             "bucket": label,
             "pooled": {
@@ -448,6 +444,16 @@ def _per_pair_breakdown_of_stars(
         }
 
         for sym, s_trades in by_symbol.items():
+            # PROPOSED: filter to the star's own strategy when the star is
+            # strategy-specific. This is the actual fix.
+            if star_group != "ALL":
+                s_trades = [
+                    t for t in s_trades
+                    if str(t.get("strategy", "UNKNOWN")) == star_group
+                ]
+            if not s_trades:
+                row["per_pair"][sym] = {"trades": 0}
+                continue
             filtered = _select_bucket(s_trades, feature, label, pooled_edges)
             if not filtered:
                 row["per_pair"][sym] = {"trades": 0}
@@ -471,7 +477,6 @@ def _select_bucket(
     label: str,
     pooled_edges: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Apply the same bucket definition to a subset of trades."""
     if feature in STRING_FEATURES:
         return [t for t in trades if str(t.get(feature, "none")) == label]
     if feature in CONTINUOUS_FEATURES:
@@ -492,7 +497,6 @@ def _select_bucket(
             t for t in trades
             if _quartile_bucket_index(_safe_float(t.get(feature)), edges) == idx
         ]
-    # Discrete feature label format is "=N"
     if label.startswith("="):
         try:
             u = float(label[1:])
@@ -537,6 +541,8 @@ def run_entry_analysis(
             "window_start": None,
             "window_end": None,
             "total_trades": 0,
+            "total_buckets_tested": 0,
+            "star_buckets_count": 0,
             "baselines": [],
             "buckets": [],
             "star_pair_breakdown": [],
@@ -579,11 +585,17 @@ def run_entry_analysis(
     stars = [b for b in all_buckets if b.get("is_star")]
     star_pairs = _per_pair_breakdown_of_stars(pooled, stars, pooled_edges, q_edges)
 
+    # PROPOSED: chance check counters.
+    total_buckets_tested = len(all_buckets)
+    star_buckets_count = len(stars)
+
     return {
         "generated_at": generated_at,
         "window_start": w_start,
         "window_end": w_end,
         "total_trades": len(pooled),
+        "total_buckets_tested": total_buckets_tested,
+        "star_buckets_count": star_buckets_count,
         "baselines": baselines,
         "buckets": all_buckets,
         "star_pair_breakdown": star_pairs,
@@ -592,10 +604,6 @@ def run_entry_analysis(
 
 
 def write_entry_analysis(output_dir: Optional[str] = None) -> bool:
-    """
-    Write entry_analysis.json to output_dir. Returns True on success.
-    Never raises.
-    """
     try:
         if output_dir is None:
             output_dir = OUTPUT_DIR
@@ -607,6 +615,7 @@ def write_entry_analysis(output_dir: Optional[str] = None) -> bool:
         print(
             f"[entry_analysis] wrote {out_path} "
             f"({len(payload.get('buckets', []))} buckets, "
+            f"{payload.get('star_buckets_count', 0)} stars, "
             f"{len(payload.get('star_pair_breakdown', []))} star breakdowns, "
             f"{payload.get('total_trades', 0)} trades pooled)",
             flush=True,

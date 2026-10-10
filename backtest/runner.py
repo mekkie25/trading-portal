@@ -2,27 +2,28 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 
-PROPOSED: entry-feature capture. Each opened trade now stores the market
-condition features from backtest/features.py (see that module for the
-definitions). At the end of main() the pooled analysis is written to
-backtest/output/entry_analysis.json by backtest/entry_analysis.py. Both are
-backtest-only; the live bot is untouched.
+PROPOSED: entry-feature capture. Each opened trade stores the market
+condition features from backtest/features.py. At the end of main() the
+pooled analysis is written to backtest/output/entry_analysis.json.
 
 PROPOSED: fast engine path.
 - The six-combination matrix is Adaptive only, BE on/off, R:R 1:1 / 1:2 / 1:3.
-  There is no Legacy and no Trail combination.
-- The shared precompute pass (aggregator, volatility engine, session levels,
-  strategy evaluation) is cached to disk as <SYMBOL>_precompute.pkl.gz keyed
-  on a source hash plus the window. On a cache hit, the pass is skipped and
-  the whole pair runs in a couple of seconds.
-- Each pair's summary carries one engine line and a wrong_engine flag, so a
-  silent fallback to the old slow path is impossible to miss.
+- The shared precompute pass is cached to disk as
+  <SYMBOL>_precompute.pkl.gz keyed on a source hash plus the window.
+- The source hash only covers files that can change what a strategy
+  returns, or the levels and indicators it reads. Panel, export, entry
+  analysis, descriptions and server-side code are NOT in the hash.
 
-PROPOSED: alt-target replay. The Adaptive · BE off · R:R 1:1 combination
-passes the full M5 series to the simulator so it can replay each trade at
-1.0R, 1.5R, 2.0R and 3.0R. This adds fields only; trades, entries, exits and
-P&L are unchanged. To keep the added cost small, only that one combination
-enables the replay.
+PROPOSED (this version):
+1. On a warm run, the summary reports THIS run's time for each pair
+   (which is tiny), and the cache build time is reported separately as
+   `cache_built_at` and `cache_build_seconds`. Before, the cached build
+   times were being written into the summary and the card showed them.
+2. The source hash now covers every file that affects a strategy's
+   output: all strategies/*.py, the level and indicator code, the
+   volatility engine, the target code, the volume profile code, the
+   aggregator and the config. backtest/features.py is removed from the
+   hash because it does not change what the strategies return.
 """
 
 import sys
@@ -64,19 +65,13 @@ from backtest.export_advice import generate_pair_advice
 from backtest.paths import DATA_DIR, OUTPUT_DIR
 from backtest.diagnostics import compute_diagnostics
 from backtest.portfolio import compute_portfolio_correlation, DEFAULT_WHITELIST
-
-# PROPOSED: entry-feature capture pipeline.
 from backtest.features import compute_entry_features
 from backtest.entry_analysis import write_entry_analysis
 
 STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
 
-# PROPOSED: six combinations only. No Legacy, no Trail.
-# Each combination that needs a non-default R:R carries "rr_override".
-# The first combination is the "analysis_combo" — its trades feed
-# backtest/entry_analysis.py and its simulator gets the full M5 series so the
-# alternative-target replay can run.
+
 COMBINATIONS = [
     {
         "mode": "adaptive", "adaptive_mode": True,
@@ -128,9 +123,7 @@ COMBINATIONS = [
     },
 ]
 
-# Phase-3 Blueprint variants (Section 5 items 22 / 23 / 25). Only run when
-# the caller asks for --variants. They are separate from the six-combination
-# matrix.
+
 VARIANT_COMBINATIONS = [
     {
         "label": "BE Structural (2-close break)",
@@ -184,10 +177,7 @@ VARIANT_COMBINATIONS = [
     },
 ]
 
-# -----------------------------------------------------------------------------
-# Strategy Lab: 12 single-setting variants on the 365-day window.
-# Baseline is Adaptive · BE on · Trail off. Each other variant changes ONE setting.
-# -----------------------------------------------------------------------------
+
 LAB_VARIANTS: List[Dict[str, Any]] = [
     {"label": "Baseline",                 "overrides": {}},
     {"label": "Max spread-in-R 0.10",     "overrides": {"strat_max_spread_in_r": 0.10}},
@@ -431,10 +421,6 @@ def compute_121_window_emas(df: pd.DataFrame) -> None:
 
 
 def compute_atr14_series(df: pd.DataFrame) -> None:
-    """
-    PROPOSED: in-place add column `atr_14` on the M5 DataFrame.
-    Simple 14-period rolling mean of true range.
-    """
     if df is None or df.empty:
         return
     if "atr_14" in df.columns:
@@ -479,37 +465,66 @@ def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
 
 # ---------------------------------------------------------------------------
 # PROPOSED: precompute cache.
-# The shared precompute pass (aggregator + volatility + session levels +
-# strategy evaluation) is expensive (~10 minutes per pair on 365 days). We
-# cache the result to disk keyed on a source hash and the window. On a cache
-# hit, the pass is skipped entirely and only the ema/atr columns are rebuilt.
+#
+# The source hash only covers files that can change what a strategy returns
+# or the levels/indicators it reads. Files outside that list (panel, export,
+# entry analysis, descriptions, server.ts, this file's own non-strategy
+# helpers) must not invalidate the cache.
+#
+# The hash is printed once per process so it is easy to see what it covers.
 # ---------------------------------------------------------------------------
 
-def _precompute_cache_path(symbol: str) -> str:
-    return os.path.join(DATA_DIR, f"{symbol}_precompute.pkl.gz")
+_PRECOMPUTE_STATIC_FILES = [
+    "core/session_config.py",
+    "core/session_levels.py",
+    "core/indicators.py",
+    "core/volatility_engine.py",
+    "core/targets.py",
+    "core/volume_profile.py",
+    "backtest/bar_aggregator.py",
+    "strategies/base.py",
+    "strategies/strategy_manager.py",
+]
+
+_HASH_SOURCE_FILES_LOGGED = False
+
+
+def _precompute_source_files() -> List[str]:
+    """
+    Return the absolute paths of every file that the precompute hash covers.
+    Static files first, then every strategies/*.py sorted.
+    """
+    files: List[str] = []
+    for rel in _PRECOMPUTE_STATIC_FILES:
+        files.append(os.path.join(PROJECT_ROOT, rel))
+    for p in sorted(glob.glob(os.path.join(PROJECT_ROOT, "strategies", "*.py"))):
+        files.append(p)
+    return files
 
 
 def _precompute_source_hash() -> str:
+    global _HASH_SOURCE_FILES_LOGGED
     h = hashlib.sha256()
-    for rel in [
-        "core/session_levels.py",
-        "core/indicators.py",
-        "core/session_config.py",
-        "core/volatility_engine.py",
-        "core/targets.py",
-        "strategies/strategy_manager.py",
-        "strategies/base.py",
-        "backtest/bar_aggregator.py",
-        "backtest/features.py",
-    ]:
-        p = os.path.join(PROJECT_ROOT, rel)
+    for path in _precompute_source_files():
+        rel = os.path.relpath(path, PROJECT_ROOT).replace("\\", "/")
         try:
-            with open(p, "rb") as f:
+            with open(path, "rb") as f:
                 h.update(rel.encode())
                 h.update(f.read())
         except FileNotFoundError:
             h.update(rel.encode())
+    if not _HASH_SOURCE_FILES_LOGGED:
+        _HASH_SOURCE_FILES_LOGGED = True
+        files_str = ", ".join(
+            os.path.relpath(p, PROJECT_ROOT).replace("\\", "/")
+            for p in _precompute_source_files()
+        )
+        print(f"[runner] precompute hash covers: {files_str}", flush=True)
     return h.hexdigest()[:16]
+
+
+def _precompute_cache_path(symbol: str) -> str:
+    return os.path.join(DATA_DIR, f"{symbol}_precompute.pkl.gz")
 
 
 def _precompute_cache_key(symbol: str, sim_start_idx: int, total_bars: int) -> str:
@@ -534,10 +549,18 @@ def _try_load_precompute(symbol: str, sim_start_idx: int, total_bars: int) -> Op
         return None
 
 
-def _save_precompute(symbol: str, sim_start_idx: int, total_bars: int, precomputed: Dict[str, Any]) -> None:
+def _save_precompute(
+    symbol: str,
+    sim_start_idx: int,
+    total_bars: int,
+    precomputed: Dict[str, Any],
+    build_seconds: float,
+) -> None:
     path = _precompute_cache_path(symbol)
     payload = dict(precomputed)
     payload["__key__"] = _precompute_cache_key(symbol, sim_start_idx, total_bars)
+    payload["__built_at__"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    payload["__build_seconds__"] = float(build_seconds)
     tmp = path + ".tmp"
     try:
         with gzip.open(tmp, "wb", compresslevel=6) as f:
@@ -692,7 +715,6 @@ def precompute_market_pass(
 
     compute_121_window_emas(m5_df)
     verify_precomputed_emas(m5_df, 300)
-    # PROPOSED: add atr_14 column for entry-feature analysis.
     compute_atr14_series(m5_df)
 
     aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
@@ -795,10 +817,6 @@ def precompute_market_pass(
                 "adr_val": adr_val,
                 "regime": regime,
                 "curr_time": curr_time,
-                # PROPOSED: cache d1_view AND h4_view so the entry-feature
-                # builder can read the last closed HTF candle without
-                # re-running the aggregator. h4_view was missing before,
-                # which made htf_h4 default to 0 for every trade.
                 "d1_view": d1_view,
                 "h4_view": h4_view,
             }
@@ -851,7 +869,6 @@ def run_cached_combination(
     trail_label = combo["trail"]
     mode_str = combo["mode"]
 
-    # PROPOSED: R:R override per combination, restored in the finally block.
     orig_target_rr = GLOBAL_PARAMS.target_rr
     rr_override = combo.get("rr_override", None)
     if rr_override is not None:
@@ -865,8 +882,6 @@ def run_cached_combination(
     if max_daily_override is not None:
         GLOBAL_PARAMS.max_daily_trades = max_daily_override
 
-    # PROPOSED: only the analysis combination carries the full M5 series into
-    # the simulator, so the alt-target replay runs exactly once per pair.
     is_analysis_combo = bool(combo.get("analysis_combo", False))
 
     sim = TradeSimulator(
@@ -913,7 +928,6 @@ def run_cached_combination(
             session_levels = item["session_levels"]
             adr_val = item["adr_val"]
             regime = item["regime"]
-            # PROPOSED: pull the cached HTF views for the entry-feature builder.
             d1_view_cached = item.get("d1_view")
             h4_view_cached = item.get("h4_view")
 
@@ -973,7 +987,6 @@ def run_cached_combination(
                         except (KeyError, IndexError, TypeError, ValueError):
                             ema_200_val = None
 
-                    # PROPOSED: build the entry features for this trade.
                     try:
                         sast_dt = curr_time.astimezone(TZ_SAST)
                         sast_date_str = sast_dt.strftime("%Y-%m-%d")
@@ -1163,13 +1176,11 @@ def run_cached_combination(
             }
         }
     finally:
-        # PROPOSED: restore GLOBAL_PARAMS values we may have changed.
         GLOBAL_PARAMS.target_rr = orig_target_rr
         GLOBAL_PARAMS.max_daily_trades = orig_max_daily
 
 
 def write_portfolio_correlation() -> bool:
-    """Read every <symbol>_*_report.json in OUTPUT_DIR and write portfolio_correlation.json."""
     try:
         payload = compute_portfolio_correlation(OUTPUT_DIR, DEFAULT_WHITELIST)
         out_file = os.path.join(OUTPUT_DIR, "portfolio_correlation.json")
@@ -1413,17 +1424,29 @@ async def run_symbol_matrix(
     window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
     history_days_before_window = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
 
-    # PROPOSED: try to load the cached precompute pass first.
+    # ---------------------------------------------------------------
+    # PROPOSED: precompute cache. On a warm run we zero the precompute
+    # phase times so the summary reflects THIS run. The cached build
+    # time is stored separately as cache_built_at and cache_build_seconds.
+    # ---------------------------------------------------------------
     cached_precompute = _try_load_precompute(symbol, sim_start_idx, total_bars)
     cache_hit = cached_precompute is not None
 
     if cache_hit:
         print(f"[*] {symbol}: loaded precompute cache (fast engine).", flush=True)
-        # The cached payload does not carry the ema/atr columns, so we rebuild
-        # them on the loaded M5 frame. This takes a couple of seconds.
         compute_121_window_emas(m5_df)
         compute_atr14_series(m5_df)
         precomputed = cached_precompute
+        cache_built_at = str(cached_precompute.get("__built_at__") or "")
+        cache_build_seconds = float(cached_precompute.get("__build_seconds__") or 0.0)
+        precompute_this_run_s = 0.0
+        # Zero the precompute phase timings in the summary. The simulator
+        # and report-writing phases are the only ones that belong to this
+        # run, and they are added below.
+        tot_agg = 0.0
+        tot_vol = 0.0
+        tot_lvl = 0.0
+        tot_strat = 0.0
     else:
         print(f"[*] {symbol}: Running shared precompute pass across {total_bars - sim_start_idx:,} candles...", flush=True)
         precompute_t0 = time.perf_counter()
@@ -1438,22 +1461,23 @@ async def run_symbol_matrix(
         )
         precompute_elapsed = time.perf_counter() - precompute_t0
         try:
-            _save_precompute(symbol, sim_start_idx, total_bars, precomputed)
+            _save_precompute(symbol, sim_start_idx, total_bars, precomputed, precompute_elapsed)
             print(f"[*] {symbol}: precompute cache saved ({precompute_elapsed:.1f}s to build).", flush=True)
         except Exception as e:
             print(f"[*] {symbol}: WARNING: could not save precompute cache: {e}", flush=True)
 
-    precompute_timing = precomputed.get("timing", {}) or {}
-    precompute_total_s = round(sum(float(v) for v in precompute_timing.values()), 1)
+        pre_timing = precomputed.get("timing", {}) or {}
+        tot_agg = pre_timing.get("aggregator_s", 0.0)
+        tot_vol = pre_timing.get("volatility_s", 0.0)
+        tot_lvl = pre_timing.get("session_levels_s", 0.0)
+        tot_strat = pre_timing.get("strategies_s", 0.0)
+        cache_built_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        cache_build_seconds = float(precompute_elapsed)
+        precompute_this_run_s = float(precompute_elapsed)
 
     matrix_rows = []
     all_day_candles: Dict[str, Any] = {}
 
-    pre_timing = precomputed["timing"]
-    tot_agg = pre_timing["aggregator_s"]
-    tot_vol = pre_timing["volatility_s"]
-    tot_lvl = pre_timing["session_levels_s"]
-    tot_strat = pre_timing["strategies_s"]
     tot_sim = 0.0
     tot_rep = 0.0
 
@@ -1505,7 +1529,6 @@ async def run_symbol_matrix(
 
             print(f"[*] {symbol} combo {idx + 1}/6 done", flush=True)
 
-        # ---- Phase-3 variant matrix (only with --variants) ----
         variant_rows: List[Dict[str, Any]] = []
         if variants:
             print(f"[*] {symbol}: running {len(VARIANT_COMBINATIONS)} variant combos...", flush=True)
@@ -1583,22 +1606,30 @@ async def run_symbol_matrix(
             with open(candles_file, "w") as f:
                 json.dump(safe_candles, f, separators=(",", ":"), allow_nan=False)
 
+        # PROPOSED: this run's own time for this pair.
         total_pair_seconds = round(tot_agg + tot_vol + tot_lvl + tot_strat + tot_sim + tot_rep, 1)
 
-        # PROPOSED: wrong-engine guard.
         wrong_engine = (
             len(matrix_rows) != 6
             or any("Legacy" in r.get("label", "") for r in matrix_rows)
             or any("Trail on" in r.get("label", "") for r in matrix_rows)
         )
 
-        # PROPOSED: engine line shown on the card and in the export.
-        engine_line = (
-            f"engine: {'fast' if cache_hit else 'cold'} | combos: {len(matrix_rows)} | "
-            f"store: {'hit' if cache_hit else 'miss'} | "
-            f"signal cache: {'hit' if cache_hit else 'miss'} | "
-            f"precompute: {precompute_total_s}s"
-        )
+        # PROPOSED: engine line shows THIS run's precompute time. On a warm
+        # run that is 0.0s, and the cache build info is shown separately.
+        if cache_hit:
+            engine_line = (
+                f"engine: fast | combos: {len(matrix_rows)} | "
+                f"store: hit | signal cache: hit | "
+                f"precompute: 0.0s | "
+                f"cache built in {int(cache_build_seconds)}s on {cache_built_at[:10]}"
+            )
+        else:
+            engine_line = (
+                f"engine: cold | combos: {len(matrix_rows)} | "
+                f"store: miss | signal cache: miss | "
+                f"precompute: {precompute_this_run_s:.1f}s"
+            )
         print(f"[{symbol}] {engine_line}", flush=True)
         if wrong_engine:
             print(f"[{symbol}] WARN: WRONG ENGINE detected — combos={len(matrix_rows)}, legacy/trail present", flush=True)
@@ -1608,7 +1639,10 @@ async def run_symbol_matrix(
             "days": days_count,
             "target_rr": orig_rr,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            # PROPOSED: total_seconds is THIS run's own time for this pair.
             "total_seconds": total_pair_seconds,
+            # PROPOSED: phase_seconds are THIS run's phases. On a warm run
+            # the first four are zero and only the last two are non-zero.
             "phase_seconds": {
                 "aggregator_s": round(tot_agg, 1),
                 "volatility_s": round(tot_vol, 1),
@@ -1620,12 +1654,17 @@ async def run_symbol_matrix(
             "cpu_cores": os.cpu_count() or 1,
             "concurrent_processes": int(os.getenv("BACKTEST_CONCURRENT_WORKERS", "1")),
             "combinations": matrix_rows,
-            # PROPOSED fields:
+            # PROPOSED: engine cache and precompute reporting.
             "engine_line": engine_line,
             "engine_cache_hit": cache_hit,
             "combos_count": len(matrix_rows),
             "wrong_engine": wrong_engine,
-            "precompute_s": precompute_total_s,
+            # precompute_s is this run's precompute time (0 on cache hit).
+            "precompute_s": round(precompute_this_run_s, 1),
+            # cache_built_at and cache_build_seconds describe the last time
+            # the cache was built, which may be earlier than this run.
+            "cache_built_at": cache_built_at,
+            "cache_build_seconds": round(cache_build_seconds, 1),
         }
 
         summary_file = os.path.join(OUTPUT_DIR, f"{symbol}_summary.json")
@@ -1634,7 +1673,6 @@ async def run_symbol_matrix(
             json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
         tot_rep += time.perf_counter() - _t0
 
-        # ---- Phase-3 variants summary file ----
         if variants and variant_rows:
             try:
                 variants_payload = {
@@ -1653,9 +1691,10 @@ async def run_symbol_matrix(
                 print(f"ERROR: saving variants file for {symbol} failed: {ve}", flush=True)
 
         print(
-            f"[time] {symbol} aggregator {tot_agg:.1f}s, volatility {tot_vol:.1f}s, "
-            f"session_levels {tot_lvl:.1f}s, strategies {tot_strat:.1f}s, "
-            f"simulator {tot_sim:.1f}s, report_writing {tot_rep:.1f}s | Total: {total_pair_seconds:.1f}s",
+            f"[time] {symbol} this run: precompute {precompute_this_run_s:.1f}s, "
+            f"simulator {tot_sim:.1f}s, report {tot_rep:.1f}s | "
+            f"Total: {total_pair_seconds:.1f}s | "
+            f"(cache built in {int(cache_build_seconds)}s on {cache_built_at[:10]})",
             flush=True
         )
 
@@ -1875,7 +1914,7 @@ async def run_strategy_lab(
             total_bars=total_bars,
         )
         try:
-            _save_precompute(symbol, sim_start_idx, total_bars, precomputed)
+            _save_precompute(symbol, sim_start_idx, total_bars, precomputed, 0.0)
         except Exception:
             pass
 
@@ -2036,7 +2075,6 @@ async def main():
                 pass
         sys.exit(0 if overall_ok else 1)
 
-    # Normal backtest path (single or multi-symbol)
     usage = shutil.disk_usage(OUTPUT_DIR)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < 80.0:
@@ -2098,8 +2136,6 @@ async def main():
         except Exception:
             pass
 
-    # PROPOSED: wall-clock total for the whole run, printed so server.ts or a
-    # human can read it.
     total_wall = time.perf_counter() - run_started_at
     print(f"[TOTAL] wall_clock_seconds={total_wall:.1f}", flush=True)
 

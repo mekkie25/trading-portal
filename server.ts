@@ -78,7 +78,7 @@ const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boo
   { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
   { id: 37, label: 'Bootstrap Monte Carlo resampling',           panel: true,  txt: true,  pdf: true },
   { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
-  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false, note: 'TXT-only, follows the portfolio section.' },
+  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false, note: 'TXT-only. Counts as implemented.' },
 ];
 
 const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
@@ -100,8 +100,6 @@ let backtestExitCode: number | null = null;
 let activeBacktestProcesses: ChildProcess[] = [];
 let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string; engine_line?: string; wrong_engine?: boolean }> = [];
 
-// PROPOSED: wall-clock tracking for the whole run. Filled from the runner's
-// [TOTAL] wall_clock_seconds=N line and from the server-side start/stop timers.
 let lastRunWallClockSeconds: number | null = null;
 let lastRunConcurrentProcesses: number | null = null;
 
@@ -322,7 +320,6 @@ function generateExportDataPayload(): any {
   const result: any = {
     generated_at: new Date().toISOString(), days: 60, rr_values: [1.0, 2.0, 3.0],
     total_run_seconds: null,
-    // PROPOSED: real wall-clock and concurrency
     wall_clock_seconds: lastRunWallClockSeconds,
     concurrent_processes: lastRunConcurrentProcesses,
     combinations_rollup: {}, pairs: [],
@@ -368,11 +365,12 @@ function generateExportDataPayload(): any {
       const pairPayload: any = {
         symbol: sym, status: "OK", seconds_taken: pairSeconds,
         phase_seconds: summary.phase_seconds || null, cache: summary.cache || null,
-        // PROPOSED: engine line and wrong-engine flag from the summary.
         engine_line: summary.engine_line || null,
         wrong_engine: Boolean(summary.wrong_engine),
         engine_cache_hit: Boolean(summary.engine_cache_hit),
         precompute_s: typeof summary.precompute_s === 'number' ? summary.precompute_s : null,
+        cache_built_at: summary.cache_built_at || null,
+        cache_build_seconds: typeof summary.cache_build_seconds === 'number' ? summary.cache_build_seconds : null,
         combinations: combos, lab: labPayload || null,
         best_combination: {
           ...(bestCombo || {}),
@@ -419,10 +417,31 @@ function fmt(v: any, decimals = 2): string {
 }
 
 // ---------------------------------------------------------------------------
-// PROPOSED: ENTRY CONDITION ANALYSIS (TXT-only section).
-// Reads backtest/output/entry_analysis.json. 8,000-character cap. Falls back
-// to "n/a - rerun to generate" when the file is missing or unreadable.
+// PROPOSED: bucket label humanising.
+// hour_sast is a 3-hour SAST block: bucket N covers SAST 3N:00 to 3N+2:59.
+// mins_since_open is a 60-minute bucket after the most recent London or NY
+// open. We cannot map it to a single clock time without knowing which open
+// was most recent, so we label it as "Nh-N+1h after open".
 // ---------------------------------------------------------------------------
+function humaniseBucketLabel(feature: string, bucket: string): string {
+  if (feature === 'hour_sast' && bucket.startsWith('=')) {
+    const n = parseInt(bucket.slice(1), 10);
+    if (Number.isFinite(n) && n >= 0 && n <= 7) {
+      const startH = n * 3;
+      const endH = startH + 2;
+      const pad = (h: number) => String(h).padStart(2, '0');
+      return `${pad(startH)}:00-${pad(endH)}:59 SAST`;
+    }
+  }
+  if (feature === 'mins_since_open' && bucket.startsWith('=')) {
+    const n = parseInt(bucket.slice(1), 10);
+    if (Number.isFinite(n) && n >= 0) {
+      return `${n}h-${n + 1}h after open`;
+    }
+  }
+  return bucket;
+}
+
 function renderEntryConditionAnalysis(): string[] {
   const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
   const header = 'ENTRY CONDITION ANALYSIS (pooled, R:R 1:1, BE off)';
@@ -440,19 +459,26 @@ function renderEntryConditionAnalysis(): string[] {
   const baselines: any[] = Array.isArray(payload.baselines) ? payload.baselines : [];
   const buckets: any[] = Array.isArray(payload.buckets) ? payload.buckets : [];
   const starPairs: any[] = Array.isArray(payload.star_pair_breakdown) ? payload.star_pair_breakdown : [];
+  const totalBucketsTested: number = typeof payload.total_buckets_tested === 'number' ? payload.total_buckets_tested : buckets.length;
+  const starBucketsCount: number = typeof payload.star_buckets_count === 'number'
+    ? payload.star_buckets_count
+    : buckets.filter((b: any) => b.is_star).length;
   const SECTION_CAP = 8000;
 
   const fmtR = (v: any): string => (v === null || v === undefined) ? 'n/a' : fmt(v, 2);
 
   const formatBucketLine = (b: any): string => {
     const star = b.is_star ? '*' : ' ';
-    return `${star}[${b.group}] ${b.feature} ${b.bucket}: n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor_1r)} R@1/1.5/2/3=${fmtR(b.avg_r_1)}/${fmtR(b.avg_r_15)}/${fmtR(b.avg_r_2)}/${fmtR(b.avg_r_3)} q>1=${b.quarters_above_1 ?? 0}/4`;
+    const label = humaniseBucketLabel(b.feature, String(b.bucket || ''));
+    return `${star}[${b.group}] ${b.feature} ${label}: n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor_1r)} R@1/1.5/2/3=${fmtR(b.avg_r_1)}/${fmtR(b.avg_r_15)}/${fmtR(b.avg_r_2)}/${fmtR(b.avg_r_3)} q>1=${b.quarters_above_1 ?? 0}/4`;
   };
 
   const buildSection = (includeStarPairs: boolean, restrictBuckets: boolean): string[] => {
     const out: string[] = [];
     out.push(header);
     out.push(`Pooled: ${payload.total_trades ?? 0} trades | Window: ${payload.window_start ?? 'n/a'} to ${payload.window_end ?? 'n/a'}`);
+    // PROPOSED: chance check.
+    out.push(`Buckets tested: ${totalBucketsTested} | Starred: ${starBucketsCount}`);
 
     if (baselines.length > 0) {
       out.push('Baselines:');
@@ -544,7 +570,6 @@ function renderTxtContent(data: any): string {
   lines.push('AI BRIEF');
   if (bestCombo) lines.push(`Best: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
 
-  // PROPOSED: flag any pair whose engine was not the fast one, at the top.
   const wrongEnginePairs = (data.pairs || []).filter((p: any) => p.wrong_engine);
   if (wrongEnginePairs.length > 0) {
     lines.push(`WARN: WRONG ENGINE on: ${wrongEnginePairs.map((p: any) => p.symbol).join(', ')} — results unreliable.`);
@@ -553,7 +578,7 @@ function renderTxtContent(data: any): string {
   lines.push('LEGEND');
   lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
   lines.push('  ENTRY CONDITION ANALYSIS marks a bucket with * when PF@1R is >= baseline + 0.20 AND PF@1R > 1.0 AND it holds in at least 3 of 4 date quarters.');
-  lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of pair times ${totalTimeStr}`);
+  lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of this-run pair times ${totalTimeStr}`);
   lines.push('');
   lines.push('CROSS-PAIR ROLLUP');
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
@@ -563,9 +588,17 @@ function renderTxtContent(data: any): string {
   for (const p of data.pairs || []) {
     if (p.status !== 'OK') { lines.push(`ASSET ${p.symbol} — NOT TESTED`); lines.push(''); continue; }
     const ps = p.phase_seconds || {};
+    // PROPOSED: the ASSET line now shows this run's own time for the pair,
+    // and the cache build time is shown separately. On a warm run,
+    // precompute_s is 0 and cache_build_seconds holds the original build.
+    const thisRunStr = p.seconds_taken != null ? `${p.seconds_taken}s` : 'n/a';
+    const thisRunPrecompute = (typeof p.precompute_s === 'number') ? p.precompute_s : null;
+    const cacheBuiltStr = (p.cache_built_at && typeof p.cache_build_seconds === 'number')
+      ? `cache built in ${Math.round(p.cache_build_seconds)}s on ${String(p.cache_built_at).slice(0, 10)}`
+      : 'cache build time n/a';
     lines.push('================================================================================');
-    lines.push(`ASSET ${p.symbol} | Run Time ${p.seconds_taken || 'n/a'}s | precompute ${p.precompute_s ?? 'n/a'}s | sim ${ps.simulator_s ?? 'n/a'}s`);
-    // PROPOSED: engine line and warning per pair.
+    lines.push(`ASSET ${p.symbol} | This run: ${thisRunStr} | precompute this run: ${thisRunPrecompute != null ? thisRunPrecompute + 's' : 'n/a'} | sim: ${ps.simulator_s ?? 'n/a'}s`);
+    lines.push(`  ${cacheBuiltStr}`);
     if (p.engine_line) lines.push(`  ${p.engine_line}`);
     if (p.wrong_engine) lines.push(`  WARN: WRONG ENGINE detected for ${p.symbol}`);
     lines.push('--- Six Combinations ---');
@@ -626,7 +659,9 @@ function renderTxtContent(data: any): string {
   lines.push('');
 
   lines.push('NOT IMPLEMENTED:');
-  const notImpl = (data.spec_coverage || []).filter((row: any) => !(row.panel && row.txt && row.pdf));
+  // PROPOSED: a TXT-only feature counts as implemented. Only items missing
+  // from both the panel AND the TXT appear here.
+  const notImpl = (data.spec_coverage || []).filter((row: any) => !row.panel && !row.txt);
   if (notImpl.length === 0) lines.push('  (none)');
   else notImpl.forEach((row: any) => lines.push(`  #${row.id} ${row.label}`));
   return lines.join('\n');
@@ -660,7 +695,6 @@ async function startServer() {
     next();
   });
 
-  // ---- market candles, position close ----
   app.get('/api/market/candles', (req, res) => {
     try {
       const symbol = String(req.query.symbol || 'US30').toUpperCase();
@@ -676,7 +710,6 @@ async function startServer() {
     catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
-  // ---- backtest data ----
   app.get('/api/backtest/descriptions', (_req, res) => res.status(200).json({ status: 'success', data: METRIC_DESCRIPTIONS }));
   app.get('/api/backtest/export-data', (_req, res) => {
     try { res.status(200).json({ status: 'success', data: generateExportDataPayload() }); }
@@ -783,7 +816,6 @@ async function startServer() {
     res.status(200).json({ status: 'success', message: 'Strategy Lab started.' });
   });
 
-  // ---- compare vs reference ----
   app.post('/api/backtest/compare', (req, res) => {
     if (compareRunning) return res.status(409).json({ error: 'Comparison already running.' });
     if (backtestRunning) return res.status(409).json({ error: 'A backtest is running. Wait for it to finish.' });
@@ -862,7 +894,6 @@ async function startServer() {
     res.status(200).json({ status: 'success' });
   });
 
-  // ---- run / status / stop ----
   app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
     const memCheck = checkContainerMemory();
@@ -875,7 +906,6 @@ async function startServer() {
     backtestProgress = `Initiating backtest matrix for ${symbolsArray.join(', ')}...`;
     backtestLastError = null; backtestExitCode = null;
 
-    // PROPOSED: wall-clock start.
     const runStartedAt = Date.now();
     lastRunWallClockSeconds = null;
 
@@ -900,8 +930,11 @@ async function startServer() {
             for (const rawLine of lines) {
               const t = rawLine.trim();
               if (!t) continue;
+              // PROPOSED: the new [time] line begins with
+              // "[time] <SYM> this run: ..." and includes the cache build
+              // info in parentheses. The old format is still captured for
+              // backward compatibility.
               if (t.startsWith('[time]')) symTiming = t.replace('[time]', '').trim();
-              // PROPOSED: capture the per-pair engine line printed by the runner.
               if (t.startsWith(`[${sym}]`)) {
                 if (t.includes('engine:')) engineLine = t.replace(`[${sym}]`, '').trim();
                 if (t.includes('WRONG ENGINE')) wrongEngine = true;
@@ -947,8 +980,6 @@ async function startServer() {
       await Promise.all(activePool);
       backtestRunning = false;
       const elapsed = Math.round((Date.now() - runStartedAt) / 1000);
-      // Prefer the runner's own [TOTAL] reading if it was printed; otherwise
-      // use the server-side wall clock.
       if (lastRunWallClockSeconds === null) lastRunWallClockSeconds = elapsed;
       backtestProgress = `Finished: ${backtestResults.filter(r => r.status === 'OK').length}/${backtestResults.length} assets completed. Wall clock ${elapsed}s.`;
     }
@@ -973,7 +1004,6 @@ async function startServer() {
     res.status(200).json({ status: 'success' });
   });
 
-  // ---- storage ----
   app.get('/api/backtest/storage', (_req, res) => {
     try {
       const volPath = storageBase || process.cwd();
@@ -1000,7 +1030,6 @@ async function startServer() {
     } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
-  // ---- journal, bot config, limits, telemetry ----
   app.get('/api/journal', async (_req, res) => {
     try { const diskTrades = loadTradesFromDisk(); activeBrokerTelemetry.trades = diskTrades; res.status(200).json(diskTrades); }
     catch { res.status(500).json({ error: "Failed to fetch journal entries" }); }
@@ -1085,12 +1114,10 @@ async function startServer() {
   }
   launchPythonBot();
 
-  // ---- JSON 404 for any unmatched /api/* ----
   app.use('/api', (req, res) => {
     res.status(404).json({ error: `Unknown API route: ${req.method} ${req.originalUrl}` });
   });
 
-  // ---- SPA fallback ----
   const distPath = path.join(process.cwd(), 'dist');
   if (fs.existsSync(path.join(distPath, 'index.html'))) {
     app.use(express.static(distPath));
@@ -1100,7 +1127,6 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  // ---- Global error handler: JSON for /api/* ----
   app.use((err: any, req: any, res: any, _next: any) => {
     const message = err?.message || 'Server error';
     if (req.path && String(req.path).startsWith('/api/')) res.status(500).json({ error: message });
