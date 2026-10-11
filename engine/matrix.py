@@ -48,6 +48,13 @@ from core.indicators import calculate_supertrend
 from core.fx import get_fx_rate_to_account, FX_CONVERSION_ALIASES
 from core.volatility_engine import volatility_engine
 from core.targets import compute_fixed_target
+from core.pair_settings import (
+    load_pair_settings,
+    get_strategy_settings,
+    passes_signal_filters,
+    get_effective_rr,
+    get_effective_be,
+)
 
 try:
     import google.generativeai as genai
@@ -1503,7 +1510,7 @@ class CloudExecutionEngine:
         # PROPOSED (logging-only): symbol -> {"expires_at": epoch, "last_log_at": epoch}
         self._failed_order_cooldowns: Dict[str, Dict[str, float]] = {}
 
-    async def process_signal(self, signal: Any, current_balance: float, current_equity: float, candle_stats: dict) -> bool:
+    async def process_signal(self, signal: Any, current_balance: float, current_equity: float, candle_stats: dict, use_breakeven_override: Optional[bool] = None) -> bool:
         symbol = getattr(signal, 'symbol')
 
         # PROPOSED (logging-only): per-symbol cooldown gate. If the last
@@ -1625,7 +1632,8 @@ class CloudExecutionEngine:
                 "lots": res["lots"],
                 "contract_size": contract_size,
                 "is_be_moved": False,
-                "trail_mode": trail_mode
+                "trail_mode": trail_mode,
+                "use_breakeven_override": use_breakeven_override,
             }
             save_trade_record({
                 "id": f"pos-{pid}",
@@ -1690,6 +1698,10 @@ class MatrixEngineMaster:
         self._last_risk_block_reason: str = "None"
         # PROPOSED (Gap 3b): one-shot tracker for risk profile changes.
         self._last_profile_seen: Optional[str] = None
+        # PROPOSED: per-pair, per-strategy settings. Reloaded at the top of
+        # every scan loop iteration so editing config/pair_settings.json
+        # takes effect without restarting the bot.
+        self.pair_settings: Dict[str, Any] = load_pair_settings()
 
     async def start(self) -> None:
         log.info("Starting Nexus Matrix Trading Engine (Fusion Markets / cTrader Edition)...")
@@ -1772,7 +1784,9 @@ class MatrixEngineMaster:
                                     await whatsapp.send_alert(alert)
                                 continue
 
-                    if GLOBAL_PARAMS.use_breakeven and not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
+                    per_pos_be = pos.get("use_breakeven_override", None)
+                    be_on = per_pos_be if per_pos_be is not None else GLOBAL_PARAMS.use_breakeven
+                    if be_on and not be_moved and self.risk_mgr.check_breakeven_trigger(entry, sl, tp, quote, direction):
                         log.info(f"DYNAMIC BREAKEVEN HIT ON {sym} (Pos #{pid})! Moving SL to Break-Even.")
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
                         if success:
@@ -1922,6 +1936,10 @@ class MatrixEngineMaster:
                     else:
                         log.info("[RISK] profile=None (Legacy) loaded from bot_config.json")
 
+                # PROPOSED: reload pair settings each scan so edits take effect
+                # without a restart.
+                self.pair_settings = load_pair_settings()
+
                 last_signal: Optional[Any] = None
 
                 for friendly_name in ConfigManager.SYMBOL_ALIASES.keys():
@@ -2016,12 +2034,58 @@ class MatrixEngineMaster:
                         data_h1=h1_df
                     )
 
+                    # PROPOSED: apply per-pair, per-strategy settings.
+                    # Defaults reproduce today's behaviour exactly (all
+                    # strategies enabled, no filters). Nothing changes
+                    # unless the settings file has non-default values.
+                    strat_s_for_signal: Optional[Dict[str, Any]] = None
+                    if signal:
+                        strat_s_for_signal = get_strategy_settings(
+                            self.pair_settings, friendly_name, signal.strategy
+                        )
+                        try:
+                            last_m5_time = pd.to_datetime(
+                                m5_df.iloc[-1]['time'], utc=True
+                            ).to_pydatetime()
+                        except Exception:
+                            last_m5_time = None
+                        try:
+                            if len(m5_df) >= 15:
+                                tr_h = (m5_df['high'] - m5_df['low']).abs()
+                                tr_c = (m5_df['high'] - m5_df['close'].shift(1)).abs()
+                                tr_l = (m5_df['low'] - m5_df['close'].shift(1)).abs()
+                                tr_live = pd.concat([tr_h, tr_c, tr_l], axis=1).max(axis=1)
+                                atr14_live = float(tr_live.tail(14).mean())
+                            else:
+                                atr14_live = 0.0
+                        except Exception:
+                            atr14_live = 0.0
+                        live_spread = self.risk_mgr.spread_ranges.get(
+                            friendly_name, {}
+                        ).get("standard", 0.0)
+                        passes_ps, ps_reason = passes_signal_filters(
+                            strat_s_for_signal, signal, last_m5_time,
+                            atr14_live, live_spread,
+                        )
+                        if not passes_ps:
+                            log.info(
+                                f"[PAIR_SETTINGS] {friendly_name} "
+                                f"{signal.strategy} blocked: {ps_reason}"
+                            )
+                            signal = None
+
                     if signal and GLOBAL_PARAMS.adaptive_mode:
+                        
                         if not vol_metrics.get("valid", False):
                             log.warning(f"Vol metrics invalid for {friendly_name}; skipping setup under adaptive_mode.")
                             continue
 
-                        adapted = volatility_engine.adapt_signal(signal, vol_metrics, self.risk_mgr.risk_to_reward, session_levels)
+                        strat_rr_live = (
+                            get_effective_rr(strat_s_for_signal, self.risk_mgr.risk_to_reward)
+                            if strat_s_for_signal
+                            else self.risk_mgr.risk_to_reward
+                        )
+                        adapted = volatility_engine.adapt_signal(signal, vol_metrics, strat_rr_live, session_levels)
                         if not adapted:
                             continue
 
@@ -2043,7 +2107,15 @@ class MatrixEngineMaster:
                         if self.risk_mgr.last_signal_event.get(friendly_name) != event_key:
                             self.risk_mgr.last_signal_event[friendly_name] = event_key
                             last_signal = signal
-                            await self.execution_engine.process_signal(signal, balance, equity, candle_stats)
+                            strat_be_live = (
+                                get_effective_be(strat_s_for_signal, GLOBAL_PARAMS.use_breakeven)
+                                if strat_s_for_signal is not None
+                                else None
+                            )
+                            await self.execution_engine.process_signal(
+                                signal, balance, equity, candle_stats,
+                                use_breakeven_override=strat_be_live,
+                            )
 
                 regime_status = "ACTIVE" if self.risk_mgr.master_execution else "HALTED"
                 active_setup_str = getattr(last_signal, 'strategy', getattr(last_signal, 'setup_type', 'NONE')) if last_signal else "NONE"

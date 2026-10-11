@@ -3,7 +3,7 @@ import { motion } from 'motion/react';
 import {
   TrendingUp, RefreshCw, Play, Lightbulb, Trash2,
   Layers, Square, Copy, Check, Database, Clock, ShieldCheck, Download, Printer,
-  FileText, Activity, Network, Info, FlaskConical
+  FileText, Activity, Network, Info, FlaskConical, Wand2
 } from 'lucide-react';
 import {
   ThemeMode, BacktestReportPayload, BacktestKPIs, ImprovementTip,
@@ -53,6 +53,17 @@ interface LabPayload {
   symbol: string; days: number; generated_at: string;
   window_start: string; window_end: string; baseline_label: string;
   variants: LabVariantRow[];
+}
+
+// PROPOSED: optimizer status shape returned by /api/backtest/optimize-status
+interface OptimizerDetails {
+  isRunning?: boolean;
+  pair?: string;
+  strategy?: string;
+  elapsed_s?: number;
+  variants_tested?: number;
+  suggested_file?: string;
+  summary_file?: string;
 }
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
@@ -126,6 +137,9 @@ const VerdictPill: React.FC<{ verdict?: string }> = ({ verdict }) => {
     INCONCLUSIVE: 'bg-slate-400/15 text-slate-500 border border-slate-400/30',
     IMPROVES: 'bg-emerald-500/15 text-emerald-600 border border-emerald-500/30',
     NO: 'bg-slate-500/15 text-slate-500 border border-slate-400/30',
+    ROBUST: 'bg-emerald-500/15 text-emerald-600 border border-emerald-500/30',
+    'NO CHANGE': 'bg-slate-500/15 text-slate-500 border border-slate-400/30',
+    SKIPPED: 'bg-amber-500/15 text-amber-600 border border-amber-500/30',
   };
   return (
     <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${cfg[v] || cfg.INCONCLUSIVE}`}>
@@ -184,6 +198,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [isLoadingLab, setIsLoadingLab] = useState<boolean>(false);
   const [labCopyStatus, setLabCopyStatus] = useState<Record<string, 'idle' | 'copied'>>({});
 
+  // PROPOSED: Optimizer state
+  const [optimizerRunning, setOptimizerRunning] = useState<boolean>(false);
+  const [optimizerProgress, setOptimizerProgress] = useState<string>('');
+  const [optimizerError, setOptimizerError] = useState<string | null>(null);
+  const [optimizerDetails, setOptimizerDetails] = useState<OptimizerDetails | null>(null);
+  const [optimizerSummaryText, setOptimizerSummaryText] = useState<string | null>(null);
+  const [optimizerCopyStatus, setOptimizerCopyStatus] = useState<'idle' | 'copied'>('idle');
+  const [showOptimizerSummary, setShowOptimizerSummary] = useState<boolean>(false);
+
   const [dismissedTipIds, setDismissedTipIds] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem('dismissed_improvement_tips');
@@ -192,7 +215,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   });
 
   const chartContainerRef = useRef<HTMLDivElement>(null);
-  const chartApiRef = useRef<IChartApi | null>(null);
 
   const fetchStorageInfo = useCallback(async () => {
     try {
@@ -357,8 +379,40 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return () => clearInterval(interval);
   }, [labRunning, selectedSymbols, fetchLabForSymbol]);
 
+  // PROPOSED: poll the optimizer while it is running, and fetch its summary
+  // once when it stops.
+  useEffect(() => {
+    const fetchOptimizerStatus = async () => {
+      try {
+        const res = await fetch('/api/backtest/optimize-status');
+        if (!res.ok) return;
+        const json = await res.json();
+        if (json.progress) setOptimizerProgress(json.progress);
+        if (json.details) setOptimizerDetails(json.details);
+        if (json.lastError) setOptimizerError(json.lastError);
+        if (typeof json.summaryText === 'string' && json.summaryText.length > 0) {
+          setOptimizerSummaryText(json.summaryText);
+        }
+        if (optimizerRunning && !json.isRunning) {
+          setOptimizerRunning(false);
+          setShowOptimizerSummary(true);
+        }
+      } catch {}
+    };
+    fetchOptimizerStatus();
+    const interval = setInterval(fetchOptimizerStatus, 3000);
+    return () => clearInterval(interval);
+  }, [optimizerRunning]);
+
   const currentSymbolReports = useMemo(() => {
-    return reportFiles.filter(f => f.startsWith(`${testSymbol}_`) && f !== 'portfolio_correlation.json' && !f.endsWith('_lab.json') && !f.endsWith('_verify.json') && !f.endsWith('_compare.json'));
+    return reportFiles.filter(f =>
+      f.startsWith(`${testSymbol}_`) &&
+      f !== 'portfolio_correlation.json' &&
+      !f.endsWith('_lab.json') &&
+      !f.endsWith('_verify.json') &&
+      !f.endsWith('_compare.json') &&
+      f !== 'optimizer_summary.json'
+    );
   }, [reportFiles, testSymbol]);
 
   const toggleSymbol = (sym: string) => {
@@ -471,6 +525,58 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     }
   };
 
+  // PROPOSED: start the optimizer. Runs on ALL whitelisted pairs by default
+  // so a single button press gives the full picture.
+  const handleRunOptimizer = async () => {
+    if (optimizerRunning || isRunning || labRunning) return;
+    if (!window.confirm(
+      'Run the settings optimizer?\n\n' +
+      'It will test many setting variations per strategy per pair on the ' +
+      'cached signals. This takes up to 20 minutes. The live bot is NOT ' +
+      'affected while it runs.\n\n' +
+      'It writes config/pair_settings.suggested.json. Your live settings ' +
+      'file is never touched.'
+    )) return;
+
+    setOptimizerRunning(true);
+    setOptimizerError(null);
+    setOptimizerSummaryText(null);
+    setShowOptimizerSummary(false);
+    setOptimizerProgress(`Launching optimizer for all ${WHITELIST_ASSETS.length} pairs...`);
+
+    try {
+      const res = await fetch('/api/backtest/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbols: 'ALL' }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setOptimizerError(err.message || 'Optimizer launch failed.');
+        setOptimizerRunning(false);
+      }
+    } catch (e: any) {
+      setOptimizerError(`Network error: ${e.message}`);
+      setOptimizerRunning(false);
+    }
+  };
+
+  const handleStopOptimizer = async () => {
+    try {
+      await fetch('/api/backtest/stop', { method: 'POST' });
+      setOptimizerRunning(false);
+      setOptimizerProgress('Optimizer cancelled.');
+    } catch {}
+  };
+
+  const handleCopyOptimizerSummary = () => {
+    if (!optimizerSummaryText) return;
+    navigator.clipboard.writeText(optimizerSummaryText).then(() => {
+      setOptimizerCopyStatus('copied');
+      setTimeout(() => setOptimizerCopyStatus('idle'), 2500);
+    }).catch(() => {});
+  };
+
   const handleCopyLabForAI = (sym: string) => {
     const lab = labPayloadBySymbol[sym];
     if (!lab) return;
@@ -500,9 +606,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     if (r.old_kpis) lines.push(`Old KPIs: WR ${r.old_kpis.win_rate}%, PF ${r.old_kpis.profit_factor}, PnL $${r.old_kpis.net_pnl}, Max DD $${r.old_kpis.max_dd_money}`);
     if (r.new_kpis) lines.push(`New KPIs: WR ${r.new_kpis.win_rate}%, PF ${r.new_kpis.profit_factor}, PnL $${r.new_kpis.net_pnl}, Max DD $${r.new_kpis.max_dd_money}`);
     lines.push(`Verdict: ${r.verdict}`);
-    if (r.old_run && r.old_run.error) lines.push(`Old engine run: ${r.old_run.error}`);
-    if (r.new_run && r.new_run.error) lines.push(`New engine run: ${r.new_run.error}`);
-    if (r.csv_copied && r.csv_copied.length > 0) lines.push(`CSVs copied to reference: ${r.csv_copied.join(', ')}`);
     if (Array.isArray(r.divergences_sample) && r.divergences_sample.length > 0) {
       lines.push('');
       lines.push(`First ${r.divergences_sample.length} divergent trades:`);
@@ -643,6 +746,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   const exportPairCount = reportFiles.filter(f => f.endsWith('_summary.json') && !f.startsWith('.')).length;
 
+  const anyJobRunning = isRunning || labRunning || optimizerRunning;
+
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
       <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-300 dark:border-[#1a2030]">
@@ -693,7 +798,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-100 dark:border-[#1a2030]">
-          <select value={testDays} onChange={(e) => setTestDays(parseInt(e.target.value, 10))} disabled={isRunning || labRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none border border-slate-300 dark:border-[#1a2030]">
+          <select value={testDays} onChange={(e) => setTestDays(parseInt(e.target.value, 10))} disabled={anyJobRunning} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none border border-slate-300 dark:border-[#1a2030]">
             <option value={60}>60 Days</option>
             <option value={90}>90 Days</option>
             <option value={180}>180 Days</option>
@@ -702,17 +807,22 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
           {!isRunning ? (
             <>
-              <button type="button" onClick={handleRunSelected} disabled={selectedSymbols.length === 0 || labRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunSelected} disabled={selectedSymbols.length === 0 || labRunning || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50">
                 <Play className="w-3.5 h-3.5" />
                 <span>Run Selected ({selectedSymbols.length})</span>
               </button>
-              <button type="button" onClick={handleRunAll} disabled={labRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunAll} disabled={labRunning || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50">
                 <Layers className="w-3.5 h-3.5" />
                 <span>Run All</span>
               </button>
-              <button type="button" onClick={handleRunStrategyLab} disabled={selectedSymbols.length === 0} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunStrategyLab} disabled={selectedSymbols.length === 0 || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50">
                 <FlaskConical className="w-3.5 h-3.5" />
                 <span>Strategy Lab</span>
+              </button>
+              {/* PROPOSED: Optimize settings button */}
+              <button type="button" onClick={handleRunOptimizer} disabled={labRunning || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50">
+                <Wand2 className="w-3.5 h-3.5" />
+                <span>Optimize settings</span>
               </button>
             </>
           ) : (
@@ -723,6 +833,77 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           )}
         </div>
       </motion.div>
+
+      {/* PROPOSED: optimizer progress + summary panel */}
+      {(optimizerRunning || optimizerError || optimizerSummaryText) && (
+        <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <Wand2 className="w-4 h-4 text-purple-500" />
+              <span className="text-xs font-bold text-black dark:text-white">
+                Optimizer
+              </span>
+              {optimizerRunning && <RefreshCw className="w-3.5 h-3.5 text-purple-500 animate-spin" />}
+            </div>
+            <div className="flex items-center gap-2">
+              {optimizerRunning && (
+                <button type="button" onClick={handleStopOptimizer} className="px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer">
+                  Stop optimizer
+                </button>
+              )}
+              {optimizerSummaryText && (
+                <>
+                  <button type="button" onClick={handleCopyOptimizerSummary} className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer">
+                    {optimizerCopyStatus === 'copied' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{optimizerCopyStatus === 'copied' ? 'Copied' : 'Copy summary'}</span>
+                  </button>
+                  <button type="button" onClick={() => setShowOptimizerSummary(v => !v)} className="px-3 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] dark:hover:bg-[#1a2030] border border-slate-300 dark:border-[#1a2030] text-slate-700 dark:text-slate-200 text-xs font-semibold cursor-pointer">
+                    {showOptimizerSummary ? 'Hide summary' : 'Show summary'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {optimizerRunning && (
+            <div className="text-xs text-slate-500 font-mono">
+              {optimizerProgress || 'Working...'}
+              {optimizerDetails?.variants_tested != null && (
+                <span className="ml-2">Variants tested: {optimizerDetails.variants_tested}</span>
+              )}
+              {optimizerDetails?.elapsed_s != null && (
+                <span className="ml-2">Elapsed: {Math.round(optimizerDetails.elapsed_s)}s</span>
+              )}
+            </div>
+          )}
+
+          {optimizerError && !optimizerRunning && (
+            <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-700 dark:text-rose-300 font-mono">
+              {optimizerError}
+            </div>
+          )}
+
+          {optimizerSummaryText && !optimizerRunning && (
+            <div className="space-y-2">
+              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-800 dark:text-emerald-300">
+                Optimizer finished. Your suggested settings file is at{' '}
+                <code className="font-mono">config/pair_settings.suggested.json</code>.
+                Your live settings file has not been changed. Review the summary
+                and the TXT export before copying anything in.
+              </div>
+              {showOptimizerSummary && (
+                <textarea
+                  readOnly
+                  value={optimizerSummaryText}
+                  rows={24}
+                  onFocus={(e) => e.target.select()}
+                  className="w-full p-3.5 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] font-mono text-[11px] text-black dark:text-slate-200 focus:outline-none"
+                />
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <motion.div
         initial={{ opacity: 0, y: 15 }}
@@ -742,7 +923,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             <Printer className="w-3.5 h-3.5 text-emerald-500" />
             <span>{isExportingPdf ? 'Building PDF...' : 'Export PDF'}</span>
           </button>
-          <button type="button" disabled={isVerifying || isRunning || labRunning} onClick={handleVerifyVsOriginal} className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors">
+          <button type="button" disabled={isVerifying || anyJobRunning} onClick={handleVerifyVsOriginal} className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors">
             <ShieldCheck className="w-3.5 h-3.5" />
             <span>{isVerifying ? 'Verifying...' : 'Verify vs Reference (60 days)'}</span>
           </button>
@@ -811,10 +992,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               <span className="font-mono text-[11px] text-slate-500">Reports: <strong className="text-blue-500">{storageInfo.reports_mb} MB</strong> · Data: <strong className="text-emerald-500">{storageInfo.market_data_mb} MB</strong></span>
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <button type="button" disabled={isCleaning || isRunning || labRunning} onClick={() => handleCleanup('symbol')} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+              <button type="button" disabled={isCleaning || anyJobRunning} onClick={() => handleCleanup('symbol')} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-[#141722] text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-[#1a2030] text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
                 <Trash2 className="w-3 h-3 text-amber-500" /><span>Clear {testSymbol} reports</span>
               </button>
-              <button type="button" disabled={isCleaning || isRunning || labRunning} onClick={() => handleCleanup('all_reports')} className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+              <button type="button" disabled={isCleaning || anyJobRunning} onClick={() => handleCleanup('all_reports')} className="px-3 py-1.5 rounded-lg bg-rose-600/10 hover:bg-rose-600/20 text-rose-600 border border-rose-500/30 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
                 <Trash2 className="w-3 h-3 text-rose-500" /><span>Clear all</span>
               </button>
             </div>
