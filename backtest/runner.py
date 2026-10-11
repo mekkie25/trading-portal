@@ -2,28 +2,14 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 
-PROPOSED: entry-feature capture. Each opened trade stores the market
-condition features from backtest/features.py. At the end of main() the
-pooled analysis is written to backtest/output/entry_analysis.json.
+PROPOSED: entry-feature capture.
 
 PROPOSED: fast engine path.
-- The six-combination matrix is Adaptive only, BE on/off, R:R 1:1 / 1:2 / 1:3.
-- The shared precompute pass is cached to disk as
-  <SYMBOL>_precompute.pkl.gz keyed on a source hash plus the window.
-- The source hash only covers files that can change what a strategy
-  returns, or the levels and indicators it reads. Panel, export, entry
-  analysis, descriptions and server-side code are NOT in the hash.
 
-PROPOSED (this version):
-1. On a warm run, the summary reports THIS run's time for each pair
-   (which is tiny), and the cache build time is reported separately as
-   `cache_built_at` and `cache_build_seconds`. Before, the cached build
-   times were being written into the summary and the card showed them.
-2. The source hash now covers every file that affects a strategy's
-   output: all strategies/*.py, the level and indicator code, the
-   volatility engine, the target code, the volume profile code, the
-   aggregator and the config. backtest/features.py is removed from the
-   hash because it does not change what the strategies return.
+PROPOSED: per-strategy pair settings (config/pair_settings.json) applied
+to every combination. Defaults reproduce the previous behaviour exactly.
+
+PROPOSED: --optimize mode which hands off to backtest/settings_optimizer.py.
 """
 
 import sys
@@ -67,6 +53,16 @@ from backtest.diagnostics import compute_diagnostics
 from backtest.portfolio import compute_portfolio_correlation, DEFAULT_WHITELIST
 from backtest.features import compute_entry_features
 from backtest.entry_analysis import write_entry_analysis
+from core.pair_settings import (
+    load_pair_settings,
+    get_strategy_settings,
+    passes_signal_filters,
+    get_effective_rr,
+    get_effective_be,
+    get_effective_max_daily,
+    WHITELIST_PAIRS,
+    STRATEGY_NAMES,
+)
 
 STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
@@ -463,17 +459,6 @@ def verify_precomputed_emas(df: pd.DataFrame, n_samples: int = 300) -> None:
         print(f"[check] indicator discrepancy: {max_diff:.6f}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# PROPOSED: precompute cache.
-#
-# The source hash only covers files that can change what a strategy returns
-# or the levels/indicators it reads. Files outside that list (panel, export,
-# entry analysis, descriptions, server.ts, this file's own non-strategy
-# helpers) must not invalidate the cache.
-#
-# The hash is printed once per process so it is easy to see what it covers.
-# ---------------------------------------------------------------------------
-
 _PRECOMPUTE_STATIC_FILES = [
     "core/session_config.py",
     "core/session_levels.py",
@@ -490,10 +475,6 @@ _HASH_SOURCE_FILES_LOGGED = False
 
 
 def _precompute_source_files() -> List[str]:
-    """
-    Return the absolute paths of every file that the precompute hash covers.
-    Static files first, then every strategies/*.py sorted.
-    """
     files: List[str] = []
     for rel in _PRECOMPUTE_STATIC_FILES:
         files.append(os.path.join(PROJECT_ROOT, rel))
@@ -854,6 +835,8 @@ def run_cached_combination(
     trail_override: Optional[str] = None,
     max_daily_override: Optional[int] = None,
     report_file_override: Optional[str] = None,
+    pair_settings: Optional[Dict[str, Any]] = None,
+    write_report: bool = True,
 ) -> Dict[str, Any]:
     t_vol = 0.0
     t_strat = 0.0
@@ -894,6 +877,8 @@ def run_cached_combination(
     cached_signals = precomputed["cached_signals"]
     m5_times_list = m5_df['time'].tolist()
     has_ema200_col = 'ema_200' in m5_df.columns
+    has_atr14_col = 'atr_14' in m5_df.columns
+    asset_spread = ASSETS.get(symbol, {}).get("spread", 0.0)
 
     unique_setups = 0
     prev_signal_key = None
@@ -903,7 +888,8 @@ def run_cached_combination(
         "adapted_signals_passed": 0,
         "vol_filters_blocked": 0,
         "sim_trades_attempted": 0,
-        "sim_trades_filled": 0
+        "sim_trades_filled": 0,
+        "pair_settings_blocked": 0,
     }
     vol_block_reasons: Dict[str, int] = {}
     strategy_errors: Dict[str, int] = {}
@@ -930,6 +916,31 @@ def run_cached_combination(
             regime = item["regime"]
             d1_view_cached = item.get("d1_view")
             h4_view_cached = item.get("h4_view")
+            filter_time = item.get("curr_time", curr_time)
+
+            # PROPOSED: apply per-strategy pair settings.
+            strat_be_for_trade: Optional[bool] = None
+            strat_max_daily_for_trade: Optional[int] = None
+            if pair_settings is not None:
+                strat_s = get_strategy_settings(pair_settings, symbol, signal.strategy)
+                try:
+                    atr14_val = float(m5_df.iloc[i]['atr_14']) if has_atr14_col else 0.0
+                    if math.isnan(atr14_val):
+                        atr14_val = 0.0
+                except Exception:
+                    atr14_val = 0.0
+                passes, reason = passes_signal_filters(
+                    strat_s, signal, filter_time, atr14_val, asset_spread
+                )
+                if not passes:
+                    funnel["pair_settings_blocked"] += 1
+                    vol_block_reasons[reason] = vol_block_reasons.get(reason, 0) + 1
+                    continue
+                strat_rr = get_effective_rr(strat_s, GLOBAL_PARAMS.target_rr)
+                strat_be_for_trade = get_effective_be(strat_s, use_be)
+                strat_max_daily_for_trade = get_effective_max_daily(strat_s, 0) or None
+            else:
+                strat_rr = GLOBAL_PARAMS.target_rr
 
             if trail_override:
                 signal.trail_mode = trail_override
@@ -943,7 +954,7 @@ def run_cached_combination(
             _t0 = time.perf_counter()
             if adaptive_mode:
                 if active_vol.get("valid", False):
-                    adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=GLOBAL_PARAMS.target_rr, session_levels=session_levels)
+                    adapted = volatility_engine.adapt_signal(signal, active_vol, ui_rr=strat_rr, session_levels=session_levels)
                     if adapted:
                         funnel["adapted_signals_passed"] += 1
                         spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
@@ -1015,6 +1026,8 @@ def run_cached_combination(
                         signal, curr_time, adr_val, regime, session_levels,
                         ema_200_value=ema_200_val,
                         entry_features=entry_feats,
+                        use_breakeven_override=strat_be_for_trade,
+                        max_daily_override=strat_max_daily_for_trade,
                     )
                     if opened:
                         funnel["sim_trades_filled"] += 1
@@ -1031,7 +1044,7 @@ def run_cached_combination(
 
         report_warnings = []
         if adaptive_mode and adaptive_pct < 90.0:
-            warn_msg = f"WARNING: ADAPTIVE only active on {adaptive_pct:.1f}% of bars (needs 120 D1 bars of history before the window)"
+            warn_msg = f"WARNING: ADAPTIVE only active on {adaptive_pct:.1f}% of bars"
             report_warnings.append(warn_msg)
 
         all_trades = sim.completed_trades
@@ -1152,10 +1165,12 @@ def run_cached_combination(
         else:
             rr_tag = f"rr{rr_override:.1f}" if rr_override is not None else "rr_default"
             report_filename = f"{symbol}_{mode_str}_be{be_label}_trail{trail_label}_{rr_tag}_report.json"
-        out_file = os.path.join(OUTPUT_DIR, report_filename)
-        safe_payload = sanitize_for_json(report_payload)
-        with open(out_file, "w") as f:
-            json.dump(safe_payload, f, separators=(",", ":"), allow_nan=False)
+
+        if write_report:
+            out_file = os.path.join(OUTPUT_DIR, report_filename)
+            safe_payload = sanitize_for_json(report_payload)
+            with open(out_file, "w") as f:
+                json.dump(safe_payload, f, separators=(",", ":"), allow_nan=False)
         t_rep += time.perf_counter() - _t0
 
         return {
@@ -1194,11 +1209,7 @@ def write_portfolio_correlation() -> bool:
         return False
 
 
-def compare_runs(
-    symbol: str = "US30",
-    days_count: int = 30,
-    eurusd_df: Optional[pd.DataFrame] = None
-) -> str:
+def compare_runs(symbol: str = "US30", days_count: int = 30, eurusd_df: Optional[pd.DataFrame] = None) -> str:
     m5_path = os.path.join(DATA_DIR, f"{symbol}_M5.csv")
     h1_path = os.path.join(DATA_DIR, f"{symbol}_H1.csv")
     h4_path = os.path.join(DATA_DIR, f"{symbol}_H4.csv")
@@ -1230,13 +1241,12 @@ def compare_runs(
 
     diff_lines = []
     diff_lines.append("=" * 80)
-    diff_lines.append("NEXUS MATRIX VERIFICATION HARNESS (PROMPT F: 4 COMBINATIONS · 30 DAYS)")
+    diff_lines.append("NEXUS MATRIX VERIFICATION HARNESS")
     diff_lines.append("=" * 80)
     diff_lines.append(f"• Asset Under Test  : {symbol}")
-    diff_lines.append(f"• Fixed End Time    : {window_end_str} (Frozen at 00:00 UTC boundary)")
+    diff_lines.append(f"• Fixed End Time    : {window_end_str}")
     diff_lines.append(f"• Fixed Start Time  : {window_start_str}")
     diff_lines.append(f"• In-Window Bars    : {total_bars - sim_start_idx:,} M5 candles")
-    diff_lines.append(f"• Market Data Used  : Local CSV cache only (Zero network download)")
     diff_lines.append("-" * 80)
 
     precomputed = precompute_market_pass(
@@ -1265,15 +1275,10 @@ def compare_runs(
         t0 = time.perf_counter()
         ref_res = run_backtest_reference(
             symbol=symbol,
-            m5_df=m5_df,
-            h1_df=h1_df,
-            h4_df=h4_df,
-            d1_df=d1_df,
-            sim_start_idx=sim_start_idx,
-            total_bars=total_bars,
+            m5_df=m5_df, h1_df=h1_df, h4_df=h4_df, d1_df=d1_df,
+            sim_start_idx=sim_start_idx, total_bars=total_bars,
             adaptive_mode=combo["adaptive_mode"],
-            use_be=combo["use_be"],
-            use_trail=combo["use_trail"],
+            use_be=combo["use_be"], use_trail=combo["use_trail"],
             eurusd_df=eurusd_df
         )
         t_ref = time.perf_counter() - t0
@@ -1282,17 +1287,12 @@ def compare_runs(
 
         t0 = time.perf_counter()
         fast_res = run_cached_combination(
-            symbol=symbol,
-            m5_df=m5_df,
-            precomputed=precomputed,
-            sim_start_idx=sim_start_idx,
-            total_bars=total_bars,
-            combo=combo,
-            days_count=days_count,
-            window_start_str=window_start_str,
-            window_end_str=window_end_str,
-            history_days_before_window=0.0,
-            eurusd_df=eurusd_df
+            symbol=symbol, m5_df=m5_df, precomputed=precomputed,
+            sim_start_idx=sim_start_idx, total_bars=total_bars,
+            combo=combo, days_count=days_count,
+            window_start_str=window_start_str, window_end_str=window_end_str,
+            history_days_before_window=0.0, eurusd_df=eurusd_df,
+            write_report=False,
         )
         t_fast = time.perf_counter() - t0
         fast_trades = fast_res["trades"]
@@ -1328,30 +1328,18 @@ def compare_runs(
                 divergences.append({"trade_num": idx + 1, "stage": diff_stage, "ref": r, "fast": f})
 
         diff_lines.append(f"\n[COMBO {c_idx + 1}/4] {combo_label}")
-        diff_lines.append(f"  • Reference (Per-Candle) : {len(ref_trades)} trades | Net P&L: ${ref_kpis['net_pnl']} | WR: {ref_kpis['win_rate']}% | Time: {t_ref:.2f}s")
-        diff_lines.append(f"  • Optimized (Precompute) : {len(fast_trades)} trades | Net P&L: ${fast_kpis['net_pnl']} | WR: {fast_kpis['win_rate']}% | Time: {t_fast:.2f}s")
-        diff_lines.append(f"  • Compared Trades Count  : {n_compare} total executions analyzed")
+        diff_lines.append(f"  • Reference : {len(ref_trades)} trades | PnL ${ref_kpis['net_pnl']} | Time: {t_ref:.2f}s")
+        diff_lines.append(f"  • Optimized : {len(fast_trades)} trades | PnL ${fast_kpis['net_pnl']} | Time: {t_fast:.2f}s")
 
         if not divergences:
-            diff_lines.append("  • Match Status           : 100% IDENTICAL across all fields")
-            all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): VERIFIED IDENTICAL ({len(ref_trades)} trades, 0 differences)")
+            diff_lines.append("  • Match : 100% IDENTICAL")
+            all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): IDENTICAL")
         else:
-            diff_lines.append(f"  • Divergent Trades Found : {len(divergences)} trade(s) differed")
-            all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): DIVERGENCE DETECTED ({len(divergences)} trades differ)")
-            diff_lines.append(f"  --- First {min(5, len(divergences))} Divergent Trades ---")
-            for d_item in divergences[:5]:
-                t_num = d_item["trade_num"]
-                stage = d_item["stage"]
-                r = d_item["ref"]
-                f = d_item["fast"]
-                diff_lines.append(f"  [Trade #{t_num} Diverged First At: {stage}]")
-                if r:
-                    diff_lines.append(f"    • Ref  : {r['signal_time_utc']} {r['direction']} {r['strategy']} | Entry: {r['entry_price']} | SL: {r['sl']} | TP: {r['tp']} | Exit: {r['exit_time']} @ {r['exit_price']} ({r['exit_reason']}) | Net: ${r['money_pnl']}")
-                if f:
-                    diff_lines.append(f"    • Fast : {f['signal_time_utc']} {f['direction']} {f['strategy']} | Entry: {f['entry_price']} | SL: {f['sl']} | TP: {f['tp']} | Exit: {f['exit_time']} @ {f['exit_price']} ({f['exit_reason']}) | Net: ${f['money_pnl']}")
+            diff_lines.append(f"  • Divergent : {len(divergences)} trade(s)")
+            all_verdicts.append(f"Combo {c_idx + 1}/4 ({combo_label}): DIVERGENCE ({len(divergences)} trades)")
 
     diff_lines.append("\n" + "=" * 80)
-    diff_lines.append("FOUR-COMBINATION VERDICT SUMMARY:")
+    diff_lines.append("VERDICT SUMMARY:")
     for v_line in all_verdicts:
         diff_lines.append(f"  ✓ {v_line}")
 
@@ -1366,6 +1354,7 @@ async def run_symbol_matrix(
     days_count: int,
     eurusd_df: Optional[pd.DataFrame] = None,
     variants: bool = False,
+    pair_settings: Optional[Dict[str, Any]] = None,
 ) -> bool:
     orig_adaptive = GLOBAL_PARAMS.adaptive_mode
     orig_be = GLOBAL_PARAMS.use_breakeven
@@ -1424,11 +1413,6 @@ async def run_symbol_matrix(
     window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
     history_days_before_window = max(0, round((m5_df['time'].iloc[sim_start_idx] - m5_df['time'].iloc[0]).total_seconds() / 86400.0, 1))
 
-    # ---------------------------------------------------------------
-    # PROPOSED: precompute cache. On a warm run we zero the precompute
-    # phase times so the summary reflects THIS run. The cached build
-    # time is stored separately as cache_built_at and cache_build_seconds.
-    # ---------------------------------------------------------------
     cached_precompute = _try_load_precompute(symbol, sim_start_idx, total_bars)
     cache_hit = cached_precompute is not None
 
@@ -1440,9 +1424,6 @@ async def run_symbol_matrix(
         cache_built_at = str(cached_precompute.get("__built_at__") or "")
         cache_build_seconds = float(cached_precompute.get("__build_seconds__") or 0.0)
         precompute_this_run_s = 0.0
-        # Zero the precompute phase timings in the summary. The simulator
-        # and report-writing phases are the only ones that belong to this
-        # run, and they are added below.
         tot_agg = 0.0
         tot_vol = 0.0
         tot_lvl = 0.0
@@ -1451,13 +1432,8 @@ async def run_symbol_matrix(
         print(f"[*] {symbol}: Running shared precompute pass across {total_bars - sim_start_idx:,} candles...", flush=True)
         precompute_t0 = time.perf_counter()
         precomputed = precompute_market_pass(
-            symbol=symbol,
-            m5_df=m5_df,
-            h1_df=h1_df,
-            h4_df=h4_df,
-            d1_df=d1_df,
-            sim_start_idx=sim_start_idx,
-            total_bars=total_bars
+            symbol=symbol, m5_df=m5_df, h1_df=h1_df, h4_df=h4_df, d1_df=d1_df,
+            sim_start_idx=sim_start_idx, total_bars=total_bars
         )
         precompute_elapsed = time.perf_counter() - precompute_t0
         try:
@@ -1484,17 +1460,13 @@ async def run_symbol_matrix(
     try:
         for idx, combo in enumerate(COMBINATIONS):
             res = run_cached_combination(
-                symbol=symbol,
-                m5_df=m5_df,
-                precomputed=precomputed,
-                sim_start_idx=sim_start_idx,
-                total_bars=total_bars,
-                combo=combo,
-                days_count=days_count,
-                window_start_str=window_start_str,
-                window_end_str=window_end_str,
+                symbol=symbol, m5_df=m5_df, precomputed=precomputed,
+                sim_start_idx=sim_start_idx, total_bars=total_bars,
+                combo=combo, days_count=days_count,
+                window_start_str=window_start_str, window_end_str=window_end_str,
                 history_days_before_window=history_days_before_window,
-                eurusd_df=eurusd_df
+                eurusd_df=eurusd_df,
+                pair_settings=pair_settings,
             )
 
             k = res["kpis"]
@@ -1535,30 +1507,24 @@ async def run_symbol_matrix(
             for v_idx, vcombo in enumerate(VARIANT_COMBINATIONS):
                 try:
                     v_res = run_cached_combination(
-                        symbol=symbol,
-                        m5_df=m5_df,
-                        precomputed=precomputed,
-                        sim_start_idx=sim_start_idx,
-                        total_bars=total_bars,
-                        combo=vcombo,
-                        days_count=days_count,
-                        window_start_str=window_start_str,
-                        window_end_str=window_end_str,
+                        symbol=symbol, m5_df=m5_df, precomputed=precomputed,
+                        sim_start_idx=sim_start_idx, total_bars=total_bars,
+                        combo=vcombo, days_count=days_count,
+                        window_start_str=window_start_str, window_end_str=window_end_str,
                         history_days_before_window=history_days_before_window,
                         eurusd_df=eurusd_df,
                         be_mode=vcombo.get("be_mode", "FIXED_80"),
                         trail_override=vcombo.get("trail_override"),
                         max_daily_override=vcombo.get("max_daily_override"),
                         report_file_override=vcombo.get("report_file"),
+                        pair_settings=pair_settings,
                     )
-
                     v_k = v_res["kpis"]
                     v_timing = v_res.get("timing", {})
                     tot_vol += v_timing.get("volatility_s", 0.0)
                     tot_strat += v_timing.get("strategies_s", 0.0)
                     tot_sim += v_timing.get("simulator_s", 0.0)
                     tot_rep += v_timing.get("report_writing_s", 0.0)
-
                     variant_rows.append({
                         "label": vcombo["label"],
                         "mode": vcombo["mode"],
@@ -1578,25 +1544,9 @@ async def run_symbol_matrix(
                         "funnel": v_res["funnel"],
                         "tune_validate": v_res["tune_validate"],
                     })
-
-                    v_day_candles = v_res.get("day_candles", {})
-                    for d_str, c_list in v_day_candles.items():
-                        if d_str not in all_day_candles:
-                            all_day_candles[d_str] = c_list
-
                 except Exception as ve:
                     print(f"ERROR: variant '{vcombo.get('label', '?')}' failed on {symbol}: {ve}", flush=True)
-                    variant_rows.append({
-                        "label": vcombo.get("label", "UNKNOWN"),
-                        "error": str(ve),
-                        "total_trades": 0,
-                        "win_rate": 0.0,
-                        "expectancy": 0.0,
-                        "profit_factor": 0.0,
-                        "max_drawdown": 0.0,
-                        "net_pnl": 0.0,
-                    })
-
+                    variant_rows.append({"label": vcombo.get("label", "UNKNOWN"), "error": str(ve), "total_trades": 0})
                 print(f"[*] {symbol} variant {v_idx + 1}/{len(VARIANT_COMBINATIONS)} done", flush=True)
 
         _t0 = time.perf_counter()
@@ -1606,7 +1556,6 @@ async def run_symbol_matrix(
             with open(candles_file, "w") as f:
                 json.dump(safe_candles, f, separators=(",", ":"), allow_nan=False)
 
-        # PROPOSED: this run's own time for this pair.
         total_pair_seconds = round(tot_agg + tot_vol + tot_lvl + tot_strat + tot_sim + tot_rep, 1)
 
         wrong_engine = (
@@ -1615,8 +1564,6 @@ async def run_symbol_matrix(
             or any("Trail on" in r.get("label", "") for r in matrix_rows)
         )
 
-        # PROPOSED: engine line shows THIS run's precompute time. On a warm
-        # run that is 0.0s, and the cache build info is shown separately.
         if cache_hit:
             engine_line = (
                 f"engine: fast | combos: {len(matrix_rows)} | "
@@ -1631,18 +1578,13 @@ async def run_symbol_matrix(
                 f"precompute: {precompute_this_run_s:.1f}s"
             )
         print(f"[{symbol}] {engine_line}", flush=True)
-        if wrong_engine:
-            print(f"[{symbol}] WARN: WRONG ENGINE detected — combos={len(matrix_rows)}, legacy/trail present", flush=True)
 
         summary_payload = {
             "symbol": symbol,
             "days": days_count,
             "target_rr": orig_rr,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            # PROPOSED: total_seconds is THIS run's own time for this pair.
             "total_seconds": total_pair_seconds,
-            # PROPOSED: phase_seconds are THIS run's phases. On a warm run
-            # the first four are zero and only the last two are non-zero.
             "phase_seconds": {
                 "aggregator_s": round(tot_agg, 1),
                 "volatility_s": round(tot_vol, 1),
@@ -1654,15 +1596,11 @@ async def run_symbol_matrix(
             "cpu_cores": os.cpu_count() or 1,
             "concurrent_processes": int(os.getenv("BACKTEST_CONCURRENT_WORKERS", "1")),
             "combinations": matrix_rows,
-            # PROPOSED: engine cache and precompute reporting.
             "engine_line": engine_line,
             "engine_cache_hit": cache_hit,
             "combos_count": len(matrix_rows),
             "wrong_engine": wrong_engine,
-            # precompute_s is this run's precompute time (0 on cache hit).
             "precompute_s": round(precompute_this_run_s, 1),
-            # cache_built_at and cache_build_seconds describe the last time
-            # the cache was built, which may be earlier than this run.
             "cache_built_at": cache_built_at,
             "cache_build_seconds": round(cache_build_seconds, 1),
         }
@@ -1676,9 +1614,7 @@ async def run_symbol_matrix(
         if variants and variant_rows:
             try:
                 variants_payload = {
-                    "symbol": symbol,
-                    "days": days_count,
-                    "target_rr": orig_rr,
+                    "symbol": symbol, "days": days_count, "target_rr": orig_rr,
                     "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                     "variants": variant_rows,
                 }
@@ -1698,7 +1634,7 @@ async def run_symbol_matrix(
             flush=True
         )
 
-        print(f"[✓] {symbol} Matrix Complete: {len(matrix_rows)}/{len(COMBINATIONS)} combinations saved to {summary_file}", flush=True)
+        print(f"[✓] {symbol} Matrix Complete", flush=True)
         return len(matrix_rows) > 0
 
     finally:
@@ -1905,13 +1841,8 @@ async def run_strategy_lab(
         precomputed = cached_precompute
     else:
         precomputed = precompute_market_pass(
-            symbol=symbol,
-            m5_df=m5_df,
-            h1_df=h1_df,
-            h4_df=h4_df,
-            d1_df=d1_df,
-            sim_start_idx=sim_start_idx,
-            total_bars=total_bars,
+            symbol=symbol, m5_df=m5_df, h1_df=h1_df, h4_df=h4_df, d1_df=d1_df,
+            sim_start_idx=sim_start_idx, total_bars=total_bars,
         )
         try:
             _save_precompute(symbol, sim_start_idx, total_bars, precomputed, 0.0)
@@ -1937,15 +1868,10 @@ async def run_strategy_lab(
         print(f"[LAB] {symbol}: variant {idx + 1}/{len(LAB_VARIANTS)} — {label}", flush=True)
         try:
             trades = run_lab_combination(
-                symbol=symbol,
-                m5_df=m5_df,
-                precomputed=precomputed,
-                sim_start_idx=sim_start_idx,
-                total_bars=total_bars,
-                filter_overrides=overrides,
-                target_rr_value=target_rr_value,
-                sm_for_filters=sm_for_filters,
-                eurusd_df=eurusd_df,
+                symbol=symbol, m5_df=m5_df, precomputed=precomputed,
+                sim_start_idx=sim_start_idx, total_bars=total_bars,
+                filter_overrides=overrides, target_rr_value=target_rr_value,
+                sm_for_filters=sm_for_filters, eurusd_df=eurusd_df,
             )
             kpi = _lab_kpis_and_split(trades, window_start_str, window_end_str)
         except Exception as e:
@@ -1966,13 +1892,10 @@ async def run_strategy_lab(
         row["verdict"] = _lab_verdict(baseline_kpis, row)
 
     payload = {
-        "symbol": symbol,
-        "days": days_count,
+        "symbol": symbol, "days": days_count,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "window_start": window_start_str,
-        "window_end": window_end_str,
-        "baseline_label": "Baseline",
-        "variants": results,
+        "window_start": window_start_str, "window_end": window_end_str,
+        "baseline_label": "Baseline", "variants": results,
     }
     safe = sanitize_for_json(payload)
     with open(lab_file, "w") as f:
@@ -1982,29 +1905,43 @@ async def run_strategy_lab(
     return True
 
 
+def run_settings_optimizer_cli(symbols_list: List[str]) -> int:
+    """
+    PROPOSED: entry point for --optimize. Delegates to
+    backtest/settings_optimizer.py.
+    """
+    try:
+        from backtest.settings_optimizer import run_optimizer
+    except Exception as e:
+        print(f"ERROR: could not import optimizer: {e}", flush=True)
+        return 2
+    try:
+        return 0 if run_optimizer(symbols_list) else 1
+    except Exception as e:
+        print(f"ERROR: optimizer failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
-    parser.add_argument("--symbols", type=str, default=None,
-                        help="Comma-separated list of symbols (overrides --symbol)")
+    parser.add_argument("--symbols", type=str, default=None)
     parser.add_argument("--days", type=int, default=60)
-    parser.add_argument("--rr", type=float, default=1.0, help="Default target R:R; each combo may override")
+    parser.add_argument("--rr", type=float, default=1.0)
     parser.add_argument("--mode", type=str, default=None)
     parser.add_argument("--adaptive", action="store_true", default=True)
     parser.add_argument("--breakeven", type=str, default="off")
     parser.add_argument("--supertrend", type=str, default="on")
-    parser.add_argument("--compare", action="store_true", default=False,
-                        help="Run 4-combination verification vs reference engine")
-    parser.add_argument("--prepare-only", action="store_true", default=False,
-                        help="Prepare and update market data only, then exit")
-    parser.add_argument("--skip-download", action="store_true", default=False,
-                        help="Skip downloading data and run matrix from local cache")
-    parser.add_argument("--variants", action="store_true", default=False,
-                        help="Also run Phase-3 variant combos and save <symbol>_variants.json")
-    parser.add_argument("--portfolio-only", action="store_true", default=False,
-                        help="Only compute the cross-pair correlation matrix and exit")
-    parser.add_argument("--lab", action="store_true", default=False,
-                        help="Run Strategy Lab on the given symbol(s) and write <symbol>_lab.json")
+    parser.add_argument("--compare", action="store_true", default=False)
+    parser.add_argument("--prepare-only", action="store_true", default=False)
+    parser.add_argument("--skip-download", action="store_true", default=False)
+    parser.add_argument("--variants", action="store_true", default=False)
+    parser.add_argument("--portfolio-only", action="store_true", default=False)
+    parser.add_argument("--lab", action="store_true", default=False)
+    parser.add_argument("--optimize", action="store_true", default=False,
+                        help="Run the per-strategy settings optimizer and exit.")
     args = parser.parse_args()
 
     if args.symbols:
@@ -2012,7 +1949,13 @@ async def main():
     else:
         symbols_list = [args.symbol.upper()]
 
+    # PROPOSED: --optimize hands off before touching the broker client.
+    if args.optimize:
+        code = run_settings_optimizer_cli(symbols_list)
+        sys.exit(code)
+
     client = CTraderClient()
+    pair_settings = load_pair_settings()
 
     if args.portfolio_only:
         ok = write_portfolio_correlation()
@@ -2057,7 +2000,7 @@ async def main():
                         overall_ok = False
                         continue
                 else:
-                    print(f"[LAB] {sym}: EURUSD history missing (required for GERMAN30)", flush=True)
+                    print(f"[LAB] {sym}: EURUSD history missing", flush=True)
                     overall_ok = False
                     continue
             try:
@@ -2067,7 +2010,6 @@ async def main():
             except Exception as e:
                 print(f"[LAB] {sym}: fatal error: {e}", flush=True)
                 overall_ok = False
-
         if client.ws:
             try:
                 await client.ws.close()
@@ -2078,7 +2020,7 @@ async def main():
     usage = shutil.disk_usage(OUTPUT_DIR)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < 80.0:
-        print(f"ERROR: Low disk space on storage volume ({int(free_mb)} MB free). Clear old reports from the Storage panel.", flush=True)
+        print(f"ERROR: Low disk space ({int(free_mb)} MB free).", flush=True)
         sys.exit(1)
 
     GLOBAL_PARAMS.target_rr = args.rr
@@ -2116,6 +2058,7 @@ async def main():
                 client, sym, args.days,
                 eurusd_df=eurusd_df,
                 variants=args.variants,
+                pair_settings=pair_settings,
             )
         if not success:
             all_ok = False
@@ -2147,13 +2090,7 @@ def print_startup_diagnostics() -> None:
     print("BACKTEST STARTUP DIAGNOSTICS", flush=True)
     print("=" * 60, flush=True)
     print(f"Python version: {sys.version.split()[0]}", flush=True)
-
-    env_checks = [
-        "CTRADER_CLIENT_ID",
-        "CTRADER_CLIENT_SECRET",
-        "CTRADER_ACCESS_TOKEN",
-        "CTRADER_ACCOUNT_ID",
-    ]
+    env_checks = ["CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_ACCESS_TOKEN", "CTRADER_ACCOUNT_ID"]
     for key in env_checks:
         value = os.environ.get(key, "").strip()
         status = "SET" if value else "MISSING"

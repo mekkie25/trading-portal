@@ -15,13 +15,12 @@ two clean rules:
     OR until price has moved 3x the original TP distance past the TP,
     OR the end of the data.
 
-PROPOSED (2026-10-10): the alt-target replay now uses `pos["open_time"]`
-converted to epoch seconds via datetime.timestamp(). It no longer reads
-record["signal_time_utc"] and parses it. The previous version was silently
-returning early on pandas versions where the datetime column conversion
-raised inside a broad except, which produced null alt_r_* fields on
-every trade. On any failure, the init path now prints a visible traceback
-so a silent failure cannot happen again.
+PROPOSED (2026-10-10): the alt-target replay now uses pos["open_time"]
+converted to epoch seconds via datetime.timestamp().
+
+PROPOSED (this version): per-trade break-even flag and per-strategy daily
+trade counter. These let the settings file control BE and the daily cap
+on a per (pair, strategy) basis without touching the strategies themselves.
 """
 
 import sys
@@ -32,7 +31,7 @@ import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
@@ -82,6 +81,8 @@ class TradeSimulator:
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
         self.skipped: List[Dict[str, Any]] = []
         self.daily_trade_counts: Dict[str, int] = {}
+        # PROPOSED: per-strategy daily counters keyed on (strategy, sast_date).
+        self.strategy_daily_counts: Dict[Tuple[str, str], int] = {}
         self._trade_counter: int = 0
 
         self._eurusd_times: List[float] = []
@@ -105,9 +106,6 @@ class TradeSimulator:
                 if not pd.api.types.is_datetime64_any_dtype(df['time']):
                     df['time'] = pd.to_datetime(df['time'], utc=True)
                 df = df.sort_values('time').reset_index(drop=True)
-                # Robust epoch conversion: never rely on pandas .astype(int64)
-                # on a tz-aware column. Use .value (nanoseconds since epoch)
-                # and integer-divide.
                 epochs = np.empty(len(df), dtype=np.int64)
                 for i, t in enumerate(df['time']):
                     try:
@@ -118,8 +116,6 @@ class TradeSimulator:
                 self._m5_highs = df['high'].astype(float).to_numpy()
                 self._m5_lows = df['low'].astype(float).to_numpy()
                 self._m5_closes = df['close'].astype(float).to_numpy()
-                # One-shot visible log. The user can see this in the deploy
-                # logs and it proves the arrays were built.
                 print(
                     f"[simulator] alt replay ready: {len(epochs)} candles, "
                     f"first={epochs[0] if len(epochs) > 0 else 'n/a'}, "
@@ -203,6 +199,8 @@ class TradeSimulator:
         ref_levels: dict,
         ema_200_value: Optional[float] = None,
         entry_features: Optional[Dict[str, Any]] = None,
+        use_breakeven_override: Optional[bool] = None,
+        max_daily_override: Optional[int] = None,
     ) -> bool:
         symbol = signal.symbol
         direction = signal.direction.upper()
@@ -220,6 +218,13 @@ class TradeSimulator:
         max_daily = getattr(GLOBAL_PARAMS, 'max_daily_trades', 2)
         if current_daily_count >= max_daily:
             return self._record_skip(current_time, symbol, strategy, "DAILY_CAP", direction)
+
+        # PROPOSED: per-strategy daily cap.
+        if max_daily_override is not None:
+            strat_key = (strategy, sast_date_str)
+            strat_count = self.strategy_daily_counts.get(strat_key, 0)
+            if strat_count >= int(max_daily_override):
+                return self._record_skip(current_time, symbol, strategy, "STRATEGY_DAILY_CAP", direction)
 
         fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
         if fixed_tp is None:
@@ -282,13 +287,13 @@ class TradeSimulator:
         except Exception:
             is_in_news = False
 
-        # PROPOSED: entry_epoch is captured here as a plain integer number of
-        # seconds. The alt-target replay uses this directly, so no string
-        # parsing and no timezone conversion is done at replay time.
         try:
             entry_epoch = int(current_time.timestamp())
         except Exception:
             entry_epoch = 0
+
+        # PROPOSED: per-trade break-even flag.
+        effective_be = use_breakeven_override if use_breakeven_override is not None else bool(GLOBAL_PARAMS.use_breakeven)
 
         position = {
             "trade_id": trade_id,
@@ -310,6 +315,7 @@ class TradeSimulator:
             "ref_levels": ref_levels,
             "trail_mode": getattr(signal, "trail_mode", "MOVE_TO_BE_80"),
             "is_be_moved": False,
+            "use_breakeven": effective_be,
             "mfe_price": actual_entry,
             "mae_price": actual_entry,
             "profit_seen": False,
@@ -326,6 +332,9 @@ class TradeSimulator:
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
+        if max_daily_override is not None:
+            strat_key = (strategy, sast_date_str)
+            self.strategy_daily_counts[strat_key] = self.strategy_daily_counts.get(strat_key, 0) + 1
         self.open_positions.append(position)
         return True
 
@@ -391,7 +400,9 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            if GLOBAL_PARAMS.use_breakeven and not pos["is_be_moved"]:
+            # PROPOSED: per-trade break-even flag.
+            be_enabled_for_pos = bool(pos.get("use_breakeven", GLOBAL_PARAMS.use_breakeven))
+            if be_enabled_for_pos and not pos["is_be_moved"]:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
                 target_dist = abs(tp - entry)
                 progress_met = (
@@ -592,11 +603,6 @@ class TradeSimulator:
         self.pending_sl_evaluations = []
 
     def _replay_alt_targets(self, record: Dict[str, Any]) -> None:
-        """
-        PROPOSED: writes the four alt_r_* fields and the alt_timeout flag.
-        Uses record["entry_epoch"] (an int) set by _close_position, so no
-        string parsing and no timezone conversion happens here.
-        """
         for k in ALT_TARGET_KEYS:
             record[k] = None
         record[ALT_TIMEOUT_FLAG_KEY] = False
@@ -794,8 +800,6 @@ class TradeSimulator:
                     continue
                 record[k] = v
 
-        # Alt-target replay runs first so the four fields exist before
-        # the post-exit tracker potentially rewrites other fields.
         self._replay_alt_targets(record)
 
         if result == "LOSS" and "SL" in reason:
