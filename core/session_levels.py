@@ -14,6 +14,40 @@ from core.session_config import MarketSessionManager
 _DAY_LEVELS_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
+def _select_last_completed_d1_bar(d1_df: pd.DataFrame, now_utc: datetime) -> Optional[int]:
+    """
+    Returns the index of the last COMPLETED D1 bar in d1_df, or None if
+    d1_df is empty or no bar has closed by now_utc.
+
+    A cTrader D1 bar closes 24 hours after its open. A bar is completed
+    when now_utc >= bar_open + 24h.
+
+    The two callers feed d1_df with different shapes:
+
+      * Backtest (bar_aggregator): the last row is TODAY's forming bar.
+        Its close time is in the future, so it is skipped and we return
+        yesterday's index. Same result as the old iloc[-2] assumption.
+
+      * Live (fetch_ohlc_candles): the last row is the most recent CLOSED
+        bar, which is yesterday's. Its close time is in the past, so it
+        is picked. This is the fix: the old iloc[-2] assumption returned
+        the day before yesterday in this case.
+
+    Returned index is a label into d1_df.index, suitable for d1_df.loc[...].
+    """
+    if d1_df is None or d1_df.empty:
+        return None
+    try:
+        d1_times = pd.to_datetime(d1_df['time'], utc=True)
+    except Exception:
+        return None
+    close_times = d1_times + pd.Timedelta(hours=24)
+    completed_mask = close_times <= now_utc
+    if not completed_mask.any():
+        return None
+    return completed_mask[completed_mask].index[-1]
+
+
 def compute_frozen_opening_range(
     symbol: str,
     m5_df: pd.DataFrame,
@@ -91,6 +125,11 @@ def build_session_levels(
     Uses daily structural caching for previous-day levels, pivots, and weekly open.
     """
     now = as_of if as_of is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+
     today_str = now.strftime("%Y-%m-%d")
     cache_key = (symbol, today_str)
 
@@ -98,7 +137,19 @@ def build_session_levels(
     cached_day = _DAY_LEVELS_CACHE.get(cache_key)
 
     if cached_day is None:
-        if len(d1_df) >= 2:
+        # PROPOSED: pick yesterday's D1 bar by CLOSE TIME, not by an
+        # assumption about where it sits in the DataFrame. See
+        # _select_last_completed_d1_bar for why. Backtest is unchanged;
+        # live now reads yesterday's bar instead of the day before.
+        prev_idx = _select_last_completed_d1_bar(d1_df, now)
+
+        if prev_idx is not None:
+            prev_d1 = d1_df.loc[prev_idx]
+            pdh = float(prev_d1['high'])
+            pdl = float(prev_d1['low'])
+            pdc = float(prev_d1['close'])
+        elif len(d1_df) >= 2:
+            # Fallback: preserve the old iloc[-2] assumption.
             prev_d1 = d1_df.iloc[-2]
             pdh = float(prev_d1['high'])
             pdl = float(prev_d1['low'])
