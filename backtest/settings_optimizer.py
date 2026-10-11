@@ -7,7 +7,7 @@ PROPOSED.
 WHAT IT DOES
 ------------
 For each (pair, strategy) that has enough historical trades:
-  1. Runs the strategy with default settings (current live behaviour).
+  1. Runs the strategy with default settings.
   2. Tries one setting change at a time from a fixed search space.
   3. Keeps the change that most improves TUNE-period profit factor.
   4. Accepts it ONLY if the honest validation rules pass:
@@ -16,6 +16,14 @@ For each (pair, strategy) that has enough historical trades:
        (c) VALIDATE PF > 1.0
        (d) PF > 1.0 in at least 3 of 4 date quarters
   5. Repeats up to 3 accepted changes per (pair, strategy).
+
+BASELINE GUARD
+--------------
+The optimizer runs its own combined baseline per pair that matches the
+"Adaptive · BE on · R:R 1:1" six-combination. It reads {pair}_summary.json
+for the same window and compares trade counts. If the difference is > 2%
+the pair is INVALID, listed under "OPTIMIZER INVALID" at the top of the
+summary, and excluded from the suggested file and the combined backtest.
 
 OUTPUTS
 -------
@@ -26,25 +34,6 @@ OUTPUTS
 TIME BUDGET
 -----------
 OPTIMIZER_MAX_SECONDS is a hard wall-clock cap (default 1200 = 20 min).
-The optimizer stops when the budget is hit, writes whatever it finished,
-and marks unfinished pairs/strategies as SKIPPED in the summary.
-
-HONEST NOTE
------------
-On a warm cache, on 7 pairs x 8 strategies with the search space below,
-this optimizer will very likely NOT finish every strategy within 20 minutes.
-That is expected. Do not widen the search space to try to make it fit —
-narrow it, or run it overnight. The validation rules are the whole point;
-skipping them makes the output worthless.
-
-If you want a faster first run, edit SEARCH_SPACE below (it is at the top
-of this file) and remove some options. Do not raise OPTIMIZER_MAX_SECONDS
-past what your host will actually keep alive.
-
-NOT IN THE HASH
----------------
-This file is not part of the backtest signal cache hash. Editing it does
-not cold-start the precompute cache.
 """
 
 import os
@@ -83,30 +72,34 @@ from core.pair_settings import (
 from core.volatility_engine import volatility_engine
 from core.session_config import GLOBAL_PARAMS, TZ_SAST
 
+
 # ---------------------------------------------------------------------------
 # Knobs
 # ---------------------------------------------------------------------------
+OPTIMIZER_MAX_SECONDS = 1200
+MIN_BASELINE_TRADES = 60
+MIN_TRADES_TUNE_VALIDATE = 30
+MIN_VALIDATE_PF_IMPROVEMENT = 0.10
+MIN_VALIDATE_PF = 1.00
+MIN_QUARTERS_ABOVE_ONE = 3
+MAX_ACCEPTED_CHANGES = 3
+OPTIMIZE_WINDOW_DAYS = 365
 
-OPTIMIZER_MAX_SECONDS = 1200          # hard wall-clock cap (20 min)
-MIN_BASELINE_TRADES = 60              # skip a (pair, strategy) below this
-MIN_TRADES_TUNE_VALIDATE = 30         # TUNE and VALIDATE each need this many
-MIN_VALIDATE_PF_IMPROVEMENT = 0.10    # VALIDATE PF must improve by this much
-MIN_VALIDATE_PF = 1.00                # VALIDATE PF must beat this
-MIN_QUARTERS_ABOVE_ONE = 3            # 3 of 4 date quarters must have PF > 1
-MAX_ACCEPTED_CHANGES = 3              # per (pair, strategy)
-OPTIMIZE_WINDOW_DAYS = 365            # window used for the optimizer itself
+# The baseline the optimizer compares itself to.
+BASELINE_COMBINATION_LABEL = "Adaptive · BE on · R:R 1:1"
+BASELINE_USE_BE = True
+BASELINE_RR = 1.0
 
-# Search space. Each list is the set of values tried for ONE setting.
-# Keep this modest. Widening it directly multiplies runtime.
+# Search space.
 SEARCH_SPACE: Dict[str, List[Any]] = {
-    "session_window_sast": [None, "LONDON", "LONDON_NY", "NY", "ALL_DAY"],
-    "weekdays": [None, [0, 1, 2, 3, 4], [0, 1, 2, 3], [1, 2, 3, 4]],
-    "min_stop_atr": [0.0, 1.0, 2.0],
-    "max_stop_atr": [None, 3.0, 5.0],
-    "max_spread_in_r": [None, 0.05],
-    "rr": [1.0, 1.5, 2.0],
+    "session_window_sast": [None, "ASIA", "LONDON", "LONDON_NY", "NY", "ALL_DAY"],
+    "weekdays": [None, [1, 2, 3, 4], [0, 2, 3, 4], [0, 1, 3, 4], [0, 1, 2, 4], [0, 1, 2, 3]],
+    "min_stop_atr": [0.0, 0.5, 1.0, 1.5, 2.0],
+    "max_stop_atr": [None, 3.0, 4.0, 5.0],
+    "max_spread_in_r": [None, 0.10, 0.05, 0.03],
+    "rr": [1.0, 1.25, 1.5, 2.0],
     "be_enabled": [False, True],
-    "max_daily_trades": [None, 2],
+    "max_daily_trades": [None, 1, 2, 3],
 }
 
 STATUS_FILE = os.path.join(DATA_DIR, "optimizer_status.json")
@@ -114,10 +107,10 @@ SUGGESTED_PATH = os.path.join(PROJECT_ROOT, "config", "pair_settings.suggested.j
 SUMMARY_PATH = os.path.join(OUTPUT_DIR, "optimizer_summary.txt")
 SUMMARY_JSON_PATH = os.path.join(OUTPUT_DIR, "optimizer_summary.json")
 
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
 _start_time: float = 0.0
 _variants_tested: int = 0
 
@@ -159,6 +152,13 @@ def _blank_settings() -> Dict[str, Any]:
     }
 
 
+def _baseline_settings() -> Dict[str, Any]:
+    d = _blank_settings()
+    d["be_enabled"] = BASELINE_USE_BE
+    d["rr"] = BASELINE_RR
+    return d
+
+
 def _settings_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     for k in _blank_settings().keys():
         if a.get(k) != b.get(k):
@@ -167,7 +167,6 @@ def _settings_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 
 def _pair_from_live(live_settings: Dict[str, Any], pair: str) -> Dict[str, Any]:
-    """Return a full, normalised copy of the live settings for one pair."""
     live_pair = (live_settings.get("pairs") or {}).get(pair) or {}
     strategies: Dict[str, Any] = {}
     for s in STRATEGY_NAMES:
@@ -185,7 +184,6 @@ def _pair_from_live(live_settings: Dict[str, Any], pair: str) -> Dict[str, Any]:
 
 
 def _quarters_above_one(trades: List[Dict[str, Any]]) -> int:
-    """Count date quarters (out of 4) where PF > 1.0 and there were >= 5 trades."""
     if not trades:
         return 0
     times: List[datetime] = []
@@ -230,7 +228,9 @@ def _load_pair_data(pair: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.Data
     if not os.path.exists(m5_path) or not os.path.exists(d1_path):
         return None, None
     try:
-        return pd.read_csv(m5_path), pd.read_csv(d1_path)
+        m5 = pd.read_csv(m5_path).reset_index(drop=True)
+        d1 = pd.read_csv(d1_path).reset_index(drop=True)
+        return m5, d1
     except Exception:
         return None, None
 
@@ -246,8 +246,155 @@ def _window_bounds(m5_df: pd.DataFrame, days_count: int) -> Tuple[int, int, str,
     return sim_start_idx, total_bars, start_str, end_str
 
 
+def _load_summary_days(pair: str, default_days: int) -> int:
+    summary_path = os.path.join(OUTPUT_DIR, f"{pair}_summary.json")
+    if not os.path.exists(summary_path):
+        return default_days
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        d = data.get("days")
+        if isinstance(d, (int, float)) and d > 0:
+            return int(d)
+    except Exception:
+        pass
+    return default_days
+
+
+def _load_summary_combination_count(pair: str, label: str) -> Optional[int]:
+    summary_path = os.path.join(OUTPUT_DIR, f"{pair}_summary.json")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    combos = data.get("combinations") or []
+    for c in combos:
+        if c.get("label") == label:
+            try:
+                return int(c.get("total_trades") or 0)
+            except Exception:
+                return None
+    return None
+
+
+def _read_strategy_modes() -> Dict[str, Any]:
+    try:
+        cfg_path = os.path.join(PROJECT_ROOT, "bot_config.json")
+        if not os.path.exists(cfg_path):
+            cfg_path = "bot_config.json"
+        if not os.path.exists(cfg_path):
+            return {}
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("strategyModes", {}) or {}
+    except Exception:
+        return {}
+
+
 # ---------------------------------------------------------------------------
-# The simulation pass for ONE strategy with ONE candidate setting set
+# Combined baseline (matches the six-combination exactly)
+# ---------------------------------------------------------------------------
+
+def _run_combined_baseline(
+    pair: str,
+    m5_df: pd.DataFrame,
+    cached_signals: Dict[int, Dict[str, Any]],
+    sim_start_idx: int,
+    total_bars: int,
+    strategy_settings_map: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    sim = TradeSimulator(starting_balance=1000.0, risk_pct=1.0)
+    m5_times_list = m5_df['time'].tolist()
+    has_atr14 = 'atr_14' in m5_df.columns
+    asset_spread = ASSETS.get(pair, {}).get("spread", 0.0)
+
+    funnel = {
+        "raw_signals": 0,
+        "after_settings": 0,
+        "after_adapt": 0,
+        "after_filters": 0,
+        "after_position_check": 0,
+        "opened": 0,
+        "sim_rejected": 0,
+    }
+
+    for i in range(sim_start_idx, total_bars):
+        curr_bar = m5_df.iloc[i]
+        curr_time = m5_times_list[i].to_pydatetime()
+
+        if sim.open_positions or sim.pending_sl_evaluations:
+            m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+            sim.process_candle(pair, curr_bar, m5_slice)
+
+        if i not in cached_signals:
+            continue
+        item = cached_signals[i]
+        signal = copy.deepcopy(item["raw_signal"])
+        funnel["raw_signals"] += 1
+
+        s = strategy_settings_map.get(signal.strategy)
+        if s is None:
+            s = _baseline_settings()
+
+        try:
+            atr14_val = float(m5_df.iloc[i]['atr_14']) if has_atr14 else 0.0
+            if not np.isfinite(atr14_val):
+                atr14_val = 0.0
+        except Exception:
+            atr14_val = 0.0
+
+        passes, _ = passes_signal_filters(s, signal, curr_time, atr14_val, asset_spread)
+        if not passes:
+            continue
+        funnel["after_settings"] += 1
+
+        active_vol = item["active_vol"]
+        if not active_vol.get("valid", False):
+            continue
+
+        strat_rr = get_effective_rr(s, BASELINE_RR)
+        adapted = volatility_engine.adapt_signal(
+            signal, active_vol, ui_rr=strat_rr, session_levels=item["session_levels"]
+        )
+        if not adapted:
+            continue
+        funnel["after_adapt"] += 1
+
+        spread = ASSETS.get(pair, {}).get("spread", 0.0001)
+        sl_d = abs(adapted.entry_price - adapted.stop_loss)
+        tp_d = abs(adapted.take_profit_2 - adapted.entry_price)
+        vol_ok, _ = volatility_engine.evaluate_volatility_filters(
+            active_vol, spread, sl_d, tp_d,
+            adapted.direction, adapted.entry_price, adapted.strategy,
+        )
+        if not vol_ok:
+            continue
+        funnel["after_filters"] += 1
+
+        if any(p["symbol"] == pair for p in sim.open_positions):
+            continue
+        funnel["after_position_check"] += 1
+
+        opened = sim.open_trade(
+            adapted, curr_time, item["adr_val"], item["regime"], item["session_levels"],
+            use_breakeven_override=get_effective_be(s, BASELINE_USE_BE),
+        )
+        if opened:
+            funnel["opened"] += 1
+        else:
+            funnel["sim_rejected"] += 1
+
+    if sim.open_positions:
+        sim.close_all(pair, m5_df.iloc[-1])
+
+    return sim.completed_trades, funnel
+
+
+# ---------------------------------------------------------------------------
+# Isolated per-strategy search pass
 # ---------------------------------------------------------------------------
 
 def _simulate_strategy_pass(
@@ -261,11 +408,6 @@ def _simulate_strategy_pass(
     balance: float = 1000.0,
     risk_pct: float = 1.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Run one pass of the simulator using ONLY the signals from one strategy,
-    filtered by 'settings'. Other strategies are ignored entirely so their
-    trades cannot contaminate this strategy's tuning.
-    """
     global _variants_tested
 
     sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct)
@@ -273,8 +415,8 @@ def _simulate_strategy_pass(
     has_atr14 = 'atr_14' in m5_df.columns
     asset_spread = ASSETS.get(symbol, {}).get("spread", 0.0)
 
-    strat_rr = get_effective_rr(settings, GLOBAL_PARAMS.target_rr)
-    strat_be = get_effective_be(settings, False)
+    strat_rr = get_effective_rr(settings, BASELINE_RR)
+    strat_be = get_effective_be(settings, BASELINE_USE_BE)
     strat_cap = get_effective_max_daily(settings, 0)
     if strat_cap is not None and strat_cap <= 0:
         strat_cap = None
@@ -342,92 +484,6 @@ def _simulate_strategy_pass(
 
 
 # ---------------------------------------------------------------------------
-# Same idea, but ALL strategies with their OWN settings in one pass.
-# Used only for the final combined backtest.
-# ---------------------------------------------------------------------------
-
-def _simulate_pair_all_strategies(
-    symbol: str,
-    m5_df: pd.DataFrame,
-    cached_signals: Dict[int, Dict[str, Any]],
-    sim_start_idx: int,
-    total_bars: int,
-    strat_settings: Dict[str, Dict[str, Any]],
-    balance: float = 1000.0,
-    risk_pct: float = 1.0,
-) -> List[Dict[str, Any]]:
-    sim = TradeSimulator(starting_balance=balance, risk_pct=risk_pct)
-    m5_times_list = m5_df['time'].tolist()
-    has_atr14 = 'atr_14' in m5_df.columns
-    asset_spread = ASSETS.get(symbol, {}).get("spread", 0.0)
-
-    for i in range(sim_start_idx, total_bars):
-        curr_bar = m5_df.iloc[i]
-        curr_time = m5_times_list[i].to_pydatetime()
-        if sim.open_positions or sim.pending_sl_evaluations:
-            m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
-            sim.process_candle(symbol, curr_bar, m5_slice)
-
-        if i not in cached_signals:
-            continue
-        item = cached_signals[i]
-        raw = item["raw_signal"]
-        s_settings = strat_settings.get(raw.strategy)
-        if s_settings is None or not s_settings.get("enabled", True):
-            continue
-        signal = copy.deepcopy(raw)
-
-        try:
-            atr14_val = float(m5_df.iloc[i]['atr_14']) if has_atr14 else 0.0
-            if not np.isfinite(atr14_val):
-                atr14_val = 0.0
-        except Exception:
-            atr14_val = 0.0
-
-        passes, _ = passes_signal_filters(s_settings, signal, curr_time, atr14_val, asset_spread)
-        if not passes:
-            continue
-
-        active_vol = item["active_vol"]
-        if not active_vol.get("valid", False):
-            continue
-
-        strat_rr = get_effective_rr(s_settings, GLOBAL_PARAMS.target_rr)
-        adapted = volatility_engine.adapt_signal(
-            signal, active_vol, ui_rr=strat_rr, session_levels=item["session_levels"]
-        )
-        if not adapted:
-            continue
-
-        spread = ASSETS.get(symbol, {}).get("spread", 0.0001)
-        sl_d = abs(adapted.entry_price - adapted.stop_loss)
-        tp_d = abs(adapted.take_profit_2 - adapted.entry_price)
-        vol_ok, _ = volatility_engine.evaluate_volatility_filters(
-            active_vol, spread, sl_d, tp_d,
-            adapted.direction, adapted.entry_price, adapted.strategy,
-        )
-        if not vol_ok:
-            continue
-
-        if any(p["symbol"] == symbol for p in sim.open_positions):
-            continue
-
-        strat_cap = get_effective_max_daily(s_settings, 0)
-        if strat_cap is not None and strat_cap <= 0:
-            strat_cap = None
-
-        sim.open_trade(
-            adapted, curr_time, item["adr_val"], item["regime"], item["session_levels"],
-            use_breakeven_override=get_effective_be(s_settings, False),
-            max_daily_override=strat_cap,
-        )
-
-    if sim.open_positions:
-        sim.close_all(symbol, m5_df.iloc[-1])
-    return sim.completed_trades
-
-
-# ---------------------------------------------------------------------------
 # Greedy forward selection
 # ---------------------------------------------------------------------------
 
@@ -442,12 +498,9 @@ def _greedy_select(
     window_end_str: str,
     deadline: float,
 ) -> Dict[str, Any]:
-    """
-    Returns a dict with: settings, trades, tv, accepted, verdict, hit_deadline.
-    """
     global _variants_tested
 
-    current = _blank_settings()
+    current = _baseline_settings()
     trades = _simulate_strategy_pass(
         symbol, m5_df, cached_signals, sim_start_idx, total_bars,
         strategy_name, current,
@@ -590,11 +643,11 @@ def _run_combined(
             if use_settings:
                 block = (suggested.get("pairs", {}).get(pair, {})
                          .get("strategies", {}).get(s))
-                strat_settings[s] = block if block else _blank_settings()
+                strat_settings[s] = block if block else _baseline_settings()
             else:
-                strat_settings[s] = _blank_settings()
+                strat_settings[s] = _baseline_settings()
 
-        trades = _simulate_pair_all_strategies(
+        trades, _funnel = _run_combined_baseline(
             pair, m5_df, cached_signals, sim_start_idx, total_bars, strat_settings,
         )
         combined.extend(trades)
@@ -618,220 +671,324 @@ def run_optimizer(symbols_list: Optional[List[str]] = None) -> bool:
     live_settings = load_pair_settings()
     suggested: Dict[str, Any] = {"pairs": {}}
 
+    default_settings_map: Dict[str, Dict[str, Any]] = {}
+    for s in STRATEGY_NAMES:
+        default_settings_map[s] = _baseline_settings()
+
+    strategy_modes = _read_strategy_modes()
+
     blocks: List[str] = []
     blocks.append("OPTIMIZER SUMMARY")
     blocks.append(f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     blocks.append(f"Symbols: {', '.join(symbols_list)}")
-    blocks.append(f"Window per pair: {OPTIMIZE_WINDOW_DAYS} days")
+    blocks.append(f"Baseline: {BASELINE_COMBINATION_LABEL}")
     blocks.append(f"Max wall clock: {OPTIMIZER_MAX_SECONDS}s")
-    blocks.append(f"Rules: TUNE>=30 trades, VALIDATE>=30 trades, "
-                  f"VALIDATE PF >= baseline + {MIN_VALIDATE_PF_IMPROVEMENT:.2f}, "
-                  f"VALIDATE PF > {MIN_VALIDATE_PF:.2f}, "
-                  f"PF > 1.0 in {MIN_QUARTERS_ABOVE_ONE}/4 quarters")
+    blocks.append(
+        f"Rules: TUNE>={MIN_TRADES_TUNE_VALIDATE} trades, VALIDATE>={MIN_TRADES_TUNE_VALIDATE} trades, "
+        f"VALIDATE PF >= baseline + {MIN_VALIDATE_PF_IMPROVEMENT:.2f}, "
+        f"VALIDATE PF > {MIN_VALIDATE_PF:.2f}, "
+        f"PF > 1.0 in {MIN_QUARTERS_ABOVE_ONE}/4 quarters"
+    )
+    if strategy_modes:
+        off_list = [k for k, v in strategy_modes.items() if v == "OFF"]
+        if off_list:
+            blocks.append(f"bot_config strategyModes OFF: {', '.join(off_list)}")
+        else:
+            blocks.append(f"bot_config strategyModes: all LIVE/DRY_RUN")
+    else:
+        blocks.append("bot_config strategyModes: (no bot_config.json or empty)")
     blocks.append("")
     _write_summary(blocks)
 
     _log(f"starting, symbols={symbols_list}, budget={OPTIMIZER_MAX_SECONDS}s")
 
-    for pair in symbols_list:
-        pair_block = _pair_from_live(live_settings, pair)
-        suggested["pairs"][pair] = pair_block
+    invalid_pairs: List[str] = []
+    ok_pairs: List[str] = []
 
-        if _over_budget(deadline):
-            blocks.append(f"[{pair}] SKIPPED — optimizer over time budget.")
-            _write_summary(blocks)
-            continue
+    saved_adaptive = GLOBAL_PARAMS.adaptive_mode
+    saved_be = GLOBAL_PARAMS.use_breakeven
+    saved_trail = GLOBAL_PARAMS.use_supertrend_trail
+    saved_rr = GLOBAL_PARAMS.target_rr
+    GLOBAL_PARAMS.adaptive_mode = True
+    GLOBAL_PARAMS.use_breakeven = BASELINE_USE_BE
+    GLOBAL_PARAMS.use_supertrend_trail = False
+    GLOBAL_PARAMS.target_rr = BASELINE_RR
 
-        _log(f"pair {pair}: loading data")
-        m5_df, _d1 = _load_pair_data(pair)
-        if m5_df is None:
-            blocks.append(f"[{pair}] SKIPPED — no market data found.")
-            _write_summary(blocks)
-            continue
+    try:
+        for pair in symbols_list:
+            pair_block = _pair_from_live(live_settings, pair)
+            suggested["pairs"][pair] = pair_block
 
-        m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
-        sim_start_idx, total_bars, ws, we = _window_bounds(m5_df, OPTIMIZE_WINDOW_DAYS)
-        if total_bars < 200:
-            blocks.append(f"[{pair}] SKIPPED — only {total_bars} bars.")
-            _write_summary(blocks)
-            continue
+            if _over_budget(deadline):
+                blocks.append(f"[{pair}] SKIPPED — optimizer over time budget.")
+                _write_summary(blocks)
+                continue
 
-        cached = _try_load_precompute(pair, sim_start_idx, total_bars)
-        if cached is None:
-            _log(f"pair {pair}: building precompute cache (cold; this is the slow part)")
-            blocks.append(f"[{pair}] building precompute cache (cold)...")
-            _write_summary(blocks)
-            try:
-                h1_df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_H1.csv"))
-                h4_df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_H4.csv"))
-                d1_df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_D1.csv"))
+            _log(f"pair {pair}: loading data")
+            m5_df, _d1 = _load_pair_data(pair)
+            if m5_df is None:
+                blocks.append(f"[{pair}] SKIPPED — no market data found.")
+                _write_summary(blocks)
+                continue
+
+            summary_days = _load_summary_days(pair, OPTIMIZE_WINDOW_DAYS)
+            m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+            sim_start_idx, total_bars, ws, we = _window_bounds(m5_df, summary_days)
+            if total_bars < 200:
+                blocks.append(f"[{pair}] SKIPPED — only {total_bars} bars.")
+                _write_summary(blocks)
+                continue
+
+            cached = _try_load_precompute(pair, sim_start_idx, total_bars)
+            if cached is None:
+                _log(f"pair {pair}: building precompute cache (cold; this is the slow part)")
+                blocks.append(f"[{pair}] building precompute cache (cold, window={summary_days}d)...")
+                _write_summary(blocks)
+                try:
+                    h1_df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_H1.csv"))
+                    h4_df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_H4.csv"))
+                    d1_df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_D1.csv"))
+                    compute_121_window_emas(m5_df)
+                    compute_atr14_series(m5_df)
+                    t0 = time.time()
+                    precomputed = precompute_market_pass(
+                        symbol=pair, m5_df=m5_df, h1_df=h1_df, h4_df=h4_df, d1_df=d1_df,
+                        sim_start_idx=sim_start_idx, total_bars=total_bars,
+                    )
+                    try:
+                        _save_precompute(pair, sim_start_idx, total_bars, precomputed, time.time() - t0)
+                    except Exception:
+                        pass
+                    cached = precomputed
+                except Exception as e:
+                    blocks.append(f"[{pair}] FAILED to build precompute: {e}")
+                    _write_summary(blocks)
+                    continue
+            else:
+                _log(f"pair {pair}: loaded cached precompute")
                 compute_121_window_emas(m5_df)
                 compute_atr14_series(m5_df)
-                t0 = time.time()
-                precomputed = precompute_market_pass(
-                    symbol=pair, m5_df=m5_df, h1_df=h1_df, h4_df=h4_df, d1_df=d1_df,
-                    sim_start_idx=sim_start_idx, total_bars=total_bars,
-                )
-                try:
-                    _save_precompute(pair, sim_start_idx, total_bars, precomputed, time.time() - t0)
-                except Exception:
-                    pass
-                cached = precomputed
-            except Exception as e:
-                blocks.append(f"[{pair}] FAILED to build precompute: {e}")
-                _write_summary(blocks)
-                continue
-        else:
-            compute_121_window_emas(m5_df)
-            compute_atr14_series(m5_df)
 
-        cached_signals = cached.get("cached_signals") or {}
-        if not cached_signals:
-            blocks.append(f"[{pair}] SKIPPED — no cached signals.")
-            _write_summary(blocks)
-            continue
-
-        _log(f"pair {pair}: starting strategy loop")
-
-        for strategy in STRATEGY_NAMES:
-            if _over_budget(deadline):
-                blocks.append(f"[{pair} / {strategy}] SKIPPED — over time budget.")
+            cached_signals = cached.get("cached_signals") or {}
+            if not cached_signals:
+                blocks.append(f"[{pair}] SKIPPED — no cached signals.")
                 _write_summary(blocks)
                 continue
 
-            # Baseline count check (cheap simulation with default settings)
-            try:
-                baseline_trades = _simulate_strategy_pass(
-                    pair, m5_df, cached_signals, sim_start_idx, total_bars,
-                    strategy, _blank_settings(),
-                )
-                _variants_tested += 1
-            except Exception as e:
-                blocks.append(f"[{pair} / {strategy}] baseline FAILED: {e}")
-                _write_summary(blocks)
-                continue
+            raw_strategy_counts: Dict[str, int] = {}
+            for _, item in cached_signals.items():
+                sn = item["raw_signal"].strategy
+                raw_strategy_counts[sn] = raw_strategy_counts.get(sn, 0) + 1
 
-            if len(baseline_trades) < MIN_BASELINE_TRADES:
-                blocks.append(
-                    f"[{pair} / {strategy}] SKIPPED — baseline only "
-                    f"{len(baseline_trades)} trades (need >= {MIN_BASELINE_TRADES})."
-                )
-                _write_summary(blocks)
-                continue
-
-            _log(f"pair {pair}, strategy {strategy}: greedy selection")
-
-            try:
-                sel = _greedy_select(
-                    pair, m5_df, cached_signals, sim_start_idx, total_bars,
-                    strategy, ws, we, deadline,
-                )
-            except Exception as e:
-                blocks.append(f"[{pair} / {strategy}] FAILED: {e}")
-                _write_summary(blocks)
-                traceback.print_exc()
-                continue
-
-            current = sel["settings"]
-            accepted = sel["accepted"]
-            verdict = sel["verdict"]
-            hit_deadline = sel["hit_deadline"]
-            f_tv = sel["tv"]
-            f_trades = sel["trades"]
-            f_q = _quarters_above_one(f_trades)
-
-            b_tv = compute_tune_validate_kpis(baseline_trades, ws, we)
-            b_tune = b_tv["tune"]
-            b_val = b_tv["validate"]
-            f_tune = f_tv["tune"]
-            f_val = f_tv["validate"]
-
-            settings_desc = ", ".join(
-                f"{c['field']}={c['value']}" for c in accepted
-            ) if accepted else "defaults (no qualifying change found)"
-
-            blocks.append(
-                f"[{pair} / {strategy}]\n"
-                f"  Baseline: TUNE TR {int(b_tune.get('count', 0)):>4}  "
-                f"PF {float(b_tune.get('profit_factor') or 0):.2f}  |  "
-                f"VALIDATE TR {int(b_val.get('count', 0)):>4}  "
-                f"PF {float(b_val.get('profit_factor') or 0):.2f}\n"
-                f"  Chosen:   {settings_desc}\n"
-                f"  Result:   TUNE TR {int(f_tune.get('count', 0)):>4}  "
-                f"PF {float(f_tune.get('profit_factor') or 0):.2f}  |  "
-                f"VALIDATE TR {int(f_val.get('count', 0)):>4}  "
-                f"PF {float(f_val.get('profit_factor') or 0):.2f}  |  "
-                f"quarters>1: {f_q}/4\n"
-                f"  Verdict:  {verdict}"
-                + ("  (deadline hit mid-search)" if hit_deadline else "")
+            _log(f"pair {pair}: running combined baseline")
+            baseline_trades, funnel = _run_combined_baseline(
+                pair, m5_df, cached_signals, sim_start_idx, total_bars, default_settings_map,
             )
+            baseline_by_strategy: Dict[str, List[Dict[str, Any]]] = {}
+            for t in baseline_trades:
+                baseline_by_strategy.setdefault(t["strategy"], []).append(t)
 
-            if accepted:
-                for c in accepted:
-                    pair_block["strategies"][strategy][c["field"]] = c["value"]
+            expected = _load_summary_combination_count(pair, BASELINE_COMBINATION_LABEL)
+            guard_msg = None
+            guard_ok = True
+            if expected is None:
+                guard_msg = f"[{pair}] GUARD SKIPPED — no summary for '{BASELINE_COMBINATION_LABEL}'. Using optimizer baseline only."
+            else:
+                diff = abs(len(baseline_trades) - expected)
+                pct = (diff / max(1, expected)) * 100.0
+                if pct > 2.0:
+                    guard_ok = False
+                    guard_msg = (
+                        f"[{pair}] BASELINE MISMATCH: optimizer {len(baseline_trades)} "
+                        f"vs backtest {expected} ({pct:.1f}%)"
+                    )
+                    invalid_pairs.append(pair)
 
-            _write_summary(blocks)
-            _write_status({
-                "isRunning": True,
-                "pair": pair,
-                "strategy": strategy,
-                "elapsed_s": round(_elapsed(), 1),
-                "variants_tested": _variants_tested,
-            })
+            funnel_line = (
+                f"[{pair}] FUNNEL window_days={summary_days} "
+                f"raw={funnel['raw_signals']} "
+                f"after_settings={funnel['after_settings']} "
+                f"after_adapt={funnel['after_adapt']} "
+                f"after_filters={funnel['after_filters']} "
+                f"after_position_check={funnel['after_position_check']} "
+                f"opened={funnel['opened']} "
+                f"sim_rejected={funnel['sim_rejected']} "
+                f"backtest={expected if expected is not None else 'n/a'}"
+            )
+            _log(funnel_line)
+            blocks.append(funnel_line)
 
-    # ---- write suggested file ----
-    try:
-        save_pair_settings(suggested, path=SUGGESTED_PATH)
-        _log(f"suggested file written: {SUGGESTED_PATH}")
-    except Exception as e:
-        _log(f"WARNING: could not write suggested file: {e}")
+            raw_breakdown = " ".join(f"{k}={v}" for k, v in sorted(raw_strategy_counts.items()))
+            blocks.append(f"[{pair}] CACHED SIGNALS BY STRATEGY: {raw_breakdown or '(none)'}")
 
-    # ---- final combined backtest ----
+            if guard_msg:
+                blocks.append(guard_msg)
+                _write_summary(blocks)
+
+            if not guard_ok:
+                blocks.append(f"[{pair}] SEARCH SKIPPED — guard failed.")
+                _write_summary(blocks)
+                continue
+
+            ok_pairs.append(pair)
+
+            _log(f"pair {pair}: starting strategy loop")
+            for strategy in STRATEGY_NAMES:
+                if _over_budget(deadline):
+                    blocks.append(f"[{pair} / {strategy}] SKIPPED — over time budget.")
+                    _write_summary(blocks)
+                    continue
+
+                baseline_count = len(baseline_by_strategy.get(strategy, []))
+                if baseline_count < MIN_BASELINE_TRADES:
+                    blocks.append(
+                        f"[{pair} / {strategy}] SKIPPED — baseline only "
+                        f"{baseline_count} trades (need >= {MIN_BASELINE_TRADES})."
+                    )
+                    _write_summary(blocks)
+                    continue
+
+                _log(f"pair {pair}, strategy {strategy}: greedy selection")
+
+                try:
+                    sel = _greedy_select(
+                        pair, m5_df, cached_signals, sim_start_idx, total_bars,
+                        strategy, ws, we, deadline,
+                    )
+                except Exception as e:
+                    blocks.append(f"[{pair} / {strategy}] FAILED: {e}")
+                    _write_summary(blocks)
+                    traceback.print_exc()
+                    continue
+
+                current = sel["settings"]
+                accepted = sel["accepted"]
+                verdict = sel["verdict"]
+                hit_deadline = sel["hit_deadline"]
+                f_tv = sel["tv"]
+                f_trades = sel["trades"]
+                f_q = _quarters_above_one(f_trades)
+
+                b_tv = compute_tune_validate_kpis(
+                    baseline_by_strategy.get(strategy, []), ws, we
+                )
+                b_tune = b_tv["tune"]
+                b_val = b_tv["validate"]
+                f_tune = f_tv["tune"]
+                f_val = f_tv["validate"]
+
+                settings_desc = ", ".join(
+                    f"{c['field']}={c['value']}" for c in accepted
+                ) if accepted else "defaults (no qualifying change found)"
+
+                blocks.append(
+                    f"[{pair} / {strategy}]\n"
+                    f"  Baseline: TUNE TR {int(b_tune.get('count', 0)):>4}  "
+                    f"PF {float(b_tune.get('profit_factor') or 0):.2f}  |  "
+                    f"VALIDATE TR {int(b_val.get('count', 0)):>4}  "
+                    f"PF {float(b_val.get('profit_factor') or 0):.2f}\n"
+                    f"  Chosen:   {settings_desc}\n"
+                    f"  Result:   TUNE TR {int(f_tune.get('count', 0)):>4}  "
+                    f"PF {float(f_tune.get('profit_factor') or 0):.2f}  |  "
+                    f"VALIDATE TR {int(f_val.get('count', 0)):>4}  "
+                    f"PF {float(f_val.get('profit_factor') or 0):.2f}  |  "
+                    f"quarters>1: {f_q}/4\n"
+                    f"  Verdict:  {verdict}"
+                    + ("  (deadline hit mid-search)" if hit_deadline else "")
+                )
+
+                if accepted:
+                    for c in accepted:
+                        pair_block["strategies"][strategy][c["field"]] = c["value"]
+
+                _write_summary(blocks)
+                _write_status({
+                    "isRunning": True,
+                    "pair": pair,
+                    "strategy": strategy,
+                    "elapsed_s": round(_elapsed(), 1),
+                    "variants_tested": _variants_tested,
+                })
+    finally:
+        GLOBAL_PARAMS.adaptive_mode = saved_adaptive
+        GLOBAL_PARAMS.use_breakeven = saved_be
+        GLOBAL_PARAMS.use_supertrend_trail = saved_trail
+        GLOBAL_PARAMS.target_rr = saved_rr
+
+    if invalid_pairs:
+        for bad in invalid_pairs:
+            suggested["pairs"].pop(bad, None)
+
+    if ok_pairs:
+        try:
+            save_pair_settings(suggested, path=SUGGESTED_PATH)
+            _log(f"suggested file written: {SUGGESTED_PATH}")
+        except Exception as e:
+            _log(f"WARNING: could not write suggested file: {e}")
+    else:
+        blocks.append("")
+        blocks.append("SUGGESTED FILE NOT WRITTEN — no pair passed the guard.")
+        _write_summary(blocks)
+
     blocks.append("")
     blocks.append("FINAL COMBINED BACKTEST (all ROBUST settings applied together)")
     _write_summary(blocks)
 
-    try:
-        baseline_combined = _run_combined(
-            symbols_list, suggested, OPTIMIZE_WINDOW_DAYS, use_settings=False,
-        )
-        robust_combined = _run_combined(
-            symbols_list, suggested, OPTIMIZE_WINDOW_DAYS, use_settings=True,
-        )
-        bk = calculate_kpis(baseline_combined)
-        rk = calculate_kpis(robust_combined)
-        blocks.append(
-            f"  Baseline (defaults):   TR {int(bk.get('count', 0))}  "
-            f"PF {float(bk.get('profit_factor') or 0):.2f}  "
-            f"PnL ${float(bk.get('net_pnl') or 0):.2f}  "
-            f"Max DD ${float(bk.get('max_dd_money') or 0):.2f}"
-        )
-        blocks.append(
-            f"  With ROBUST settings:  TR {int(rk.get('count', 0))}  "
-            f"PF {float(rk.get('profit_factor') or 0):.2f}  "
-            f"PnL ${float(rk.get('net_pnl') or 0):.2f}  "
-            f"Max DD ${float(rk.get('max_dd_money') or 0):.2f}"
-        )
-    except Exception as e:
-        blocks.append(f"  FAILED: {e}")
-        traceback.print_exc()
+    if ok_pairs:
+        try:
+            baseline_combined = _run_combined(
+                ok_pairs, suggested, OPTIMIZE_WINDOW_DAYS, use_settings=False,
+            )
+            robust_combined = _run_combined(
+                ok_pairs, suggested, OPTIMIZE_WINDOW_DAYS, use_settings=True,
+            )
+            bk = calculate_kpis(baseline_combined)
+            rk = calculate_kpis(robust_combined)
+            blocks.append(
+                f"  Baseline (defaults):   TR {int(bk.get('count', 0))}  "
+                f"PF {float(bk.get('profit_factor') or 0):.2f}  "
+                f"PnL ${float(bk.get('net_pnl') or 0):.2f}  "
+                f"Max DD ${float(bk.get('max_dd_money') or 0):.2f}"
+            )
+            blocks.append(
+                f"  With ROBUST settings:  TR {int(rk.get('count', 0))}  "
+                f"PF {float(rk.get('profit_factor') or 0):.2f}  "
+                f"PnL ${float(rk.get('net_pnl') or 0):.2f}  "
+                f"Max DD ${float(rk.get('max_dd_money') or 0):.2f}"
+            )
+        except Exception as e:
+            blocks.append(f"  FAILED: {e}")
+            traceback.print_exc()
+    else:
+        blocks.append("  SKIPPED — no pair passed the guard.")
 
     blocks.append("")
     blocks.append(f"Variants tested: {_variants_tested}")
     blocks.append(f"Elapsed: {round(_elapsed(), 1)}s")
-    blocks.append(f"Suggested file: {SUGGESTED_PATH}")
+    if invalid_pairs:
+        blocks.append(f"Pairs failing the baseline guard: {', '.join(invalid_pairs)}")
+    blocks.append(f"Suggested file: {SUGGESTED_PATH if ok_pairs else '(not written)'}")
     blocks.append("")
     blocks.append(
         "HOW TO READ THIS:\n"
         "  * ROBUST means the change passed all four validation rules.\n"
-        "  * NO CHANGE means nothing qualified — the strategy stays at defaults.\n"
+        "  * NO CHANGE means nothing qualified.\n"
         "  * SKIPPED means there was not enough data or the time budget ran out.\n"
+        "  * BASELINE MISMATCH means the optimizer's trade count for the pair did not\n"
+        "    match the six-combination summary. That pair is left untouched.\n"
         "  * The suggested file does NOT overwrite your live file. Copy it in only\n"
         "    after reviewing this summary."
     )
+
+    if invalid_pairs:
+        header = [
+            f"OPTIMIZER INVALID — BASELINE GUARD FAILED FOR: {', '.join(invalid_pairs)}",
+            "",
+        ]
+        blocks = header + blocks
+
     _write_summary(blocks)
 
-    # Mirror to JSON for the panel
     try:
         os.makedirs(os.path.dirname(SUMMARY_JSON_PATH), exist_ok=True)
         with open(SUMMARY_JSON_PATH, "w", encoding="utf-8") as f:
@@ -839,8 +996,10 @@ def run_optimizer(symbols_list: Optional[List[str]] = None) -> bool:
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "variants_tested": _variants_tested,
                 "elapsed_s": round(_elapsed(), 1),
-                "suggested_file": SUGGESTED_PATH,
+                "suggested_file": SUGGESTED_PATH if ok_pairs else None,
                 "summary_file": SUMMARY_PATH,
+                "invalid_pairs": invalid_pairs,
+                "ok_pairs": ok_pairs,
                 "text": "\n".join(blocks),
             }, f, indent=2)
     except Exception:
@@ -850,8 +1009,9 @@ def run_optimizer(symbols_list: Optional[List[str]] = None) -> bool:
         "isRunning": False,
         "elapsed_s": round(_elapsed(), 1),
         "variants_tested": _variants_tested,
-        "suggested_file": SUGGESTED_PATH,
+        "suggested_file": SUGGESTED_PATH if ok_pairs else None,
         "summary_file": SUMMARY_PATH,
+        "invalid_pairs": invalid_pairs,
     })
 
     _log(f"done. {_variants_tested} variants tested in {round(_elapsed(), 1)}s")
