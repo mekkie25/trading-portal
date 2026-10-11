@@ -55,7 +55,6 @@ interface LabPayload {
   variants: LabVariantRow[];
 }
 
-// PROPOSED: optimizer status shape returned by /api/backtest/optimize-status
 interface OptimizerDetails {
   isRunning?: boolean;
   pair?: string;
@@ -198,8 +197,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [isLoadingLab, setIsLoadingLab] = useState<boolean>(false);
   const [labCopyStatus, setLabCopyStatus] = useState<Record<string, 'idle' | 'copied'>>({});
 
-  // PROPOSED: Optimizer state
+  // Optimizer state.
   const [optimizerRunning, setOptimizerRunning] = useState<boolean>(false);
+  // NEW: mirrors the server's reported isRunning so the Stop button stays
+  // visible even when this tab did not start the run itself.
+  const [optimizerServerRunning, setOptimizerServerRunning] = useState<boolean>(false);
   const [optimizerProgress, setOptimizerProgress] = useState<string>('');
   const [optimizerError, setOptimizerError] = useState<string | null>(null);
   const [optimizerDetails, setOptimizerDetails] = useState<OptimizerDetails | null>(null);
@@ -379,21 +381,34 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return () => clearInterval(interval);
   }, [labRunning, selectedSymbols, fetchLabForSymbol]);
 
-  // PROPOSED: poll the optimizer while it is running, and fetch its summary
-  // once when it stops.
+  // Poll the optimizer status. Adopt the server's isRunning state so the UI
+  // never gets stuck on "already running" while the server is idle, and never
+  // hides the Stop button while the server is busy.
   useEffect(() => {
     const fetchOptimizerStatus = async () => {
       try {
         const res = await fetch('/api/backtest/optimize-status');
         if (!res.ok) return;
         const json = await res.json();
+
         if (json.progress) setOptimizerProgress(json.progress);
         if (json.details) setOptimizerDetails(json.details);
         if (json.lastError) setOptimizerError(json.lastError);
         if (typeof json.summaryText === 'string' && json.summaryText.length > 0) {
           setOptimizerSummaryText(json.summaryText);
         }
-        if (optimizerRunning && !json.isRunning) {
+
+        const serverRunning = Boolean(json.isRunning);
+        setOptimizerServerRunning(serverRunning);
+
+        // Server has a live process but the client thinks it stopped.
+        if (serverRunning && !optimizerRunning) {
+          setOptimizerRunning(true);
+          setOptimizerError(null);
+        }
+
+        // Server is idle but the client thought it was still running.
+        if (!serverRunning && optimizerRunning) {
           setOptimizerRunning(false);
           setShowOptimizerSummary(true);
         }
@@ -525,10 +540,8 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     }
   };
 
-  // PROPOSED: start the optimizer. Runs on ALL whitelisted pairs by default
-  // so a single button press gives the full picture.
   const handleRunOptimizer = async () => {
-    if (optimizerRunning || isRunning || labRunning) return;
+    if (optimizerRunning || optimizerServerRunning || isRunning || labRunning) return;
     if (!window.confirm(
       'Run the settings optimizer?\n\n' +
       'It will test many setting variations per strategy per pair on the ' +
@@ -563,8 +576,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   const handleStopOptimizer = async () => {
     try {
-      await fetch('/api/backtest/stop', { method: 'POST' });
+      await fetch('/api/backtest/optimize/stop', { method: 'POST' });
       setOptimizerRunning(false);
+      setOptimizerServerRunning(false);
       setOptimizerProgress('Optimizer cancelled.');
     } catch {}
   };
@@ -746,7 +760,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   const exportPairCount = reportFiles.filter(f => f.endsWith('_summary.json') && !f.startsWith('.')).length;
 
-  const anyJobRunning = isRunning || labRunning || optimizerRunning;
+  const anyJobRunning = isRunning || labRunning || optimizerRunning || optimizerServerRunning;
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
@@ -807,20 +821,19 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
           {!isRunning ? (
             <>
-              <button type="button" onClick={handleRunSelected} disabled={selectedSymbols.length === 0 || labRunning || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunSelected} disabled={selectedSymbols.length === 0 || labRunning || optimizerRunning || optimizerServerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50">
                 <Play className="w-3.5 h-3.5" />
                 <span>Run Selected ({selectedSymbols.length})</span>
               </button>
-              <button type="button" onClick={handleRunAll} disabled={labRunning || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunAll} disabled={labRunning || optimizerRunning || optimizerServerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50">
                 <Layers className="w-3.5 h-3.5" />
                 <span>Run All</span>
               </button>
-              <button type="button" onClick={handleRunStrategyLab} disabled={selectedSymbols.length === 0 || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunStrategyLab} disabled={selectedSymbols.length === 0 || optimizerRunning || optimizerServerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50">
                 <FlaskConical className="w-3.5 h-3.5" />
                 <span>Strategy Lab</span>
               </button>
-              {/* PROPOSED: Optimize settings button */}
-              <button type="button" onClick={handleRunOptimizer} disabled={labRunning || optimizerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50">
+              <button type="button" onClick={handleRunOptimizer} disabled={labRunning || optimizerRunning || optimizerServerRunning} className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50">
                 <Wand2 className="w-3.5 h-3.5" />
                 <span>Optimize settings</span>
               </button>
@@ -834,8 +847,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       </motion.div>
 
-      {/* PROPOSED: optimizer progress + summary panel */}
-      {(optimizerRunning || optimizerError || optimizerSummaryText) && (
+      {(optimizerRunning || optimizerServerRunning || optimizerError || optimizerSummaryText) && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-2">
@@ -843,15 +855,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               <span className="text-xs font-bold text-black dark:text-white">
                 Optimizer
               </span>
-              {optimizerRunning && <RefreshCw className="w-3.5 h-3.5 text-purple-500 animate-spin" />}
+              {(optimizerRunning || optimizerServerRunning) && <RefreshCw className="w-3.5 h-3.5 text-purple-500 animate-spin" />}
             </div>
             <div className="flex items-center gap-2">
-              {optimizerRunning && (
+              {(optimizerRunning || optimizerServerRunning) && (
                 <button type="button" onClick={handleStopOptimizer} className="px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer">
                   Stop optimizer
                 </button>
               )}
-              {optimizerSummaryText && (
+              {optimizerSummaryText && !optimizerRunning && !optimizerServerRunning && (
                 <>
                   <button type="button" onClick={handleCopyOptimizerSummary} className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer">
                     {optimizerCopyStatus === 'copied' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
@@ -865,7 +877,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </div>
           </div>
 
-          {optimizerRunning && (
+          {(optimizerRunning || optimizerServerRunning) && (
             <div className="text-xs text-slate-500 font-mono">
               {optimizerProgress || 'Working...'}
               {optimizerDetails?.variants_tested != null && (
@@ -877,13 +889,13 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </div>
           )}
 
-          {optimizerError && !optimizerRunning && (
+          {optimizerError && !optimizerRunning && !optimizerServerRunning && (
             <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-700 dark:text-rose-300 font-mono">
               {optimizerError}
             </div>
           )}
 
-          {optimizerSummaryText && !optimizerRunning && (
+          {optimizerSummaryText && !optimizerRunning && !optimizerServerRunning && (
             <div className="space-y-2">
               <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-800 dark:text-emerald-300">
                 Optimizer finished. Your suggested settings file is at{' '}
