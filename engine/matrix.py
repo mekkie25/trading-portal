@@ -44,7 +44,7 @@ if PROJECT_ROOT not in sys.path:
 
 import core.session_config
 from core.session_config import MarketSessionManager, GLOBAL_PARAMS, TZ_SAST
-from core.indicators import calculate_supertrend
+from core.indicators import calculate_supertrend, get_session_volume_profile
 from core.fx import get_fx_rate_to_account, FX_CONVERSION_ALIASES
 from core.volatility_engine import volatility_engine
 from core.targets import compute_fixed_target
@@ -66,7 +66,6 @@ from strategies.base import StrategySignal
 from strategies.strategy_manager import StrategyManager
 from risk.risk_manager import RiskManager, RISK_PROFILES
 
-# PROPOSED: Support shared DATA_DIR persistent storage volume
 DATA_DIR = os.getenv("DATA_DIR", "").strip() or PROJECT_ROOT
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -75,6 +74,73 @@ TELEMETRY_FILE = os.path.join(DATA_DIR, "bot_telemetry.json")
 TRADES_DB_FILE = os.path.join(DATA_DIR, "trades_db.json")
 CANDLES_CACHE_FILE = os.path.join(DATA_DIR, "candles_cache.json")
 CLOSE_COMMAND_FILE = os.path.join(DATA_DIR, "close_command.json")
+
+# ==============================================================================
+# PROPOSED (Fix 7b): developing-session value area.
+#
+# The value area (POC/VAH/VAL) that ORB_LIQUIDITY_SWEEP and
+# PDH_PDL_FAILED_BREAKOUT read is now computed from the DEVELOPING SESSION
+# (the current D1 bar's open time up to now), matching the mentor's setup.
+#
+# Before, live used the local OrderFlowAnalyzer on the trailing 120 bars,
+# which produced different levels from the backtest and did not correspond
+# to any real session boundary. Now both live (this file) and backtest
+# (backtest/runner.py) use the SAME function (core.indicators.
+# get_session_volume_profile) on the SAME bar range (session-open .. now).
+#
+# Falls back to the full slice when the session has fewer than
+# MIN_SESSION_BARS M5 candles, so the first bars of a new session do not
+# produce a degenerate VA.
+# ==============================================================================
+
+MIN_SESSION_BARS = 20
+
+
+def _session_start_utc(d1_df: pd.DataFrame) -> Optional[datetime]:
+    """
+    Return the open time of the last D1 bar in d1_df, which is the start
+    of the current session. Returns None if d1_df is empty.
+
+    Note: the caller must request D1 with drop_forming=False so that the
+    last row is TODAY's forming bar. See fetch_ohlc_candles.
+    """
+    if d1_df is None or d1_df.empty:
+        return None
+    try:
+        last_bar = d1_df.iloc[-1]
+        t = pd.to_datetime(last_bar['time'], utc=True)
+        if hasattr(t, 'to_pydatetime'):
+            return t.to_pydatetime()
+        return t
+    except Exception:
+        return None
+
+
+def _compute_session_volume_profile(
+    m5_df: pd.DataFrame,
+    session_start: Optional[datetime],
+    min_bars: int = MIN_SESSION_BARS,
+) -> Dict[str, Any]:
+    """
+    Compute the developing-session volume profile. Falls back to the full
+    slice when the session has fewer than min_bars candles or when
+    session_start is None.
+    """
+    if m5_df is None or m5_df.empty:
+        return get_session_volume_profile(m5_df)
+    if session_start is None:
+        return get_session_volume_profile(m5_df)
+    try:
+        if session_start.tzinfo is None:
+            session_start = session_start.replace(tzinfo=timezone.utc)
+        m5_times = pd.to_datetime(m5_df['time'], utc=True)
+        session_bars = m5_df[m5_times >= session_start]
+        if len(session_bars) >= min_bars:
+            return get_session_volume_profile(session_bars)
+    except Exception:
+        pass
+    return get_session_volume_profile(m5_df)
+
 
 # ==============================================================================
 # 1. ADVANCED INSTITUTIONAL LOGGING
@@ -168,7 +234,6 @@ def write_telemetry(balance: float, equity: float, regime: str, active_setup: st
     except Exception as e:
         log.error(f"Failed to write telemetry atomically: {e}")
 
-# PROPOSED: Loud error logging and safe reading
 def read_ui_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
         return {}
@@ -203,7 +268,6 @@ def read_trade_history() -> List[dict]:
         log.exception(f"CRITICAL: Failed reading {TRADES_DB_FILE}: {e}")
         return []
 
-# PROPOSED: Atomic trade recording with tempfile and atomic replacement
 def save_trade_record(trade_data: dict) -> None:
     try:
         trades = read_trade_history()
@@ -295,7 +359,6 @@ class ConfigManager:
     WS_PORT = 5036
     WS_URL = f"wss://{WS_HOST}:{WS_PORT}"
 
-    # 7 Whitelist Execution Symbols
     SYMBOL_ALIASES: Dict[str, List[str]] = {
         "GOLD": ["XAUUSD", "GOLD", "XAUUSD.spot"],
         "US30": ["US30", "DJ30", "US30.cash", "WS30"],
@@ -333,7 +396,6 @@ class CTraderClient:
         self._seed_notified_deals()
 
     def _seed_notified_deals(self):
-        """Pre-seeds notified deals from trades_db.json so past trades are not re-processed on reboot."""
         for t in read_trade_history():
             tid = str(t.get("ticket", "")).replace("#", "").strip()
             if tid:
@@ -360,10 +422,6 @@ class CTraderClient:
         self._msg_counter: int = 0
         self._listen_task: Optional[asyncio.Task] = None
         self.risk_engine: Optional[Any] = None
-
-        # PROPOSED (Step 2 of deal-replay fix): one-shot flag so only the
-        # first sync of this process logs replay counts and triggers a
-        # final counter rebuild from the journal.
         self._first_sync_done: bool = False
 
     def _load_position_strategies(self):
@@ -506,7 +564,6 @@ class CTraderClient:
             deals = deal_res["payload"]["deal"]
             synced_trades = []
 
-            # PROPOSED (Step 2 of deal-replay fix): counters for this sync only.
             replayed_count = 0
             counted_count = 0
 
@@ -557,13 +614,6 @@ class CTraderClient:
                     if deal_id_str not in self.notified_closed_deals:
                         self.notified_closed_deals.add(deal_id_str)
                         if hasattr(self, 'risk_engine') and self.risk_engine:
-                            # PROPOSED (Step 2 of deal-replay fix): route through
-                            # the scoped recorder. Deals that closed BEFORE this
-                            # process started go to trades_db.json only; they
-                            # never move day/week/month loss, streak, or
-                            # expected_balance. Only deals closed AFTER startup
-                            # change live risk state. Counter incremented only
-                            # when the scoped call actually touched state.
                             replayed_count += 1
                             closed_at_utc = (
                                 datetime.fromtimestamp(t_ms / 1000.0, timezone.utc)
@@ -604,20 +654,12 @@ class CTraderClient:
                             )
                         await whatsapp.send_alert(alert)
 
-            # PROPOSED (Step 2 of deal-replay fix): one-shot log + rebuild.
-            # Fires only on the FIRST sync of this process. Later syncs
-            # during the run stay silent. The rebuild picks up deals that
-            # closed while the bot was down and are now inside the current
-            # SAST day/week/month window.
             if not self._first_sync_done:
                 self._first_sync_done = True
                 if hasattr(self, 'risk_engine') and self.risk_engine:
                     log.info(
                         f"[RISK] replayed {replayed_count} historical deals, counted {counted_count}"
                     )
-                    # PROPOSED (Step 2 of deal-replay fix): wrap the rebuild so a
-                    # failure can never stop the deal sync. The log line above
-                    # always fires; only the rebuild is guarded.
                     try:
                         self.risk_engine.persistent_risk.rebuild_period_counters_from_history()
                     except Exception as e:
@@ -862,7 +904,30 @@ class CTraderClient:
         mid = (bid + ask) / 2.0
         return mid, bid, ask
 
-    async def fetch_ohlc_candles(self, symbol_name: str, period: CTraderTrendbarPeriod, count: int = 60) -> pd.DataFrame:
+    async def fetch_ohlc_candles(
+        self,
+        symbol_name: str,
+        period: CTraderTrendbarPeriod,
+        count: int = 60,
+        drop_forming: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Fetch OHLC candles.
+
+        drop_forming: when True (the default), the last (currently forming)
+        bar is dropped, matching the historical live behaviour. When False,
+        the forming bar is kept.
+
+        PROPOSED (Fix 2): the scan loop now calls this with
+        drop_forming=False for D1. That makes live's D1 DataFrame the same
+        shape as the backtest's D1 DataFrame (bar_aggregator keeps today's
+        forming bar in the buffer). build_session_levels then picks the
+        same bar on both sides, so live reads YESTERDAY's PDH, PDL, EQ
+        and pivots, not the day-before-yesterday's.
+
+        M5/H1/H4 keep the default drop_forming=True; nothing about their
+        behaviour changes.
+        """
         sid = self.resolve_symbol_id(symbol_name)
         if not sid or not self.is_authorized:
             return pd.DataFrame()
@@ -917,7 +982,7 @@ class CTraderClient:
 
         df = pd.DataFrame(candles)
         df.sort_values("time", inplace=True)
-        if len(df) > 1:
+        if drop_forming and len(df) > 1:
             df = df.iloc[:-1]
         return df.tail(count)
 
@@ -966,9 +1031,6 @@ class CTraderClient:
                 "lots": lots
             }
 
-        # PROPOSED (logging-only): full broker diagnostic on every failure path.
-        # Never hangs (balance/equity is under asyncio.wait_for), never throws.
-        # The success path above this block is unchanged.
         payload_type_str = "n/a"
         err_code_str = "n/a"
         err_desc_str = "n/a"
@@ -1027,7 +1089,7 @@ class CTraderClient:
         return bool(res and res.get("payloadType") == 2126)
 
 # ==============================================================================
-# 6. ORDER FLOW & VOLUME PROFILE ANALYZER
+# 6. ORDER FLOW & VOLUME PROFILE ANALYZER (kept for backward-compatible imports)
 # ==============================================================================
 
 @dataclass
@@ -1155,7 +1217,6 @@ class InstitutionalRiskEngine:
         if not cfg:
             return
 
-        # PROPOSED (Gaps 3 & 5): Read the active risk profile once so downstream reads agree.
         prof_name = cfg.get("riskProfile")
         profile_is_active = prof_name in RISK_PROFILES
 
@@ -1163,8 +1224,6 @@ class InstitutionalRiskEngine:
         self.dry_run = cfg.get("dryRun", self.dry_run)
         GLOBAL_PARAMS.adaptive_mode = bool(cfg.get("adaptiveMode", GLOBAL_PARAMS.adaptive_mode))
 
-        # PROPOSED (Gap 3): Effective min R:R = higher of UI minRr and profile floor.
-        # Floors: Steady 1.0, Balanced 1.5, Aggressive 2.0, Max Growth 2.0.
         ui_min_rr = float(cfg.get("minRr", GLOBAL_PARAMS.min_rr))
         if profile_is_active:
             profile_floor = float(RISK_PROFILES[prof_name]["min_rr_floor"])
@@ -1175,9 +1234,6 @@ class InstitutionalRiskEngine:
         self.risk_per_trade_pct = float(cfg.get("riskPerTradePct", getattr(self, 'risk_per_trade_pct', GLOBAL_PARAMS.base_risk_per_trade_pct)))
         self.risk_to_reward = float(cfg.get("riskToReward", self.risk_to_reward))
 
-        # PROPOSED (Gap 5): Only let the UI's maxDailyTrades override when NO profile is active.
-        # When a valid profile is selected, RiskManager owns the daily trade cap
-        # (Steady=2, Balanced=3, Aggressive=4, Max Growth=4).
         if not profile_is_active and "maxDailyTrades" in cfg:
             self.max_daily_trades = int(cfg["maxDailyTrades"])
 
@@ -1303,8 +1359,6 @@ class InstitutionalRiskEngine:
 
         equity = current_equity if current_equity > 0 else 10.0
 
-        # Delegate sizing % entirely through unified RiskManager.
-        # PROPOSED: Pass account_currency so profile ZAR bands convert correctly.
         _, dow_mult, _ = MarketSessionManager.get_day_of_week_policy()
         final_risk_pct = self.persistent_risk.combined_risk_pct(
             current_equity=equity,
@@ -1325,9 +1379,6 @@ class InstitutionalRiskEngine:
         pip_value_per_lot = (pip_size * contract_size) * fx_rate_to_account
         risk_per_lot = pips_at_risk * pip_value_per_lot
 
-        # Min-lot risk ceiling check (cannot exceed tolerance * risk_cash)
-        # PROPOSED: log symbol + reason so the UI/logs can show which instrument
-        # was skipped for minimum-lot reasons.
         min_lot_ok, min_lot_msg = self.persistent_risk.validate_min_lot_risk(min_lots, risk_per_lot, risk_cash)
         if not min_lot_ok:
             log.warning(
@@ -1338,7 +1389,6 @@ class InstitutionalRiskEngine:
             return 0.0
 
         raw_lots = risk_cash / (risk_per_lot + 1e-9)
-        # Broker step quantisation (round before floor to eliminate precision errors)
         stepped_lots = math.floor(round(raw_lots / lot_step, 6)) * lot_step
         final_lots = round(max(min(stepped_lots, max_lots), min_lots), 4)
         return final_lots
@@ -1495,27 +1545,18 @@ class AIOverseer:
 # ==============================================================================
 
 class CloudExecutionEngine:
-    # PROPOSED (logging-only): seconds to wait after a failed dispatch before
-    # the same symbol can be retried by the market scan loop.
     FAILED_ORDER_COOLDOWN_SECONDS: float = 600.0
-
-    # PROPOSED (logging-only): minimum gap between repeated "still in cooldown"
-    # log lines for the same symbol, so we don't spam one line per candle.
     COOLDOWN_LOG_INTERVAL_SECONDS: float = 60.0
 
     def __init__(self, ctrader_client: CTraderClient, risk_mgr: InstitutionalRiskEngine):
         self.ctrader = ctrader_client
         self.risk = risk_mgr
         self.ai_overseer = AIOverseer()
-        # PROPOSED (logging-only): symbol -> {"expires_at": epoch, "last_log_at": epoch}
         self._failed_order_cooldowns: Dict[str, Dict[str, float]] = {}
 
     async def process_signal(self, signal: Any, current_balance: float, current_equity: float, candle_stats: dict, use_breakeven_override: Optional[bool] = None) -> bool:
         symbol = getattr(signal, 'symbol')
 
-        # PROPOSED (logging-only): per-symbol cooldown gate. If the last
-        # dispatch for this symbol failed, skip until the cooldown expires.
-        # "still active" log is throttled to once per COOLDOWN_LOG_INTERVAL_SECONDS.
         cd = self._failed_order_cooldowns.get(symbol)
         if cd is not None:
             now = time.time()
@@ -1526,7 +1567,6 @@ class CloudExecutionEngine:
                     cd["last_log_at"] = now
                 return False
             else:
-                # Cooldown expired, clear silently so a fresh signal can run.
                 self._failed_order_cooldowns.pop(symbol, None)
 
         direction = getattr(signal, 'direction')
@@ -1587,7 +1627,6 @@ class CloudExecutionEngine:
 
         if not is_ok:
             log.warning(f"ORDER BLOCKED BY RISK GATE: {reason}")
-            # PROPOSED: Capture last risk block reason for status reporting
             self.risk.persistent_risk.last_trigger_reason = reason
             return False
 
@@ -1662,13 +1701,9 @@ class CloudExecutionEngine:
                 f"• TP: {bp['take_profit']}"
             )
             await whatsapp.send_alert(whatsapp_msg)
-            # PROPOSED (logging-only): clear any stale cooldown for this symbol
-            # after a successful fill, so a later fresh signal is not gated.
             self._failed_order_cooldowns.pop(bp['symbol'], None)
             return True
 
-        # PROPOSED (logging-only): failed dispatch. Arm a per-symbol cooldown
-        # and log once. Success path above is unchanged.
         now = time.time()
         self._failed_order_cooldowns[bp['symbol']] = {
             "expires_at": now + self.FAILED_ORDER_COOLDOWN_SECONDS,
@@ -1691,16 +1726,11 @@ class MatrixEngineMaster:
         self.risk_mgr = InstitutionalRiskEngine()
         self.ctrader.risk_engine = self.risk_mgr
         self.execution_engine: Optional[CloudExecutionEngine] = None
-        self.volume_profiles: Dict[str, VolumeProfileNode] = {}
+        self.volume_profiles: Dict[str, Any] = {}
         self.frozen_opening_ranges: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        # PROPOSED: Read-only periodic status logging timer
         self._last_status_log_time: float = 0.0
         self._last_risk_block_reason: str = "None"
-        # PROPOSED (Gap 3b): one-shot tracker for risk profile changes.
         self._last_profile_seen: Optional[str] = None
-        # PROPOSED: per-pair, per-strategy settings. Reloaded at the top of
-        # every scan loop iteration so editing config/pair_settings.json
-        # takes effect without restarting the bot.
         self.pair_settings: Dict[str, Any] = load_pair_settings()
 
     async def start(self) -> None:
@@ -1726,7 +1756,6 @@ class MatrixEngineMaster:
             self._manual_close_listener_loop()
         )
 
-    # PROPOSED: Verify broker close confirmation and log exceptions with log.exception
     async def _manual_close_listener_loop(self) -> None:
         while True:
             try:
@@ -1920,13 +1949,6 @@ class MatrixEngineMaster:
                 balance, equity = await self.ctrader.get_balance_and_equity()
                 self.risk_mgr.sync_ui_config()
 
-                # PROPOSED (Gap 3b): one-shot log when the active profile changes.
-                # Fires once per change, not every scan.
-                # Refresh persistent_risk from bot_config.json so the log reflects the
-                # UI selection even before a signal reaches validate_pre_trade.
-                # Do NOT move this into InstitutionalRiskEngine.sync_ui_config():
-                # that would change sizing at execution time (calculate_smart_lot_size
-                # reads persistent_risk.active_profile via combined_risk_pct).
                 self.risk_mgr.persistent_risk.sync_ui_config()
                 current_profile = self.risk_mgr.persistent_risk.active_profile_name
                 if current_profile != self._last_profile_seen:
@@ -1936,8 +1958,6 @@ class MatrixEngineMaster:
                     else:
                         log.info("[RISK] profile=None (Legacy) loaded from bot_config.json")
 
-                # PROPOSED: reload pair settings each scan so edits take effect
-                # without a restart.
                 self.pair_settings = load_pair_settings()
 
                 last_signal: Optional[Any] = None
@@ -1948,10 +1968,15 @@ class MatrixEngineMaster:
                     if self.risk_mgr.has_active_position(friendly_name):
                         continue
 
+                    # PROPOSED (Fix 2): D1 is requested with drop_forming=False
+                    # so live's D1 DataFrame has the same shape as the
+                    # backtest's D1 DataFrame (bar_aggregator keeps today's
+                    # forming bar). M5/H1/H4 keep the default drop_forming
+                    # of True, so their behaviour is unchanged.
                     m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
                     h1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H1, count=30)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
-                    d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=150)
+                    d1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.D1, count=150, drop_forming=False)
 
                     if m5_df.empty:
                         continue
@@ -1967,51 +1992,17 @@ class MatrixEngineMaster:
                             adr_val = vol_metrics["adr"]
 
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
-                    vp = OrderFlowAnalyzer.compute_volume_profile(m5_df, num_bins=30)
+
+                    # PROPOSED (Fix 7a + Fix 7b): use the SAME VA function the
+                    # backtester uses (core.indicators.get_session_volume_profile)
+                    # on the SAME bar range (developing session, from the
+                    # current D1 bar's open up to now). The previous local
+                    # OrderFlowAnalyzer used a different algorithm on the
+                    # trailing 120 bars and produced different POC/VAH/VAL,
+                    # so live and backtest were never measuring the same level.
+                    session_start = _session_start_utc(d1_df)
+                    vp = _compute_session_volume_profile(m5_df, session_start)
                     self.volume_profiles[friendly_name] = vp
-
-                    if len(d1_df) >= 2:
-                        prev_d1 = d1_df.iloc[-2]
-                        pdh = float(prev_d1['high'])
-                        pdl = float(prev_d1['low'])
-                        pdc = float(prev_d1['close'])
-                    else:
-                        pdh = float(m5_df['high'].max())
-                        pdl = float(m5_df['low'].min())
-                        pdc = float(m5_df.iloc[-1]['close'])
-
-                    daily_pivot = (pdh + pdl + pdc) / 3.0
-                    pivot_r1 = (2.0 * daily_pivot) - pdl
-                    pivot_s1 = (2.0 * daily_pivot) - pdh
-                    pivot_r2 = daily_pivot + (pdh - pdl)
-                    pivot_s2 = daily_pivot - (pdh - pdl)
-                    daily_eq = (pdh + pdl) / 2.0
-
-                    m5_df['utc_time'] = pd.to_datetime(m5_df['time'])
-                    asia_candles = m5_df[(m5_df['utc_time'].dt.hour >= 23) | (m5_df['utc_time'].dt.hour < 4)]
-                    if not asia_candles.empty:
-                        asia_high = float(asia_candles['high'].max())
-                        asia_low = float(asia_candles['low'].min())
-                    else:
-                        asia_high = float(m5_df['high'].tail(36).max())
-                        asia_low = float(m5_df['low'].tail(36).min())
-
-                    weekly_open = float(d1_df.iloc[-1]['open']) if not d1_df.empty else float(m5_df.iloc[-1]['open'])
-                    if not d1_df.empty:
-                        d1_times_shifted = pd.to_datetime(d1_df['time'], utc=True) + pd.Timedelta(hours=3)
-                        curr_week = d1_times_shifted.iloc[-1].isocalendar().week
-                        curr_year = d1_times_shifted.iloc[-1].isocalendar().year
-                        week_bars = d1_df[(d1_times_shifted.dt.isocalendar().week == curr_week) & (d1_times_shifted.dt.isocalendar().year == curr_year)]
-                        if not week_bars.empty:
-                            weekly_open = float(week_bars.iloc[0]['open'])
-
-                    avwap_anchor_idx = 0
-                    if not m5_df.empty:
-                        mon_candles = m5_df[m5_df['utc_time'].dt.weekday == 0]
-                        if not mon_candles.empty:
-                            avwap_anchor_idx = int(m5_df.index.get_loc(mon_candles.index[0]))
-
-                    orb_h, orb_l, orb_established, cracker_h, cracker_l, cracker_established = self._compute_frozen_opening_range(friendly_name, m5_df)
 
                     session_levels = build_session_levels(
                         symbol=friendly_name,
@@ -2034,10 +2025,6 @@ class MatrixEngineMaster:
                         data_h1=h1_df
                     )
 
-                    # PROPOSED: apply per-pair, per-strategy settings.
-                    # Defaults reproduce today's behaviour exactly (all
-                    # strategies enabled, no filters). Nothing changes
-                    # unless the settings file has non-default values.
                     strat_s_for_signal: Optional[Dict[str, Any]] = None
                     if signal:
                         strat_s_for_signal = get_strategy_settings(
@@ -2168,13 +2155,8 @@ class MatrixEngineMaster:
                     "openPositions": open_positions_telemetry
                 })
 
-                # PROPOSED (Gap 3a + 3b): Periodic status log with profile, min R:R,
-                # chosen risk %, and daily allowance remaining. Fires once every 5 minutes.
                 if (time.time() - self._last_status_log_time) >= 300.0:
                     self._last_status_log_time = time.time()
-                    # Refresh persistent_risk so BOT_STATUS reflects the current UI
-                    # profile. Log-only; see comment above for why this is not lifted
-                    # into InstitutionalRiskEngine.sync_ui_config().
                     self.risk_mgr.persistent_risk.sync_ui_config()
                     b_state = self.risk_mgr.persistent_risk
                     breaker_str = "TRIGGERED" if b_state.breaker_triggered else "CLEAR"

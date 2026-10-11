@@ -14,13 +14,13 @@ from core.session_config import MarketSessionManager
 _DAY_LEVELS_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
-def _select_last_completed_d1_bar(d1_df: pd.DataFrame, now_utc: datetime) -> Optional[int]:
+def _select_last_completed_d1_bar(d1_df: pd.DataFrame, now_utc: datetime) -> Optional[Any]:
     """
-    Returns the index of the last COMPLETED D1 bar in d1_df, or None if
+    Returns the index label of the last COMPLETED D1 bar in d1_df, or None if
     d1_df is empty or no bar has closed by now_utc.
 
-    A cTrader D1 bar closes 24 hours after its open. A bar is completed
-    when now_utc >= bar_open + 24h.
+    A cTrader D1 bar closes 24 hours after its open. A bar is completed when
+    now_utc >= bar_open + 24h.
 
     The two callers feed d1_df with different shapes:
 
@@ -111,6 +111,45 @@ def compute_frozen_opening_range(
     return orb_h, orb_l, True, cracker_h, cracker_l, True
 
 
+def _read_volume_profile(vp_node: Any) -> Tuple[float, float, float]:
+    """
+    PROPOSED: read (poc, vah, val) from either shape of VA the two callers
+    produce:
+
+      * Live passes an engine.matrix.VolumeProfileNode dataclass, with
+        attributes poc_price, value_area_high, value_area_low.
+      * Backtest passes a plain dict from core.indicators with keys
+        poc, vah, val.
+
+    A plain dict has no attributes, so the previous getattr chain silently
+    returned 0.0 in the backtest. That made every strategy using the VA
+    run against zeros.
+    """
+    if vp_node is None:
+        return 0.0, 0.0, 0.0
+    if isinstance(vp_node, dict):
+        try:
+            poc = float(vp_node.get('poc', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            poc = 0.0
+        try:
+            vah = float(vp_node.get('vah', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            vah = 0.0
+        try:
+            val = float(vp_node.get('val', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        return poc, vah, val
+    poc = getattr(vp_node, 'poc_price', getattr(vp_node, 'poc', 0.0))
+    vah = getattr(vp_node, 'value_area_high', getattr(vp_node, 'vah', 0.0))
+    val = getattr(vp_node, 'value_area_low', getattr(vp_node, 'val', 0.0))
+    try:
+        return float(poc), float(vah), float(val)
+    except (TypeError, ValueError):
+        return 0.0, 0.0, 0.0
+
+
 def build_session_levels(
     symbol: str,
     m5_df: pd.DataFrame,
@@ -139,8 +178,9 @@ def build_session_levels(
     if cached_day is None:
         # PROPOSED: pick yesterday's D1 bar by CLOSE TIME, not by an
         # assumption about where it sits in the DataFrame. See
-        # _select_last_completed_d1_bar for why. Backtest is unchanged;
-        # live now reads yesterday's bar instead of the day before.
+        # _select_last_completed_d1_bar for why. Backtest is unchanged by
+        # this specific line; live now reads yesterday's bar instead of
+        # the day before.
         prev_idx = _select_last_completed_d1_bar(d1_df, now)
 
         if prev_idx is not None:
@@ -225,10 +265,9 @@ def build_session_levels(
         symbol, m5_df, frozen_orbs, as_of=as_of
     )
 
-    # 4. Extract Volume Profile properties
-    poc = getattr(vp_node, 'poc_price', getattr(vp_node, 'poc', 0.0))
-    vah = getattr(vp_node, 'value_area_high', getattr(vp_node, 'vah', 0.0))
-    val = getattr(vp_node, 'value_area_low', getattr(vp_node, 'val', 0.0))
+    # 4. Extract Volume Profile properties. PROPOSED: use the shared reader
+    # so the backtest (dict) and live (dataclass) shapes both work.
+    poc, vah, val = _read_volume_profile(vp_node)
 
     return {
         "asia_high": asia_high,

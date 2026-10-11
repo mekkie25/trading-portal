@@ -60,28 +60,51 @@ class GrubberKick:
         # Dynamic EQ tolerance and fallback target scaling
         adr = session_levels.get("adr")
         if GLOBAL_PARAMS.adaptive_mode and adr is not None and adr > 0:
-            eq_tolerance = 0.05 * adr      # [PROPOSED]: 5% of daily range tolerance around EQ
-            fallback_dist = 0.25 * adr     # [PROPOSED]: 25% of daily range target expansion
+            eq_tolerance = 0.05 * adr
+            fallback_dist = 0.25 * adr
         else:
-            eq_tolerance = 15.0            # Legacy fixed point tolerance
-            fallback_dist = 80.0           # Legacy fixed point fallback target
+            eq_tolerance = 15.0
+            fallback_dist = 80.0
 
         asia_range_height = abs(ah - al)
 
-        # LONG CRITERIA: Sweep of Asia Low -> EQ Retest -> 2 Closes above EQ
+        # ------------------------------------------------------------------
+        # LONG CRITERIA:
+        #   1. Asia LOW swept.
+        #   2. Price RETURNS to EQ after the sweep.
+        #   3. Two consecutive closes above EQ.
+        #   4. Entry is NEAR EQ (so the fixed stop makes sense).
+        #   5. Trigger candle is bullish.
+        #
+        # PROPOSED: steps (2) and (4) were missing. Without (2), the setup
+        # fired on a rally far above EQ. Without (4), the entry could be
+        # 100+ points above EQ with a 35-point stop placed below EQ,
+        # meaning the true risk was 100+ points on a 35-point strategy.
+        # ------------------------------------------------------------------
         swept_al = False
+        sweep_idx = -1
         for i in range(len(recent_bars) - 2):
             b = recent_bars.iloc[i]
             if b['low'] < al and b['close'] > al:
                 swept_al = True
+                sweep_idx = i
                 break
 
         if swept_al:
+            returned_to_eq = False
+            if sweep_idx >= 0:
+                for j in range(sweep_idx + 1, len(recent_bars) - 2):
+                    b = recent_bars.iloc[j]
+                    if b['low'] <= (eq + eq_tolerance):
+                        returned_to_eq = True
+                        break
+
             two_closes_above_eq = (c_prev['close'] > eq) and (c_curr['close'] > eq)
             held_support_on_eq = (c_prev['low'] >= (eq - eq_tolerance)) and (c_curr['low'] >= (eq - eq_tolerance))
             trigger_candle_bullish = c_curr['close'] > c_curr['open']
+            entry_near_eq = abs(c_curr['close'] - eq) <= self.stop_loss_points
 
-            if two_closes_above_eq and held_support_on_eq and trigger_candle_bullish:
+            if returned_to_eq and entry_near_eq and two_closes_above_eq and held_support_on_eq and trigger_candle_bullish:
                 sl_price = float(eq - self.stop_loss_points)
                 tp1 = float(ah)
                 tp2 = float(r1) if r1 and r1 > c_curr['close'] else float(c_curr['close'] + fallback_dist)
@@ -103,24 +126,37 @@ class GrubberKick:
                     trail_mode="MOVE_TO_BE_80",
                     session="POST_ASIA",
                     confidence=0.92,
-                    reason="US30 Asia Low swept + 2 consecutive 5M closes holding above EQ",
+                    reason="US30 Asia Low swept + return to EQ + 2 consecutive 5M closes holding above EQ",
                     diagnostics=diagnostics
                 )
 
-        # SHORT CRITERIA: Sweep of Asia High -> EQ Retest -> 2 Closes below EQ
+        # ------------------------------------------------------------------
+        # SHORT CRITERIA: mirror of the long.
+        # ------------------------------------------------------------------
         swept_ah = False
+        sweep_idx = -1
         for i in range(len(recent_bars) - 2):
             b = recent_bars.iloc[i]
             if b['high'] > ah and b['close'] < ah:
                 swept_ah = True
+                sweep_idx = i
                 break
 
         if swept_ah:
+            returned_to_eq = False
+            if sweep_idx >= 0:
+                for j in range(sweep_idx + 1, len(recent_bars) - 2):
+                    b = recent_bars.iloc[j]
+                    if b['high'] >= (eq - eq_tolerance):
+                        returned_to_eq = True
+                        break
+
             two_closes_below_eq = (c_prev['close'] < eq) and (c_curr['close'] < eq)
             held_resistance_on_eq = (c_prev['high'] <= (eq + eq_tolerance)) and (c_curr['high'] <= (eq + eq_tolerance))
             trigger_candle_bearish = c_curr['close'] < c_curr['open']
+            entry_near_eq = abs(c_curr['close'] - eq) <= self.stop_loss_points
 
-            if two_closes_below_eq and held_resistance_on_eq and trigger_candle_bearish:
+            if returned_to_eq and entry_near_eq and two_closes_below_eq and held_resistance_on_eq and trigger_candle_bearish:
                 sl_price = float(eq + self.stop_loss_points)
                 tp1 = float(al)
                 tp2 = float(s1) if s1 and s1 < c_curr['close'] else float(c_curr['close'] - fallback_dist)
@@ -142,7 +178,7 @@ class GrubberKick:
                     trail_mode="MOVE_TO_BE_80",
                     session="POST_ASIA",
                     confidence=0.92,
-                    reason="US30 Asia High swept + 2 consecutive 5M closes holding below EQ",
+                    reason="US30 Asia High swept + return to EQ + 2 consecutive 5M closes holding below EQ",
                     diagnostics=diagnostics
                 )
 

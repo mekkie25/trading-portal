@@ -5,10 +5,21 @@ Dynamic 9 EMA / 25 EMA Crossover with Pullback Confirmation (Spec Setup 4).
 - Fast 9 EMA crosses 25 EMA
 - Strict Retest Entry: Pullback to 9 or 25 EMA that HOLDS
 - Reads precomputed EMAs from DataFrame columns if present, avoiding redundant calculations.
+
+PROPOSED stop change:
+  The stop is now the swing low (or high) of the last 8 M5 bars. The
+  previous version anchored the stop to the 25 EMA, which sits within a
+  few points of price on M5 and produces very tight stops on a strategy
+  whose targets are 1.2R and 2R. That is inside the noise band. The
+  swing low is what the pullback-to-EMA setup uses.
 """
 
 import pandas as pd
 from strategies.base import StrategySignal
+
+# Number of M5 bars to look back for the swing low/high used as the stop.
+SWING_LOOKBACK_BARS = 8
+
 
 class EMACrossTrail:
     def evaluate(self, symbol: str, data_5m: pd.DataFrame, data_h4: pd.DataFrame = None, data_d1: pd.DataFrame = None, session_levels: dict = None) -> StrategySignal | None:
@@ -53,7 +64,8 @@ class EMACrossTrail:
                 held_and_closed_up = curr_bar['close'] > curr_bar['open'] and curr_bar['close'] > ema_9.iloc[-1]
 
                 if tested_support and held_and_closed_up:
-                    sl = float(min(ema_25.iloc[-1], data_5m['low'].tail(4).min()))
+                    # PROPOSED: swing low over the last N bars, no EMA in the min.
+                    sl = float(data_5m['low'].tail(SWING_LOOKBACK_BARS).min())
                     risk = abs(curr_bar['close'] - sl)
                     if risk > 0:
                         diagnostics.update({"passed": True, "action": "BUY"})
@@ -81,7 +93,8 @@ class EMACrossTrail:
                 held_and_closed_down = curr_bar['close'] < curr_bar['open'] and curr_bar['close'] < ema_9.iloc[-1]
 
                 if tested_resistance and held_and_closed_down:
-                    sl = float(max(ema_25.iloc[-1], data_5m['high'].tail(4).max()))
+                    # PROPOSED: swing high over the last N bars, no EMA in the max.
+                    sl = float(data_5m['high'].tail(SWING_LOOKBACK_BARS).max())
                     risk = abs(sl - curr_bar['close'])
                     if risk > 0:
                         diagnostics.update({"passed": True, "action": "SELL"})

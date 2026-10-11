@@ -8,6 +8,12 @@ Anchored VWAP (AVWAP) + 200 EMA Trend Continuation (Spec Setup 2).
 - Stop: Beyond the pullback swing extremum, plus a small buffer
 - Targets: TP1 at 1.5R, TP2 at 2.0R
 - Trail: SuperTrend 5M (lets winners run)
+
+PROPOSED tolerance change:
+  The adaptive tolerance is now max(legacy, 5% ADR) instead of just
+  5% ADR. Previously adaptive mode was 3x tighter than legacy on
+  US30 and NAS100, so the AVWAP "pullback" rarely fired. The tolerance
+  can only widen under adaptive mode now, never tighten.
 """
 
 import pandas as pd
@@ -68,12 +74,15 @@ class AVWAPTrendContinuation:
         curr = data_5m.iloc[-1]
         prev = data_5m.iloc[-2]
 
-        # Tolerance band around structural levels
+        # Tolerance band around structural levels.
+        # PROPOSED: adaptive mode can only widen the legacy band, never tighten it.
+        legacy_tolerance = max(2.0, 0.001 * float(curr['close']))
         adr = session_levels.get("adr")
         if GLOBAL_PARAMS.adaptive_mode and adr is not None and adr > 0:
-            tolerance = 0.05 * adr
+            adaptive_tolerance = 0.05 * adr
+            tolerance = max(legacy_tolerance, adaptive_tolerance)
         else:
-            tolerance = max(2.0, 0.001 * float(curr['close']))
+            tolerance = legacy_tolerance
 
         # ---------------- Bullish continuation ----------------
         bullish_trend = float(curr['close']) > current_200

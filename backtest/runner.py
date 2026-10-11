@@ -1,15 +1,6 @@
 """
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
-
-PROPOSED: entry-feature capture.
-
-PROPOSED: fast engine path.
-
-PROPOSED: per-strategy pair settings (config/pair_settings.json) applied
-to every combination. Defaults reproduce the previous behaviour exactly.
-
-PROPOSED: --optimize mode which hands off to backtest/settings_optimizer.py.
 """
 
 import sys
@@ -218,6 +209,66 @@ def sanitize_for_json(obj):
         return sanitize_for_json(float(obj))
     except Exception:
         return str(obj)
+
+
+# ==============================================================================
+# PROPOSED: value-area helpers (Fix 7b)
+#
+# The value area (POC/VAH/VAL) used by ORB_LIQUIDITY_SWEEP and
+# PDH_PDL_FAILED_BREAKOUT is now computed from the DEVELOPING SESSION, i.e.
+# from the current D1 bar's open time up to now. Previously it was computed
+# from a fixed 120-bar trailing window, so the levels sat in a different
+# place than the mentor's setup and than the live bot.
+#
+# Falls back to the full slice if the session has fewer than MIN_SESSION_BARS
+# M5 candles, so the very first bars of a session do not produce a degenerate
+# 3-bar VA.
+# ==============================================================================
+
+MIN_SESSION_BARS = 20
+
+
+def _session_start_utc(d1_view: pd.DataFrame) -> Optional[datetime]:
+    """
+    Return the open time of the last D1 bar in d1_view, which is the start
+    of the current session. Returns None if d1_view is empty.
+    """
+    if d1_view is None or d1_view.empty:
+        return None
+    try:
+        last_bar = d1_view.iloc[-1]
+        t = pd.to_datetime(last_bar['time'], utc=True)
+        if hasattr(t, 'to_pydatetime'):
+            return t.to_pydatetime()
+        return t
+    except Exception:
+        return None
+
+
+def _compute_session_volume_profile(
+    m5_df: pd.DataFrame,
+    session_start: Optional[datetime],
+    min_bars: int = MIN_SESSION_BARS,
+) -> Dict[str, Any]:
+    """
+    Compute the developing-session volume profile. Falls back to the full
+    slice when the session has fewer than min_bars candles or when
+    session_start is None.
+    """
+    if m5_df is None or m5_df.empty:
+        return get_session_volume_profile(m5_df)
+    if session_start is None:
+        return get_session_volume_profile(m5_df)
+    try:
+        if session_start.tzinfo is None:
+            session_start = session_start.replace(tzinfo=timezone.utc)
+        m5_times = pd.to_datetime(m5_df['time'], utc=True)
+        session_bars = m5_df[m5_times >= session_start]
+        if len(session_bars) >= min_bars:
+            return get_session_volume_profile(session_bars)
+    except Exception:
+        pass
+    return get_session_volume_profile(m5_df)
 
 
 def _parse_window_time(s: Optional[str]) -> Optional[datetime]:
@@ -767,7 +818,11 @@ def precompute_market_pass(
         t_vol += time.perf_counter() - _t0
 
         _t0 = time.perf_counter()
-        vp = get_session_volume_profile(m5_slice)
+        # PROPOSED (Fix 7b): value area is now the DEVELOPING SESSION's VA,
+        # from the current D1 bar's open to now, not a 120-bar trailing
+        # window. Falls back to the full slice if the session has too few bars.
+        session_start = _session_start_utc(d1_view)
+        vp = _compute_session_volume_profile(m5_slice, session_start)
         session_levels = build_session_levels(
             symbol=symbol,
             m5_df=m5_slice,
@@ -918,7 +973,6 @@ def run_cached_combination(
             h4_view_cached = item.get("h4_view")
             filter_time = item.get("curr_time", curr_time)
 
-            # PROPOSED: apply per-strategy pair settings.
             strat_be_for_trade: Optional[bool] = None
             strat_max_daily_for_trade: Optional[int] = None
             if pair_settings is not None:
@@ -1644,10 +1698,6 @@ async def run_symbol_matrix(
         GLOBAL_PARAMS.target_rr = orig_rr
 
 
-# -----------------------------------------------------------------------------
-# Strategy Lab
-# -----------------------------------------------------------------------------
-
 def _lab_kpis_and_split(trades: List[Dict[str, Any]], window_start_str: str, window_end_str: str) -> Dict[str, Any]:
     kpis = calculate_kpis(trades)
     tv = compute_tune_validate_kpis(trades, window_start_str, window_end_str)
@@ -1906,10 +1956,6 @@ async def run_strategy_lab(
 
 
 def run_settings_optimizer_cli(symbols_list: List[str]) -> int:
-    """
-    PROPOSED: entry point for --optimize. Delegates to
-    backtest/settings_optimizer.py.
-    """
     try:
         from backtest.settings_optimizer import run_optimizer
     except Exception as e:
@@ -1949,7 +1995,6 @@ async def main():
     else:
         symbols_list = [args.symbol.upper()]
 
-    # PROPOSED: --optimize hands off before touching the broker client.
     if args.optimize:
         code = run_settings_optimizer_cli(symbols_list)
         sys.exit(code)
