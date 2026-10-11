@@ -93,6 +93,11 @@ const storageBase = (process.env.BACKTEST_STORAGE_DIR || '').trim();
 const BACKTEST_OUTPUT_DIR = storageBase ? path.join(storageBase, 'output') : path.join(process.cwd(), 'backtest', 'output');
 const BACKTEST_DATA_DIR = storageBase ? path.join(storageBase, 'data') : path.join(process.cwd(), 'backtest', 'data');
 
+// PROPOSED: optimizer files read/written by backtest/settings_optimizer.py.
+const OPTIMIZER_STATUS_FILE = path.join(BACKTEST_DATA_DIR, 'optimizer_status.json');
+const OPTIMIZER_SUMMARY_TXT = path.join(BACKTEST_OUTPUT_DIR, 'optimizer_summary.txt');
+const OPTIMIZER_SUMMARY_JSON = path.join(BACKTEST_OUTPUT_DIR, 'optimizer_summary.json');
+
 let backtestRunning = false;
 let backtestProgress = '';
 let backtestLastError: string | null = null;
@@ -108,6 +113,12 @@ let compareProgress = '';
 let compareSymbol = '';
 let compareLastError: string | null = null;
 let compareProcess: ChildProcess | null = null;
+
+// PROPOSED: optimizer background-job state.
+let optimizerRunning = false;
+let optimizerProgress = '';
+let optimizerLastError: string | null = null;
+let optimizerProcess: ChildProcess | null = null;
 
 let activeBotConfig: BotGatewayConfig = {
   masterExecution: true, riskPerTradePct: 1.0, minRr: 1.0, adaptiveMode: false,
@@ -212,6 +223,44 @@ function holdoutVerdict(tune: any, val: any): string {
   if (vPf < 0.95 || vPf < 0.70 * tPf) return 'FAILS';
   if (vPf < 1.10) return 'FLAT';
   return 'HOLDS';
+}
+
+// PROPOSED: read config/pair_settings.json and list any (pair, strategy, key)
+// triple whose value differs from the schema default. Empty list means every
+// pair is on defaults, which is worth saying explicitly in the export.
+function summariseNonDefaultSettings(): string[] {
+  const out: string[] = [];
+  try {
+    const settingsPath = path.join(process.cwd(), 'config', 'pair_settings.json');
+    if (!fs.existsSync(settingsPath)) return out;
+    const raw = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    const pairs = raw?.pairs || {};
+    const defaults: Record<string, any> = {
+      enabled: true,
+      session_window_sast: null,
+      weekdays: null,
+      min_stop_atr: 0.0,
+      max_stop_atr: null,
+      max_spread_in_r: null,
+      rr: null,
+      be_enabled: null,
+      max_daily_trades: null,
+    };
+    for (const [pairName, block] of Object.entries<any>(pairs)) {
+      const stratMap = block?.strategies || {};
+      for (const [stratName, ss] of Object.entries<any>(stratMap)) {
+        for (const key of Object.keys(defaults)) {
+          const cur = ss?.[key];
+          const def = defaults[key];
+          const same = JSON.stringify(cur) === JSON.stringify(def);
+          if (!same) out.push(`${pairName}/${stratName}.${key} = ${JSON.stringify(cur)} (default ${JSON.stringify(def)})`);
+        }
+      }
+      if (block?.live_enabled === false) out.push(`${pairName}.live_enabled = false`);
+      if (block?.risk_pct !== null && block?.risk_pct !== undefined) out.push(`${pairName}.risk_pct = ${block.risk_pct}`);
+    }
+  } catch {}
+  return out;
 }
 
 function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text: string; impact: number; is_measured: boolean; type: string }> {
@@ -325,6 +374,7 @@ function generateExportDataPayload(): any {
     combinations_rollup: {}, pairs: [],
     portfolio_suggestions: [], what_to_test_next: [], portfolio_correlation: null,
     spec_coverage: SPEC_COVERAGE, descriptions: METRIC_DESCRIPTIONS,
+    non_default_settings: summariseNonDefaultSettings(),
   };
   const allSummaryCombos: Record<string, { trades: number; pnl: number; win_count: number }> = {};
   let totalTime = 0.0; let hasValidTimes = false;
@@ -416,13 +466,6 @@ function fmt(v: any, decimals = 2): string {
   return n.toFixed(decimals);
 }
 
-// ---------------------------------------------------------------------------
-// PROPOSED: bucket label humanising.
-// hour_sast is a 3-hour SAST block: bucket N covers SAST 3N:00 to 3N+2:59.
-// mins_since_open is a 60-minute bucket after the most recent London or NY
-// open. We cannot map it to a single clock time without knowing which open
-// was most recent, so we label it as "Nh-N+1h after open".
-// ---------------------------------------------------------------------------
 function humaniseBucketLabel(feature: string, bucket: string): string {
   if (feature === 'hour_sast' && bucket.startsWith('=')) {
     const n = parseInt(bucket.slice(1), 10);
@@ -435,9 +478,7 @@ function humaniseBucketLabel(feature: string, bucket: string): string {
   }
   if (feature === 'mins_since_open' && bucket.startsWith('=')) {
     const n = parseInt(bucket.slice(1), 10);
-    if (Number.isFinite(n) && n >= 0) {
-      return `${n}h-${n + 1}h after open`;
-    }
+    if (Number.isFinite(n) && n >= 0) return `${n}h-${n + 1}h after open`;
   }
   return bucket;
 }
@@ -445,16 +486,10 @@ function humaniseBucketLabel(feature: string, bucket: string): string {
 function renderEntryConditionAnalysis(): string[] {
   const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
   const header = 'ENTRY CONDITION ANALYSIS (pooled, R:R 1:1, BE off)';
-
-  if (!fs.existsSync(analysisFile)) {
-    return [header, '  n/a - rerun to generate'];
-  }
+  if (!fs.existsSync(analysisFile)) return [header, '  n/a - rerun to generate'];
   let payload: any;
-  try {
-    payload = JSON.parse(fs.readFileSync(analysisFile, 'utf8'));
-  } catch {
-    return [header, '  n/a - rerun to generate'];
-  }
+  try { payload = JSON.parse(fs.readFileSync(analysisFile, 'utf8')); }
+  catch { return [header, '  n/a - rerun to generate']; }
 
   const baselines: any[] = Array.isArray(payload.baselines) ? payload.baselines : [];
   const buckets: any[] = Array.isArray(payload.buckets) ? payload.buckets : [];
@@ -464,7 +499,6 @@ function renderEntryConditionAnalysis(): string[] {
     ? payload.star_buckets_count
     : buckets.filter((b: any) => b.is_star).length;
   const SECTION_CAP = 8000;
-
   const fmtR = (v: any): string => (v === null || v === undefined) ? 'n/a' : fmt(v, 2);
 
   const formatBucketLine = (b: any): string => {
@@ -477,21 +511,12 @@ function renderEntryConditionAnalysis(): string[] {
     const out: string[] = [];
     out.push(header);
     out.push(`Pooled: ${payload.total_trades ?? 0} trades | Window: ${payload.window_start ?? 'n/a'} to ${payload.window_end ?? 'n/a'}`);
-    // PROPOSED: chance check.
     out.push(`Buckets tested: ${totalBucketsTested} | Starred: ${starBucketsCount}`);
-
     if (baselines.length > 0) {
       out.push('Baselines:');
-      for (const b of baselines) {
-        out.push(`  [${b.group}] n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor)} pf@1R=${fmt(b.profit_factor_1r)} q>1=${b.quarters_above_1 ?? 0}/4`);
-      }
+      for (const b of baselines) out.push(`  [${b.group}] n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor)} pf@1R=${fmt(b.profit_factor_1r)} q>1=${b.quarters_above_1 ?? 0}/4`);
     }
-
-    if (buckets.length === 0) {
-      out.push('  (no buckets meet the minimum trade count)');
-      return out;
-    }
-
+    if (buckets.length === 0) { out.push('  (no buckets meet the minimum trade count)'); return out; }
     let rows: any[] = buckets;
     let truncatedNote = '';
     if (restrictBuckets) {
@@ -512,20 +537,13 @@ function renderEntryConditionAnalysis(): string[] {
         keepNon.push(...sorted.slice(0, 3));
       }
       rows = [...stars, ...keepNon];
-      rows.sort((a, b) => {
-        if (a.is_star !== b.is_star) return a.is_star ? -1 : 1;
-        return (b.profit_factor_1r ?? 0) - (a.profit_factor_1r ?? 0);
-      });
+      rows.sort((a, b) => a.is_star !== b.is_star ? (a.is_star ? -1 : 1) : (b.profit_factor_1r ?? 0) - (a.profit_factor_1r ?? 0));
       const omitted = buckets.length - rows.length;
-      if (omitted > 0) {
-        truncatedNote = `  (truncated to fit the ${SECTION_CAP}-char budget: ${omitted} bucket rows omitted)`;
-      }
+      if (omitted > 0) truncatedNote = `  (truncated to fit the ${SECTION_CAP}-char budget: ${omitted} bucket rows omitted)`;
     }
-
     out.push('Buckets:');
     for (const r of rows) out.push(formatBucketLine(r));
     if (truncatedNote) out.push(truncatedNote);
-
     if (includeStarPairs && starPairs.length > 0) {
       out.push('');
       out.push('Star bucket cross-pair check:');
@@ -540,18 +558,14 @@ function renderEntryConditionAnalysis(): string[] {
         out.push(`  [${sp.group}] ${sp.feature} ${sp.bucket} (pooled n=${sp.pooled?.trades ?? 0}) -> ${parts.join(' | ')}`);
       }
     }
-
     return out;
   };
 
   let section = buildSection(true, false);
   if (section.join('\n').length <= SECTION_CAP) return section;
-
   section = buildSection(true, true);
   if (section.join('\n').length <= SECTION_CAP) return section;
-
-  section = buildSection(false, true);
-  return section;
+  return buildSection(false, true);
 }
 
 function renderTxtContent(data: any): string {
@@ -580,17 +594,26 @@ function renderTxtContent(data: any): string {
   lines.push('  ENTRY CONDITION ANALYSIS marks a bucket with * when PF@1R is >= baseline + 0.20 AND PF@1R > 1.0 AND it holds in at least 3 of 4 date quarters.');
   lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of this-run pair times ${totalTimeStr}`);
   lines.push('');
+
+  // PROPOSED (Req 6): show settings that differ from the schema defaults.
+  lines.push('ACTIVE SETTINGS DIFFERING FROM DEFAULT:');
+  const nonDefault: string[] = Array.isArray(data.non_default_settings) ? data.non_default_settings : [];
+  if (nonDefault.length === 0) {
+    lines.push('  (none — all pairs and strategies use schema defaults)');
+  } else {
+    for (const row of nonDefault) lines.push(`  ${row}`);
+  }
+  lines.push('');
+
   lines.push('CROSS-PAIR ROLLUP');
   Object.entries(data.combinations_rollup || {}).forEach(([combo, r]: any) => {
     lines.push(`  ${combo.padEnd(32)} | TR ${String(r.total_trades).padStart(5)} | WR ${fmt(r.weighted_win_rate, 1)}% | PNL $${fmt(r.total_pnl)}`);
   });
   lines.push('');
+
   for (const p of data.pairs || []) {
     if (p.status !== 'OK') { lines.push(`ASSET ${p.symbol} — NOT TESTED`); lines.push(''); continue; }
     const ps = p.phase_seconds || {};
-    // PROPOSED: the ASSET line now shows this run's own time for the pair,
-    // and the cache build time is shown separately. On a warm run,
-    // precompute_s is 0 and cache_build_seconds holds the original build.
     const thisRunStr = p.seconds_taken != null ? `${p.seconds_taken}s` : 'n/a';
     const thisRunPrecompute = (typeof p.precompute_s === 'number') ? p.precompute_s : null;
     const cacheBuiltStr = (p.cache_built_at && typeof p.cache_build_seconds === 'number')
@@ -658,9 +681,25 @@ function renderTxtContent(data: any): string {
   lines.push('================================================================================');
   lines.push('');
 
+  // PROPOSED (Req 14): include the optimizer summary if it exists on disk.
+  lines.push('================================================================================');
+  lines.push('OPTIMIZER SUMMARY');
+  if (fs.existsSync(OPTIMIZER_SUMMARY_TXT)) {
+    try { lines.push(fs.readFileSync(OPTIMIZER_SUMMARY_TXT, 'utf8').trimEnd()); }
+    catch (e: any) { lines.push(`  (read error: ${e?.message || String(e)})`); }
+  } else if (fs.existsSync(OPTIMIZER_SUMMARY_JSON)) {
+    try {
+      const p = JSON.parse(fs.readFileSync(OPTIMIZER_SUMMARY_JSON, 'utf8'));
+      if (typeof p.text === 'string') lines.push(p.text.trimEnd());
+      else lines.push('  (optimizer_summary.json has no "text" field)');
+    } catch (e: any) { lines.push(`  (read error: ${e?.message || String(e)})`); }
+  } else {
+    lines.push('  n/a — click "Optimize settings" to generate it.');
+  }
+  lines.push('================================================================================');
+  lines.push('');
+
   lines.push('NOT IMPLEMENTED:');
-  // PROPOSED: a TXT-only feature counts as implemented. Only items missing
-  // from both the panel AND the TXT appear here.
   const notImpl = (data.spec_coverage || []).filter((row: any) => !row.panel && !row.txt);
   if (notImpl.length === 0) lines.push('  (none)');
   else notImpl.forEach((row: any) => lines.push(`  #${row.id} ${row.label}`));
@@ -727,9 +766,7 @@ async function startServer() {
   app.get('/api/backtest/entry-analysis', (_req, res) => {
     try {
       const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
-      if (fs.existsSync(analysisFile)) {
-        return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(analysisFile, 'utf8')) });
-      }
+      if (fs.existsSync(analysisFile)) return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(analysisFile, 'utf8')) });
       return res.status(404).json({ status: 'error', message: 'entry_analysis.json not yet generated. Run a backtest first.' });
     } catch (err: any) { return res.status(500).json({ status: 'error', message: err?.message }); }
   });
@@ -814,6 +851,108 @@ async function startServer() {
       if (code !== 0) backtestLastError = `Exited with code ${code}`;
     });
     res.status(200).json({ status: 'success', message: 'Strategy Lab started.' });
+  });
+
+  // ==========================================================================
+  // PROPOSED: settings optimizer routes (start / status / stop)
+  // ==========================================================================
+  app.post('/api/backtest/optimize', (req, res) => {
+    if (optimizerRunning) return res.status(409).json({ status: 'error', message: 'Optimizer already running.' });
+    if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is running. Wait for it to finish before starting the optimizer.' });
+    const memCheck = checkContainerMemory();
+    if (!memCheck.ok) {
+      console.warn(`[OPT] ${memCheck.reason}`);
+      return res.status(503).json({ status: 'error', message: memCheck.reason });
+    }
+    const requested: any = req.body?.symbols ?? req.body?.symbol ?? 'ALL';
+    const symbolsArray: string[] = Array.isArray(requested)
+      ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean)
+      : String(requested).toUpperCase() === 'ALL'
+        ? [...WHITELIST_ASSETS]
+        : [String(requested).toUpperCase()];
+    if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
+
+    optimizerRunning = true;
+    optimizerProgress = `Launching optimizer for ${symbolsArray.join(', ')}...`;
+    optimizerLastError = null;
+
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const proc = spawn(pythonCmd, ['backtest/runner.py', '--optimize', '--symbols', symbolsArray.join(',')], {
+      env: { ...process.env, PYTHONPATH: process.cwd() },
+    });
+    optimizerProcess = proc;
+
+    let stdoutBuf = '';
+    proc.stdout.on('data', data => {
+      stdoutBuf += data.toString();
+      const lines = stdoutBuf.split('\n');
+      stdoutBuf = lines.pop() ?? '';
+      for (const raw of lines) {
+        const l = raw.trim();
+        if (!l) continue;
+        if (l.startsWith('[OPTIMIZE]')) {
+          optimizerProgress = l.replace('[OPTIMIZE]', '').trim();
+          console.log(l);
+        }
+      }
+    });
+    let stderrBuf = '';
+    proc.stderr.on('data', data => {
+      stderrBuf += data.toString();
+      const lines = stderrBuf.split('\n');
+      stderrBuf = lines.pop() ?? '';
+      for (const raw of lines) if (raw.trimEnd()) console.error(`[OPT:ERR] ${raw.trimEnd()}`);
+    });
+    proc.on('exit', code => {
+      optimizerRunning = false;
+      optimizerProcess = null;
+      if (code === 0) {
+        optimizerProgress = 'Optimizer complete.';
+      } else {
+        optimizerLastError = `Exited with code ${code}`;
+        optimizerProgress = 'Optimizer failed.';
+      }
+    });
+    proc.on('error', err => {
+      optimizerRunning = false;
+      optimizerProcess = null;
+      optimizerLastError = `spawn error: ${err.message}`;
+      optimizerProgress = 'Optimizer failed to start.';
+    });
+
+    res.status(200).json({ status: 'success', message: `Optimizer started for ${symbolsArray.join(', ')}.` });
+  });
+
+  app.get('/api/backtest/optimize-status', (_req, res) => {
+    let details: any = null;
+    if (fs.existsSync(OPTIMIZER_STATUS_FILE)) {
+      try { details = JSON.parse(fs.readFileSync(OPTIMIZER_STATUS_FILE, 'utf8')); } catch {}
+    }
+    let summaryText: string | null = null;
+    if (fs.existsSync(OPTIMIZER_SUMMARY_TXT)) {
+      try { summaryText = fs.readFileSync(OPTIMIZER_SUMMARY_TXT, 'utf8'); } catch {}
+    } else if (fs.existsSync(OPTIMIZER_SUMMARY_JSON)) {
+      try {
+        const p = JSON.parse(fs.readFileSync(OPTIMIZER_SUMMARY_JSON, 'utf8'));
+        if (typeof p.text === 'string') summaryText = p.text;
+      } catch {}
+    }
+    res.status(200).json({
+      status: 'success',
+      isRunning: optimizerRunning,
+      progress: optimizerProgress,
+      lastError: optimizerLastError,
+      details,
+      summaryText,
+    });
+  });
+
+  app.post('/api/backtest/optimize/stop', (_req, res) => {
+    if (optimizerProcess) { try { optimizerProcess.kill(); } catch {} }
+    optimizerProcess = null;
+    optimizerRunning = false;
+    optimizerProgress = 'Optimizer cancelled.';
+    res.status(200).json({ status: 'success', message: 'Optimizer stopped.' });
   });
 
   app.post('/api/backtest/compare', (req, res) => {
@@ -930,10 +1069,6 @@ async function startServer() {
             for (const rawLine of lines) {
               const t = rawLine.trim();
               if (!t) continue;
-              // PROPOSED: the new [time] line begins with
-              // "[time] <SYM> this run: ..." and includes the cache build
-              // info in parentheses. The old format is still captured for
-              // backward compatibility.
               if (t.startsWith('[time]')) symTiming = t.replace('[time]', '').trim();
               if (t.startsWith(`[${sym}]`)) {
                 if (t.includes('engine:')) engineLine = t.replace(`[${sym}]`, '').trim();
@@ -941,10 +1076,7 @@ async function startServer() {
               }
               if (t.startsWith('[TOTAL]') && t.includes('wall_clock_seconds=')) {
                 const m = t.match(/wall_clock_seconds=([0-9.]+)/);
-                if (m) {
-                  const v = parseFloat(m[1]);
-                  if (Number.isFinite(v)) lastRunWallClockSeconds = Math.round(v);
-                }
+                if (m) { const v = parseFloat(m[1]); if (Number.isFinite(v)) lastRunWallClockSeconds = Math.round(v); }
               }
             }
           });
