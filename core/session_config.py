@@ -2,6 +2,15 @@
 trading-portal/core/session_config.py
 Institutional Quantitative Strategy Parameters, Session Timing & DST Management.
 Single Source of Truth for all quantitative parameters.
+
+BRIEF CHANGES (2026-10-12):
+- target_rr default raised from 1.0 to 2.5 (backtest parameter sweep §35 shows peak at >=2.5R on all pairs).
+- New breakeven_trigger_r = 1.5 (BE is now a fixed R multiple, not 80% of TP).
+- max_spread_in_r raised from 0.04 to 0.05 (brief item 3).
+- trail_after_1r_enabled set to False (brief item 2: do not force BE at 1R).
+- strat_always_htf_targets added for STRATEGY_513 and EMA_9_25_CROSS (brief item 6).
+- blocked_hours_sast now includes 23 and 0 on every pair (rollover blackout, brief item 3).
+- get_day_of_week_policy now halves risk on Monday AND Thursday (brief item 5).
 """
 
 import sys
@@ -19,8 +28,8 @@ from dataclasses import dataclass, field
 class StrategyParameters:
     # Feature Toggle: Volatility Engine
     adaptive_mode: bool = False                  # False = Legacy fixed bands; True = Adaptive ADR Engine
-    target_rr: float = 1.0                       # Fixed risk-to-reward target multiplier
-    use_breakeven: bool = False                  # Move stop to BE at 80% R:R if enabled
+    target_rr: float = 2.5                       # BRIEF: raised from 1.0 to 2.5
+    use_breakeven: bool = False                  # Move stop to BE if enabled
     use_supertrend_trail: bool = True            # Dynamic SuperTrend trailing exit gate
 
     # Risk & Execution Caps (Spec Section 5 & 7)
@@ -86,14 +95,21 @@ class StrategyParameters:
     ema_trend_200: int = 200
 
     # Day-of-Week Filters (Spec Section 1)
+    # BRIEF: Thursday now takes 0.5x alongside Monday. Friday is full risk.
     skip_monday_trading: bool = False
-    reduce_friday_risk: bool = True
-    friday_risk_multiplier: float = 0.5
+    reduce_friday_risk: bool = False             # retained for backwards compat; not used in policy
+    friday_risk_multiplier: float = 1.0          # retained for backwards compat; not used in policy
 
     # Strategy Specific Settings
     grubber_kick_fixed_sl: float = 35.0
     pdh_pdl_liquidity_buffer_pts: float = 15.0
+
+    # BRIEF: BE is now an absolute R multiple. 1.5R means BE fires after the
+    # trade has banked 1.5x the stop distance in open profit.
+    # breakeven_trigger_ratio is retained for backwards compat; it is no longer
+    # read by the simulator or the live supervisor.
     breakeven_trigger_ratio: float = 0.80
+    breakeven_trigger_r: float = 1.5
 
     # Blackout dates (YYYY-MM-DD HH:MM in UTC)
     news_blackout_schedule: List[str] = field(default_factory=lambda: [
@@ -101,6 +117,73 @@ class StrategyParameters:
         "2026-10-14 12:30",
         "2026-11-04 18:00",
     ])
+
+    # ========================================================================
+    # IMPROVEMENT PACK v1 + BRIEF ITEM 3 (ROLLOVER BLACKOUT)
+    # Every pair blocks SAST hours 23 and 0 (Asian open / US rollover).
+    # Additional per-pair hours come from §19 hour matrix.
+    # ========================================================================
+    blocked_hours_sast: Dict[str, List[int]] = field(default_factory=lambda: {
+        "US30":     [0, 6, 7, 10, 11, 15, 23],
+        "GOLD":     [0, 3, 6, 8, 10, 23],
+        "NAS100":   [0, 4, 5, 13, 14, 23],
+        "GERMAN30": [0, 9, 12, 13, 14, 23],
+        "EURUSD":   [0, 2, 3, 8, 11, 13, 15, 23],
+        "GBPUSD":   [0, 11, 14, 22, 23],
+        "USDJPY":   [0, 3, 5, 13, 14, 23],
+    })
+
+    # Per-symbol weekday blackout (Mon=0 ... Sun=6).
+    # NOTE: this is a HARD blacklist. The brief's Monday/Thursday risk
+    # reduction is handled by get_day_of_week_policy, NOT by this list.
+    blocked_weekdays: Dict[str, List[int]] = field(default_factory=lambda: {
+        "US30":     [],
+        "GOLD":     [],
+        "NAS100":   [],
+        "GERMAN30": [],
+        "EURUSD":   [],
+        "GBPUSD":   [],
+        "USDJPY":   [],
+    })
+
+    # BRIEF item 3: spread ceiling raised from 0.04 to 0.05.
+    max_spread_in_r: float = 0.05
+
+    # Post-SL recovery compensation (§16).
+    stop_distance_multiplier: float = 1.5
+
+    # BRIEF item 2: trail-after-1R is disabled because it forced BE at 1R.
+    # The dedicated breakeven_trigger_r now controls BE.
+    trail_after_1r_enabled: bool = False
+
+    # ========================================================================
+    # BRIEF item 6: always-on HTF alignment filter.
+    # These strategies must have their direction agree with the D1 trend
+    # (last closed D1 close vs its 20-period EMA). Applies in both live and
+    # backtest — see StrategyManager._apply_always_on_filters.
+    # ========================================================================
+    strat_always_htf_targets: List[str] = field(default_factory=lambda: [
+        "STRATEGY_513",
+        "EMA_9_25_CROSS",
+    ])
+
+    # --------------------------------------------------------------------------
+    # Backtest-Only Strategy Filters (all default OFF; live behaviour unchanged)
+    # Applied as post-filters in StrategyManager.evaluate_all, only for the
+    # strategies listed in strat_filter_targets, and only when the runner
+    # explicitly asks for them (apply_strat_filters=True).
+    # --------------------------------------------------------------------------
+    strat_filters_backtest_only: bool = True
+    strat_filter_targets: List[str] = field(default_factory=lambda: [
+        "STRATEGY_513",
+        "AVWAP_200EMA_CONTINUATION",
+    ])
+    strat_disabled: List[str] = field(default_factory=list)
+    strat_session_window_sast: Tuple[int, int] = None
+    strat_htf_trend_filter: bool = False
+    strat_min_stop_atr: float = 0.0
+    strat_max_spread_in_r: float = 0.0
+
 
 GLOBAL_PARAMS = StrategyParameters()
 
@@ -122,6 +205,7 @@ TZ_SAST = ZoneInfo("Africa/Johannesburg")
 TZ_LONDON = ZoneInfo("Europe/London")
 TZ_NEWYORK = ZoneInfo("America/New_York")
 TZ_UTC = ZoneInfo("UTC")
+
 
 class MarketSessionManager:
     @staticmethod
@@ -195,36 +279,69 @@ class MarketSessionManager:
         hour = dt_utc.hour
         minute = dt_utc.minute
 
-        # First Friday NFP (12:30 UTC window: 12:20 - 12:45)
         if weekday == 4 and day <= 7:
             if hour == 12 and 20 <= minute <= 45:
                 return True, "NFP First-Friday Macro Blackout (12:30 UTC)"
 
-        # Mid-month CPI (12:30 UTC window: 12:20 - 12:45)
         if 10 <= day <= 16 and weekday in (1, 2, 3, 4):
             if hour == 12 and 20 <= minute <= 45:
                 return True, "US CPI Release Macro Blackout (12:30 UTC)"
 
-        # Wednesday FOMC Rate Decision (18:00 UTC / 20:00 SAST)
         if weekday == 2 and ((hour == 17 and minute >= 50) or (hour == 18 and minute <= 20)):
             return True, "FOMC Interest Rate Decision Blackout (18:00 UTC)"
 
         return False, ""
 
+    # ========================================================================
+    # BRIEF item 5: Monday AND Thursday get 0.5x. Everything else full risk.
+    # ========================================================================
     @classmethod
     def get_day_of_week_policy(cls, dt_utc: datetime = None) -> Tuple[bool, float, str]:
         times = cls.get_current_times(dt_utc)
         wd = times["SAST"].weekday()
 
-        if wd == 0:
+        if wd == 0:  # Monday
             if GLOBAL_PARAMS.skip_monday_trading:
                 return False, 0.0, "Monday Trading Blocked via Policy"
-            return True, 0.5, "Monday Low-Volume Caution (50% Size)"
-        elif wd == 3:
-            return True, 1.0, "Thursday Peak Statistical Edge (100% Size)"
-        elif wd == 4:
-            if GLOBAL_PARAMS.reduce_friday_risk:
-                return True, GLOBAL_PARAMS.friday_risk_multiplier, "Friday Pullback Caution (Reduced Size)"
+            return True, 0.5, "Monday Reduced Risk (50% Size)"
+
+        if wd == 1:  # Tuesday
+            return True, 1.0, "Tuesday Normal Trading"
+
+        if wd == 2:  # Wednesday
+            return True, 1.0, "Wednesday Normal Trading"
+
+        if wd == 3:  # Thursday
+            return True, 0.5, "Thursday Reduced Risk (50% Size)"
+
+        if wd == 4:  # Friday
             return True, 1.0, "Friday Normal Trading"
 
-        return True, 1.0, "Standard Session Day"
+        return True, 1.0, "Weekend"
+
+    # ========================================================================
+    # Hour / weekday blacklist gates.
+    # Called from StrategyManager._apply_always_on_filters (live + backtest).
+    # ========================================================================
+
+    @classmethod
+    def is_blocked_hour(cls, symbol: str, dt_utc: datetime = None) -> Tuple[bool, str]:
+        """True if the current SAST hour is blacklisted for this symbol."""
+        times = cls.get_current_times(dt_utc)
+        hour_sast = times["SAST"].hour
+        blocked = getattr(GLOBAL_PARAMS, "blocked_hours_sast", {}) or {}
+        hours = blocked.get(symbol.upper(), [])
+        if hour_sast in hours:
+            return True, f"BLOCKED_HOUR_{hour_sast:02d}_SAST"
+        return False, ""
+
+    @classmethod
+    def is_blocked_weekday(cls, symbol: str, dt_utc: datetime = None) -> Tuple[bool, str]:
+        """True if the current SAST weekday is blacklisted for this symbol."""
+        times = cls.get_current_times(dt_utc)
+        wd = times["SAST"].weekday()
+        blocked = getattr(GLOBAL_PARAMS, "blocked_weekdays", {}) or {}
+        days = blocked.get(symbol.upper(), [])
+        if wd in days:
+            return True, f"BLOCKED_WEEKDAY_{wd}"
+        return False, ""
