@@ -2,11 +2,18 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 
-BRIEF CHANGES (2026-10-12):
-- COMBINATIONS list replaced: the R:R 1:1 combos are gone. New set:
-  Adaptive · BE off/on · R:R 1:2, 1:2.5, 1:3.
-- LAB_VARIANTS "Target R:R 1.5" removed; "Target R:R 2.0" and "Target R:R 3.0" kept.
+CHANGES (2026-10-12):
+- COMBINATIONS: R:R 1:1 and 1:2 dropped; new set = BE off/on x {1:2, 1:2.5, 1:3}.
+- LAB_VARIANTS: "Target R:R 1.5" removed; "Target R:R 2.0" and "Target R:R 3.0" kept.
 - run_lab_combination default target_rr raised from 1.0 to 2.5.
+- --rr CLI default raised from 1.0 to 2.5.
+
+FIX (2026-10-12):
+- precompute_market_pass now drains sm.drain_filter_skips() and returns
+  them as `filter_skips`. These are the always-on rejections
+  (SPREAD_IN_R, BLOCKED_HOUR_*, ALWAYS_HTF) that previously vanished.
+- run_cached_combination replays `filter_skips` into the simulator so
+  the skip summary in the report shows them.
 """
 
 import sys
@@ -65,7 +72,6 @@ STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
 
 
-# BRIEF: 1:1 and 1:2 dropped. New combos: BE off/on × R:R 1:2, 1:2.5, 1:3.
 COMBINATIONS = [
     {
         "mode": "adaptive", "adaptive_mode": True,
@@ -172,7 +178,6 @@ VARIANT_COMBINATIONS = [
 ]
 
 
-# BRIEF: "Target R:R 1.5" removed. "Target R:R 2.0" and "Target R:R 3.0" kept.
 LAB_VARIANTS: List[Dict[str, Any]] = [
     {"label": "Baseline",                 "overrides": {}},
     {"label": "Max spread-in-R 0.10",     "overrides": {"strat_max_spread_in_r": 0.10}},
@@ -218,10 +223,6 @@ def sanitize_for_json(obj):
     except Exception:
         return str(obj)
 
-
-# ==============================================================================
-# PROPOSED: value-area helpers (Fix 7b)
-# ==============================================================================
 
 MIN_SESSION_BARS = 20
 
@@ -845,8 +846,18 @@ def precompute_market_pass(
 
     print(f"[*] {symbol} precompute 100% complete.", flush=True)
 
+    # FIX: drain always-on filter skips so SPREAD_IN_R, BLOCKED_HOUR_* and
+    # ALWAYS_HTF rejections are visible in the report.
+    try:
+        filter_skips = sm.drain_filter_skips()
+    except Exception:
+        filter_skips = []
+    if filter_skips:
+        print(f"[*] {symbol} precompute: {len(filter_skips)} always-on filter skips recorded.", flush=True)
+
     return {
         "cached_signals": cached_signals_by_index,
+        "filter_skips": filter_skips,
         "valid_vol_bars": valid_vol_bars,
         "simulated_bars_count": total_sim_bars,
         "timing": {
@@ -916,6 +927,16 @@ def run_cached_combination(
         m5_df_full=(m5_df if is_analysis_combo else None),
     )
     cached_signals = precomputed["cached_signals"]
+
+    # FIX: replay always-on filter skips (recorded once during precompute)
+    # into the simulator's skipped list so the skip summary in the report
+    # includes SPREAD_IN_R, BLOCKED_HOUR_* and ALWAYS_HTF rejections.
+    for _skip in precomputed.get("filter_skips", []) or []:
+        try:
+            sim.skipped.append(dict(_skip))
+        except Exception:
+            pass
+
     m5_times_list = m5_df['time'].tolist()
     has_ema200_col = 'ema_200' in m5_df.columns
     has_atr14_col = 'atr_14' in m5_df.columns
@@ -1899,7 +1920,6 @@ async def run_strategy_lab(
     for idx, variant in enumerate(LAB_VARIANTS):
         label = variant["label"]
         overrides = dict(variant["overrides"])
-        # BRIEF: default baseline R:R raised from 1.0 to 2.5.
         target_rr_value = float(overrides.pop("target_rr", 2.5))
 
         print(f"[LAB] {symbol}: variant {idx + 1}/{len(LAB_VARIANTS)} — {label}", flush=True)
