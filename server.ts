@@ -8,12 +8,13 @@ import { spawn, ChildProcess } from 'child_process';
 import { METRIC_DESCRIPTIONS, describe } from './shared/metricDescriptions';
 
 // =============================================================================
-// PROPOSED: how many ledger rows to write per pair in the TXT export.
-// Full ledger always goes to backtest_ledger.csv. This cap is only for the
-// human-readable TXT block.
-//   0 -> every row (only safe if you have one pair)
+// AI-FRIENDLY EXPORT (2026-10-12)
+// -----------------------------------------------------------------------------
+// Default sample size per pair for backtest_sample.csv. Overridable via
+// GET /api/backtest/export-zip?sample=N. Setting it to 0 falls back to the
+// full ledger dump (backtest_ledger.csv) for anyone who still wants it.
 // =============================================================================
-const LEDGER_CAP_PER_PAIR = 100;
+const SAMPLE_TRADES_PER_PAIR = 30;
 
 // A pair summary older than this is marked [STALE] in the export.
 const STALE_SUMMARY_HOURS = 24;
@@ -90,7 +91,7 @@ const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boo
   { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
   { id: 37, label: 'Bootstrap Monte Carlo resampling',           panel: true,  txt: true,  pdf: true },
   { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
-  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false },
+  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:2.5, BE off)', panel: false, txt: true, pdf: false },
 ];
 
 const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
@@ -131,7 +132,7 @@ let optimizerLastError: string | null = null;
 let optimizerProcess: ChildProcess | null = null;
 
 let activeBotConfig: BotGatewayConfig = {
-  masterExecution: true, riskPerTradePct: 1.0, minRr: 1.0, adaptiveMode: false,
+  masterExecution: true, riskPerTradePct: 1.0, minRr: 2.5, adaptiveMode: false,
   stopOnDailyGoalReached: false, dailyGoalTarget: 5.0, weeklyGoalTarget: 20.0,
   monthlyGoalTarget: 50.0, weeklyDepositBaseline: 10.0, maxDailyTrades: 4,
   trailingStopActive: true, autoBreakevenPips: 15, currency: 'USD',
@@ -352,7 +353,7 @@ function computeRuleBasedPairAdvice(pairPayload: any): Array<{ tag: string; text
   if (holdoutVerdict(bestTv.tune, bestTv.validate) === 'HOLDS' && totalTrades >= 30) {
     suggestions.push({
       tag: '[TEST NEEDED]',
-      text: `Test larger R:R targets on ${symbol}: best combination is HOLDS.`,
+      text: `Test target R:R 2.5 and 3.0 on ${symbol}: the best combination is HOLDS, so R:R expansion is worth testing.`,
       impact: 0.0, is_measured: false, type: 'RR_EXPANSION'
     });
   }
@@ -368,14 +369,14 @@ function computePortfolioNextTests(all: Array<{ type: string }>): string[] {
   if (all.some(s => s.type === 'DAY_FILTER')) tests.push('Add a weekday blackout filter.');
   if (all.some(s => s.type === 'BE_TUNING')) tests.push('Lock in the better Breakeven policy per pair.');
   if (all.some(s => s.type === 'COST_DRAG')) tests.push('Add a spread or minimum-stop filter where cost drag exceeds 0.07R.');
-  if (all.some(s => s.type === 'RR_EXPANSION')) tests.push('Test larger R:R targets on HOLDS pairs.');
+  if (all.some(s => s.type === 'RR_EXPANSION')) tests.push('Test target R:R 2.5 and 3.0 on HOLDS pairs.');
   else tests.push('Run the Strategy Lab on the pairs with the highest PF.');
   return tests.slice(0, 5);
 }
 
 function generateExportDataPayload(): any {
   const result: any = {
-    generated_at: new Date().toISOString(), days: 60, rr_values: [1.0, 2.0, 3.0],
+    generated_at: new Date().toISOString(), days: 60, rr_values: [2.0, 2.5, 3.0],
     total_run_seconds: null,
     wall_clock_seconds: lastRunWallClockSeconds,
     concurrent_processes: lastRunConcurrentProcesses,
@@ -482,6 +483,162 @@ function fmt(v: any, decimals = 2): string {
   return n.toFixed(decimals);
 }
 
+function csvEscape(v: any): string {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+// =============================================================================
+// AI-FRIENDLY SUMMARY CSV
+// -----------------------------------------------------------------------------
+// One row per (pair x combination). 14 columns. ~42 rows for 7 pairs.
+// This is the file the AI should read first to see what is and is not working.
+// =============================================================================
+function renderSummaryCsv(pairs: any[]): string {
+  const cols = [
+    'pair','combo','trades','win_rate','avg_r','expectancy','profit_factor',
+    'max_dd_money','net_pnl','tune_trades','tune_pf','validate_trades','validate_pf','verdict'
+  ];
+  const out: string[] = [cols.join(',')];
+  for (const p of pairs) {
+    if (p.status !== 'OK') continue;
+    for (const c of (p.combinations || [])) {
+      const tv = c.tune_validate || {};
+      const t = tv.tune || {};
+      const v = tv.validate || {};
+      out.push([
+        p.symbol,
+        c.label || '',
+        c.total_trades ?? 0,
+        c.win_rate ?? 0,
+        c.avg_r ?? c.expectancy ?? 0,
+        c.expectancy ?? 0,
+        c.profit_factor ?? 0,
+        c.max_drawdown ?? 0,
+        c.net_pnl ?? 0,
+        t.count ?? 0,
+        t.profit_factor ?? 0,
+        v.count ?? 0,
+        v.profit_factor ?? 0,
+        c.holdout_verdict || 'INCONCLUSIVE',
+      ].map(csvEscape).join(','));
+    }
+  }
+  return out.join('\n');
+}
+
+// =============================================================================
+// AI-FRIENDLY SAMPLE CSV
+// -----------------------------------------------------------------------------
+// A stratified sample of trades per pair. Composition per pair:
+//   - top third (by R) = the biggest wins
+//   - bottom third = the biggest losses
+//   - middle third = spread evenly through time (to catch slow drift)
+// Only 12 columns, all essential. Default 30 rows per pair.
+// =============================================================================
+function renderSampleCsv(pairs: any[], samplePerPair: number = SAMPLE_TRADES_PER_PAIR): string {
+  const cols = [
+    'pair','strategy','dir','entry_sast','exit_reason','r','pnl',
+    'mfe_r','mae_r','regime','hour_sast','duration_min'
+  ];
+  const out: string[] = [cols.join(',')];
+  for (const p of pairs) {
+    if (p.status !== 'OK') continue;
+    const b = p.best_combination || {};
+    const trades: any[] = Array.isArray(b.all_trades) ? b.all_trades : [];
+    if (trades.length === 0) continue;
+
+    const sorted = [...trades].sort((a, b) =>
+      String(a?.signal_time_utc || '').localeCompare(String(b?.signal_time_utc || ''))
+    );
+
+    let picked: any[] = [];
+    if (samplePerPair <= 0 || trades.length <= samplePerPair) {
+      picked = sorted;
+    } else {
+      const third = Math.max(1, Math.floor(samplePerPair / 3));
+      const byR = [...sorted].sort((a, b) => (b.r_multiple || 0) - (a.r_multiple || 0));
+      const topWins = byR.slice(0, third);
+      const topLosses = byR.slice(-third).reverse();
+      const spreadCount = samplePerPair - topWins.length - topLosses.length;
+      const step = Math.max(1, Math.floor(sorted.length / Math.max(1, spreadCount)));
+      const spread: any[] = [];
+      for (let i = 0; i < sorted.length && spread.length < spreadCount; i += step) {
+        spread.push(sorted[i]);
+      }
+      const seen = new Set<string>();
+      for (const t of [...topWins, ...topLosses, ...spread]) {
+        const key = String(t?.trade_id || `${t?.symbol}_${t?.signal_time_utc}_${t?.strategy}`);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        picked.push(t);
+      }
+      // sort picked back to chronological order so the AI sees a coherent
+      // sequence, not three shuffled blocks.
+      picked.sort((a, b) => String(a?.signal_time_utc || '').localeCompare(String(b?.signal_time_utc || '')));
+    }
+
+    for (const t of picked) {
+      out.push([
+        p.symbol,
+        t.strategy || '',
+        t.direction || '',
+        (t.signal_time_sast || '').slice(0, 16),
+        t.exit_reason || '',
+        t.r_multiple ?? '',
+        t.money_pnl ?? '',
+        t.mfe_r ?? '',
+        t.mae_r ?? '',
+        t.regime || '',
+        t.hour_sast ?? '',
+        t.duration_minutes ?? '',
+      ].map(csvEscape).join(','));
+    }
+  }
+  return out.join('\n');
+}
+
+// Kept as an escape hatch for the "?sample=0" case only. Not exported by default.
+function renderLedgerCsv(pairs: any[]): string {
+  const cols = [
+    'pair','combination','ticket','entry_time_sast','exit_time_sast','strategy','direction','lots',
+    'entry','sl','tp','exit_price','exit_reason','pnl_usd','pnl_r','duration_minutes',
+    'htf_d1','htf_h4','ema200_dist_atr','ema_spread_atr','eff_ratio_30','atr_pctile','adr_used',
+    'session','mins_since_open','room_atr','stop_atr','spread_r','trade_of_day','hour_sast','weekday','setup_tag',
+    'result','mfe_r','mae_r','failure_reason','alignment_200ema','confirmation_type','is_in_news_window',
+  ];
+  const out: string[] = [cols.join(',')];
+  for (const p of pairs) {
+    if (p.status !== 'OK') continue;
+    const b = p.best_combination || {};
+    const trades: any[] = Array.isArray(b.all_trades) ? b.all_trades : [];
+    const comboLabel = b.label || '';
+    for (const t of trades) {
+      const row = [
+        p.symbol, comboLabel,
+        t.trade_id || '', t.signal_time_sast || '', t.exit_time || '',
+        t.strategy || '', t.direction || '', t.lots ?? '',
+        t.entry_price ?? '', t.sl ?? '', t.tp ?? '',
+        t.exit_price ?? '', t.exit_reason || '',
+        t.money_pnl ?? '', t.r_multiple ?? '', t.duration_minutes ?? '',
+        t.htf_d1 ?? '', t.htf_h4 ?? '', t.ema200_dist_atr ?? '',
+        t.ema_spread_atr ?? '', t.eff_ratio_30 ?? '', t.atr_pctile ?? '',
+        t.adr_used ?? '', t.session ?? '', t.mins_since_open ?? '',
+        t.room_atr ?? '', t.stop_atr ?? '', t.spread_r ?? '',
+        t.trade_of_day ?? '', t.hour_sast ?? '', t.weekday ?? '',
+        t.setup_tag || '', t.result || '', t.mfe_r ?? '',
+        t.mae_r ?? '', t.failure_reason || '',
+        t.alignment_200ema || '', t.confirmation_type || '',
+        t.is_in_news_window ?? '',
+      ];
+      out.push(row.map(csvEscape).join(','));
+    }
+  }
+  return out.join('\n');
+}
+
 function humaniseBucketLabel(feature: string, bucket: string): string {
   if (feature === 'hour_sast' && bucket.startsWith('=')) {
     const n = parseInt(bucket.slice(1), 10);
@@ -499,10 +656,6 @@ function humaniseBucketLabel(feature: string, bucket: string): string {
   return bucket;
 }
 
-// =============================================================================
-// Section renderers
-// =============================================================================
-
 function renderToc(pairs: any[], hasOptimizer: boolean): string[] {
   const out: string[] = [];
   out.push('TABLE OF CONTENTS');
@@ -511,7 +664,7 @@ function renderToc(pairs: any[], hasOptimizer: boolean): string[] {
   out.push('  3. Cross-pair rollup');
   out.push('  4. Per-pair sections:');
   for (const p of pairs) {
-    out.push(`       ${p.symbol} — Summary, Six Combinations, Per-Strategy, Per-Weekday, Skipped, Ledger Summary, Diagnostics (all cards), Tips, Strategy Lab`);
+    out.push(`       ${p.symbol} — Summary, Six Combinations, Per-Strategy, Per-Weekday, Skipped, Ledger Summary, Diagnostics, Tips, Strategy Lab`);
   }
   out.push('  5. Portfolio correlation (full matrix)');
   out.push('  6. Ranked portfolio suggestions');
@@ -519,6 +672,10 @@ function renderToc(pairs: any[], hasOptimizer: boolean): string[] {
   out.push('  8. Entry condition analysis');
   out.push(`  9. Optimizer summary${hasOptimizer ? '' : ' (not generated)'}`);
   out.push(' 10. Not implemented');
+  out.push('');
+  out.push('COMPANION CSVs IN THIS ZIP:');
+  out.push('  backtest_summary.csv  — one row per (pair x combination). Read this first.');
+  out.push('  backtest_sample.csv   — 30 stratified trades per pair, 12 columns. Use for pattern spotting.');
   out.push('');
   return out;
 }
@@ -583,51 +740,9 @@ function renderLedgerSummary(trades: any[]): string[] {
   out.push(header);
   for (const t of worst10) out.push(rowLine(t));
 
-  return out;
-}
+  out.push('');
+  out.push('  (Full sample of trades lives in backtest_sample.csv, not in this TXT.)');
 
-function renderLedgerBlock(trades: any[], cap: number): string[] {
-  const out: string[] = [];
-  if (!Array.isArray(trades) || trades.length === 0) {
-    out.push('  (no trades)');
-    return out;
-  }
-  const n = trades.length;
-  const sorted = [...trades].sort((a, b) =>
-    String(a?.signal_time_utc || '').localeCompare(String(b?.signal_time_utc || ''))
-  );
-
-  let rows: any[] = sorted;
-  let omitted = 0;
-  if (cap > 0 && n > cap) {
-    const half = Math.floor(cap / 2);
-    const head = sorted.slice(0, half);
-    const tail = sorted.slice(n - (cap - half));
-    const winsSorted = [...sorted].sort((a, b) => (b.money_pnl || 0) - (a.money_pnl || 0));
-    const lossesSorted = [...sorted].sort((a, b) => (a.money_pnl || 0) - (b.money_pnl || 0));
-    const topWins = winsSorted.slice(0, 5);
-    const topLosses = lossesSorted.slice(0, 5);
-    const seen = new Set<string>();
-    const merged: any[] = [];
-    for (const t of [...topWins, ...topLosses, ...head, ...tail]) {
-      const key = String(t.trade_id || `${t.symbol}_${t.signal_time_utc}_${t.strategy}`);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      merged.push(t);
-    }
-    rows = merged;
-    omitted = n - rows.length;
-  }
-
-  out.push('  #    signal_utc          symb    strat                              dir   entry       exit        R       PnL$    reason');
-  let idx = 0;
-  for (const t of rows) {
-    idx++;
-    out.push(`  ${String(idx).padStart(4)} ${String(t.signal_time_utc || '').padEnd(19)} ${String(t.symbol || '').padEnd(7)} ${String(t.strategy || '').padEnd(34).slice(0,34)} ${String(t.direction || '').padEnd(4)}  ${fmt(t.entry_price, 5).padStart(11)} ${fmt(t.exit_price, 5).padStart(11)} ${fmt(t.r_multiple, 2).padStart(6)} ${fmt(t.money_pnl, 2).padStart(8)} ${String(t.exit_reason || '').slice(0, 22)}`);
-  }
-  if (omitted > 0) {
-    out.push(`  (... ${omitted} rows omitted from TXT — the full ${n} rows are in backtest_ledger.csv.)`);
-  }
   return out;
 }
 
@@ -772,76 +887,9 @@ function renderConsistencyChecks(pairs: any[]): string[] {
   return out;
 }
 
-function renderLedgerCsv(pairs: any[]): string {
-  const cols = [
-    'pair','combination','ticket','entry_time_sast','exit_time_sast','strategy','direction','lots',
-    'entry','sl','tp','exit_price','exit_reason','pnl_usd','pnl_r','duration_minutes',
-    'htf_d1','htf_h4','ema200_dist_atr','ema_spread_atr','eff_ratio_30','atr_pctile','adr_used',
-    'session','mins_since_open','room_atr','stop_atr','spread_r','trade_of_day','hour_sast','weekday','setup_tag',
-    'result','mfe_r','mae_r','failure_reason','alignment_200ema','confirmation_type','is_in_news_window',
-  ];
-  const escape = (v: any): string => {
-    if (v === null || v === undefined) return '';
-    const s = String(v);
-    if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
-    return s;
-  };
-  const out: string[] = [cols.join(',')];
-  for (const p of pairs) {
-    if (p.status !== 'OK') continue;
-    const b = p.best_combination || {};
-    const trades: any[] = Array.isArray(b.all_trades) ? b.all_trades : [];
-    const comboLabel = b.label || '';
-    for (const t of trades) {
-      const row = [
-        p.symbol, comboLabel,
-        t.trade_id || '',
-        t.signal_time_sast || '',
-        t.exit_time || '',
-        t.strategy || '',
-        t.direction || '',
-        t.lots ?? '',
-        t.entry_price ?? '',
-        t.sl ?? '',
-        t.tp ?? '',
-        t.exit_price ?? '',
-        t.exit_reason || '',
-        t.money_pnl ?? '',
-        t.r_multiple ?? '',
-        t.duration_minutes ?? '',
-        t.htf_d1 ?? '',
-        t.htf_h4 ?? '',
-        t.ema200_dist_atr ?? '',
-        t.ema_spread_atr ?? '',
-        t.eff_ratio_30 ?? '',
-        t.atr_pctile ?? '',
-        t.adr_used ?? '',
-        t.session ?? '',
-        t.mins_since_open ?? '',
-        t.room_atr ?? '',
-        t.stop_atr ?? '',
-        t.spread_r ?? '',
-        t.trade_of_day ?? '',
-        t.hour_sast ?? '',
-        t.weekday ?? '',
-        t.setup_tag || '',
-        t.result || '',
-        t.mfe_r ?? '',
-        t.mae_r ?? '',
-        t.failure_reason || '',
-        t.alignment_200ema || '',
-        t.confirmation_type || '',
-        t.is_in_news_window ?? '',
-      ];
-      out.push(row.map(escape).join(','));
-    }
-  }
-  return out.join('\n');
-}
-
 function renderEntryConditionAnalysis(): string[] {
   const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
-  const header = 'ENTRY CONDITION ANALYSIS (pooled, R:R 1:1, BE off)';
+  const header = 'ENTRY CONDITION ANALYSIS (pooled, R:R 1:2.5, BE off)';
   if (!fs.existsSync(analysisFile)) return [header, '  n/a - rerun to generate'];
   let payload: any;
   try { payload = JSON.parse(fs.readFileSync(analysisFile, 'utf8')); }
@@ -860,7 +908,7 @@ function renderEntryConditionAnalysis(): string[] {
   const formatBucketLine = (b: any): string => {
     const star = b.is_star ? '*' : ' ';
     const label = humaniseBucketLabel(b.feature, String(b.bucket || ''));
-    return `${star}[${b.group}] ${b.feature} ${label}: n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor_1r)} R@1/1.5/2/3=${fmtR(b.avg_r_1)}/${fmtR(b.avg_r_15)}/${fmtR(b.avg_r_2)}/${fmtR(b.avg_r_3)} q>1=${b.quarters_above_1 ?? 0}/4`;
+    return `${star}[${b.group}] ${b.feature} ${label}: n=${b.trades} wr=${fmt(b.win_rate, 1)} pf=${fmt(b.profit_factor_1r)} q>1=${b.quarters_above_1 ?? 0}/4`;
   };
 
   const buildSection = (includeStarPairs: boolean, restrictBuckets: boolean): string[] => {
@@ -929,7 +977,6 @@ function renderTxtContent(data: any): string {
   const wallSeconds = (typeof data.wall_clock_seconds === 'number' && data.wall_clock_seconds > 0) ? data.wall_clock_seconds : null;
   const wallStr = wallSeconds !== null ? `${wallSeconds}s` : 'n/a';
   const concurrentStr = (typeof data.concurrent_processes === 'number' && data.concurrent_processes > 0) ? data.concurrent_processes : 'n/a';
-  const ledgerRows = Number(data.total_ledger_rows || 0);
 
   const lines: string[] = [];
   const okPairs = (data.pairs || []).filter((p: any) => p.status === 'OK');
@@ -943,7 +990,9 @@ function renderTxtContent(data: any): string {
 
   lines.push('AI BRIEF');
   if (bestCombo) lines.push(`Best: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
-  lines.push(`Full trade ledger: backtest_ledger.csv (${ledgerRows} rows)`);
+  lines.push('Companion CSVs in this ZIP:');
+  lines.push('  backtest_summary.csv  — one row per (pair x combo). Read this first.');
+  lines.push('  backtest_sample.csv   — 30 stratified trades per pair, 12 columns. Use for pattern spotting.');
 
   const wrongEnginePairs = (data.pairs || []).filter((p: any) => p.wrong_engine);
   if (wrongEnginePairs.length > 0) {
@@ -954,8 +1003,8 @@ function renderTxtContent(data: any): string {
   lines.push(...renderToc(data.pairs || [], hasOptimizer));
 
   lines.push('LEGEND');
-  lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
-  lines.push('  Ledger Summary shows streaks and the 10 best and 10 worst trades. The full ledger is in backtest_ledger.csv.');
+  lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:2 / 1:2.5 / 1:3.');
+  lines.push('  Ledger Summary shows streaks and the 10 best and 10 worst trades. The rest of the sample is in backtest_sample.csv.');
   lines.push('  Diagnostics sections use §N labels that match the Blueprint.');
   lines.push('  Any bucket or row with fewer than 30 trades is tagged INCONCLUSIVE.');
   lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of this-run pair times ${totalTimeStr}`);
@@ -1044,13 +1093,13 @@ function renderTxtContent(data: any): string {
     }
 
     lines.push('');
-    lines.push('--- Ledger: Summary ---');
+    lines.push('--- Ledger: Summary (10 best + 10 worst) ---');
     const allTrades = Array.isArray(b.all_trades) ? b.all_trades : [];
     for (const l of renderLedgerSummary(allTrades)) lines.push(l);
-
-    lines.push('');
-    lines.push('--- Ledger: Compact rows ---');
-    for (const l of renderLedgerBlock(allTrades, LEDGER_CAP_PER_PAIR)) lines.push(l);
+    // NOTE (2026-10-12): the previous "Compact rows" block (up to 100 rows per
+    // pair) has been removed. The stratified sample now lives in
+    // backtest_sample.csv, keeping the TXT small enough for the AI to consume
+    // 7 pairs x 365 days in a single pass.
 
     lines.push('');
     lines.push('--- Diagnostics (all cards) ---');
@@ -1202,7 +1251,6 @@ async function startServer() {
     catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
-  // ---- TXT only (kept for compatibility; the panel now uses the zip) ----
   app.get('/api/backtest/export.txt', (_req, res) => {
     try {
       const txt = renderTxtContent(generateExportDataPayload());
@@ -1213,13 +1261,30 @@ async function startServer() {
     } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
   });
 
-  // ---- NEW: one-click zip with TXT + CSV ----
-  app.get('/api/backtest/export-zip', (_req, res) => {
+  // ===========================================================================
+  // AI-FRIENDLY EXPORT (2026-10-12)
+  // ---------------------------------------------------------------------------
+  // Default ZIP contains:
+  //   - backtest_ai.txt        (diagnostics + brief, no full ledger)
+  //   - backtest_summary.csv   (one row per pair x combo, ~42 rows)
+  //   - backtest_sample.csv    (30 stratified trades per pair, 12 columns)
+  //
+  // Query params:
+  //   ?sample=N    override the per-pair sample size (default 30, max 200)
+  //   ?sample=0    fall back to the full ledger CSV (backtest_ledger.csv)
+  // ===========================================================================
+  app.get('/api/backtest/export-zip', (req, res) => {
     try {
+      const sampleRaw = parseInt(String(req.query.sample ?? ''), 10);
+      const sampleSize = Number.isFinite(sampleRaw)
+        ? Math.max(0, Math.min(200, sampleRaw))
+        : SAMPLE_TRADES_PER_PAIR;
+
       const data = generateExportDataPayload();
       const txt = renderTxtContent(data);
-      const csv = renderLedgerCsv(data.pairs || []);
+      const summaryCsv = renderSummaryCsv(data.pairs || []);
       const dateStr = new Date().toISOString().slice(0, 10);
+
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.zip"`);
       const archive = archiver('zip', { zlib: { level: 9 } });
@@ -1229,7 +1294,14 @@ async function startServer() {
       });
       archive.pipe(res);
       archive.append(txt, { name: 'backtest_ai.txt' });
-      archive.append(csv, { name: 'backtest_ledger.csv' });
+      archive.append(summaryCsv, { name: 'backtest_summary.csv' });
+      if (sampleSize > 0) {
+        const sampleCsv = renderSampleCsv(data.pairs || [], sampleSize);
+        archive.append(sampleCsv, { name: 'backtest_sample.csv' });
+      } else {
+        const fullCsv = renderLedgerCsv(data.pairs || []);
+        archive.append(fullCsv, { name: 'backtest_ledger.csv' });
+      }
       archive.finalize();
     } catch (err: any) {
       if (!res.headersSent) res.status(500).send(`Export error: ${err?.message}`);
