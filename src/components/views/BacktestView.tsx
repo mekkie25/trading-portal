@@ -158,6 +158,454 @@ function holdoutVerdictLocal(tune: any, val: any): string {
   return 'HOLDS';
 }
 
+// =============================================================================
+// PDF HTML builders (mirrors the TXT sections)
+// =============================================================================
+
+function esc(s: any): string {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function hTable(headers: string[], rows: string[][]): string {
+  const th = headers.map(h => `<th>${esc(h)}</th>`).join('');
+  const body = rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('');
+  return `<table class="data"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function kpiRow(k: any): string {
+  if (!k) return 'n/a';
+  return `TR ${k.count ?? 0} | WR ${formatNum(k.win_rate, 1)}% | PF ${formatNum(k.profit_factor)} | $${formatNum(k.net_pnl)}`;
+}
+
+function diagnosticsHtml(diag: any): string {
+  if (!diag) return '<p class="muted">(no diagnostics in this report)</p>';
+  const parts: string[] = [];
+  if (diag.post_sl) parts.push(`<li><b>§16 Post-SL continuation:</b> n=${diag.post_sl.count} mean ${formatNum(diag.post_sl.mean_pips,1)} pips | median ${formatNum(diag.post_sl.median_pips,1)} | max ${formatNum(diag.post_sl.max_pips,1)} | mean_R ${formatNum(diag.post_sl.mean_r,2)} | recovered_to_TP ${diag.post_sl.recovered_count} (${formatNum(diag.post_sl.recovered_pct,1)}%)</li>`);
+  if (diag.post_tp) parts.push(`<li><b>§17 Post-TP extra:</b> n=${diag.post_tp.count} mean ${formatNum(diag.post_tp.mean_pips,1)} pips | median ${formatNum(diag.post_tp.median_pips,1)} | max ${formatNum(diag.post_tp.max_pips,1)} | mean_R ${formatNum(diag.post_tp.mean_r,2)} | avg_missed_R ${formatNum(diag.post_tp.avg_missed_r,2)}</li>`);
+  if (diag.premature_be) parts.push(`<li><b>§18 Premature BE:</b> moved ${diag.premature_be.total_be_moved} | premature ${diag.premature_be.premature_count} (${formatNum(diag.premature_be.premature_pct,1)}%) | total_missed_R ${formatNum(diag.premature_be.total_missed_r,2)}</li>`);
+  if (diag.hour_kpis) {
+    const rows: string[][] = [];
+    for (let h = 0; h < 24; h++) {
+      const k = diag.hour_kpis[String(h)];
+      if (!k || k.count === 0) continue;
+      rows.push([`${String(h).padStart(2,'0')}:00`, String(k.count), `${formatNum(k.win_rate,1)}%`, formatNum(k.profit_factor), `$${formatNum(k.net_pnl)}`, `${formatNum(k.expectancy,3)}R`]);
+    }
+    if (rows.length > 0) {
+      parts.push(`<li><b>§19 Hour matrix (SAST):</b>${hTable(['Hour','Trades','WR','PF','Net $','Expectancy'], rows)}</li>`);
+    }
+  }
+  if (diag.session_rollover) parts.push(`<li><b>§21 Session rollover:</b> in ${kpiRow(diag.session_rollover.in_transition)} | out ${kpiRow(diag.session_rollover.out_of_transition)}</li>`);
+  if (diag.breakeven_variants) {
+    const bv = diag.breakeven_variants;
+    parts.push(`<li><b>§22 BE variants:</b> A_current ${formatNum(bv.A_current?.total_r,2)}R (n=${bv.A_current?.count ?? 0}) | B_no_BE ${formatNum(bv.B_no_be?.total_r,2)}R | C_delayed ${formatNum(bv.C_delayed_be?.total_r,2)}R | best ${esc(bv.best_variant)} | ${esc(bv.verdict)}</li>`);
+  }
+  if (diag.sizing_comparison) {
+    const s = diag.sizing_comparison;
+    parts.push(`<li><b>§24 Sizing:</b> fixed net $${formatNum(s.fixed?.net_pnl)} (final $${formatNum(s.fixed?.final_equity)}) | compounding $${formatNum(s.compounding?.net_pnl)} (final $${formatNum(s.compounding?.final_equity)}) | diff $${formatNum(s.difference)}</li>`);
+  }
+  if (diag.daily_cap_comparison) {
+    const rows = Object.entries<any>(diag.daily_cap_comparison).map(([k, v]) => [esc(k), String(v.count ?? 0), `${formatNum(v.win_rate,1)}%`, formatNum(v.profit_factor), `$${formatNum(v.net_pnl)}`]);
+    if (rows.length) parts.push(`<li><b>§25 Daily cap comparison:</b>${hTable(['Cap','Trades','WR','PF','Net $'], rows)}</li>`);
+  }
+  if (diag.atr_tier_kpis) {
+    const rows: string[][] = [];
+    for (const tier of ['LOW','NORMAL','HIGH','UNKNOWN']) {
+      const k = diag.atr_tier_kpis[tier];
+      if (!k || k.count === 0) continue;
+      rows.push([tier, String(k.count), `${formatNum(k.win_rate,1)}%`, formatNum(k.profit_factor), `$${formatNum(k.net_pnl)}`]);
+    }
+    if (rows.length) parts.push(`<li><b>§26 ATR tiers:</b>${hTable(['Tier','Trades','WR','PF','Net $'], rows)}</li>`);
+  }
+  if (diag.ema_200_alignment) {
+    const e = diag.ema_200_alignment;
+    parts.push(`<li><b>§27 EMA-200 alignment:</b> aligned ${kpiRow(e.aligned)} | counter ${kpiRow(e.counter_trend)}</li>`);
+  }
+  if (diag.confirmation_type) parts.push(`<li><b>§28 Confirmation:</b> close ${kpiRow(diag.confirmation_type.close)} | touch ${kpiRow(diag.confirmation_type.touch)}</li>`);
+  if (diag.news_window) parts.push(`<li><b>§29 News window:</b> in ${kpiRow(diag.news_window.in_news)} | out ${kpiRow(diag.news_window.out_of_news)}</li>`);
+  if (diag.streak_analysis) {
+    const s = diag.streak_analysis;
+    parts.push(`<li><b>§31 Streaks:</b> max ${s.max_consecutive_losses ?? 0} | avg ${formatNum(s.average_streak,2)} | peak DD -$${formatNum(s.peak_drawdown)} | recovery ${s.recovery_trades_from_peak_dd ?? 0} trades</li>`);
+  }
+  if (diag.circuit_breaker_sim) {
+    const c = diag.circuit_breaker_sim;
+    parts.push(`<li><b>§32 Breaker sim:</b> orig $${formatNum(c.original_net_pnl)} -> sim $${formatNum(c.simulated_net_pnl)} | halved ${c.trades_halved ?? 0} | protection $${formatNum(c.protection_delta)}</li>`);
+  }
+  if (diag.daily_dd_cutoff) {
+    const d = diag.daily_dd_cutoff;
+    parts.push(`<li><b>§33 Daily DD cutoff:</b> cutoff ${formatNum(d.cutoff_pct,1)}% | days ${d.days_triggered} | blocked ${d.trades_blocked} | protection $${formatNum(d.protection_delta)}</li>`);
+  }
+  if (diag.slippage_sensitivity) {
+    const rows: string[][] = [];
+    for (const [, pt] of Object.entries<any>(diag.slippage_sensitivity)) {
+      rows.push([`${pt.slippage_pips} pips`, `$${formatNum(pt.net_pnl)}`, `${formatNum(pt.win_rate,1)}%`, `${formatNum(pt.per_trade_cost_r,3)}R`]);
+    }
+    if (rows.length) parts.push(`<li><b>§34 Slippage:</b>${hTable(['Slippage','Net $','WR','Cost/trade'], rows)}</li>`);
+  }
+  if (diag.parameter_sensitivity && Array.isArray(diag.parameter_sensitivity.sweep) && diag.parameter_sensitivity.sweep.length > 0) {
+    const rows = diag.parameter_sensitivity.sweep.map((r: any) => [`1:${formatNum(r.rr,2)}`, String(r.count), `$${formatNum(r.net_pnl)}`]);
+    parts.push(`<li><b>§35 Parameter sweep:</b>${hTable(['R:R','Trades','Net $'], rows)} best R:R ${formatNum(diag.parameter_sensitivity.best_rr,2)}</li>`);
+  }
+  if (diag.outlier_removal) {
+    const o = diag.outlier_removal;
+    parts.push(`<li><b>§36 Outliers removed:</b> ${o.outlier_count ?? 0} | full ${kpiRow(o.full)} | trimmed ${kpiRow(o.trimmed)} | impact ${formatNum(o.impact_pct,1)}%</li>`);
+  }
+  if (diag.monte_carlo) {
+    const m = diag.monte_carlo;
+    parts.push(`<li><b>§37 Bootstrap MC:</b> iterations ${m.iterations} | median final $${formatNum(m.median_final_pnl)} (P5 $${formatNum(m.p5_final_pnl)}, P95 $${formatNum(m.p95_final_pnl)}) | median DD -$${formatNum(m.median_max_dd)} | prob positive ${formatNum(m.prob_positive,1)}%</li>`);
+  }
+  if (diag.buy_and_hold) {
+    const b = diag.buy_and_hold;
+    parts.push(`<li><b>§38 Alpha:</b> hold ${formatNum(b.bh_return_pct,2)}% ($${formatNum(b.bh_net_pnl)}) | strategy $${formatNum(b.strategy_net_pnl)} | alpha $${formatNum(b.alpha)} | ${esc(b.verdict)}</li>`);
+  }
+  return `<ul class="kv">${parts.join('')}</ul>`;
+}
+
+function portfolioMatrixHtml(pc: any): string {
+  if (!pc || !Array.isArray(pc.symbols) || pc.symbols.length === 0) return '<p class="muted">(portfolio correlation matrix unavailable)</p>';
+  const syms: string[] = pc.symbols;
+  const corr: Record<string, Record<string, number>> = pc.correlation_matrix || {};
+  const headers = ['Symbol', ...syms];
+  const rows = syms.map(row => {
+    const cells = syms.map(col => {
+      const v = corr?.[row]?.[col];
+      return formatNum(typeof v === 'number' ? v : 0, 2);
+    });
+    return [row, ...cells];
+  });
+  return hTable(headers, rows) +
+    `<p class="muted">Portfolio max DD $${formatNum(pc.portfolio_drawdown)} | Sum of individual DDs $${formatNum(pc.sum_of_individual_drawdowns)} | Diversification ${formatNum(pc.diversification_ratio,2)}x | Avg daily corr ${formatNum(pc.avg_daily_correlation,3)} | Days ${pc.days}</p>`;
+}
+
+function ledgerSummaryHtml(trades: any[]): string {
+  if (!Array.isArray(trades) || trades.length === 0) return '<p class="muted">(no trades)</p>';
+  const n = trades.length;
+  const wins = trades.filter(t => t.result === 'WIN');
+  const losses = trades.filter(t => t.result === 'LOSS');
+  const avgWinR = wins.length > 0 ? wins.reduce((s, t) => s + (t.r_multiple || 0), 0) / wins.length : 0;
+  const avgLossR = losses.length > 0 ? losses.reduce((s, t) => s + (t.r_multiple || 0), 0) / losses.length : 0;
+  const totalR = trades.reduce((s, t) => s + (t.r_multiple || 0), 0);
+  const totalPnl = trades.reduce((s, t) => s + (t.money_pnl || 0), 0);
+
+  const ordered = [...trades].sort((a, b) => String(a.signal_time_utc || '').localeCompare(String(b.signal_time_utc || '')));
+  let maxW = 0, maxL = 0, cw = 0, cl = 0;
+  for (const t of ordered) {
+    if (t.result === 'WIN') { cw++; cl = 0; if (cw > maxW) maxW = cw; }
+    else if (t.result === 'LOSS') { cl++; cw = 0; if (cl > maxL) maxL = cl; }
+  }
+
+  const byPnl = [...trades].sort((a, b) => (b.money_pnl || 0) - (a.money_pnl || 0));
+  const top25 = byPnl.slice(0, 25);
+  const worst25 = byPnl.slice(-25).reverse();
+
+  const tradeRow = (t: any) => [
+    esc(t.date_sast || ''), esc(t.symbol || ''), esc(t.strategy || ''), esc(t.direction || ''),
+    formatNum(t.entry_price, 5), formatNum(t.exit_price, 5),
+    formatNum(t.r_multiple, 2), `$${formatNum(t.money_pnl)}`, esc(t.exit_reason || '')
+  ];
+  const tradeHeaders = ['Date','Symbol','Strategy','Dir','Entry','Exit','R','PnL $','Reason'];
+
+  return `
+    <p>Trades ${n} | Wins ${wins.length} | Losses ${losses.length} | Avg win ${formatNum(avgWinR,3)}R | Avg loss ${formatNum(avgLossR,3)}R | Total R ${formatNum(totalR,2)} | Net $${formatNum(totalPnl)}</p>
+    <p>Longest win streak ${maxW} | Longest loss streak ${maxL}</p>
+    <h4>Top 25 wins</h4>
+    ${hTable(tradeHeaders, top25.map(tradeRow))}
+    <h4>Top 25 losses</h4>
+    ${hTable(tradeHeaders, worst25.map(tradeRow))}
+  `;
+}
+
+function buildPdfHtml(exp: any): string {
+  const okPairs = (exp.pairs || []).filter((p: any) => p.status === 'OK');
+  const notTested = (exp.pairs || []).filter((p: any) => p.status !== 'OK');
+  const ledgerRows = Number(exp.total_ledger_rows || 0);
+
+  const sections: string[] = [];
+
+  // Header
+  sections.push(`
+    <div class="header">
+      <h1>NEXUS MATRIX — SIX-COMBINATION AUDIT REPORT</h1>
+      <p class="muted">Run Date: ${esc(exp.generated_at?.slice(0, 10))} | Window: ${esc(exp.days)} days | Full trade ledger: backtest_ledger.csv (${ledgerRows} rows)</p>
+    </div>
+  `);
+
+  // TOC
+  sections.push(`
+    <h2>Table of Contents</h2>
+    <ol class="toc">
+      <li>Legend</li>
+      <li>Active settings differing from default</li>
+      <li>Cross-pair rollup</li>
+      <li>Per-pair sections (Summary, six combinations, per-strategy, per-weekday, skipped, ledger summary, diagnostics, tips, strategy lab)</li>
+      <li>Portfolio correlation (full matrix)</li>
+      <li>Ranked portfolio suggestions</li>
+      <li>What to test next</li>
+      <li>Entry condition analysis</li>
+      <li>Optimizer summary</li>
+      <li>Cost assumptions</li>
+      <li>Consistency checks</li>
+      <li>Not implemented</li>
+    </ol>
+  `);
+
+  // Legend
+  sections.push(`
+    <h2>Legend</h2>
+    <ul class="kv">
+      <li>Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.</li>
+      <li>Ledger summary lists streaks and the 25 best/worst trades. The full ledger is in <b>backtest_ledger.csv</b>.</li>
+      <li>Diagnostics sections use §N labels that match the Blueprint.</li>
+      <li>Any row under 30 trades is tagged INCONCLUSIVE.</li>
+    </ul>
+  `);
+
+  // Non-default settings
+  const nonDefault: string[] = Array.isArray(exp.non_default_settings) ? exp.non_default_settings : [];
+  sections.push(`
+    <h2>Active settings differing from default</h2>
+    ${nonDefault.length === 0
+      ? '<p class="muted">(none — all pairs and strategies use schema defaults)</p>'
+      : `<ul class="kv">${nonDefault.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`}
+  `);
+
+  // Cross-pair rollup
+  const rollupRows = Object.entries<any>(exp.combinations_rollup || {}).map(([combo, r]) => [
+    esc(combo), String(r.total_trades), `${formatNum(r.weighted_win_rate,1)}%`, `$${formatNum(r.total_pnl)}`
+  ]);
+  sections.push(`
+    <h2>Cross-pair rollup</h2>
+    ${rollupRows.length ? hTable(['Combination','Trades','WR','Net $'], rollupRows) : '<p class="muted">(no data)</p>'}
+  `);
+
+  // Per-pair sections
+  for (const p of okPairs) {
+    const b = p.best_combination || {};
+    const combos = p.combinations || [];
+
+    const combosRows = combos.map((c: any) => {
+      const tv = c.tune_validate || {};
+      const t = tv.tune || {};
+      const v = tv.validate || {};
+      return [
+        esc(c.label), String(c.total_trades ?? 0), `${formatNum(c.win_rate,1)}%`, formatNum(c.expectancy),
+        formatNum(c.profit_factor), `-$${formatNum(c.max_drawdown)}`, `$${formatNum(c.net_pnl)}`,
+        `${t.count ?? 0}t/${formatNum(t.profit_factor)}`,
+        `${v.count ?? 0}t/${formatNum(v.profit_factor)}`,
+        esc(c.holdout_verdict || 'INCONCLUSIVE')
+      ];
+    });
+
+    const stratStv: Record<string, any> = b.strategy_tune_validate || {};
+    const stratRows = Object.entries(b.strategy_kpis || {}).map(([sName, s]: any) => {
+      const tv = stratStv[sName] || {};
+      const t = tv.tune || {};
+      const v = tv.validate || {};
+      const inc = (s.count || 0) < 30 ? ' [INCONCLUSIVE]' : '';
+      return [
+        esc(sName) + inc, String(s.count ?? 0), `${formatNum(s.win_rate,1)}%`, formatNum(s.profit_factor),
+        `$${formatNum(s.net_pnl)}`,
+        `${t.count ?? 0}t/${formatNum(t.profit_factor)}`,
+        `${v.count ?? 0}t/${formatNum(v.profit_factor)}`
+      ];
+    });
+
+    const dowRows = Object.entries(b.dow_kpis || {}).map(([dow, k]: any) => {
+      const inc = (k.count || 0) < 30 ? ' [INCONCLUSIVE]' : '';
+      return [esc(dow), String(k.count ?? 0), `${formatNum(k.win_rate,1)}%`, formatNum(k.profit_factor), `$${formatNum(k.net_pnl)}` + inc];
+    });
+
+    const skipEntries = Object.entries(b.skipped_summary || {});
+    const skipRows = skipEntries.map(([reason, val]: [string, any]) => {
+      if (val && typeof val === 'object') {
+        return [esc(reason), String(val.candle_skips ?? 0), String(val.unique_setups ?? 0)];
+      }
+      return [esc(reason), String(val), ''];
+    });
+
+    const labRows = (p.lab && Array.isArray(p.lab.variants)) ? p.lab.variants.map((v: any) => [
+      esc(v.label), String(v.trades), `${formatNum(v.win_rate,1)}%`, formatNum(v.profit_factor),
+      `-$${formatNum(v.max_drawdown)}`, `$${formatNum(v.net_pnl)}`,
+      `${formatNum(v.tune_pf)} (${v.tune_trades})`, `${formatNum(v.validate_pf)} (${v.validate_trades})`,
+      esc(v.verdict)
+    ]) : [];
+
+    const tips = Array.isArray(b.improvement_tips) ? b.improvement_tips : [];
+    const ruleSuggestions = Array.isArray(b.rule_suggestions) ? b.rule_suggestions : [];
+
+    sections.push(`
+      <div class="pair">
+        <h2>${esc(p.symbol)} ${p.wrong_engine ? '— <span class="warn">WRONG ENGINE</span>' : ''}</h2>
+        <p class="muted">
+          Generated: ${esc(p.generated_at || 'unknown')} | This run: ${p.seconds_taken != null ? p.seconds_taken + 's' : 'n/a'}
+          ${p.engine_line ? ' | ' + esc(p.engine_line) : ''}
+        </p>
+
+        <h3>Summary: Six combinations</h3>
+        ${hTable(['Combination','Trades','WR','Exp R','PF','Max DD','Net $','TUNE','VALIDATE','Verdict'], combosRows)}
+
+        <h3>Summary: Per-strategy (best = ${esc(b.label || 'n/a')})</h3>
+        ${stratRows.length ? hTable(['Strategy','Trades','WR','PF','Net $','TUNE','VALIDATE'], stratRows) : '<p class="muted">(no per-strategy data)</p>'}
+
+        <h3>Summary: Per-weekday</h3>
+        ${dowRows.length ? hTable(['Weekday','Trades','WR','PF','Net $'], dowRows) : '<p class="muted">(no weekday data)</p>'}
+
+        <h3>Summary: Skipped signals</h3>
+        ${skipRows.length ? hTable(['Reason','Candle skips','Unique setups'], skipRows) : '<p class="muted">(none)</p>'}
+
+        <h3>Ledger summary</h3>
+        ${ledgerSummaryHtml(b.all_trades || [])}
+
+        <h3>Diagnostics</h3>
+        ${diagnosticsHtml(b.diagnostics)}
+
+        ${(tips.length > 0 || ruleSuggestions.length > 0) ? `
+          <h3>Tips</h3>
+          <ul class="kv">
+            ${tips.map((t: any) => `<li><b>[${esc(t.severity || 'INFO')}] [${esc(t.strategy || 'ALL')}]</b> ${esc(t.title || '')}${t.action ? ` — <i>${esc(t.action)}</i>` : ''}</li>`).join('')}
+            ${ruleSuggestions.map((s: any) => `<li><b>${esc(s.tag)}</b> ${esc(s.text)}</li>`).join('')}
+          </ul>
+        ` : ''}
+
+        ${labRows.length ? `
+          <h3>Strategy Lab (${esc(p.lab.days)} days)</h3>
+          ${hTable(['Variant','Trades','WR','PF','Max DD','Net $','TUNE PF','VALIDATE PF','Verdict'], labRows)}
+        ` : ''}
+      </div>
+    `);
+  }
+
+  // Not tested pairs
+  if (notTested.length > 0) {
+    sections.push(`
+      <h2>NOT TESTED</h2>
+      <ul class="kv">
+        ${notTested.map((p: any) => `<li><b>${esc(p.symbol)}:</b> ${esc(p.error || 'unknown error')}</li>`).join('')}
+      </ul>
+    `);
+  }
+
+  // Portfolio
+  sections.push(`
+    <h2>Portfolio correlation</h2>
+    ${portfolioMatrixHtml(exp.portfolio_correlation)}
+  `);
+
+  // Ranked suggestions
+  const rankedSuggestions = Array.isArray(exp.portfolio_suggestions) ? exp.portfolio_suggestions : [];
+  if (rankedSuggestions.length > 0) {
+    sections.push(`
+      <h2>Ranked portfolio suggestions</h2>
+      <ul class="kv">
+        ${rankedSuggestions.map((s: any) => `<li><b>${esc(s.tag)}</b> ${esc(s.text)}</li>`).join('')}
+      </ul>
+    `);
+  }
+
+  // What to test next
+  const nextTests = Array.isArray(exp.what_to_test_next) ? exp.what_to_test_next : [];
+  if (nextTests.length > 0) {
+    sections.push(`
+      <h2>What to test next</h2>
+      <ol class="toc">
+        ${nextTests.map((t: string) => `<li>${esc(t)}</li>`).join('')}
+      </ol>
+    `);
+  }
+
+  // Entry condition analysis
+  sections.push(`
+    <h2>Entry condition analysis</h2>
+    <p class="muted">See backtest_ai.txt for the pooled entry-condition analysis; the PDF shows the same section list but the full buckets remain in the TXT.</p>
+  `);
+
+  // Optimizer summary
+  sections.push(`
+    <h2>Optimizer summary</h2>
+    <p class="muted">See backtest_ai.txt for the full optimizer summary text. The optimizer writes config/pair_settings.suggested.json.</p>
+  `);
+
+  // Cost table
+  sections.push(`
+    <h2>Cost assumptions</h2>
+    ${hTable(
+      ['Symbol','Pip size','Contract size','Spread'],
+      [
+        ['GOLD','0.01','100.0','0.30'],
+        ['US30','1.0','1.0','2.50'],
+        ['NAS100','0.1','1.0','1.50'],
+        ['GERMAN30','0.1','1.0','1.80'],
+        ['EURUSD','0.0001','100000.0','0.00010'],
+        ['USDJPY','0.01','100000.0','0.012'],
+        ['GBPUSD','0.0001','100000.0','0.00014'],
+      ]
+    )}
+    <p class="muted">Identical between the backtest and the live bot.</p>
+  `);
+
+  // Consistency checks
+  const consistencyRows: string[][] = [];
+  for (const p of okPairs) {
+    const notes: string[] = [];
+    if (p.wrong_engine) notes.push('WRONG ENGINE');
+    if (p.engine_line) notes.push(p.engine_line);
+    if (p.precompute_s != null) notes.push(`precompute this run ${p.precompute_s}s`);
+    if (p.cache_built_at && p.cache_build_seconds != null) notes.push(`cache built ${Math.round(p.cache_build_seconds)}s on ${String(p.cache_built_at).slice(0,10)}`);
+    if (notes.length) consistencyRows.push([p.symbol, notes.join(' | ')]);
+  }
+  if (consistencyRows.length > 0) {
+    sections.push(`
+      <h2>Consistency checks</h2>
+      ${hTable(['Pair','Notes'], consistencyRows)}
+    `);
+  }
+
+  // Not implemented
+  const notImpl = (exp.spec_coverage || []).filter((row: any) => !row.panel && !row.txt);
+  sections.push(`
+    <h2>Not implemented</h2>
+    ${notImpl.length === 0
+      ? '<p class="muted">(none)</p>'
+      : `<ul class="kv">${notImpl.map((row: any) => `<li>#${row.id} ${esc(row.label)}</li>`).join('')}</ul>`}
+  `);
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Nexus Matrix Audit Report</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #111827; padding: 24px; font-size: 11px; }
+  h1 { font-size: 18px; margin: 0 0 4px 0; }
+  h2 { font-size: 14px; margin: 22px 0 8px; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  h3 { font-size: 12px; margin: 14px 0 6px; }
+  h4 { font-size: 11px; margin: 10px 0 4px; }
+  .header { border-bottom: 2px solid #2563eb; padding-bottom: 12px; margin-bottom: 12px; }
+  .muted { color: #6b7280; font-size: 10px; margin: 4px 0; }
+  .warn { color: #b91c1c; font-weight: bold; }
+  .kv { margin: 4px 0; padding-left: 20px; }
+  .kv li { margin: 3px 0; }
+  .toc { margin: 4px 0; padding-left: 20px; }
+  .toc li { margin: 2px 0; }
+  .data { width: 100%; border-collapse: collapse; margin: 6px 0 10px; font-family: 'Courier New', monospace; font-size: 9px; }
+  .data th, .data td { border-bottom: 1px solid #e5e7eb; padding: 3px 5px; text-align: left; }
+  .data th { background: #f3f4f6; font-weight: bold; text-transform: uppercase; font-size: 9px; }
+  .pair { page-break-before: auto; margin-bottom: 20px; }
+  @media print { body { padding: 12px; } h2 { page-break-after: avoid; } table { page-break-inside: auto; } tr { page-break-inside: avoid; } }
+</style>
+</head>
+<body>
+${sections.join('\n')}
+<script>window.onload = function(){ setTimeout(function(){ window.print(); }, 300); };</script>
+</body>
+</html>`;
+  return html;
+}
+
 export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', brokerCurrency = 'USD' }) => {
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
@@ -197,10 +645,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [isLoadingLab, setIsLoadingLab] = useState<boolean>(false);
   const [labCopyStatus, setLabCopyStatus] = useState<Record<string, 'idle' | 'copied'>>({});
 
-  // Optimizer state.
   const [optimizerRunning, setOptimizerRunning] = useState<boolean>(false);
-  // NEW: mirrors the server's reported isRunning so the Stop button stays
-  // visible even when this tab did not start the run itself.
   const [optimizerServerRunning, setOptimizerServerRunning] = useState<boolean>(false);
   const [optimizerProgress, setOptimizerProgress] = useState<string>('');
   const [optimizerError, setOptimizerError] = useState<string | null>(null);
@@ -381,9 +826,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return () => clearInterval(interval);
   }, [labRunning, selectedSymbols, fetchLabForSymbol]);
 
-  // Poll the optimizer status. Adopt the server's isRunning state so the UI
-  // never gets stuck on "already running" while the server is idle, and never
-  // hides the Stop button while the server is busy.
   useEffect(() => {
     const fetchOptimizerStatus = async () => {
       try {
@@ -401,13 +843,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         const serverRunning = Boolean(json.isRunning);
         setOptimizerServerRunning(serverRunning);
 
-        // Server has a live process but the client thinks it stopped.
         if (serverRunning && !optimizerRunning) {
           setOptimizerRunning(true);
           setOptimizerError(null);
         }
 
-        // Server is idle but the client thought it was still running.
         if (!serverRunning && optimizerRunning) {
           setOptimizerRunning(false);
           setShowOptimizerSummary(true);
@@ -704,33 +1144,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
       if (!res.ok) throw new Error('Could not fetch export data.');
       const json = await res.json();
       const exp = json.data;
-      const overviewHtml = (exp.pairs || []).map((p: any) => `
-        <tr>
-          <td><strong>${p.symbol}</strong></td>
-          <td>${p.best_combination?.label || 'N/A'}</td>
-          <td>${p.best_combination?.total_trades || 0}</td>
-          <td>${formatNum(p.best_combination?.win_rate)}%</td>
-          <td>${formatNum(p.best_combination?.profit_factor)}</td>
-          <td>$${formatNum(p.best_combination?.net_pnl)}</td>
-        </tr>
-      `).join('');
+      const html = buildPdfHtml(exp);
       const printWindow = window.open('', '_blank');
-      if (printWindow) {
-        printWindow.document.write(`
-          <html><head><title>Nexus Matrix Audit Report</title>
-          <style>body{font-family:sans-serif;padding:30px;} table{width:100%;border-collapse:collapse;} th,td{padding:8px;border-bottom:1px solid #e2e8f0;}</style>
-          </head><body>
-          <h1>NEXUS MATRIX - SIX-COMBINATION REPORT</h1>
-          <p>Run Date: ${exp.generated_at.slice(0, 10)} | Window: ${exp.days} Days</p>
-          <h2>Portfolio Overview</h2>
-          <table><thead><tr><th>Asset</th><th>Best Combination</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>Net P&L</th></tr></thead><tbody>${overviewHtml}</tbody></table>
-          <script>window.onload = function() { window.print(); };</script>
-          </body></html>
-        `);
-        printWindow.document.close();
+      if (!printWindow) {
+        throw new Error('Popup blocked. Please allow popups for this site and try again.');
       }
+      printWindow.document.write(html);
+      printWindow.document.close();
     } catch (err: any) {
-      alert(`PDF Export Notice: ${err.message}`);
+      alert(`PDF Export Notice: ${err?.message || String(err)}`);
     } finally {
       setIsExportingPdf(false);
     }
@@ -927,9 +1349,9 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
           <span>Exporting <strong className="text-black dark:text-white">{exportPairCount}</strong> pair{exportPairCount === 1 ? '' : 's'}</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <a href="/api/backtest/export.txt" download className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
+          <a href="/api/backtest/export-zip" download className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
             <Download className="w-3.5 h-3.5 text-blue-500" />
-            <span>Export for AI (.txt)</span>
+            <span>Export for AI (.zip)</span>
           </a>
           <button type="button" onClick={handleExportPDF} disabled={isExportingPdf} className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-xs font-semibold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs disabled:opacity-50">
             <Printer className="w-3.5 h-3.5 text-emerald-500" />

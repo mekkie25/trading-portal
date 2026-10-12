@@ -2,9 +2,21 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import archiver from 'archiver';
 import { createServer as createViteServer } from 'vite';
 import { spawn, ChildProcess } from 'child_process';
 import { METRIC_DESCRIPTIONS, describe } from './shared/metricDescriptions';
+
+// =============================================================================
+// PROPOSED: how many ledger rows to write per pair in the TXT export.
+// Full ledger always goes to backtest_ledger.csv. This cap is only for the
+// human-readable TXT block.
+//   0 -> every row (only safe if you have one pair)
+// =============================================================================
+const LEDGER_CAP_PER_PAIR = 100;
+
+// A pair summary older than this is marked [STALE] in the export.
+const STALE_SUMMARY_HOURS = 24;
 
 interface BotGatewayConfig {
   masterExecution: boolean; riskPerTradePct: number; minRr: number; adaptiveMode: boolean;
@@ -78,7 +90,7 @@ const SPEC_COVERAGE: Array<{ id: number; label: string; panel: boolean; txt: boo
   { id: 36, label: 'Outlier dependency removal',                 panel: true,  txt: true,  pdf: true },
   { id: 37, label: 'Bootstrap Monte Carlo resampling',           panel: true,  txt: true,  pdf: true },
   { id: 38, label: 'Buy-and-hold benchmark (alpha)',             panel: true,  txt: true,  pdf: true },
-  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false, note: 'TXT-only. Counts as implemented.' },
+  { id: 39, label: 'Entry condition analysis (pooled, R:R 1:1, BE off)', panel: false, txt: true, pdf: false },
 ];
 
 const DATA_DIR = (process.env.DATA_DIR || '').trim() || process.cwd();
@@ -93,7 +105,6 @@ const storageBase = (process.env.BACKTEST_STORAGE_DIR || '').trim();
 const BACKTEST_OUTPUT_DIR = storageBase ? path.join(storageBase, 'output') : path.join(process.cwd(), 'backtest', 'output');
 const BACKTEST_DATA_DIR = storageBase ? path.join(storageBase, 'data') : path.join(process.cwd(), 'backtest', 'data');
 
-// PROPOSED: optimizer files read/written by backtest/settings_optimizer.py.
 const OPTIMIZER_STATUS_FILE = path.join(BACKTEST_DATA_DIR, 'optimizer_status.json');
 const OPTIMIZER_SUMMARY_TXT = path.join(BACKTEST_OUTPUT_DIR, 'optimizer_summary.txt');
 const OPTIMIZER_SUMMARY_JSON = path.join(BACKTEST_OUTPUT_DIR, 'optimizer_summary.json');
@@ -114,7 +125,6 @@ let compareSymbol = '';
 let compareLastError: string | null = null;
 let compareProcess: ChildProcess | null = null;
 
-// PROPOSED: optimizer background-job state.
 let optimizerRunning = false;
 let optimizerProgress = '';
 let optimizerLastError: string | null = null;
@@ -225,9 +235,6 @@ function holdoutVerdict(tune: any, val: any): string {
   return 'HOLDS';
 }
 
-// PROPOSED: read config/pair_settings.json and list any (pair, strategy, key)
-// triple whose value differs from the schema default. Empty list means every
-// pair is on defaults, which is worth saying explicitly in the export.
 function summariseNonDefaultSettings(): string[] {
   const out: string[] = [];
   try {
@@ -252,8 +259,9 @@ function summariseNonDefaultSettings(): string[] {
         for (const key of Object.keys(defaults)) {
           const cur = ss?.[key];
           const def = defaults[key];
-          const same = JSON.stringify(cur) === JSON.stringify(def);
-          if (!same) out.push(`${pairName}/${stratName}.${key} = ${JSON.stringify(cur)} (default ${JSON.stringify(def)})`);
+          if (JSON.stringify(cur) !== JSON.stringify(def)) {
+            out.push(`${pairName}/${stratName}.${key} = ${JSON.stringify(cur)} (default ${JSON.stringify(def)})`);
+          }
         }
       }
       if (block?.live_enabled === false) out.push(`${pairName}.live_enabled = false`);
@@ -421,18 +429,22 @@ function generateExportDataPayload(): any {
         precompute_s: typeof summary.precompute_s === 'number' ? summary.precompute_s : null,
         cache_built_at: summary.cache_built_at || null,
         cache_build_seconds: typeof summary.cache_build_seconds === 'number' ? summary.cache_build_seconds : null,
+        generated_at: summary.generated_at || null,
         combinations: combos, lab: labPayload || null,
         best_combination: {
           ...(bestCombo || {}),
           strategy_kpis: bestReportDetail.strategy_kpis || {},
           dow_kpis: bestReportDetail.dow_kpis || {},
           skipped_summary: bestReportDetail.skipped_summary || {},
+          skipped_detail: bestReportDetail.skipped_detail || null,
           warnings: bestReportDetail.warnings || [],
           adaptive_effective_pct: bestReportDetail.adaptive_effective_pct ?? 100,
           strategy_tune_validate: bestReportDetail.strategy_tune_validate || {},
           tune_validate: bestReportDetail.tune_validate || (bestCombo ? bestCombo.tune_validate : null) || {},
           diagnostics: bestReportDetail.diagnostics || null,
           improvement_tips: bestReportDetail.improvement_tips || [],
+          all_trades: bestReportDetail.all_trades || [],
+          run_settings: bestReportDetail.run_settings || '',
         }
       };
       const suggestions = computeRuleBasedPairAdvice(pairPayload);
@@ -457,6 +469,10 @@ function generateExportDataPayload(): any {
     };
   });
   result.combinations_rollup = rollup;
+  result.total_ledger_rows = (result.pairs || []).reduce(
+    (acc: number, p: any) => acc + (Array.isArray(p?.best_combination?.all_trades) ? p.best_combination.all_trades.length : 0),
+    0
+  );
   return result;
 }
 
@@ -481,6 +497,346 @@ function humaniseBucketLabel(feature: string, bucket: string): string {
     if (Number.isFinite(n) && n >= 0) return `${n}h-${n + 1}h after open`;
   }
   return bucket;
+}
+
+// =============================================================================
+// Section renderers
+// =============================================================================
+
+function renderToc(pairs: any[], hasOptimizer: boolean): string[] {
+  const out: string[] = [];
+  out.push('TABLE OF CONTENTS');
+  out.push('  1. Legend');
+  out.push('  2. Active settings differing from default');
+  out.push('  3. Cross-pair rollup');
+  out.push('  4. Per-pair sections:');
+  for (const p of pairs) {
+    out.push(`       ${p.symbol} — Summary, Six Combinations, Per-Strategy, Per-Weekday, Skipped, Ledger Summary, Diagnostics (all cards), Tips, Strategy Lab`);
+  }
+  out.push('  5. Portfolio correlation (full matrix)');
+  out.push('  6. Ranked portfolio suggestions');
+  out.push('  7. What to test next');
+  out.push('  8. Entry condition analysis');
+  out.push(`  9. Optimizer summary${hasOptimizer ? '' : ' (not generated)'}`);
+  out.push(' 10. Not implemented');
+  out.push('');
+  return out;
+}
+
+function renderWeekdayTable(dowKpis: any): string[] {
+  const out: string[] = [];
+  if (!dowKpis || Object.keys(dowKpis).length === 0) {
+    out.push('  (no weekday data)');
+    return out;
+  }
+  out.push('  Weekday     | Trades | WR%   | PF    | PNL$');
+  for (const [dow, k] of Object.entries<any>(dowKpis)) {
+    const inc = (k.count < 30) ? '  [INCONCLUSIVE <30]' : '';
+    out.push(`  ${dow.padEnd(11)} | ${String(k.count ?? 0).padStart(6)} | ${fmt(k.win_rate, 1).padStart(5)} | ${fmt(k.profit_factor).padStart(5)} | ${fmt(k.net_pnl).padStart(8)}${inc}`);
+  }
+  return out;
+}
+
+function renderLedgerSummary(trades: any[]): string[] {
+  const out: string[] = [];
+  if (!Array.isArray(trades) || trades.length === 0) {
+    out.push('  (no trades)');
+    return out;
+  }
+  const n = trades.length;
+  const wins = trades.filter(t => t.result === 'WIN');
+  const losses = trades.filter(t => t.result === 'LOSS');
+  const bes = trades.filter(t => t.result === 'BREAKEVEN');
+  const avgWinR = wins.length > 0 ? wins.reduce((s, t) => s + (t.r_multiple || 0), 0) / wins.length : 0;
+  const avgLossR = losses.length > 0 ? losses.reduce((s, t) => s + (t.r_multiple || 0), 0) / losses.length : 0;
+  const totalR = trades.reduce((s, t) => s + (t.r_multiple || 0), 0);
+  const totalPnl = trades.reduce((s, t) => s + (t.money_pnl || 0), 0);
+  const avgWinUsd = wins.length > 0 ? wins.reduce((s, t) => s + (t.money_pnl || 0), 0) / wins.length : 0;
+  const avgLossUsd = losses.length > 0 ? losses.reduce((s, t) => s + (t.money_pnl || 0), 0) / losses.length : 0;
+
+  const ordered = [...trades].sort((a, b) => String(a.signal_time_utc || '').localeCompare(String(b.signal_time_utc || '')));
+  let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
+  for (const t of ordered) {
+    if (t.result === 'WIN') { curW++; curL = 0; if (curW > maxWinStreak) maxWinStreak = curW; }
+    else if (t.result === 'LOSS') { curL++; curW = 0; if (curL > maxLossStreak) maxLossStreak = curL; }
+  }
+
+  out.push(`  Total trades: ${n}  |  Wins ${wins.length}  |  Losses ${losses.length}  |  BE ${bes.length}`);
+  out.push(`  Avg win: ${fmt(avgWinR, 3)}R ($${fmt(avgWinUsd, 2)})  |  Avg loss: ${fmt(avgLossR, 3)}R ($${fmt(avgLossUsd, 2)})`);
+  out.push(`  Total R: ${fmt(totalR, 2)}  |  Total PnL: $${fmt(totalPnl, 2)}`);
+  out.push(`  Longest win streak: ${maxWinStreak}  |  Longest loss streak: ${maxLossStreak}`);
+
+  const header = '  date_sast    symb   strat                              dir   entry       exit        R       PnL$    reason';
+  const rowLine = (t: any) => `  ${String(t.date_sast || '').padEnd(12)} ${String(t.symbol || '').padEnd(6)} ${String(t.strategy || '').padEnd(34).slice(0,34)} ${String(t.direction || '').padEnd(4)}  ${fmt(t.entry_price, 5).padStart(11)} ${fmt(t.exit_price, 5).padStart(11)} ${fmt(t.r_multiple, 2).padStart(6)} ${fmt(t.money_pnl, 2).padStart(8)} ${String(t.exit_reason || '').slice(0, 22)}`;
+
+  const byPnl = [...trades].sort((a, b) => (b.money_pnl || 0) - (a.money_pnl || 0));
+  const top10 = byPnl.slice(0, 10);
+  const worst10 = byPnl.slice(-10).reverse();
+
+  out.push('');
+  out.push('  Top 10 wins:');
+  out.push(header);
+  for (const t of top10) out.push(rowLine(t));
+
+  out.push('');
+  out.push('  Top 10 losses:');
+  out.push(header);
+  for (const t of worst10) out.push(rowLine(t));
+
+  return out;
+}
+
+function renderLedgerBlock(trades: any[], cap: number): string[] {
+  const out: string[] = [];
+  if (!Array.isArray(trades) || trades.length === 0) {
+    out.push('  (no trades)');
+    return out;
+  }
+  const n = trades.length;
+  const sorted = [...trades].sort((a, b) =>
+    String(a?.signal_time_utc || '').localeCompare(String(b?.signal_time_utc || ''))
+  );
+
+  let rows: any[] = sorted;
+  let omitted = 0;
+  if (cap > 0 && n > cap) {
+    const half = Math.floor(cap / 2);
+    const head = sorted.slice(0, half);
+    const tail = sorted.slice(n - (cap - half));
+    const winsSorted = [...sorted].sort((a, b) => (b.money_pnl || 0) - (a.money_pnl || 0));
+    const lossesSorted = [...sorted].sort((a, b) => (a.money_pnl || 0) - (b.money_pnl || 0));
+    const topWins = winsSorted.slice(0, 5);
+    const topLosses = lossesSorted.slice(0, 5);
+    const seen = new Set<string>();
+    const merged: any[] = [];
+    for (const t of [...topWins, ...topLosses, ...head, ...tail]) {
+      const key = String(t.trade_id || `${t.symbol}_${t.signal_time_utc}_${t.strategy}`);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(t);
+    }
+    rows = merged;
+    omitted = n - rows.length;
+  }
+
+  out.push('  #    signal_utc          symb    strat                              dir   entry       exit        R       PnL$    reason');
+  let idx = 0;
+  for (const t of rows) {
+    idx++;
+    out.push(`  ${String(idx).padStart(4)} ${String(t.signal_time_utc || '').padEnd(19)} ${String(t.symbol || '').padEnd(7)} ${String(t.strategy || '').padEnd(34).slice(0,34)} ${String(t.direction || '').padEnd(4)}  ${fmt(t.entry_price, 5).padStart(11)} ${fmt(t.exit_price, 5).padStart(11)} ${fmt(t.r_multiple, 2).padStart(6)} ${fmt(t.money_pnl, 2).padStart(8)} ${String(t.exit_reason || '').slice(0, 22)}`);
+  }
+  if (omitted > 0) {
+    out.push(`  (... ${omitted} rows omitted from TXT — the full ${n} rows are in backtest_ledger.csv.)`);
+  }
+  return out;
+}
+
+function renderAllDiagnostics(diag: any): string[] {
+  const out: string[] = [];
+  if (!diag) {
+    out.push('  (no diagnostics in this report)');
+    return out;
+  }
+  const kpiLine = (k: any): string => (!k ? 'n/a' : `TR ${k.count ?? 0} WR ${fmt(k.win_rate, 1)}% PF ${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`);
+
+  if (diag.post_sl) out.push(`§16 Post-SL continuation: n=${diag.post_sl.count} mean ${fmt(diag.post_sl.mean_pips, 1)} pips | median ${fmt(diag.post_sl.median_pips, 1)} | max ${fmt(diag.post_sl.max_pips, 1)} | mean_R ${fmt(diag.post_sl.mean_r, 2)} | recovered_to_TP ${diag.post_sl.recovered_count} (${fmt(diag.post_sl.recovered_pct, 1)}%)`);
+  if (diag.post_tp) out.push(`§17 Post-TP extra: n=${diag.post_tp.count} mean ${fmt(diag.post_tp.mean_pips, 1)} pips | median ${fmt(diag.post_tp.median_pips, 1)} | max ${fmt(diag.post_tp.max_pips, 1)} | mean_R ${fmt(diag.post_tp.mean_r, 2)} | avg_missed_R ${fmt(diag.post_tp.avg_missed_r, 2)}`);
+  if (diag.premature_be) out.push(`§18 Premature BE: moved ${diag.premature_be.total_be_moved} | premature ${diag.premature_be.premature_count} (${fmt(diag.premature_be.premature_pct, 1)}%) | total_missed_R ${fmt(diag.premature_be.total_missed_r, 2)} | avg_missed_R ${fmt(diag.premature_be.avg_missed_r, 2)}`);
+
+  if (diag.hour_kpis) {
+    out.push('§19 Hour matrix (SAST, one line per hour with trades):');
+    for (let h = 0; h < 24; h++) {
+      const k = diag.hour_kpis[String(h)];
+      if (!k || k.count === 0) continue;
+      out.push(`    ${String(h).padStart(2, '0')}: ${kpiLine(k)} exp ${fmt(k.expectancy, 3)}R`);
+    }
+  }
+  if (diag.session_rollover) out.push(`§21 Session rollover: in_transition ${kpiLine(diag.session_rollover.in_transition)} | out_of_transition ${kpiLine(diag.session_rollover.out_of_transition)}`);
+  if (diag.breakeven_variants) {
+    const bv = diag.breakeven_variants;
+    out.push(`§22 BE variants: A_current ${fmt(bv.A_current?.total_r, 2)}R (n=${bv.A_current?.count ?? 0}) | B_no_BE ${fmt(bv.B_no_be?.total_r, 2)}R (n=${bv.B_no_be?.count ?? 0}) | C_delayed ${fmt(bv.C_delayed_be?.total_r, 2)}R (n=${bv.C_delayed_be?.count ?? 0}) | best ${bv.best_variant} | ${bv.verdict}`);
+  }
+  if (diag.sizing_comparison) {
+    const s = diag.sizing_comparison;
+    out.push(`§24 Sizing: fixed net $${fmt(s.fixed?.net_pnl)} (final eq $${fmt(s.fixed?.final_equity)}) | compounding $${fmt(s.compounding?.net_pnl)} (final eq $${fmt(s.compounding?.final_equity)}) | diff $${fmt(s.difference)}`);
+  }
+  if (diag.daily_cap_comparison) {
+    out.push('§25 Daily cap comparison:');
+    for (const [k, v] of Object.entries<any>(diag.daily_cap_comparison)) out.push(`    ${k}: ${kpiLine(v)}`);
+  }
+  if (diag.atr_tier_kpis) {
+    out.push('§26 ATR tiers:');
+    for (const tier of ['LOW', 'NORMAL', 'HIGH', 'UNKNOWN']) {
+      const k = diag.atr_tier_kpis[tier];
+      if (!k || k.count === 0) continue;
+      out.push(`    ${tier}: ${kpiLine(k)}`);
+    }
+  }
+  if (diag.ema_200_alignment) out.push(`§27 EMA-200 alignment: aligned ${kpiLine(diag.ema_200_alignment.aligned)} | counter_trend ${kpiLine(diag.ema_200_alignment.counter_trend)} | unknown ${kpiLine(diag.ema_200_alignment.unknown)}`);
+  if (diag.confirmation_type) out.push(`§28 Confirmation: close ${kpiLine(diag.confirmation_type.close)} | touch ${kpiLine(diag.confirmation_type.touch)}`);
+  if (diag.news_window) out.push(`§29 News window: in_news ${kpiLine(diag.news_window.in_news)} | out_of_news ${kpiLine(diag.news_window.out_of_news)}`);
+  if (diag.streak_analysis) {
+    const s = diag.streak_analysis;
+    out.push(`§31 Streaks: max ${s.max_consecutive_losses ?? 0} | avg ${fmt(s.average_streak, 2)} | streak count ${s.streak_count ?? 0} | recovery trades ${s.recovery_trades_from_peak_dd ?? 0} | peak DD -$${fmt(s.peak_drawdown)}`);
+  }
+  if (diag.circuit_breaker_sim) {
+    const c = diag.circuit_breaker_sim;
+    out.push(`§32 Breaker sim: orig $${fmt(c.original_net_pnl)} -> sim $${fmt(c.simulated_net_pnl)} | trades halved ${c.trades_halved ?? 0} | protection $${fmt(c.protection_delta)}`);
+  }
+  if (diag.daily_dd_cutoff) {
+    const d = diag.daily_dd_cutoff;
+    out.push(`§33 Daily DD cutoff: cutoff ${fmt(d.cutoff_pct, 1)}% | days triggered ${d.days_triggered} | trades blocked ${d.trades_blocked} | orig $${fmt(d.original_net_pnl)} -> cutoff $${fmt(d.cutoff_net_pnl)} | protection $${fmt(d.protection_delta)}`);
+  }
+  if (diag.slippage_sensitivity) {
+    const parts: string[] = [];
+    for (const [, pt] of Object.entries<any>(diag.slippage_sensitivity)) {
+      parts.push(`${pt.slippage_pips}p: $${fmt(pt.net_pnl)} (WR ${fmt(pt.win_rate, 1)}%, cost ${fmt(pt.per_trade_cost_r, 3)}R)`);
+    }
+    out.push(`§34 Slippage: ${parts.join(' | ')}`);
+  }
+  if (diag.parameter_sensitivity && Array.isArray(diag.parameter_sensitivity.sweep) && diag.parameter_sensitivity.sweep.length > 0) {
+    const p = diag.parameter_sensitivity;
+    const parts = p.sweep.map((r: any) => `R:R ${fmt(r.rr, 2)}: $${fmt(r.net_pnl)} (n=${r.count})`);
+    out.push(`§35 Parameter sweep: ${parts.join(' | ')} | best R:R ${fmt(p.best_rr, 2)} | ${p.verdict}`);
+  }
+  if (diag.outlier_removal) {
+    const o = diag.outlier_removal;
+    out.push(`§36 Outliers removed: ${o.outlier_count ?? 0} | full ${kpiLine(o.full)} | trimmed ${kpiLine(o.trimmed)} | impact ${fmt(o.impact_pct, 1)}%`);
+  }
+  if (diag.monte_carlo) {
+    const m = diag.monte_carlo;
+    out.push(`§37 Bootstrap MC: iterations ${m.iterations} | median final $${fmt(m.median_final_pnl)} (P5 $${fmt(m.p5_final_pnl)}, P95 $${fmt(m.p95_final_pnl)}) | median DD -$${fmt(m.median_max_dd)} (P5 -$${fmt(m.p5_max_dd)}, P95 -$${fmt(m.p95_max_dd)}) | median final eq $${fmt(m.median_final_equity)} | prob positive ${fmt(m.prob_positive, 1)}%`);
+  }
+  if (diag.buy_and_hold) {
+    const b = diag.buy_and_hold;
+    out.push(`§38 Alpha: first close ${fmt(b.first_close, 5)} | last close ${fmt(b.last_close, 5)} | hold return ${fmt(b.bh_return_pct, 2)}% ($ ${fmt(b.bh_net_pnl)}) | strategy $${fmt(b.strategy_net_pnl)} | alpha $${fmt(b.alpha)} | verdict ${b.verdict}`);
+  }
+  return out;
+}
+
+function renderPortfolioMatrix(pc: any): string[] {
+  const out: string[] = [];
+  if (!pc || !Array.isArray(pc.symbols) || pc.symbols.length === 0) {
+    out.push('  (portfolio correlation matrix unavailable)');
+    return out;
+  }
+  const syms: string[] = pc.symbols;
+  const corr: Record<string, Record<string, number>> = pc.correlation_matrix || {};
+  out.push('  ' + ['Symbol   ', ...syms.map(s => s.padStart(7))].join(' '));
+  for (const row of syms) {
+    const cells = syms.map(col => {
+      const v = corr?.[row]?.[col];
+      return (typeof v === 'number' ? v : 0).toFixed(2).padStart(7);
+    });
+    out.push(`  ${row.padEnd(9)}${cells.join(' ')}`);
+  }
+  out.push('');
+  out.push(`  Portfolio max DD $${fmt(pc.portfolio_drawdown)} | Sum of individual DDs $${fmt(pc.sum_of_individual_drawdowns)} | Diversification ${fmt(pc.diversification_ratio, 2)}x | Avg daily corr ${fmt(pc.avg_daily_correlation, 3)} | Days ${pc.days}`);
+  return out;
+}
+
+function renderCostTable(): string[] {
+  const out: string[] = [];
+  out.push('COST ASSUMPTIONS (from ASSETS in backtest/simulator.py and engine/matrix.py)');
+  out.push('  Symbol    | pip_size | contract_size | spread');
+  const rows: Array<[string, number, number, number]> = [
+    ['GOLD',     0.01,    100.0,     0.30],
+    ['US30',     1.0,     1.0,       2.50],
+    ['NAS100',   0.1,     1.0,       1.50],
+    ['GERMAN30', 0.1,     1.0,       1.80],
+    ['EURUSD',   0.0001,  100000.0,  0.00010],
+    ['USDJPY',   0.01,    100000.0,  0.012],
+    ['GBPUSD',   0.0001,  100000.0,  0.00014],
+  ];
+  for (const [sym, pip, cs, spr] of rows) {
+    out.push(`  ${sym.padEnd(10)}| ${String(pip).padEnd(9)}| ${String(cs).padEnd(14)}| ${spr}`);
+  }
+  out.push('  (These are used identically by the backtest and the live bot. Update in one place.)');
+  return out;
+}
+
+function renderConsistencyChecks(pairs: any[]): string[] {
+  const out: string[] = [];
+  out.push('CONSISTENCY CHECKS');
+  for (const p of pairs) {
+    if (p.status !== 'OK') continue;
+    const lines: string[] = [];
+    if (p.wrong_engine) lines.push('WRONG ENGINE — combos run do not match the six-combination spec');
+    if (p.engine_line) lines.push(p.engine_line);
+    if (p.precompute_s != null) lines.push(`precompute this run: ${p.precompute_s}s`);
+    if (p.cache_built_at && p.cache_build_seconds != null) lines.push(`cache built in ${Math.round(p.cache_build_seconds)}s on ${String(p.cache_built_at).slice(0,10)}`);
+    if (lines.length === 0) continue;
+    out.push(`  ${p.symbol}:`);
+    for (const l of lines) out.push(`    ${l}`);
+  }
+  return out;
+}
+
+function renderLedgerCsv(pairs: any[]): string {
+  const cols = [
+    'pair','combination','ticket','entry_time_sast','exit_time_sast','strategy','direction','lots',
+    'entry','sl','tp','exit_price','exit_reason','pnl_usd','pnl_r','duration_minutes',
+    'htf_d1','htf_h4','ema200_dist_atr','ema_spread_atr','eff_ratio_30','atr_pctile','adr_used',
+    'session','mins_since_open','room_atr','stop_atr','spread_r','trade_of_day','hour_sast','weekday','setup_tag',
+    'result','mfe_r','mae_r','failure_reason','alignment_200ema','confirmation_type','is_in_news_window',
+  ];
+  const escape = (v: any): string => {
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const out: string[] = [cols.join(',')];
+  for (const p of pairs) {
+    if (p.status !== 'OK') continue;
+    const b = p.best_combination || {};
+    const trades: any[] = Array.isArray(b.all_trades) ? b.all_trades : [];
+    const comboLabel = b.label || '';
+    for (const t of trades) {
+      const row = [
+        p.symbol, comboLabel,
+        t.trade_id || '',
+        t.signal_time_sast || '',
+        t.exit_time || '',
+        t.strategy || '',
+        t.direction || '',
+        t.lots ?? '',
+        t.entry_price ?? '',
+        t.sl ?? '',
+        t.tp ?? '',
+        t.exit_price ?? '',
+        t.exit_reason || '',
+        t.money_pnl ?? '',
+        t.r_multiple ?? '',
+        t.duration_minutes ?? '',
+        t.htf_d1 ?? '',
+        t.htf_h4 ?? '',
+        t.ema200_dist_atr ?? '',
+        t.ema_spread_atr ?? '',
+        t.eff_ratio_30 ?? '',
+        t.atr_pctile ?? '',
+        t.adr_used ?? '',
+        t.session ?? '',
+        t.mins_since_open ?? '',
+        t.room_atr ?? '',
+        t.stop_atr ?? '',
+        t.spread_r ?? '',
+        t.trade_of_day ?? '',
+        t.hour_sast ?? '',
+        t.weekday ?? '',
+        t.setup_tag || '',
+        t.result || '',
+        t.mfe_r ?? '',
+        t.mae_r ?? '',
+        t.failure_reason || '',
+        t.alignment_200ema || '',
+        t.confirmation_type || '',
+        t.is_in_news_window ?? '',
+      ];
+      out.push(row.map(escape).join(','));
+    }
+  }
+  return out.join('\n');
 }
 
 function renderEntryConditionAnalysis(): string[] {
@@ -573,6 +929,7 @@ function renderTxtContent(data: any): string {
   const wallSeconds = (typeof data.wall_clock_seconds === 'number' && data.wall_clock_seconds > 0) ? data.wall_clock_seconds : null;
   const wallStr = wallSeconds !== null ? `${wallSeconds}s` : 'n/a';
   const concurrentStr = (typeof data.concurrent_processes === 'number' && data.concurrent_processes > 0) ? data.concurrent_processes : 'n/a';
+  const ledgerRows = Number(data.total_ledger_rows || 0);
 
   const lines: string[] = [];
   const okPairs = (data.pairs || []).filter((p: any) => p.status === 'OK');
@@ -581,28 +938,33 @@ function renderTxtContent(data: any): string {
     if ((c.total_trades || 0) < 30) continue;
     if (!bestCombo || c.profit_factor > bestCombo.pf) bestCombo = { symbol: p.symbol, label: c.label, pf: c.profit_factor, net: c.net_pnl, trades: c.total_trades, verdict: c.holdout_verdict };
   }
+
+  const hasOptimizer = fs.existsSync(OPTIMIZER_SUMMARY_TXT) || fs.existsSync(OPTIMIZER_SUMMARY_JSON);
+
   lines.push('AI BRIEF');
   if (bestCombo) lines.push(`Best: ${bestCombo.symbol} ${bestCombo.label} — PF ${fmt(bestCombo.pf)}, P&L $${fmt(bestCombo.net)}, ${bestCombo.trades} trades, ${bestCombo.verdict}.`);
+  lines.push(`Full trade ledger: backtest_ledger.csv (${ledgerRows} rows)`);
 
   const wrongEnginePairs = (data.pairs || []).filter((p: any) => p.wrong_engine);
   if (wrongEnginePairs.length > 0) {
     lines.push(`WARN: WRONG ENGINE on: ${wrongEnginePairs.map((p: any) => p.symbol).join(', ')} — results unreliable.`);
   }
   lines.push('');
+
+  lines.push(...renderToc(data.pairs || [], hasOptimizer));
+
   lines.push('LEGEND');
   lines.push('  Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.');
-  lines.push('  ENTRY CONDITION ANALYSIS marks a bucket with * when PF@1R is >= baseline + 0.20 AND PF@1R > 1.0 AND it holds in at least 3 of 4 date quarters.');
+  lines.push('  Ledger Summary shows streaks and the 10 best and 10 worst trades. The full ledger is in backtest_ledger.csv.');
+  lines.push('  Diagnostics sections use §N labels that match the Blueprint.');
+  lines.push('  Any bucket or row with fewer than 30 trades is tagged INCONCLUSIVE.');
   lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of this-run pair times ${totalTimeStr}`);
   lines.push('');
 
-  // PROPOSED (Req 6): show settings that differ from the schema defaults.
   lines.push('ACTIVE SETTINGS DIFFERING FROM DEFAULT:');
   const nonDefault: string[] = Array.isArray(data.non_default_settings) ? data.non_default_settings : [];
-  if (nonDefault.length === 0) {
-    lines.push('  (none — all pairs and strategies use schema defaults)');
-  } else {
-    for (const row of nonDefault) lines.push(`  ${row}`);
-  }
+  if (nonDefault.length === 0) lines.push('  (none — all pairs and strategies use schema defaults)');
+  else for (const row of nonDefault) lines.push(`  ${row}`);
   lines.push('');
 
   lines.push('CROSS-PAIR ROLLUP');
@@ -611,68 +973,143 @@ function renderTxtContent(data: any): string {
   });
   lines.push('');
 
+  const nowMs = Date.now();
   for (const p of data.pairs || []) {
-    if (p.status !== 'OK') { lines.push(`ASSET ${p.symbol} — NOT TESTED`); lines.push(''); continue; }
+    if (p.status !== 'OK') { lines.push(`ASSET ${p.symbol} — NOT TESTED: ${p.error || 'unknown error'}`); lines.push(''); continue; }
     const ps = p.phase_seconds || {};
     const thisRunStr = p.seconds_taken != null ? `${p.seconds_taken}s` : 'n/a';
     const thisRunPrecompute = (typeof p.precompute_s === 'number') ? p.precompute_s : null;
     const cacheBuiltStr = (p.cache_built_at && typeof p.cache_build_seconds === 'number')
       ? `cache built in ${Math.round(p.cache_build_seconds)}s on ${String(p.cache_built_at).slice(0, 10)}`
       : 'cache build time n/a';
+
+    let staleMarker = '';
+    if (p.generated_at) {
+      try {
+        const genMs = Date.parse(p.generated_at);
+        if (Number.isFinite(genMs)) {
+          const ageHours = (nowMs - genMs) / 3600000;
+          if (ageHours > STALE_SUMMARY_HOURS) staleMarker = ` [STALE: ${Math.round(ageHours)}h old]`;
+        }
+      } catch {}
+    }
+
     lines.push('================================================================================');
-    lines.push(`ASSET ${p.symbol} | This run: ${thisRunStr} | precompute this run: ${thisRunPrecompute != null ? thisRunPrecompute + 's' : 'n/a'} | sim: ${ps.simulator_s ?? 'n/a'}s`);
+    lines.push(`ASSET ${p.symbol}${staleMarker} | Generated: ${p.generated_at || 'unknown'} | This run: ${thisRunStr} | precompute this run: ${thisRunPrecompute != null ? thisRunPrecompute + 's' : 'n/a'} | sim: ${ps.simulator_s ?? 'n/a'}s`);
     lines.push(`  ${cacheBuiltStr}`);
     if (p.engine_line) lines.push(`  ${p.engine_line}`);
     if (p.wrong_engine) lines.push(`  WARN: WRONG ENGINE detected for ${p.symbol}`);
-    lines.push('--- Six Combinations ---');
+
+    lines.push('--- Summary: Six Combinations ---');
     for (const c of p.combinations || []) {
       const tv = c.tune_validate || {};
       lines.push(`  ${String(c.label).padEnd(28)} | TR ${String(c.total_trades).padStart(4)} | WR ${fmt(c.win_rate, 1)}% | PF ${fmt(c.profit_factor)} | PNL $${fmt(c.net_pnl)} | TUNE[${tv.tune?.count ?? 0}t PF ${fmt(tv.tune?.profit_factor)}] | VALIDATE[${tv.validate?.count ?? 0}t PF ${fmt(tv.validate?.profit_factor)}] | ${c.holdout_verdict}`);
     }
+
     const b = p.best_combination || {};
     lines.push('');
-    lines.push(`--- Best: ${b.label || 'N/A'} ---`);
+    lines.push(`--- Summary: Best = ${b.label || 'N/A'} ---`);
     lines.push('Per-strategy:');
+    const stv: Record<string, any> = b.strategy_tune_validate || {};
     Object.entries(b.strategy_kpis || {}).forEach(([sName, s]: any) => {
-      lines.push(`  ${sName.padEnd(28)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)}`);
+      const tv = stv[sName] || {};
+      const tn = tv.tune || {};
+      const vd = tv.validate || {};
+      const inc = ((s.count || 0) < 30) ? '  [INCONCLUSIVE <30]' : '';
+      lines.push(`  ${sName.padEnd(28)} | TR ${String(s.count).padStart(3)} | WR ${fmt(s.win_rate, 1)}% | PF ${fmt(s.profit_factor)} | PNL $${fmt(s.net_pnl)} | TUNE[${tn.count ?? 0}t PF ${fmt(tn.profit_factor)}] | VALIDATE[${vd.count ?? 0}t PF ${fmt(vd.profit_factor)}]${inc}`);
     });
+
+    lines.push('');
+    lines.push('--- Summary: Per-Weekday ---');
+    for (const l of renderWeekdayTable(b.dow_kpis || {})) lines.push(l);
+
     const skipSummary = b.skipped_summary || {};
     const skipEntries = Object.entries(skipSummary);
+    lines.push('');
+    lines.push('--- Summary: Skipped signals (candles / unique setups) ---');
     if (skipEntries.length > 0) {
       const parts = skipEntries.map(([reason, val]: [string, any]) => typeof val === 'object' && val !== null ? `${reason}: ${val.candle_skips ?? 0}/${val.unique_setups ?? 0}` : `${reason}: ${val}`);
-      lines.push(`Skipped: ${parts.join(' | ')}`);
+      lines.push(`  ${parts.join(' | ')}`);
+    } else {
+      lines.push('  (none)');
     }
-    const diag = b.diagnostics;
-    if (diag) {
-      lines.push('');
-      lines.push('--- Diagnostics ---');
-      if (diag.hour_kpis) {
-        const hp: string[] = [];
-        for (let h = 0; h < 24; h++) { const k = diag.hour_kpis[String(h)]; if (!k || k.count === 0) continue; hp.push(`${String(h).padStart(2, '0')}:n=${k.count} wr=${fmt(k.win_rate, 1)} pf=${fmt(k.profit_factor)} $${fmt(k.net_pnl)}`); }
-        lines.push(`§19 Hour matrix: ${hp.join(' | ')}`);
+    const sd = b.skipped_detail;
+    if (sd) {
+      if (sd.by_strategy && Object.keys(sd.by_strategy).length > 0) {
+        lines.push(`  By strategy: ${Object.entries(sd.by_strategy).map(([k, v]) => `${k}=${v}`).join(' | ')}`);
       }
-      const st = diag.streak_analysis || {};
-      lines.push(`§31 Streaks: max ${st.max_consecutive_losses ?? 0} | peak DD -$${fmt(st.peak_drawdown)}`);
-      const mc = diag.monte_carlo || {};
-      lines.push(`§37 Bootstrap MC: median final $${fmt(mc.median_final_pnl)} | median DD -$${fmt(mc.median_max_dd)} | prob pos ${fmt(mc.prob_positive, 1)}%`);
-      const bh = diag.buy_and_hold || {};
-      lines.push(`§38 Alpha: $${fmt(bh.alpha)} (${bh.verdict})`);
-      const slip = diag.slippage_sensitivity || {};
-      const slipParts = Object.values(slip).map((pt: any) => `${pt.slippage_pips}p $${fmt(pt.net_pnl)}`).join(' | ');
-      if (slipParts) lines.push(`§34 Slippage: ${slipParts}`);
+      if (sd.by_hour_sast && Object.keys(sd.by_hour_sast).length > 0) {
+        lines.push(`  By hour (SAST): ${Object.entries(sd.by_hour_sast).map(([k, v]) => `${String(k).padStart(2,'0')}=${v}`).join(' | ')}`);
+      }
     }
-    const suggestions: any[] = b.rule_suggestions || [];
-    if (suggestions.length > 0) {
+
+    lines.push('');
+    lines.push('--- Ledger: Summary ---');
+    const allTrades = Array.isArray(b.all_trades) ? b.all_trades : [];
+    for (const l of renderLedgerSummary(allTrades)) lines.push(l);
+
+    lines.push('');
+    lines.push('--- Ledger: Compact rows ---');
+    for (const l of renderLedgerBlock(allTrades, LEDGER_CAP_PER_PAIR)) lines.push(l);
+
+    lines.push('');
+    lines.push('--- Diagnostics (all cards) ---');
+    for (const l of renderAllDiagnostics(b.diagnostics)) lines.push(l);
+
+    const tips: any[] = b.improvement_tips || [];
+    const ruleSuggestions: any[] = b.rule_suggestions || [];
+    if (tips.length > 0 || ruleSuggestions.length > 0) {
       lines.push('');
-      lines.push(`Suggestions for ${p.symbol}:`);
-      suggestions.forEach((s: any) => lines.push(`  ${s.tag} ${s.text}`));
+      lines.push('--- Tips (advisor + rule-based) ---');
+      const seen = new Set<string>();
+      for (const t of tips) {
+        const key = `${t.category}|${t.strategy}|${t.title}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const sev = t.severity || 'INFO';
+        const strat = t.strategy || 'ALL';
+        lines.push(`  [${sev}] [${strat}] ${t.title || ''}`);
+        if (t.description) lines.push(`      ${t.description}`);
+        if (t.action) lines.push(`      ACTION: ${t.action}`);
+      }
+      for (const s of ruleSuggestions) {
+        const key = `${s.type}|${s.text}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        lines.push(`  ${s.tag} ${s.text}`);
+      }
     }
+
+    if (p.lab && Array.isArray(p.lab.variants)) {
+      lines.push('');
+      lines.push(`--- Strategy Lab (${p.lab.days}-day window) ---`);
+      lines.push(`Window: ${p.lab.window_start} to ${p.lab.window_end}`);
+      for (const v of p.lab.variants) {
+        const inc = (v.trades < 30) ? '  [INCONCLUSIVE <30]' : '';
+        lines.push(`  ${String(v.label).padEnd(28)} | TR ${String(v.trades).padStart(4)} | WR ${fmt(v.win_rate, 1)}% | PF ${fmt(v.profit_factor)} | DD -$${fmt(v.max_drawdown)} | PNL $${fmt(v.net_pnl)} | TUNE PF ${fmt(v.tune_pf)} (${v.tune_trades}tr) | VALIDATE PF ${fmt(v.validate_pf)} (${v.validate_trades}tr) | ${v.verdict}${inc}`);
+      }
+    }
+
     lines.push('');
   }
-  if (data.portfolio_correlation) {
-    lines.push('PORTFOLIO CORRELATION');
-    const pc = data.portfolio_correlation;
-    lines.push(`Portfolio DD $${fmt(pc.portfolio_drawdown)} | Div ratio ${fmt(pc.diversification_ratio)}x | avg corr ${fmt(pc.avg_daily_correlation, 3)}`);
+
+  lines.push('================================================================================');
+  lines.push('PORTFOLIO CORRELATION (full matrix)');
+  if (data.portfolio_correlation) for (const l of renderPortfolioMatrix(data.portfolio_correlation)) lines.push(l);
+  else lines.push('  (not generated — run at least one pair backtest to produce it)');
+  lines.push('');
+
+  if (data.portfolio_suggestions && data.portfolio_suggestions.length > 0) {
+    lines.push('================================================================================');
+    lines.push('RANKED PORTFOLIO SUGGESTIONS');
+    for (const s of data.portfolio_suggestions) lines.push(`  ${s.tag} ${s.text}`);
+    lines.push('');
+  }
+
+  if (data.what_to_test_next && data.what_to_test_next.length > 0) {
+    lines.push('================================================================================');
+    lines.push('WHAT TO TEST NEXT:');
+    data.what_to_test_next.forEach((item: string, idx: number) => lines.push(`  ${idx + 1}. ${item}`));
     lines.push('');
   }
 
@@ -681,7 +1118,16 @@ function renderTxtContent(data: any): string {
   lines.push('================================================================================');
   lines.push('');
 
-  // PROPOSED (Req 14): include the optimizer summary if it exists on disk.
+  lines.push('================================================================================');
+  lines.push(...renderCostTable());
+  lines.push('================================================================================');
+  lines.push('');
+
+  lines.push('================================================================================');
+  lines.push(...renderConsistencyChecks(data.pairs || []));
+  lines.push('================================================================================');
+  lines.push('');
+
   lines.push('================================================================================');
   lines.push('OPTIMIZER SUMMARY');
   if (fs.existsSync(OPTIMIZER_SUMMARY_TXT)) {
@@ -703,6 +1149,7 @@ function renderTxtContent(data: any): string {
   const notImpl = (data.spec_coverage || []).filter((row: any) => !row.panel && !row.txt);
   if (notImpl.length === 0) lines.push('  (none)');
   else notImpl.forEach((row: any) => lines.push(`  #${row.id} ${row.label}`));
+
   return lines.join('\n');
 }
 
@@ -754,15 +1201,41 @@ async function startServer() {
     try { res.status(200).json({ status: 'success', data: generateExportDataPayload() }); }
     catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
+
+  // ---- TXT only (kept for compatibility; the panel now uses the zip) ----
   app.get('/api/backtest/export.txt', (_req, res) => {
     try {
       const txt = renderTxtContent(generateExportDataPayload());
       const dateStr = new Date().toISOString().slice(0, 10);
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.txt"`);
+      res.setHeader('Content-Disposition', `attachment; filename="backtest_ai_${dateStr}.txt"`);
       res.status(200).send(txt);
     } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
   });
+
+  // ---- NEW: one-click zip with TXT + CSV ----
+  app.get('/api/backtest/export-zip', (_req, res) => {
+    try {
+      const data = generateExportDataPayload();
+      const txt = renderTxtContent(data);
+      const csv = renderLedgerCsv(data.pairs || []);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="backtest_${dateStr}.zip"`);
+      const archive = archiver('zip', { zlib: { level: 9 } });
+      archive.on('error', (err: any) => {
+        console.error('Archive error:', err);
+        try { res.status(500).end(`Archive error: ${err?.message}`); } catch {}
+      });
+      archive.pipe(res);
+      archive.append(txt, { name: 'backtest_ai.txt' });
+      archive.append(csv, { name: 'backtest_ledger.csv' });
+      archive.finalize();
+    } catch (err: any) {
+      if (!res.headersSent) res.status(500).send(`Export error: ${err?.message}`);
+    }
+  });
+
   app.get('/api/backtest/entry-analysis', (_req, res) => {
     try {
       const analysisFile = path.resolve(BACKTEST_OUTPUT_DIR, 'entry_analysis.json');
@@ -853,35 +1326,22 @@ async function startServer() {
     res.status(200).json({ status: 'success', message: 'Strategy Lab started.' });
   });
 
-  // ==========================================================================
-  // PROPOSED: settings optimizer routes (start / status / stop)
-  // ==========================================================================
   app.post('/api/backtest/optimize', (req, res) => {
     if (optimizerRunning) return res.status(409).json({ status: 'error', message: 'Optimizer already running.' });
     if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is running. Wait for it to finish before starting the optimizer.' });
     const memCheck = checkContainerMemory();
-    if (!memCheck.ok) {
-      console.warn(`[OPT] ${memCheck.reason}`);
-      return res.status(503).json({ status: 'error', message: memCheck.reason });
-    }
+    if (!memCheck.ok) return res.status(503).json({ status: 'error', message: memCheck.reason });
     const requested: any = req.body?.symbols ?? req.body?.symbol ?? 'ALL';
     const symbolsArray: string[] = Array.isArray(requested)
       ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean)
-      : String(requested).toUpperCase() === 'ALL'
-        ? [...WHITELIST_ASSETS]
-        : [String(requested).toUpperCase()];
+      : String(requested).toUpperCase() === 'ALL' ? [...WHITELIST_ASSETS] : [String(requested).toUpperCase()];
     if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
-
     optimizerRunning = true;
     optimizerProgress = `Launching optimizer for ${symbolsArray.join(', ')}...`;
     optimizerLastError = null;
-
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const proc = spawn(pythonCmd, ['backtest/runner.py', '--optimize', '--symbols', symbolsArray.join(',')], {
-      env: { ...process.env, PYTHONPATH: process.cwd() },
-    });
+    const proc = spawn(pythonCmd, ['backtest/runner.py', '--optimize', '--symbols', symbolsArray.join(',')], { env: { ...process.env, PYTHONPATH: process.cwd() } });
     optimizerProcess = proc;
-
     let stdoutBuf = '';
     proc.stdout.on('data', data => {
       stdoutBuf += data.toString();
@@ -890,10 +1350,7 @@ async function startServer() {
       for (const raw of lines) {
         const l = raw.trim();
         if (!l) continue;
-        if (l.startsWith('[OPTIMIZE]')) {
-          optimizerProgress = l.replace('[OPTIMIZE]', '').trim();
-          console.log(l);
-        }
+        if (l.startsWith('[OPTIMIZE]')) { optimizerProgress = l.replace('[OPTIMIZE]', '').trim(); console.log(l); }
       }
     });
     let stderrBuf = '';
@@ -906,12 +1363,8 @@ async function startServer() {
     proc.on('exit', code => {
       optimizerRunning = false;
       optimizerProcess = null;
-      if (code === 0) {
-        optimizerProgress = 'Optimizer complete.';
-      } else {
-        optimizerLastError = `Exited with code ${code}`;
-        optimizerProgress = 'Optimizer failed.';
-      }
+      optimizerProgress = code === 0 ? 'Optimizer complete.' : 'Optimizer failed.';
+      if (code !== 0) optimizerLastError = `Exited with code ${code}`;
     });
     proc.on('error', err => {
       optimizerRunning = false;
@@ -919,34 +1372,18 @@ async function startServer() {
       optimizerLastError = `spawn error: ${err.message}`;
       optimizerProgress = 'Optimizer failed to start.';
     });
-
     res.status(200).json({ status: 'success', message: `Optimizer started for ${symbolsArray.join(', ')}.` });
   });
-
   app.get('/api/backtest/optimize-status', (_req, res) => {
     let details: any = null;
-    if (fs.existsSync(OPTIMIZER_STATUS_FILE)) {
-      try { details = JSON.parse(fs.readFileSync(OPTIMIZER_STATUS_FILE, 'utf8')); } catch {}
-    }
+    if (fs.existsSync(OPTIMIZER_STATUS_FILE)) { try { details = JSON.parse(fs.readFileSync(OPTIMIZER_STATUS_FILE, 'utf8')); } catch {} }
     let summaryText: string | null = null;
-    if (fs.existsSync(OPTIMIZER_SUMMARY_TXT)) {
-      try { summaryText = fs.readFileSync(OPTIMIZER_SUMMARY_TXT, 'utf8'); } catch {}
-    } else if (fs.existsSync(OPTIMIZER_SUMMARY_JSON)) {
-      try {
-        const p = JSON.parse(fs.readFileSync(OPTIMIZER_SUMMARY_JSON, 'utf8'));
-        if (typeof p.text === 'string') summaryText = p.text;
-      } catch {}
+    if (fs.existsSync(OPTIMIZER_SUMMARY_TXT)) { try { summaryText = fs.readFileSync(OPTIMIZER_SUMMARY_TXT, 'utf8'); } catch {} }
+    else if (fs.existsSync(OPTIMIZER_SUMMARY_JSON)) {
+      try { const p = JSON.parse(fs.readFileSync(OPTIMIZER_SUMMARY_JSON, 'utf8')); if (typeof p.text === 'string') summaryText = p.text; } catch {}
     }
-    res.status(200).json({
-      status: 'success',
-      isRunning: optimizerRunning,
-      progress: optimizerProgress,
-      lastError: optimizerLastError,
-      details,
-      summaryText,
-    });
+    res.status(200).json({ status: 'success', isRunning: optimizerRunning, progress: optimizerProgress, lastError: optimizerLastError, details, summaryText });
   });
-
   app.post('/api/backtest/optimize/stop', (_req, res) => {
     if (optimizerProcess) { try { optimizerProcess.kill(); } catch {} }
     optimizerProcess = null;
@@ -966,23 +1403,15 @@ async function startServer() {
     compareLastError = null;
     const oldFile = path.resolve(BACKTEST_OUTPUT_DIR, `${symbol}_compare.json`);
     if (fs.existsSync(oldFile)) { try { fs.unlinkSync(oldFile); } catch {} }
-
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-    const proc = spawn(pythonCmd, ['backtest/compare_engines.py', '--symbol', symbol, '--days', String(days)], {
-      env: { ...process.env, PYTHONPATH: process.cwd() },
-    });
+    const proc = spawn(pythonCmd, ['backtest/compare_engines.py', '--symbol', symbol, '--days', String(days)], { env: { ...process.env, PYTHONPATH: process.cwd() } });
     compareProcess = proc;
-
     let stdoutBuf = '';
     proc.stdout.on('data', data => {
       stdoutBuf += data.toString();
       const lines = stdoutBuf.split('\n');
       stdoutBuf = lines.pop() ?? '';
-      for (const raw of lines) {
-        const l = raw.trim();
-        if (!l) continue;
-        if (l.startsWith('[COMPARE]')) { compareProgress = l; console.log(l); }
-      }
+      for (const raw of lines) { const l = raw.trim(); if (l.startsWith('[COMPARE]')) { compareProgress = l; console.log(l); } }
     });
     let stderrBuf = '';
     proc.stderr.on('data', data => {
@@ -992,44 +1421,27 @@ async function startServer() {
       for (const raw of lines) if (raw.trimEnd()) console.error(`[COMPARE:ERR] ${raw.trimEnd()}`);
     });
     proc.on('exit', code => {
-      compareRunning = false;
-      compareProcess = null;
+      compareRunning = false; compareProcess = null;
       if (code !== 0) { compareLastError = `Exited with code ${code}`; compareProgress = 'Comparison failed.'; }
       else compareProgress = 'Comparison complete.';
     });
     proc.on('error', err => {
-      compareRunning = false;
-      compareProcess = null;
-      compareLastError = `spawn error: ${err.message}`;
-      compareProgress = 'Comparison failed.';
+      compareRunning = false; compareProcess = null;
+      compareLastError = `spawn error: ${err.message}`; compareProgress = 'Comparison failed.';
     });
-
     res.status(200).json({ status: 'success', message: `Comparison started for ${symbol}.`, symbol, days });
   });
-
   app.get('/api/backtest/compare/status', (_req, res) => {
     let result: any = null;
     if (compareSymbol) {
       const f = path.resolve(BACKTEST_OUTPUT_DIR, `${compareSymbol}_compare.json`);
-      if (fs.existsSync(f)) {
-        try { result = JSON.parse(fs.readFileSync(f, 'utf8')); } catch {}
-      }
+      if (fs.existsSync(f)) { try { result = JSON.parse(fs.readFileSync(f, 'utf8')); } catch {} }
     }
-    res.status(200).json({
-      status: 'success',
-      isRunning: compareRunning,
-      progress: compareProgress,
-      symbol: compareSymbol,
-      lastError: compareLastError,
-      result,
-    });
+    res.status(200).json({ status: 'success', isRunning: compareRunning, progress: compareProgress, symbol: compareSymbol, lastError: compareLastError, result });
   });
-
   app.post('/api/backtest/compare/stop', (_req, res) => {
     if (compareProcess) { try { compareProcess.kill(); } catch {} }
-    compareProcess = null;
-    compareRunning = false;
-    compareProgress = 'Comparison cancelled.';
+    compareProcess = null; compareRunning = false; compareProgress = 'Comparison cancelled.';
     res.status(200).json({ status: 'success' });
   });
 
@@ -1044,14 +1456,11 @@ async function startServer() {
     backtestResults = []; activeBacktestProcesses = []; backtestRunning = true;
     backtestProgress = `Initiating backtest matrix for ${symbolsArray.join(', ')}...`;
     backtestLastError = null; backtestExitCode = null;
-
     const runStartedAt = Date.now();
     lastRunWallClockSeconds = null;
-
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
     const CONCURRENT_PAIRS = 2;
     lastRunConcurrentProcesses = CONCURRENT_PAIRS;
-
     async function executeMatrix() {
       let activeIndex = 0; let completedCount = 0;
       async function runWorker(sym: string): Promise<void> {
@@ -1120,14 +1529,9 @@ async function startServer() {
   });
   app.get('/api/backtest/status', (_req, res) => {
     res.status(200).json({
-      status: 'success',
-      isRunning: backtestRunning,
-      progress: backtestProgress,
-      lastError: backtestLastError,
-      exitCode: backtestExitCode,
-      results: backtestResults,
-      wall_clock_seconds: lastRunWallClockSeconds,
-      concurrent_processes: lastRunConcurrentProcesses,
+      status: 'success', isRunning: backtestRunning, progress: backtestProgress,
+      lastError: backtestLastError, exitCode: backtestExitCode, results: backtestResults,
+      wall_clock_seconds: lastRunWallClockSeconds, concurrent_processes: lastRunConcurrentProcesses,
     });
   });
   app.post('/api/backtest/stop', (_req, res) => {
