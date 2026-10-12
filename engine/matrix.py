@@ -3,15 +3,10 @@
 ================================================================================
 NEXUS MATRIX QUANTITATIVE ENGINE (CTRADER OPEN API / FUSION MARKETS)
 ================================================================================
-Architecture: Master-Grade Institutional Multi-Strategy Execution Engine
-Components:   - Dynamic Multi-Currency Support (USD, ZAR, EUR) via core/fx.py
-              - Adaptive Volatility Engine Integration (ADR, AWR, AMR)
-              - 150 D1 Bar Volatility Context & Sunday-Night ISO Weekly Open
-              - Real Mark-to-Market Floating Equity Calculation
-              - Live Broker Position Reconciliation (ProtoOAReconcile 2124)
-              - Dynamic Breakeven Supervisor (80% R:R + 0.5x SL Distance)
-              - SuperTrend 5M Trailing Stop & Fixed Target Exits
-              - Institutional Drawdown Throttling & Auto Re-arming
+BRIEF CHANGES (2026-10-12):
+- check_breakeven_trigger now uses GLOBAL_PARAMS.breakeven_trigger_r (1.5R)
+  instead of a fraction of the TP distance. This matches backtest/simulator.py
+  so live and backtest fire BE at exactly the same R.
 ================================================================================
 """
 
@@ -75,35 +70,10 @@ TRADES_DB_FILE = os.path.join(DATA_DIR, "trades_db.json")
 CANDLES_CACHE_FILE = os.path.join(DATA_DIR, "candles_cache.json")
 CLOSE_COMMAND_FILE = os.path.join(DATA_DIR, "close_command.json")
 
-# ==============================================================================
-# PROPOSED (Fix 7b): developing-session value area.
-#
-# The value area (POC/VAH/VAL) that ORB_LIQUIDITY_SWEEP and
-# PDH_PDL_FAILED_BREAKOUT read is now computed from the DEVELOPING SESSION
-# (the current D1 bar's open time up to now), matching the mentor's setup.
-#
-# Before, live used the local OrderFlowAnalyzer on the trailing 120 bars,
-# which produced different levels from the backtest and did not correspond
-# to any real session boundary. Now both live (this file) and backtest
-# (backtest/runner.py) use the SAME function (core.indicators.
-# get_session_volume_profile) on the SAME bar range (session-open .. now).
-#
-# Falls back to the full slice when the session has fewer than
-# MIN_SESSION_BARS M5 candles, so the first bars of a new session do not
-# produce a degenerate VA.
-# ==============================================================================
-
 MIN_SESSION_BARS = 20
 
 
 def _session_start_utc(d1_df: pd.DataFrame) -> Optional[datetime]:
-    """
-    Return the open time of the last D1 bar in d1_df, which is the start
-    of the current session. Returns None if d1_df is empty.
-
-    Note: the caller must request D1 with drop_forming=False so that the
-    last row is TODAY's forming bar. See fetch_ohlc_candles.
-    """
     if d1_df is None or d1_df.empty:
         return None
     try:
@@ -121,11 +91,6 @@ def _compute_session_volume_profile(
     session_start: Optional[datetime],
     min_bars: int = MIN_SESSION_BARS,
 ) -> Dict[str, Any]:
-    """
-    Compute the developing-session volume profile. Falls back to the full
-    slice when the session has fewer than min_bars candles or when
-    session_start is None.
-    """
     if m5_df is None or m5_df.empty:
         return get_session_volume_profile(m5_df)
     if session_start is None:
@@ -911,23 +876,6 @@ class CTraderClient:
         count: int = 60,
         drop_forming: bool = True,
     ) -> pd.DataFrame:
-        """
-        Fetch OHLC candles.
-
-        drop_forming: when True (the default), the last (currently forming)
-        bar is dropped, matching the historical live behaviour. When False,
-        the forming bar is kept.
-
-        PROPOSED (Fix 2): the scan loop now calls this with
-        drop_forming=False for D1. That makes live's D1 DataFrame the same
-        shape as the backtest's D1 DataFrame (bar_aggregator keeps today's
-        forming bar in the buffer). build_session_levels then picks the
-        same bar on both sides, so live reads YESTERDAY's PDH, PDL, EQ
-        and pivots, not the day-before-yesterday's.
-
-        M5/H1/H4 keep the default drop_forming=True; nothing about their
-        behaviour changes.
-        """
         sid = self.resolve_symbol_id(symbol_name)
         if not sid or not self.is_authorized:
             return pd.DataFrame()
@@ -1089,7 +1037,7 @@ class CTraderClient:
         return bool(res and res.get("payloadType") == 2126)
 
 # ==============================================================================
-# 6. ORDER FLOW & VOLUME PROFILE ANALYZER (kept for backward-compatible imports)
+# 6. ORDER FLOW & VOLUME PROFILE ANALYZER
 # ==============================================================================
 
 @dataclass
@@ -1274,20 +1222,24 @@ class InstitutionalRiskEngine:
                 return False, f"Gold Stop ({pips:.1f} pips) outside spec [12-60 pips]"
         return True, "Stop size valid"
 
+    # ==========================================================================
+    # BRIEF: check_breakeven_trigger now uses GLOBAL_PARAMS.breakeven_trigger_r
+    # (default 1.5R) instead of a fraction of the TP distance. This matches
+    # backtest/simulator.py exactly, so live and backtest fire BE at the
+    # same R multiple regardless of the pair's target R:R.
+    # ==========================================================================
     def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
-        total_target_distance = abs(tp - entry)
-        if total_target_distance <= 0:
+        sl_distance = abs(entry - sl)
+        if sl_distance <= 0:
             return False
 
-        sl_distance = abs(entry - sl)
         if direction.upper() == "BUY":
             current_progress = current_price - entry
         else:
             current_progress = entry - current_price
 
-        target_condition = (current_progress / total_target_distance) >= GLOBAL_PARAMS.breakeven_trigger_ratio
-        noise_buffer_condition = current_progress >= (0.50 * sl_distance)
-        return bool(target_condition and noise_buffer_condition)
+        be_trigger_r = float(getattr(GLOBAL_PARAMS, "breakeven_trigger_r", 1.5) or 1.5)
+        return bool(current_progress >= (be_trigger_r * sl_distance))
 
     @staticmethod
     def calculate_candle_metrics(m5_df: pd.DataFrame, h4_df: pd.DataFrame, d1_df: pd.DataFrame) -> dict:
@@ -1820,7 +1772,7 @@ class MatrixEngineMaster:
                         success = await self.ctrader.update_position_sl(int(pid), new_sl=entry)
                         if success:
                             pos["is_be_moved"] = True
-                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} progressed >=80% of TP!\n• SL moved to Entry ({entry}).\n• Trade is now Risk-Free."
+                            alert = f"🛡️ *[BREAK-EVEN MOVED]*\n• {direction} {sym} reached 1.5R!\n• SL moved to Entry ({entry}).\n• Trade is now Risk-Free."
                             await whatsapp.send_alert(alert)
 
                 await asyncio.sleep(2.0)
@@ -1968,11 +1920,6 @@ class MatrixEngineMaster:
                     if self.risk_mgr.has_active_position(friendly_name):
                         continue
 
-                    # PROPOSED (Fix 2): D1 is requested with drop_forming=False
-                    # so live's D1 DataFrame has the same shape as the
-                    # backtest's D1 DataFrame (bar_aggregator keeps today's
-                    # forming bar). M5/H1/H4 keep the default drop_forming
-                    # of True, so their behaviour is unchanged.
                     m5_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.M5, count=120)
                     h1_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H1, count=30)
                     h4_df = await self.ctrader.fetch_ohlc_candles(friendly_name, CTraderTrendbarPeriod.H4, count=30)
@@ -1993,13 +1940,6 @@ class MatrixEngineMaster:
 
                     candle_stats = self.risk_mgr.calculate_candle_metrics(m5_df, h4_df, d1_df)
 
-                    # PROPOSED (Fix 7a + Fix 7b): use the SAME VA function the
-                    # backtester uses (core.indicators.get_session_volume_profile)
-                    # on the SAME bar range (developing session, from the
-                    # current D1 bar's open up to now). The previous local
-                    # OrderFlowAnalyzer used a different algorithm on the
-                    # trailing 120 bars and produced different POC/VAH/VAL,
-                    # so live and backtest were never measuring the same level.
                     session_start = _session_start_utc(d1_df)
                     vp = _compute_session_volume_profile(m5_df, session_start)
                     self.volume_profiles[friendly_name] = vp
@@ -2209,4 +2149,3 @@ def start_bot() -> None:
 
 if __name__ == "__main__":
     start_bot()
-    

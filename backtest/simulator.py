@@ -2,31 +2,19 @@
 backtest/simulator.py
 Replicates the exact single-order live position management of engine/matrix.py.
 
-PROPOSED: alt-target replay. When the simulator is constructed with the full
-M5 series (m5_df_full=...), every closed trade gets four additional fields
-(alt_r_1, alt_r_15, alt_r_2, alt_r_3) plus a boolean alt_timeout.
-
-PROPOSED: post-exit tracking replaces the old fixed 24-candle window with
-two clean rules:
-  - After a SL exit: track until price reaches the original TP (recovered),
-    OR until price has moved 2x the original SL distance further past the SL,
-    OR the end of the data.
-  - After a TP exit: track until price returns to entry (invalid),
-    OR until price has moved 3x the original TP distance past the TP,
-    OR the end of the data.
-
-PROPOSED (2026-10-10): the alt-target replay now uses pos["open_time"]
-converted to epoch seconds via datetime.timestamp().
-
-PROPOSED (this version): per-trade break-even flag and per-strategy daily
-trade counter. These let the settings file control BE and the daily cap
-on a per (pair, strategy) basis without touching the strategies themselves.
+BRIEF CHANGES (2026-10-12):
+- Break-Even trigger is now a fixed R multiple (GLOBAL_PARAMS.breakeven_trigger_r,
+  default 1.5R) instead of 80% of the TP distance. The old 80%-of-TP rule was
+  firing too early when TP was 1R, and too late when TP was 3R.
+- trail_after_1r_enabled is now False in session_config; the block is left in
+  place so it can be re-enabled via config without a code change.
 """
 
 import sys
 import os
 import math
 import bisect
+import copy
 import traceback
 import numpy as np
 import pandas as pd
@@ -81,7 +69,6 @@ class TradeSimulator:
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
         self.skipped: List[Dict[str, Any]] = []
         self.daily_trade_counts: Dict[str, int] = {}
-        # PROPOSED: per-strategy daily counters keyed on (strategy, sast_date).
         self.strategy_daily_counts: Dict[Tuple[str, str], int] = {}
         self._trade_counter: int = 0
 
@@ -219,14 +206,24 @@ class TradeSimulator:
         if current_daily_count >= max_daily:
             return self._record_skip(current_time, symbol, strategy, "DAILY_CAP", direction)
 
-        # PROPOSED: per-strategy daily cap.
         if max_daily_override is not None:
             strat_key = (strategy, sast_date_str)
             strat_count = self.strategy_daily_counts.get(strat_key, 0)
             if strat_count >= int(max_daily_override):
                 return self._record_skip(current_time, symbol, strategy, "STRATEGY_DAILY_CAP", direction)
 
-        fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
+        # ==== IMPROVEMENT PACK v1: widen the stop outside the noise band ====
+        _widen = float(getattr(GLOBAL_PARAMS, "stop_distance_multiplier", 1.0) or 1.0)
+        if _widen != 1.0:
+            _widened_dist = sl_dist * _widen
+            sl = (entry_price - _widened_dist) if direction == "BUY" else (entry_price + _widened_dist)
+            sl_dist = _widened_dist
+            _sig_for_target = copy.copy(signal)
+            _sig_for_target.stop_loss = sl
+        else:
+            _sig_for_target = signal
+
+        fixed_tp = compute_fixed_target(_sig_for_target, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
         if fixed_tp is None:
             return self._record_skip(current_time, symbol, strategy, "NO_ROOM", direction)
 
@@ -292,7 +289,6 @@ class TradeSimulator:
         except Exception:
             entry_epoch = 0
 
-        # PROPOSED: per-trade break-even flag.
         effective_be = use_breakeven_override if use_breakeven_override is not None else bool(GLOBAL_PARAMS.use_breakeven)
 
         position = {
@@ -329,6 +325,7 @@ class TradeSimulator:
             "consec_above_entry": 0,
             "consec_below_entry": 0,
             "entry_features": dict(entry_features) if entry_features else None,
+            "trail_after_1r_active": False,
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
@@ -400,16 +397,13 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            # PROPOSED: per-trade break-even flag.
+            # ---- Break-Even logic (BRIEF: fixed breakeven_trigger_r) ----
             be_enabled_for_pos = bool(pos.get("use_breakeven", GLOBAL_PARAMS.use_breakeven))
-            if be_enabled_for_pos and not pos["is_be_moved"]:
+            if be_enabled_for_pos and not pos["is_be_moved"] and sl_dist > 0:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
-                target_dist = abs(tp - entry)
-                progress_met = (
-                    target_dist > 0
-                    and (progress / target_dist) >= 0.80
-                    and progress >= (0.50 * sl_dist)
-                )
+                be_trigger_r = float(getattr(GLOBAL_PARAMS, "breakeven_trigger_r", 1.5) or 1.5)
+                progress_r = progress / sl_dist
+                progress_met = progress_r >= be_trigger_r
 
                 if self.be_mode == "STRUCTURAL":
                     structural_break = (
@@ -424,7 +418,28 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            if GLOBAL_PARAMS.use_supertrend_trail and len(m5_slice) >= 15:
+            # ==== IMPROVEMENT PACK v1: trail-after-1R ====
+            # Now disabled by default in session_config. Behaviour is unchanged
+            # when it is re-enabled: at +1R the position hands off to the
+            # SuperTrend trail.
+            if (
+                getattr(GLOBAL_PARAMS, "trail_after_1r_enabled", False)
+                and not pos.get("trail_after_1r_active", False)
+                and sl_dist > 0
+            ):
+                _progress_r = ((c_close - entry) if direction == "BUY" else (entry - c_close)) / sl_dist
+                if _progress_r >= 1.0:
+                    pos["trail_after_1r_active"] = True
+                    if not pos["is_be_moved"]:
+                        pos["stop_loss"] = entry
+                        pos["is_be_moved"] = True
+                    pos["trail_mode"] = "SUPERTREND"
+
+            _trail_active = (
+                GLOBAL_PARAMS.use_supertrend_trail
+                or pos.get("trail_after_1r_active", False)
+            )
+            if _trail_active and len(m5_slice) >= 15:
                 exited = False
                 if pos["trail_mode"] == "SUPERTREND":
                     st = calculate_supertrend(m5_slice, period=10, factor=1.6)
