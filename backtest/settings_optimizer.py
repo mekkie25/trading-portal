@@ -2,8 +2,6 @@
 backtest/settings_optimizer.py
 Per-strategy, per-pair settings optimizer.
 
-PROPOSED.
-
 WHAT IT DOES
 ------------
 For each (pair, strategy) that has enough historical trades:
@@ -20,10 +18,15 @@ For each (pair, strategy) that has enough historical trades:
 BASELINE GUARD
 --------------
 The optimizer runs its own combined baseline per pair that matches the
-"Adaptive · BE on · R:R 1:1" six-combination. It reads {pair}_summary.json
+"Adaptive · BE on · R:R 2.5" six-combination. It reads {pair}_summary.json
 for the same window and compares trade counts. If the difference is > 2%
 the pair is INVALID, listed under "OPTIMIZER INVALID" at the top of the
 summary, and excluded from the suggested file and the combined backtest.
+
+BRIEF CHANGES (2026-10-12):
+- BASELINE_RR raised from 1.0 to 2.5.
+- SEARCH_SPACE rr values raised to 1.5-3.5 to match the brief's target band.
+- BASELINE_COMBINATION_LABEL updated to match the new runner combinations.
 
 OUTPUTS
 -------
@@ -86,9 +89,11 @@ MAX_ACCEPTED_CHANGES = 3
 OPTIMIZE_WINDOW_DAYS = 365
 
 # The baseline the optimizer compares itself to.
-BASELINE_COMBINATION_LABEL = "Adaptive · BE on · R:R 1:1"
+# BRIEF: label now matches the new runner combination label.
+BASELINE_COMBINATION_LABEL = "Adaptive · BE on · R:R 1:2.5"
 BASELINE_USE_BE = True
-BASELINE_RR = 1.0
+# BRIEF: baseline R:R raised from 1.0 to 2.5.
+BASELINE_RR = 2.5
 
 # Search space.
 SEARCH_SPACE: Dict[str, List[Any]] = {
@@ -97,7 +102,8 @@ SEARCH_SPACE: Dict[str, List[Any]] = {
     "min_stop_atr": [0.0, 0.5, 1.0, 1.5, 2.0],
     "max_stop_atr": [None, 3.0, 4.0, 5.0],
     "max_spread_in_r": [None, 0.10, 0.05, 0.03],
-    "rr": [1.0, 1.25, 1.5, 2.0],
+    # BRIEF: R:R search values raised to the 1.5-3.5 band.
+    "rr": [1.5, 2.0, 2.5, 3.0, 3.5],
     "be_enabled": [False, True],
     "max_daily_trades": [None, 1, 2, 3],
 }

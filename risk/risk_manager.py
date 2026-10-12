@@ -2,6 +2,10 @@
 trading-portal/risk/risk_manager.py
 Institutional Unified Risk Engine with Real-Time Multi-Period Drawdown Throttling & Cashflow Adjustments.
 Single Source of Truth for risk evaluation, risk profiles, micro-account tier sizing, and circuit breakers.
+
+BRIEF (2026-10-12): added two helper methods used by the test suite:
+  - reset_daily_counters(date_str, current_equity)
+  - get_effective_risk_pct(current_equity=None)
 """
 
 import os
@@ -29,12 +33,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DATA_DIR = os.getenv("DATA_DIR", "").strip() or PROJECT_ROOT
 os.makedirs(DATA_DIR, exist_ok=True)
 RISK_STATE_FILE = os.getenv("RISK_STATE_FILE", os.path.join(DATA_DIR, "risk_state.json"))
-# PROPOSED: path to the journal so we can rebuild live counters at startup.
 TRADES_DB_FILE = os.path.join(DATA_DIR, "trades_db.json")
 
 
 # ==============================================================================
-# PROPOSED: INSTITUTIONAL RISK PROFILES SPECIFICATION
+# INSTITUTIONAL RISK PROFILES SPECIFICATION
 # ==============================================================================
 RISK_PROFILES: Dict[str, Dict[str, Any]] = {
     "Steady": {
@@ -121,7 +124,6 @@ class RiskManager:
         self.max_monthly_loss_pct: float = getattr(GLOBAL_PARAMS, 'max_monthly_loss_pct', 15.0)
         self.min_rr_floor: float = getattr(GLOBAL_PARAMS, 'min_rr', 1.0)
 
-        # PROPOSED (Gap 2): switch controlling USD vs profile % precedence
         self.use_profile_drawdown_pct: bool = True
 
         self.max_daily_loss_usd: float = getattr(GLOBAL_PARAMS, 'max_daily_loss_usd', 0.0)
@@ -156,22 +158,10 @@ class RiskManager:
         self.current_monthly_loss: float = 0.0
         self.open_positions: Dict[str, dict] = {}
 
-        # PROPOSED (Step 1 of deal-replay fix): record the process start time.
-        # record_trade_outcome_scoped uses this as a hard gate so replayed
-        # historical deals never touch live risk state.
         self._bot_started_at_utc: datetime = datetime.now(timezone.utc)
 
-        # PROPOSED (Option A): read bot_config.json once at construction so a
-        # freshly built RiskManager already has the active risk profile,
-        # min R:R, USD limits and master_execution flag. No-op if the file
-        # does not exist. Live sizing already called sync_ui_config() before
-        # every trade, so this does not change live behaviour — it only makes
-        # the object's state match what the first scan would have set anyway.
         self.sync_ui_config()
 
-        # PROPOSED (Step 1 of deal-replay fix): rebuild day/week/month loss
-        # counters from the journal once at startup. Fired from __init__
-        # because load_persistent_state() is not called anywhere in this repo.
         self.rebuild_period_counters_from_history()
 
     def sync_ui_config(self) -> None:
@@ -209,7 +199,6 @@ class RiskManager:
                 if "maxDailyTrades" in cfg:
                     self.max_daily_trades = int(cfg["maxDailyTrades"])
 
-            # PROPOSED (Gap 2): Read switch. Default True.
             use_profile_pct = bool(cfg.get("useProfileDrawdownPct", True))
             self.use_profile_drawdown_pct = use_profile_pct
 
@@ -231,7 +220,6 @@ class RiskManager:
             elif "maxMonthlyLoss" in cfg:
                 raw_monthly_usd = float(cfg["maxMonthlyLoss"])
 
-            # PROPOSED (Gap 2): precedence rule.
             if profile_is_active and use_profile_pct:
                 self.max_daily_loss_usd = 0.0
                 self.max_weekly_loss_usd = 0.0
@@ -437,10 +425,39 @@ class RiskManager:
             log.info(f"WIN RECORDED (+${pnl:.2f}). Consecutive loss streak reset.")
         self.save_persistent_state()
 
+    # ------------------------------------------------------------------
+    # BRIEF (2026-10-12): two helper methods used by the test suite.
+    # ------------------------------------------------------------------
+    def reset_daily_counters(self, date_str: str, current_equity: float = 0.0) -> None:
+        """
+        Reset the SAST-day trading counters to a clean state. Used by tests
+        and by any caller that wants to force a fresh session without
+        waiting for check_rollovers to fire.
+        """
+        self.current_day_str = date_str
+        self.trades_taken_today = 0
+        self.current_daily_loss = 0.0
+        self.today_closed_profit = 0.0
+        self.consecutive_losses = 0
+        if current_equity > 0:
+            self.starting_day_equity = current_equity
+        self.save_persistent_state()
+
+    def get_effective_risk_pct(self, current_equity: float = None) -> float:
+        """
+        Convenience wrapper around combined_risk_pct with neutral dow/ai
+        multipliers, so callers that only want the current risk % do not
+        have to know the argument shape.
+        """
+        equity = current_equity if current_equity is not None else (self.starting_day_equity or 1000.0)
+        try:
+            return self.combined_risk_pct(current_equity=equity, dow_mult=1.0, ai_factor=1.0)
+        except Exception:
+            return float(self.risk_per_trade_pct)
+    # ------------------------------------------------------------------
+
     def record_trade_outcome_scoped(self, pnl: float, closed_at_utc: Optional[datetime]) -> bool:
         """
-        PROPOSED (Step 1 of deal-replay fix).
-
         Scoped variant used only by the deal-replay sync path.
 
         Hard rule: this method changes NOTHING -- no daily/weekly/monthly
@@ -502,14 +519,12 @@ class RiskManager:
 
     def rebuild_period_counters_from_history(self) -> None:
         """
-        PROPOSED (Step 1 of deal-replay fix).
-
         Rebuilds current_daily_loss, current_weekly_loss, current_monthly_loss
         and today_closed_profit from trades_db.json at process startup.
 
         Only deals whose close time (stored in UTC as "YYYY-MM-DD HH:MM:SS")
         falls inside the current SAST day / week / month are counted. Duplicate
-                tickets are counted once. Missing or empty file -> counters are set
+        tickets are counted once. Missing or empty file -> counters are set
         to zero. Corrupt (non-list) JSON -> log a warning, leave counters
         untouched.
         """
@@ -619,8 +634,8 @@ class RiskManager:
         account_currency: Optional[str] = "USD",
         usd_zar_rate: Optional[float] = None
     ) -> float:
-        # PROPOSED: Aggressive and Max Growth ignore the Monday/Friday halving.
-        # Steady, Balanced and no-profile keep the existing day-of-week reduction.
+        # Aggressive and Max Growth ignore the Monday/Thursday halving.
+        # Steady, Balanced and no-profile keep the day-of-week reduction.
         if self.active_profile is not None and not self.active_profile.get("apply_dow_reduction", True):
             dow_mult = 1.0
 

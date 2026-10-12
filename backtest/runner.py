@@ -1,6 +1,12 @@
 """
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
+
+BRIEF CHANGES (2026-10-12):
+- COMBINATIONS list replaced: the R:R 1:1 combos are gone. New set:
+  Adaptive · BE off/on · R:R 1:2, 1:2.5, 1:3.
+- LAB_VARIANTS "Target R:R 1.5" removed; "Target R:R 2.0" and "Target R:R 3.0" kept.
+- run_lab_combination default target_rr raised from 1.0 to 2.5.
 """
 
 import sys
@@ -59,21 +65,22 @@ STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
 
 
+# BRIEF: 1:1 and 1:2 dropped. New combos: BE off/on × R:R 1:2, 1:2.5, 1:3.
 COMBINATIONS = [
     {
         "mode": "adaptive", "adaptive_mode": True,
         "be": "off", "use_be": False,
         "trail": "off", "use_trail": False,
-        "label": "Adaptive · BE off · R:R 1:1",
-        "rr_override": 1.0,
+        "label": "Adaptive · BE off · R:R 1:2.5",
+        "rr_override": 2.5,
         "analysis_combo": True,
     },
     {
         "mode": "adaptive", "adaptive_mode": True,
         "be": "on", "use_be": True,
         "trail": "off", "use_trail": False,
-        "label": "Adaptive · BE on · R:R 1:1",
-        "rr_override": 1.0,
+        "label": "Adaptive · BE on · R:R 1:2.5",
+        "rr_override": 2.5,
         "analysis_combo": False,
     },
     {
@@ -165,6 +172,7 @@ VARIANT_COMBINATIONS = [
 ]
 
 
+# BRIEF: "Target R:R 1.5" removed. "Target R:R 2.0" and "Target R:R 3.0" kept.
 LAB_VARIANTS: List[Dict[str, Any]] = [
     {"label": "Baseline",                 "overrides": {}},
     {"label": "Max spread-in-R 0.10",     "overrides": {"strat_max_spread_in_r": 0.10}},
@@ -176,8 +184,8 @@ LAB_VARIANTS: List[Dict[str, Any]] = [
     {"label": "HTF trend filter ON",      "overrides": {"strat_htf_trend_filter": True}},
     {"label": "Disable AVWAP",            "overrides": {"strat_disabled": ["AVWAP_200EMA_CONTINUATION"]}},
     {"label": "Disable STRATEGY_513",     "overrides": {"strat_disabled": ["STRATEGY_513"]}},
-    {"label": "Target R:R 1.5",           "overrides": {"target_rr": 1.5}},
     {"label": "Target R:R 2.0",           "overrides": {"target_rr": 2.0}},
+    {"label": "Target R:R 3.0",           "overrides": {"target_rr": 3.0}},
 ]
 
 
@@ -213,26 +221,12 @@ def sanitize_for_json(obj):
 
 # ==============================================================================
 # PROPOSED: value-area helpers (Fix 7b)
-#
-# The value area (POC/VAH/VAL) used by ORB_LIQUIDITY_SWEEP and
-# PDH_PDL_FAILED_BREAKOUT is now computed from the DEVELOPING SESSION, i.e.
-# from the current D1 bar's open time up to now. Previously it was computed
-# from a fixed 120-bar trailing window, so the levels sat in a different
-# place than the mentor's setup and than the live bot.
-#
-# Falls back to the full slice if the session has fewer than MIN_SESSION_BARS
-# M5 candles, so the very first bars of a session do not produce a degenerate
-# 3-bar VA.
 # ==============================================================================
 
 MIN_SESSION_BARS = 20
 
 
 def _session_start_utc(d1_view: pd.DataFrame) -> Optional[datetime]:
-    """
-    Return the open time of the last D1 bar in d1_view, which is the start
-    of the current session. Returns None if d1_view is empty.
-    """
     if d1_view is None or d1_view.empty:
         return None
     try:
@@ -250,11 +244,6 @@ def _compute_session_volume_profile(
     session_start: Optional[datetime],
     min_bars: int = MIN_SESSION_BARS,
 ) -> Dict[str, Any]:
-    """
-    Compute the developing-session volume profile. Falls back to the full
-    slice when the session has fewer than min_bars candles or when
-    session_start is None.
-    """
     if m5_df is None or m5_df.empty:
         return get_session_volume_profile(m5_df)
     if session_start is None:
@@ -818,9 +807,6 @@ def precompute_market_pass(
         t_vol += time.perf_counter() - _t0
 
         _t0 = time.perf_counter()
-        # PROPOSED (Fix 7b): value area is now the DEVELOPING SESSION's VA,
-        # from the current D1 bar's open to now, not a 120-bar trailing
-        # window. Falls back to the full slice if the session has too few bars.
         session_start = _session_start_utc(d1_view)
         vp = _compute_session_volume_profile(m5_slice, session_start)
         session_levels = build_session_levels(
@@ -1913,7 +1899,8 @@ async def run_strategy_lab(
     for idx, variant in enumerate(LAB_VARIANTS):
         label = variant["label"]
         overrides = dict(variant["overrides"])
-        target_rr_value = float(overrides.pop("target_rr", 1.0))
+        # BRIEF: default baseline R:R raised from 1.0 to 2.5.
+        target_rr_value = float(overrides.pop("target_rr", 2.5))
 
         print(f"[LAB] {symbol}: variant {idx + 1}/{len(LAB_VARIANTS)} — {label}", flush=True)
         try:
@@ -1975,7 +1962,7 @@ async def main():
     parser.add_argument("--symbol", type=str, default="US30")
     parser.add_argument("--symbols", type=str, default=None)
     parser.add_argument("--days", type=int, default=60)
-    parser.add_argument("--rr", type=float, default=1.0)
+    parser.add_argument("--rr", type=float, default=2.5)
     parser.add_argument("--mode", type=str, default=None)
     parser.add_argument("--adaptive", action="store_true", default=True)
     parser.add_argument("--breakeven", type=str, default="off")

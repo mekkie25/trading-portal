@@ -158,10 +158,6 @@ function holdoutVerdictLocal(tune: any, val: any): string {
   return 'HOLDS';
 }
 
-// =============================================================================
-// PDF HTML builders (mirrors the TXT sections)
-// =============================================================================
-
 function esc(s: any): string {
   if (s === null || s === undefined) return '';
   return String(s)
@@ -326,7 +322,6 @@ function buildPdfHtml(exp: any): string {
 
   const sections: string[] = [];
 
-  // Header
   sections.push(`
     <div class="header">
       <h1>NEXUS MATRIX — SIX-COMBINATION AUDIT REPORT</h1>
@@ -334,7 +329,6 @@ function buildPdfHtml(exp: any): string {
     </div>
   `);
 
-  // TOC
   sections.push(`
     <h2>Table of Contents</h2>
     <ol class="toc">
@@ -353,18 +347,16 @@ function buildPdfHtml(exp: any): string {
     </ol>
   `);
 
-  // Legend
   sections.push(`
     <h2>Legend</h2>
     <ul class="kv">
-      <li>Six combinations: Adaptive only, BE off/on, R:R 1:1 / 1:2 / 1:3.</li>
+      <li>Six combinations: Adaptive only, BE off/on, R:R 1:2 / 1:2.5 / 1:3.</li>
       <li>Ledger summary lists streaks and the 25 best/worst trades. The full ledger is in <b>backtest_ledger.csv</b>.</li>
       <li>Diagnostics sections use §N labels that match the Blueprint.</li>
       <li>Any row under 30 trades is tagged INCONCLUSIVE.</li>
     </ul>
   `);
 
-  // Non-default settings
   const nonDefault: string[] = Array.isArray(exp.non_default_settings) ? exp.non_default_settings : [];
   sections.push(`
     <h2>Active settings differing from default</h2>
@@ -373,7 +365,6 @@ function buildPdfHtml(exp: any): string {
       : `<ul class="kv">${nonDefault.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`}
   `);
 
-  // Cross-pair rollup
   const rollupRows = Object.entries<any>(exp.combinations_rollup || {}).map(([combo, r]) => [
     esc(combo), String(r.total_trades), `${formatNum(r.weighted_win_rate,1)}%`, `$${formatNum(r.total_pnl)}`
   ]);
@@ -382,7 +373,6 @@ function buildPdfHtml(exp: any): string {
     ${rollupRows.length ? hTable(['Combination','Trades','WR','Net $'], rollupRows) : '<p class="muted">(no data)</p>'}
   `);
 
-  // Per-pair sections
   for (const p of okPairs) {
     const b = p.best_combination || {};
     const combos = p.combinations || [];
@@ -479,7 +469,6 @@ function buildPdfHtml(exp: any): string {
     `);
   }
 
-  // Not tested pairs
   if (notTested.length > 0) {
     sections.push(`
       <h2>NOT TESTED</h2>
@@ -489,13 +478,11 @@ function buildPdfHtml(exp: any): string {
     `);
   }
 
-  // Portfolio
   sections.push(`
     <h2>Portfolio correlation</h2>
     ${portfolioMatrixHtml(exp.portfolio_correlation)}
   `);
 
-  // Ranked suggestions
   const rankedSuggestions = Array.isArray(exp.portfolio_suggestions) ? exp.portfolio_suggestions : [];
   if (rankedSuggestions.length > 0) {
     sections.push(`
@@ -506,7 +493,6 @@ function buildPdfHtml(exp: any): string {
     `);
   }
 
-  // What to test next
   const nextTests = Array.isArray(exp.what_to_test_next) ? exp.what_to_test_next : [];
   if (nextTests.length > 0) {
     sections.push(`
@@ -517,19 +503,16 @@ function buildPdfHtml(exp: any): string {
     `);
   }
 
-  // Entry condition analysis
   sections.push(`
     <h2>Entry condition analysis</h2>
     <p class="muted">See backtest_ai.txt for the pooled entry-condition analysis; the PDF shows the same section list but the full buckets remain in the TXT.</p>
   `);
 
-  // Optimizer summary
   sections.push(`
     <h2>Optimizer summary</h2>
     <p class="muted">See backtest_ai.txt for the full optimizer summary text. The optimizer writes config/pair_settings.suggested.json.</p>
   `);
 
-  // Cost table
   sections.push(`
     <h2>Cost assumptions</h2>
     ${hTable(
@@ -547,7 +530,6 @@ function buildPdfHtml(exp: any): string {
     <p class="muted">Identical between the backtest and the live bot.</p>
   `);
 
-  // Consistency checks
   const consistencyRows: string[][] = [];
   for (const p of okPairs) {
     const notes: string[] = [];
@@ -564,7 +546,6 @@ function buildPdfHtml(exp: any): string {
     `);
   }
 
-  // Not implemented
   const notImpl = (exp.spec_coverage || []).filter((row: any) => !row.panel && !row.txt);
   sections.push(`
     <h2>Not implemented</h2>
@@ -1195,7 +1176,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Adaptive only. BE off/on × R:R 1:1, 1:2, 1:3.
+            Adaptive only. BE off/on × R:R 1:2, 1:2.5, 1:3.
           </p>
         </div>
       </motion.div>

@@ -4,6 +4,10 @@
  *   - the Backtest panel (info icons and "How to read this" lines)
  *   - the TXT export legend
  *   - the PDF export section headers
+ *
+ * BRIEF (2026-10-12): combination labels updated from 1:1 / 1:2 / 1:3 to
+ * 1:2 / 1:2.5 / 1:3. Break-even descriptions now reference the 1.5R trigger.
+ * param sweep guidance now mentions the 2.5-3.0R peak from the brief.
  */
 
 export interface MetricDescription {
@@ -65,8 +69,8 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   },
   col_combination: {
     title: 'Combination',
-    description: 'One of the six Adaptive combinations: BE on or off, R:R 1:1, 1:2 or 1:3.',
-    howToRead: 'The ★ marks the best combination by PF with at least 30 trades.',
+    description: 'One of six Adaptive combinations: BE on or off, R:R 1:2, 1:2.5, or 1:3.',
+    howToRead: 'The star marks the best combination by PF with at least 30 trades.',
   },
   col_trades: { title: 'Trades', description: 'Trades this combination took. Under 30 is INCONCLUSIVE.', howToRead: 'Filter by this first.' },
   col_exp_r: { title: 'Expectancy (R)', description: 'Average R per trade.', howToRead: 'Rank combinations by this, then sanity-check against PF.' },
@@ -82,7 +86,7 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   tag_fails: { title: 'FAILS', description: 'VALIDATE PF below 0.95 or below 70% of TUNE.', howToRead: 'Retune and rerun.' },
   tag_inconclusive: { title: 'INCONCLUSIVE', description: 'Fewer than 30 trades in TUNE or VALIDATE.', howToRead: 'Not enough data for a claim.' },
   sec_summary: { title: 'Summary Dashboard', description: 'Top-level KPIs.', howToRead: 'Read KPI row first.' },
-  sec_combinations: { title: 'Six Combinations', description: 'Adaptive only, BE off/on, R:R 1:1, 1:2, 1:3. Six rows per pair.', howToRead: 'Ranked by PF. Star is best of six.' },
+  sec_combinations: { title: 'Six Combinations', description: 'Adaptive only, BE off/on, R:R 1:2, 1:2.5, 1:3. Six rows per pair.', howToRead: 'Ranked by PF. Star is best of six.' },
   sec_diagnostics: { title: 'Blueprint Diagnostics', description: 'Post-hoc analytics on the trade list.', howToRead: 'Scan the biggest cards first.' },
   sec_portfolio: { title: 'Portfolio Correlation', description: 'Cross-pair daily P&L correlation matrix.', howToRead: 'Low correlation is good.' },
   sec_tips: { title: 'Actionable Tips', description: 'Rule-based suggestions from the trade list.', howToRead: 'Focus on HIGH severity.' },
@@ -98,16 +102,16 @@ export const METRIC_DESCRIPTIONS: Record<string, MetricDescription> = {
   diag_buy_and_hold: { title: '§38 Buy-and-Hold', description: 'Compares strategy P&L against holding the underlying.', howToRead: 'Positive alpha = beating the market.' },
   diag_post_sl: { title: '§16 Post-SL', description: 'How far price kept moving against you after the stop. Pips and R.', howToRead: 'High recovered-to-TP rate means the entry is swept.' },
   diag_post_tp: { title: '§17 Post-TP', description: 'Extra pips after the target hit. Pips and R.', howToRead: 'High extra R means try a wider target.' },
-  diag_premature_be: { title: '§18 Premature BE', description: 'Stopped at BE then rallied to target.', howToRead: 'High rate means BE trigger is too early.' },
-  diag_ema_200: { title: '§27 EMA-200 Alignment', description: 'Aligned vs counter-trend entries.', howToRead: 'Aligned usually outperforms.' },
+  diag_premature_be: { title: '§18 Premature BE', description: 'Stopped at BE then rallied to target. With the new 1.5R trigger this should drop sharply.', howToRead: 'If it stays high, BE is still firing too early.' },
+  diag_ema_200: { title: '§27 EMA-200 Alignment', description: 'Aligned vs counter-trend entries. STRATEGY_513 and EMA_9_25_CROSS now require HTF alignment.', howToRead: 'Aligned usually outperforms.' },
   diag_confirmation: { title: '§28 Confirmation Type', description: 'Close vs touch entries.', howToRead: 'Keep close-based if touch is worse.' },
   diag_news: { title: '§29 News Windows', description: 'Inside vs outside news windows.', howToRead: 'Extend the blackout if inside is worse.' },
   diag_sizing: { title: '§24 Position Sizing', description: 'Fixed risk vs compounding.', howToRead: 'Compounding usually wins.' },
   diag_daily_caps: { title: '§25 Daily Caps', description: 'Cap 1 and cap 2 from the trade list. Cap 3+ needs the Strategy Lab.', howToRead: 'Tighter cap that keeps profit is worth it.' },
   diag_dd_cutoff: { title: '§33 DD Cutoff', description: 'Halts the day after a fixed % loss.', howToRead: 'Positive protection delta means adopt.' },
   diag_slippage: { title: '§34 Slippage', description: 'Fixed pips of cost per trade, converted with pip_size.', howToRead: 'Edge should survive 3-5 pips.' },
-  diag_breakeven_variants: { title: '§22 BE Variants', description: 'A/B/C estimate of BE policies.', howToRead: 'Pick the one preserving the most R.' },
-  diag_parameter_sensitivity: { title: '§35 Parameter Sweep', description: 'Estimate of P&L at various R:R targets on the same trade list.', howToRead: 'Peak of the sweep is where R:R best matched MFE.' },
+  diag_breakeven_variants: { title: '§22 BE Variants', description: 'A/B/C estimate of BE policies. A is now the 1.5R trigger.', howToRead: 'Pick the one preserving the most R.' },
+  diag_parameter_sensitivity: { title: '§35 Parameter Sweep', description: 'Estimate of P&L at various R:R targets on the same trade list.', howToRead: 'Peak of the sweep is where R:R best matched MFE. Brief says 2.5-3.0.' },
   not_implemented: { title: 'Not Implemented', description: 'Blueprint items not produced.', howToRead: 'Treat as backlog.' },
 };
 
