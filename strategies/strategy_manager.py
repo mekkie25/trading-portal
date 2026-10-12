@@ -4,9 +4,15 @@ Orchestrates institutional quantitative strategies across the 7 whitelisted asse
 passing multi-timeframe market feeds (M5, H1, H4, D1) and selecting the highest-confidence
 setup among all permitted strategies (eliminating first-match short-circuiting).
 
-Also applies backtest-only post-filters (session window, HTF trend, min stop ATR,
-spread-in-R, disabled list) when the caller opts in via apply_strat_filters=True.
-Live calls leave apply_strat_filters at its default of False and are unchanged.
+BRIEF CHANGES (2026-10-12):
+- Added _apply_always_on_filters. Runs on every signal, live or backtest.
+  It enforces:
+    (a) SAST rollover/hour blackout per pair (blocked_hours_sast)
+    (b) HTF daily alignment for strat_always_htf_targets
+        (STRATEGY_513 and EMA_9_25_CROSS)
+    (c) A spread-in-R ceiling of max_spread_in_r for every strategy
+- The existing backtest-only post-filters (session window, min stop ATR,
+  disabled list, forced HTF, spread cap) are unchanged.
 """
 
 import os
@@ -30,6 +36,10 @@ try:
     from config.strategy_params import GLOBAL_PARAMS, TZ_SAST
 except ImportError:
     from core.session_config import GLOBAL_PARAMS, TZ_SAST
+
+# MarketSessionManager is not exported by the virtual 'config.strategy_params'
+# alias, so it must come from core.session_config directly.
+from core.session_config import MarketSessionManager
 
 log = logging.getLogger("StrategyManager")
 CONFIG_FILE = "bot_config.json"
@@ -71,9 +81,8 @@ class StrategyManager:
 
     def __init__(self):
         self.error_count = 0
-        # One-row-per-candle list of signals blocked by the backtest-only
-        # post-filters. The runner drains this into the simulator's skipped
-        # list after every evaluate_all call so the skip summary is accurate.
+        # One-row-per-candle list of signals blocked by filters. The runner
+        # drains this into the simulator's skipped list after every call.
         self.filter_skips: List[Dict[str, Any]] = []
         self.strategies = [
             GrubberKick(),
@@ -97,6 +106,64 @@ class StrategyManager:
             return {}
 
     # ------------------------------------------------------------------
+    # BRIEF item 6 + rollover blackout + spread ceiling.
+    # Runs on every signal, live AND backtest. Never skipped.
+    # ------------------------------------------------------------------
+
+    def _apply_always_on_filters(
+        self,
+        signal: StrategySignal,
+        data_5m: pd.DataFrame,
+        data_d1: pd.DataFrame,
+        current_time: Any = None,
+    ) -> Optional[str]:
+        """
+        Returns a skip-reason string when the signal must be dropped, or None
+        when it passes. This filter path never gets bypassed.
+        """
+        # 1. SAST rollover / hour blackout per pair.
+        try:
+            blocked, reason = MarketSessionManager.is_blocked_hour(
+                signal.symbol, current_time
+            )
+            if blocked:
+                return reason
+        except Exception:
+            pass
+
+        # 2. HTF alignment for the brief's two target strategies.
+        htf_targets = set(getattr(GLOBAL_PARAMS, "strat_always_htf_targets", []) or [])
+        if signal.strategy in htf_targets:
+            try:
+                if data_d1 is not None and len(data_d1) >= 21:
+                    closes = data_d1["close"].astype(float)
+                    # Drop the currently forming bar; use only closed bars.
+                    closed = closes.iloc[:-1] if len(closes) > 20 else closes
+                    if len(closed) >= 20:
+                        ema20 = float(closed.ewm(span=20, adjust=False).mean().iloc[-1])
+                        last_close = float(closed.iloc[-1])
+                        d = signal.direction.upper()
+                        if d == "BUY" and last_close <= ema20:
+                            return "ALWAYS_HTF"
+                        if d == "SELL" and last_close >= ema20:
+                            return "ALWAYS_HTF"
+            except Exception:
+                pass
+
+        # 3. Spread-in-R ceiling for every strategy.
+        max_spr = float(getattr(GLOBAL_PARAMS, "max_spread_in_r", 0.0) or 0.0)
+        if max_spr > 0.0:
+            try:
+                spread = _SPREADS.get(signal.symbol, 0.0)
+                sl_dist = abs(float(signal.entry_price) - float(signal.stop_loss))
+                if sl_dist > 0.0 and (spread / sl_dist) > max_spr:
+                    return "SPREAD_IN_R"
+            except Exception:
+                pass
+
+        return None
+
+    # ------------------------------------------------------------------
     # Backtest-only post-filters
     # ------------------------------------------------------------------
 
@@ -108,10 +175,9 @@ class StrategyManager:
         current_time: Any = None,
     ) -> Optional[str]:
         """
-        Returns a skip reason string when the signal must be dropped, or None
-        when the signal passes. Only runs for strategies listed in
+        Backtest-only. Only runs for strategies listed in
         GLOBAL_PARAMS.strat_filter_targets. Never runs unless the caller
-        explicitly requested filters (see evaluate_all's apply_strat_filters).
+        explicitly requested filters (apply_strat_filters=True).
         """
         targets = set(getattr(GLOBAL_PARAMS, "strat_filter_targets", []) or [])
         if signal.strategy not in targets:
@@ -144,7 +210,6 @@ class StrategyManager:
             try:
                 if data_d1 is not None and len(data_d1) >= 21:
                     closes = data_d1["close"].astype(float)
-                    # Drop the currently forming bar so only closed bars are used
                     closed = closes.iloc[:-1] if len(closes) > 20 else closes
                     if len(closed) >= 20:
                         ema20 = float(closed.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -227,23 +292,12 @@ class StrategyManager:
         data_h1: pd.DataFrame = None,
         apply_strat_filters: bool = False,
     ) -> Optional[StrategySignal]:
-        """
-        Evaluates ALL strategies for the symbol. Rather than stopping at the first match,
-        it collects all valid signals and selects the one with the highest confidence score.
-
-        When apply_strat_filters is True, the six backtest-only filters in GLOBAL_PARAMS
-        are applied as post-filters, but only to strategies listed in strat_filter_targets.
-        When apply_strat_filters is False (the default, used by the live bot), nothing
-        changes.
-        """
         if symbol not in self.ALLOWED_ASSETS:
             return None
 
         strategy_modes = self._get_strategy_modes()
         valid_signals: List[StrategySignal] = []
 
-        # The timestamp used by session-window and skip records. Uses the last
-        # candle close so the filter sees the same "now" the strategy sees.
         try:
             current_time = pd.to_datetime(data_5m["time"].iloc[-1], utc=True) if data_5m is not None and len(data_5m) > 0 else None
         except Exception:
@@ -278,7 +332,16 @@ class StrategyManager:
                     else:
                         setattr(signal, "is_dry_run", False)
 
-                    # 3. Backtest-only post-filters
+                    # 3. Always-on filters (live + backtest): rollover, HTF,
+                    #    spread-in-R ceiling.
+                    always_reason = self._apply_always_on_filters(
+                        signal, data_5m, data_d1, current_time
+                    )
+                    if always_reason is not None:
+                        self._record_filter_skip(always_reason, signal, current_time)
+                        continue
+
+                    # 4. Backtest-only post-filters
                     if apply_strat_filters and bool(getattr(GLOBAL_PARAMS, "strat_filters_backtest_only", True)):
                         reason = self._apply_post_filters(signal, data_5m, data_d1, current_time)
                         if reason is not None:
@@ -295,7 +358,6 @@ class StrategyManager:
         if not valid_signals:
             return None
 
-        # Return the highest-confidence setup (A+ setup prioritization)
         best_signal = max(valid_signals, key=lambda s: getattr(s, 'confidence', 0.80))
         if len(valid_signals) > 1:
             log.info(f"Multiple signals generated for {symbol} ({[s.strategy for s in valid_signals]}). Selected highest confidence: {best_signal.strategy} ({best_signal.confidence})")
