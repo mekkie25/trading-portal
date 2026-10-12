@@ -2,12 +2,17 @@
 backtest/simulator.py
 Replicates the exact single-order live position management of engine/matrix.py.
 
-BRIEF CHANGES (2026-10-12):
-- Break-Even trigger is now a fixed R multiple (GLOBAL_PARAMS.breakeven_trigger_r,
-  default 1.5R) instead of 80% of the TP distance. The old 80%-of-TP rule was
-  firing too early when TP was 1R, and too late when TP was 3R.
-- trail_after_1r_enabled is now False in session_config; the block is left in
-  place so it can be re-enabled via config without a code change.
+CHANGE 2026-10-12 (a):
+- ASSETS dict now reads per-symbol spread from config/spread_config.json
+  via core.spread_config.load_spreads(). Falls back to hardcoded values
+  if the JSON is missing.
+
+CHANGE 2026-10-12 (b):
+- Every open position records min_lot_cash_risk_usd and sl_pips_at_entry.
+- Every completed trade carries those two fields plus pip_size forward.
+- These three fields are what allow backtest/profile_replay.py to replay
+  the trade list across all risk profiles with zero additional candle
+  processing. Nothing else in the simulator changes.
 """
 
 import sys
@@ -29,6 +34,7 @@ from core.session_config import TZ_SAST, GLOBAL_PARAMS, MarketSessionManager
 from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
+from core.spread_config import load_spreads
 
 POST_SL_CAP_MULTIPLE = 2.0
 POST_TP_CAP_MULTIPLE = 3.0
@@ -37,14 +43,26 @@ ALT_MAX_HOLD_CANDLES = 5 * 288
 ALT_TIMEOUT_FLAG_KEY = "alt_timeout"
 ALT_TARGET_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
 
+
+# Spread values come from config/spread_config.json.
+_LOADED_SPREADS = load_spreads()
+
+
+def _spread_for(symbol: str, default: float) -> float:
+    try:
+        return float(_LOADED_SPREADS.get(symbol, default))
+    except (TypeError, ValueError):
+        return default
+
+
 ASSETS = {
-    "GOLD":     {"pip_size": PIP_SIZES["GOLD"],     "contract_size": 100.0,    "min_lots": 0.01, "lot_step": 0.01, "spread": 0.30},
-    "US30":     {"pip_size": PIP_SIZES["US30"],     "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": 2.50},
-    "NAS100":   {"pip_size": PIP_SIZES["NAS100"],   "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": 1.50},
-    "GERMAN30": {"pip_size": PIP_SIZES["GERMAN30"], "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": 1.80},
-    "EURUSD":   {"pip_size": PIP_SIZES["EURUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00010},
-    "USDJPY":   {"pip_size": PIP_SIZES["USDJPY"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.012},
-    "GBPUSD":   {"pip_size": PIP_SIZES["GBPUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.00014},
+    "GOLD":     {"pip_size": PIP_SIZES["GOLD"],     "contract_size": 100.0,    "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("GOLD", 0.30)},
+    "US30":     {"pip_size": PIP_SIZES["US30"],     "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("US30", 2.50)},
+    "NAS100":   {"pip_size": PIP_SIZES["NAS100"],   "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("NAS100", 1.50)},
+    "GERMAN30": {"pip_size": PIP_SIZES["GERMAN30"], "contract_size": 1.0,      "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("GERMAN30", 1.80)},
+    "EURUSD":   {"pip_size": PIP_SIZES["EURUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("EURUSD", 0.00010)},
+    "USDJPY":   {"pip_size": PIP_SIZES["USDJPY"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("USDJPY", 0.012)},
+    "GBPUSD":   {"pip_size": PIP_SIZES["GBPUSD"],   "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": _spread_for("GBPUSD", 0.00014)},
 }
 
 
@@ -212,7 +230,6 @@ class TradeSimulator:
             if strat_count >= int(max_daily_override):
                 return self._record_skip(current_time, symbol, strategy, "STRATEGY_DAILY_CAP", direction)
 
-        # ==== IMPROVEMENT PACK v1: widen the stop outside the noise band ====
         _widen = float(getattr(GLOBAL_PARAMS, "stop_distance_multiplier", 1.0) or 1.0)
         if _widen != 1.0:
             _widened_dist = sl_dist * _widen
@@ -291,6 +308,13 @@ class TradeSimulator:
 
         effective_be = use_breakeven_override if use_breakeven_override is not None else bool(GLOBAL_PARAMS.use_breakeven)
 
+        # PROPOSED (2026-10-12 b): record the two sizing fields the profile
+        # replay needs. min_lot_cash_risk_usd is the dollar cost of a
+        # min-lot stop for this exact trade. sl_pips_at_entry is the
+        # stop distance in pips. Both are pure data — no behaviour change.
+        _min_lot_cash_risk_usd = round(min_lots * risk_per_lot, 4)
+        _sl_pips_at_entry = round(sl_dist / pip_size, 2) if pip_size > 0 else 0.0
+
         position = {
             "trade_id": trade_id,
             "symbol": symbol,
@@ -326,6 +350,8 @@ class TradeSimulator:
             "consec_below_entry": 0,
             "entry_features": dict(entry_features) if entry_features else None,
             "trail_after_1r_active": False,
+            "min_lot_cash_risk_usd": _min_lot_cash_risk_usd,
+            "sl_pips_at_entry": _sl_pips_at_entry,
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
@@ -397,7 +423,6 @@ class TradeSimulator:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
 
-            # ---- Break-Even logic (BRIEF: fixed breakeven_trigger_r) ----
             be_enabled_for_pos = bool(pos.get("use_breakeven", GLOBAL_PARAMS.use_breakeven))
             if be_enabled_for_pos and not pos["is_be_moved"] and sl_dist > 0:
                 progress = (c_close - entry) if direction == "BUY" else (entry - c_close)
@@ -418,10 +443,6 @@ class TradeSimulator:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            # ==== IMPROVEMENT PACK v1: trail-after-1R ====
-            # Now disabled by default in session_config. Behaviour is unchanged
-            # when it is re-enabled: at +1R the position hands off to the
-            # SuperTrend trail.
             if (
                 getattr(GLOBAL_PARAMS, "trail_after_1r_enabled", False)
                 and not pos.get("trail_after_1r_active", False)
@@ -752,6 +773,9 @@ class TradeSimulator:
 
         sast_date = pos["open_time"].astimezone(TZ_SAST).strftime("%Y-%m-%d")
 
+        # PROPOSED (2026-10-12 b): carry the two sizing fields and the
+        # pip_size forward so profile_replay can use them without
+        # re-reading price action.
         record = {
             "trade_id": pos["trade_id"],
             "date": pos["open_time"].strftime("%Y-%m-%d"),
@@ -799,6 +823,9 @@ class TradeSimulator:
             "post_tp_max_pips": None,
             "post_tp_max_ratio": None,
             "post_tp_invalid": False,
+            "min_lot_cash_risk_usd": float(pos.get("min_lot_cash_risk_usd", 0.0) or 0.0),
+            "sl_pips_at_entry": float(pos.get("sl_pips_at_entry", 0.0) or 0.0),
+            "pip_size": float(pip_size),
         }
 
         _RESERVED = {

@@ -1,0 +1,14 @@
+{
+  "broker": "Fusion Markets",
+  "notes": "All-in spread: raw spread + commission converted to price terms. Update from the panel or edit this file directly.",
+  "updated": "2026-10-12",
+  "symbols": {
+    "US30":     {"spread": 1.00},
+    "NAS100":   {"spread": 0.80},
+    "GERMAN30": {"spread": 1.20},
+    "GOLD":     {"spread": 0.225},
+    "EURUSD":   {"spread": 0.00005},
+    "GBPUSD":   {"spread": 0.000061},
+    "USDJPY":   {"spread": 0.0053}
+  }
+}

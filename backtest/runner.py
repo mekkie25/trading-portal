@@ -67,6 +67,8 @@ from core.pair_settings import (
     WHITELIST_PAIRS,
     STRATEGY_NAMES,
 )
+from core.pip_calculator import write_pip_calculator
+from backtest.profile_replay import replay_matrix
 
 STORE_TARGET_DAYS = 500
 STORE_MAX_DAYS = 550
@@ -1672,6 +1674,58 @@ async def run_symbol_matrix(
             json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
         tot_rep += time.perf_counter() - _t0
 
+        # PROPOSED (2026-10-12): derive minimum SL pip distances from the
+        # trades this run produced and merge into config/pip_calculator.json.
+        # Uses the R:R 1:3 BE off report so every pair contributes with the
+        # same combo — apples to apples.
+        _chosen_label = "Adaptive · BE off · R:R 1:3"
+        _chosen_row = next((r for r in matrix_rows if r.get("label") == _chosen_label), None)
+        if _chosen_row is None and matrix_rows:
+            _chosen_row = matrix_rows[0]
+
+        _run_trades: List[Dict[str, Any]] = []
+        if _chosen_row is not None:
+            _rf = _chosen_row.get("report_file")
+            if _rf:
+                _rp = os.path.join(OUTPUT_DIR, _rf)
+                if os.path.exists(_rp):
+                    try:
+                        with open(_rp, "r", encoding="utf-8") as _f:
+                            _rep = json.load(_f)
+                        _run_trades = _rep.get("all_trades", []) or []
+                    except Exception as _re:
+                        print(f"[pip_calculator] read failed for {symbol}: {_re}", flush=True)
+
+        if _run_trades:
+            try:
+                write_pip_calculator(_run_trades)
+                print(f"[pip_calculator] {symbol}: {len(_run_trades)} trades scanned", flush=True)
+            except Exception as _pce:
+                print(f"[pip_calculator] WARNING for {symbol}: {_pce}", flush=True)
+
+            # PROPOSED (2026-10-12): per-pair profile replay matrix.
+            # Same trades, five profiles, five starting balances. Arithmetic
+            # only, no candle processing.
+            try:
+                _ordered = sorted(
+                    _run_trades,
+                    key=lambda _t: str(_t.get("signal_time_utc", "")),
+                )
+                _profile_payload = replay_matrix(
+                    _ordered,
+                    starting_balances=[10.0, 50.0, 100.0, 500.0, 1000.0],
+                )
+                _profile_payload["symbol"] = symbol
+                _profile_payload["combo_label"] = _chosen_label
+                _profile_payload["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                _prof_file = os.path.join(OUTPUT_DIR, f"{symbol}_profiles.json")
+                _safe_prof = sanitize_for_json(_profile_payload)
+                with open(_prof_file, "w", encoding="utf-8") as _f:
+                    json.dump(_safe_prof, _f, separators=(",", ":"), allow_nan=False)
+                print(f"[profile_replay] {symbol}: matrix written", flush=True)
+            except Exception as _pre:
+                print(f"[profile_replay] WARNING for {symbol}: {_pre}", flush=True)
+
         if variants and variant_rows:
             try:
                 variants_payload = {
@@ -2120,6 +2174,59 @@ async def main():
     except Exception as pe:
         print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
 
+    # PROPOSED (2026-10-12): combined profile replay across every pair,
+    # using the same R:R 1:3 BE off combo everywhere so the matrix is a
+    # real portfolio simulation, not a mix of different setups.
+    try:
+        _combined_label = "Adaptive · BE off · R:R 1:3"
+        _combined_trades: List[Dict[str, Any]] = []
+        for _sym in symbols_list:
+            _summary_file = os.path.join(OUTPUT_DIR, f"{_sym}_summary.json")
+            if not os.path.exists(_summary_file):
+                continue
+            try:
+                with open(_summary_file, "r", encoding="utf-8") as _f:
+                    _summ = json.load(_f)
+            except Exception:
+                continue
+            _chosen = next(
+                (c for c in _summ.get("combinations", []) if c.get("label") == _combined_label),
+                None,
+            )
+            if _chosen is None:
+                continue
+            _rf = _chosen.get("report_file")
+            if not _rf:
+                continue
+            _rp = os.path.join(OUTPUT_DIR, _rf)
+            if not os.path.exists(_rp):
+                continue
+            try:
+                with open(_rp, "r", encoding="utf-8") as _f:
+                    _rep = json.load(_f)
+                _combined_trades.extend(_rep.get("all_trades", []) or [])
+            except Exception:
+                continue
+
+        if _combined_trades:
+            _ordered_all = sorted(
+                _combined_trades,
+                key=lambda _t: str(_t.get("signal_time_utc", "")),
+            )
+            _combined_payload = replay_matrix(
+                _ordered_all,
+                starting_balances=[10.0, 50.0, 100.0, 500.0, 1000.0],
+            )
+            _combined_payload["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            _combined_payload["pair_count"] = len(symbols_list)
+            _combined_payload["combo_label"] = _combined_label
+            _combined_file = os.path.join(OUTPUT_DIR, "portfolio_profiles.json")
+            _safe_combined = sanitize_for_json(_combined_payload)
+            with open(_combined_file, "w", encoding="utf-8") as _f:
+                json.dump(_safe_combined, _f, separators=(",", ":"), allow_nan=False)
+            print(f"[profile_replay] portfolio matrix written: {_combined_file}", flush=True)
+    except Exception as _cpe:
+        print(f"[profile_replay] portfolio WARNING: {_cpe}", flush=True)
     try:
         write_entry_analysis(OUTPUT_DIR)
     except Exception as ea:

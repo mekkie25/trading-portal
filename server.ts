@@ -11,8 +11,8 @@ import { METRIC_DESCRIPTIONS, describe } from './shared/metricDescriptions';
 // AI-FRIENDLY EXPORT (2026-10-12)
 // -----------------------------------------------------------------------------
 // Default sample size per pair for backtest_sample.csv. Overridable via
-// GET /api/backtest/export-zip?sample=N. Setting it to 0 falls back to the
-// full ledger dump (backtest_ledger.csv) for anyone who still wants it.
+// GET /api/backtest/export-zip?sample=N or /api/backtest/export.txt?sample=N.
+// Setting it to 0 falls back to the full ledger dump.
 // =============================================================================
 const SAMPLE_TRADES_PER_PAIR = 30;
 
@@ -492,9 +492,6 @@ function csvEscape(v: any): string {
 
 // =============================================================================
 // AI-FRIENDLY SUMMARY CSV
-// -----------------------------------------------------------------------------
-// One row per (pair x combination). 14 columns. ~42 rows for 7 pairs.
-// This is the file the AI should read first to see what is and is not working.
 // =============================================================================
 function renderSummaryCsv(pairs: any[]): string {
   const cols = [
@@ -531,12 +528,6 @@ function renderSummaryCsv(pairs: any[]): string {
 
 // =============================================================================
 // AI-FRIENDLY SAMPLE CSV
-// -----------------------------------------------------------------------------
-// A stratified sample of trades per pair. Composition per pair:
-//   - top third (by R) = the biggest wins
-//   - bottom third = the biggest losses
-//   - middle third = spread evenly through time (to catch slow drift)
-// Only 12 columns, all essential. Default 30 rows per pair.
 // =============================================================================
 function renderSampleCsv(pairs: any[], samplePerPair: number = SAMPLE_TRADES_PER_PAIR): string {
   const cols = [
@@ -575,8 +566,6 @@ function renderSampleCsv(pairs: any[], samplePerPair: number = SAMPLE_TRADES_PER
         seen.add(key);
         picked.push(t);
       }
-      // sort picked back to chronological order so the AI sees a coherent
-      // sequence, not three shuffled blocks.
       picked.sort((a, b) => String(a?.signal_time_utc || '').localeCompare(String(b?.signal_time_utc || '')));
     }
 
@@ -600,7 +589,6 @@ function renderSampleCsv(pairs: any[], samplePerPair: number = SAMPLE_TRADES_PER
   return out.join('\n');
 }
 
-// Kept as an escape hatch for the "?sample=0" case only. Not exported by default.
 function renderLedgerCsv(pairs: any[]): string {
   const cols = [
     'pair','combination','ticket','entry_time_sast','exit_time_sast','strategy','direction','lots',
@@ -674,7 +662,7 @@ function renderToc(pairs: any[], hasOptimizer: boolean): string[] {
   out.push(' 10. Not implemented');
   out.push('');
   out.push('COMPANION CSVs IN THIS ZIP:');
-  out.push('  backtest_summary.csv  — one row per (pair x combination). Read this first.');
+  out.push('  backtest_summary.csv  — one row per (pair x combo). Read this first.');
   out.push('  backtest_sample.csv   — 30 stratified trades per pair, 12 columns. Use for pattern spotting.');
   out.push('');
   return out;
@@ -1096,10 +1084,6 @@ function renderTxtContent(data: any): string {
     lines.push('--- Ledger: Summary (10 best + 10 worst) ---');
     const allTrades = Array.isArray(b.all_trades) ? b.all_trades : [];
     for (const l of renderLedgerSummary(allTrades)) lines.push(l);
-    // NOTE (2026-10-12): the previous "Compact rows" block (up to 100 rows per
-    // pair) has been removed. The stratified sample now lives in
-    // backtest_sample.csv, keeping the TXT small enough for the AI to consume
-    // 7 pairs x 365 days in a single pass.
 
     lines.push('');
     lines.push('--- Diagnostics (all cards) ---');
@@ -1251,27 +1235,70 @@ async function startServer() {
     catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
-  app.get('/api/backtest/export.txt', (_req, res) => {
+  // AI-FRIENDLY TXT EXPORT (2026-10-12)
+  // -------------------------------------------------------------------------
+  // Single plain-text file with three sections:
+  //   PART 1: AI brief + all diagnostics (same as the old export.txt)
+  //   PART 2: backtest_summary.csv content (one row per pair x combo)
+  //   PART 3: backtest_sample.csv content (30 stratified trades per pair)
+  //
+  // Query params:
+  //   ?sample=N    override the per-pair sample size (default 30, max 200)
+  //   ?sample=0    fall back to the full ledger
+  //
+  // This is what the "Export for AI (.txt)" button hits. The ZIP route still
+  // exists for anyone who prefers separate files.
+  app.get('/api/backtest/export.txt', (req, res) => {
     try {
-      const txt = renderTxtContent(generateExportDataPayload());
+      const sampleRaw = parseInt(String(req.query.sample ?? ''), 10);
+      const sampleSize = Number.isFinite(sampleRaw)
+        ? Math.max(0, Math.min(200, sampleRaw))
+        : SAMPLE_TRADES_PER_PAIR;
+
+      const data = generateExportDataPayload();
+      const txt = renderTxtContent(data);
+      const summaryCsv = renderSummaryCsv(data.pairs || []);
+      const sampleCsv = sampleSize > 0
+        ? renderSampleCsv(data.pairs || [], sampleSize)
+        : renderLedgerCsv(data.pairs || []);
+
+      const bar = '='.repeat(78);
+      const combined = [
+        bar,
+        'PART 1 OF 3  —  AI BRIEF AND DIAGNOSTICS',
+        bar,
+        '',
+        txt,
+        '',
+        '',
+        bar,
+        'PART 2 OF 3  —  BACKTEST SUMMARY CSV',
+        '(One row per pair x combination. Paste into a spreadsheet or read directly.)',
+        bar,
+        '',
+        summaryCsv,
+        '',
+        '',
+        bar,
+        `PART 3 OF 3  —  BACKTEST ${sampleSize > 0 ? 'SAMPLE' : 'FULL LEDGER'} CSV`,
+        sampleSize > 0
+          ? `(${sampleSize} stratified trades per pair: top wins, top losses, spread evenly through time.)`
+          : '(Full ledger dump. Add ?sample=30 to the URL to shrink it.)',
+        bar,
+        '',
+        sampleCsv,
+        '',
+      ].join('\n');
+
       const dateStr = new Date().toISOString().slice(0, 10);
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="backtest_ai_${dateStr}.txt"`);
-      res.status(200).send(txt);
+      res.status(200).send(combined);
     } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
   });
 
   // ===========================================================================
-  // AI-FRIENDLY EXPORT (2026-10-12)
-  // ---------------------------------------------------------------------------
-  // Default ZIP contains:
-  //   - backtest_ai.txt        (diagnostics + brief, no full ledger)
-  //   - backtest_summary.csv   (one row per pair x combo, ~42 rows)
-  //   - backtest_sample.csv    (30 stratified trades per pair, 12 columns)
-  //
-  // Query params:
-  //   ?sample=N    override the per-pair sample size (default 30, max 200)
-  //   ?sample=0    fall back to the full ledger CSV (backtest_ledger.csv)
+  // AI-FRIENDLY ZIP EXPORT
   // ===========================================================================
   app.get('/api/backtest/export-zip', (req, res) => {
     try {
@@ -1721,6 +1748,84 @@ async function startServer() {
     bot.on('exit', (code, signal) => { scheduleRestart(`exit code=${code} signal=${signal ?? 'null'}`); });
   }
   launchPythonBot();
+
+    // ---------------------------------------------------------------------------
+  // PROPOSED (2026-10-12): spread config editor
+  // ---------------------------------------------------------------------------
+  const SPREAD_CONFIG_FILE = path.join(process.cwd(), 'config', 'spread_config.json');
+
+  app.get('/api/backtest/spread-config', (_req, res) => {
+    try {
+      if (!fs.existsSync(SPREAD_CONFIG_FILE)) {
+        return res.status(200).json({ status: 'success', data: null });
+      }
+      const raw = fs.readFileSync(SPREAD_CONFIG_FILE, 'utf8').trim();
+      if (!raw) return res.status(200).json({ status: 'success', data: null });
+      return res.status(200).json({ status: 'success', data: JSON.parse(raw) });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.post('/api/backtest/spread-config', (req, res) => {
+    try {
+      const payload = req.body;
+      if (!payload || typeof payload !== 'object') {
+        return res.status(400).json({ status: 'error', message: 'Invalid payload.' });
+      }
+      const dir = path.dirname(SPREAD_CONFIG_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmp = SPREAD_CONFIG_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      fs.renameSync(tmp, SPREAD_CONFIG_FILE);
+      return res.status(200).json({ status: 'success', data: payload });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // PROPOSED (2026-10-12): profile replay matrix
+  // ---------------------------------------------------------------------------
+  app.get('/api/backtest/profiles/:symbol', (req, res) => {
+    try {
+      const sym = String(req.params.symbol || '').toUpperCase();
+      const file = path.resolve(BACKTEST_OUTPUT_DIR, `${sym}_profiles.json`);
+      if (fs.existsSync(file)) {
+        return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(file, 'utf8')) });
+      }
+      return res.status(404).json({ status: 'error', message: `No profile matrix for ${sym}.` });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.get('/api/backtest/portfolio-profiles', (_req, res) => {
+    try {
+      const file = path.resolve(BACKTEST_OUTPUT_DIR, 'portfolio_profiles.json');
+      if (fs.existsSync(file)) {
+        return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(file, 'utf8')) });
+      }
+      return res.status(404).json({ status: 'error', message: 'Portfolio profile matrix not yet generated.' });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // PROPOSED (2026-10-12): pip calculator reader
+  // ---------------------------------------------------------------------------
+  app.get('/api/backtest/pip-calculator', (_req, res) => {
+    try {
+      const file = path.join(process.cwd(), 'config', 'pip_calculator.json');
+      if (!fs.existsSync(file)) {
+        return res.status(404).json({ status: 'error', message: 'pip_calculator.json not yet generated. Run a backtest first.' });
+      }
+      return res.status(200).json({ status: 'success', data: JSON.parse(fs.readFileSync(file, 'utf8')) });
+    } catch (err: any) {
+      return res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
 
   app.use('/api', (req, res) => {
     res.status(404).json({ error: `Unknown API route: ${req.method} ${req.originalUrl}` });

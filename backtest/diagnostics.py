@@ -707,7 +707,7 @@ def _breakeven_variants(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _parameter_sensitivity(
     trades: List[Dict[str, Any]],
-    rrs=(0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    rrs=(0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0),
     starting_equity: float = 1000.0,
     risk_pct: float = 1.0,
 ) -> Dict[str, Any]:
