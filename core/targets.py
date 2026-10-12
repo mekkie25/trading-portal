@@ -1,21 +1,17 @@
 """
 trading-portal/core/targets.py
 Pure function for fixed risk-to-reward target calculation and structural room checking.
+
+FIX 2026-10-12
+--------------
+STRUCTURAL_WALL_FRACTION dropped from 0.60 to 0.25.
+The old 0.60 was rejecting almost every trade at R:R 1:2.5.
 """
+
+STRUCTURAL_WALL_FRACTION = 0.25
 
 
 def compute_fixed_target(signal, target_rr, use_final_target=False):
-    """
-    Computes a fixed R:R take-profit price and verifies there is enough room:
-    - stop_distance = abs(entry_price - stop_loss)
-    - target = entry +/- stop_distance * target_rr (plus for BUY, minus for SELL)
-    - structural_target selection:
-        * if use_final_target is True: take_profit_2 if present and > 0, else take_profit (ignores take_profit_1)
-        * if use_final_target is False: take_profit_1 if present, otherwise take_profit
-    - if structural_target is CLOSER to entry than the fixed target, returns None (no room)
-    - never modifies stop_loss
-    - returns the fixed target price if room is clear
-    """
     entry = float(signal.entry_price)
     sl = float(signal.stop_loss)
     direction = str(signal.direction).upper()
@@ -25,6 +21,8 @@ def compute_fixed_target(signal, target_rr, use_final_target=False):
         return None
 
     target_distance = stop_distance * float(target_rr)
+    if target_distance <= 0:
+        return None
 
     if direction == "BUY":
         fixed_target = entry + target_distance
@@ -33,7 +31,6 @@ def compute_fixed_target(signal, target_rr, use_final_target=False):
     else:
         return None
 
-    # Check the signal's structural target based on use_final_target flag
     if use_final_target:
         tp2 = getattr(signal, "take_profit_2", None)
         if tp2 is not None and float(tp2) > 0:
@@ -50,8 +47,8 @@ def compute_fixed_target(signal, target_rr, use_final_target=False):
             structural_tp_val = float(structural_tp)
             if structural_tp_val > 0:
                 structural_distance = abs(entry - structural_tp_val)
-                # If structural target is closer than required target_distance, reject ("no room")
-                if structural_distance < (target_distance - 1e-6):
+                wall_threshold = STRUCTURAL_WALL_FRACTION * target_distance
+                if structural_distance < wall_threshold:
                     return None
         except (ValueError, TypeError):
             pass
