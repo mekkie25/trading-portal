@@ -1,14 +1,14 @@
 {
   "broker": "Fusion Markets",
-  "notes": "All-in spread: raw spread + commission converted to price terms. Update from the panel or edit this file directly.",
-  "updated": "2026-10-12",
+  "notes": "spread = all-in cost for the simulator and live execution. filter_spread = what the SPREAD_IN_R filter uses. If filter_spread is missing, spread is used.",
+  "updated": "2026-10-13",
   "symbols": {
-    "US30":     {"spread": 1.00},
-    "NAS100":   {"spread": 0.80},
-    "GERMAN30": {"spread": 1.20},
-    "GOLD":     {"spread": 0.225},
-    "EURUSD":   {"spread": 0.00005},
-    "GBPUSD":   {"spread": 0.000061},
-    "USDJPY":   {"spread": 0.0053}
+    "US30":     {"spread": 1.00,    "filter_spread": 2.50},
+    "NAS100":   {"spread": 0.80,    "filter_spread": 1.50},
+    "GERMAN30": {"spread": 1.20,    "filter_spread": 1.80},
+    "GOLD":     {"spread": 0.225,   "filter_spread": 0.30},
+    "EURUSD":   {"spread": 0.00005, "filter_spread": 0.00010},
+    "GBPUSD":   {"spread": 0.000061,"filter_spread": 0.00014},
+    "USDJPY":   {"spread": 0.0053,  "filter_spread": 0.012}
   }
 }

@@ -146,7 +146,7 @@ class TradeSimulator:
             return self._eurusd_prices[idx]
         return None
 
-        def skip_summary(self) -> Dict[str, Any]:
+    def skip_summary(self) -> Dict[str, Any]:
         by_reason_candles: Dict[str, int] = {}
         by_reason_setups: Dict[str, set] = {}
         by_strategy: Dict[str, int] = {}

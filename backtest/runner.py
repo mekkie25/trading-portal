@@ -14,6 +14,13 @@ FIX (2026-10-12):
   (SPREAD_IN_R, BLOCKED_HOUR_*, ALWAYS_HTF) that previously vanished.
 - run_cached_combination replays `filter_skips` into the simulator so
   the skip summary in the report shows them.
+
+STEP 4 CHANGES (2026-10-13):
+- New CLI flag --filter-impact. Reporting only.
+- New function run_filter_impact() runs each pair twice on the same
+  precompute cache: once with the current filters, once with the
+  always-on filters disabled (via a passthrough StrategyManager subclass).
+- Writes backtest/output/filter_impact.json. No saved setting is changed.
 """
 
 import sys
@@ -848,8 +855,6 @@ def precompute_market_pass(
 
     print(f"[*] {symbol} precompute 100% complete.", flush=True)
 
-    # FIX: drain always-on filter skips so SPREAD_IN_R, BLOCKED_HOUR_* and
-    # ALWAYS_HTF rejections are visible in the report.
     try:
         filter_skips = sm.drain_filter_skips()
     except Exception:
@@ -930,9 +935,6 @@ def run_cached_combination(
     )
     cached_signals = precomputed["cached_signals"]
 
-    # FIX: replay always-on filter skips (recorded once during precompute)
-    # into the simulator's skipped list so the skip summary in the report
-    # includes SPREAD_IN_R, BLOCKED_HOUR_* and ALWAYS_HTF rejections.
     for _skip in precomputed.get("filter_skips", []) or []:
         try:
             sim.skipped.append(dict(_skip))
@@ -1674,10 +1676,6 @@ async def run_symbol_matrix(
             json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
         tot_rep += time.perf_counter() - _t0
 
-        # PROPOSED (2026-10-12): derive minimum SL pip distances from the
-        # trades this run produced and merge into config/pip_calculator.json.
-        # Uses the R:R 1:3 BE off report so every pair contributes with the
-        # same combo — apples to apples.
         _chosen_label = "Adaptive · BE off · R:R 1:3"
         _chosen_row = next((r for r in matrix_rows if r.get("label") == _chosen_label), None)
         if _chosen_row is None and matrix_rows:
@@ -1703,9 +1701,6 @@ async def run_symbol_matrix(
             except Exception as _pce:
                 print(f"[pip_calculator] WARNING for {symbol}: {_pce}", flush=True)
 
-            # PROPOSED (2026-10-12): per-pair profile replay matrix.
-            # Same trades, five profiles, five starting balances. Arithmetic
-            # only, no candle processing.
             try:
                 _ordered = sorted(
                     _run_trades,
@@ -2031,6 +2026,150 @@ def run_settings_optimizer_cli(symbols_list: List[str]) -> int:
         return 1
 
 
+# =============================================================================
+# STEP 4 (2026-10-13): filter impact comparison. Reporting only.
+# =============================================================================
+
+async def run_filter_impact(
+    symbols_list: List[str],
+    days: int = 365,
+) -> None:
+    """
+    Runs each pair twice on the same precompute cache:
+      1. current defaults (with filters)
+      2. always-on filters disabled (SPREAD_IN_R, ALWAYS_HTF, blocked hours)
+
+    Writes backtest/output/filter_impact.json with trades, win rate, PF,
+    average R and net P&L side by side. No saved setting is touched.
+    """
+    import json
+    from backtest.paths import OUTPUT_DIR as _OUTPUT_DIR
+
+    class _PassthroughStrategyManager(StrategyManager):
+        """
+        Subclass used only for the "filters off" pass.
+        Bypasses the three always-on filters so we can measure their impact.
+        """
+        def _apply_always_on_filters(self, signal, data_5m, data_d1, current_time=None):
+            return None
+
+    report: Dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "days": days,
+        "pairs": {},
+    }
+
+    for sym in symbols_list:
+        print(f"[FILTER-IMPACT] {sym}: loading data", flush=True)
+
+        m5_path = os.path.join(DATA_DIR, f"{sym}_M5.csv")
+        h1_path = os.path.join(DATA_DIR, f"{sym}_H1.csv")
+        h4_path = os.path.join(DATA_DIR, f"{sym}_H4.csv")
+        d1_path = os.path.join(DATA_DIR, f"{sym}_D1.csv")
+
+        if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+            report["pairs"][sym] = {"error": "missing market data files"}
+            continue
+
+        m5_df = pd.read_csv(m5_path)
+        h1_df = pd.read_csv(h1_path)
+        h4_df = pd.read_csv(h4_path)
+        d1_df = pd.read_csv(d1_path)
+        m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+        total_bars = len(m5_df)
+        if total_bars < 130:
+            report["pairs"][sym] = {"error": f"insufficient bars ({total_bars})"}
+            continue
+
+        last_bar_time = m5_df['time'].iloc[-1]
+        window_cutoff = last_bar_time - timedelta(days=days)
+        matching_indices = m5_df.index[m5_df['time'] >= window_cutoff].tolist()
+        sim_start_idx = max(120, matching_indices[0]) if matching_indices else max(120, total_bars - 1)
+
+        window_start_str = m5_df['time'].iloc[sim_start_idx].strftime('%Y-%m-%d %H:%M:%S UTC')
+        window_end_str = last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        precomputed = _try_load_precompute(sym, sim_start_idx, total_bars)
+        if precomputed is None:
+            print(f"[FILTER-IMPACT] {sym}: precomputing (cold)", flush=True)
+            precomputed = precompute_market_pass(
+                symbol=sym, m5_df=m5_df, h1_df=h1_df, h4_df=h4_df, d1_df=d1_df,
+                sim_start_idx=sim_start_idx, total_bars=total_bars,
+            )
+            try:
+                _save_precompute(sym, sim_start_idx, total_bars, precomputed, 0.0)
+            except Exception:
+                pass
+        else:
+            print(f"[FILTER-IMPACT] {sym}: using cached precompute", flush=True)
+            compute_121_window_emas(m5_df)
+            compute_atr14_series(m5_df)
+
+        baseline_combo = COMBINATIONS[0]
+
+        print(f"[FILTER-IMPACT] {sym}: with filters", flush=True)
+        baseline_res = run_cached_combination(
+            symbol=sym, m5_df=m5_df, precomputed=precomputed,
+            sim_start_idx=sim_start_idx, total_bars=total_bars,
+            combo=baseline_combo, days_count=days,
+            window_start_str=window_start_str, window_end_str=window_end_str,
+            history_days_before_window=0.0,
+            report_file_override=f"{sym}_filter_impact_on.json",
+        )
+        baseline_trades = baseline_res["trades"]
+
+        print(f"[FILTER-IMPACT] {sym}: without filters", flush=True)
+        import strategies.strategy_manager as _sm_mod
+        _original_cls = _sm_mod.StrategyManager
+        _sm_mod.StrategyManager = _PassthroughStrategyManager
+        try:
+            filters_off_res = run_cached_combination(
+                symbol=sym, m5_df=m5_df, precomputed=precomputed,
+                sim_start_idx=sim_start_idx, total_bars=total_bars,
+                combo=baseline_combo, days_count=days,
+                window_start_str=window_start_str, window_end_str=window_end_str,
+                history_days_before_window=0.0,
+                report_file_override=f"{sym}_filter_impact_off.json",
+            )
+        finally:
+            _sm_mod.StrategyManager = _original_cls
+
+        filters_off_trades = filters_off_res["trades"]
+
+        def _summary(trades):
+            if not trades:
+                return {"trades": 0, "win_rate": 0.0, "pf": 0.0, "avg_r": 0.0, "net": 0.0}
+            wins = [t for t in trades if t.get("result") == "WIN"]
+            losses = [t for t in trades if t.get("result") == "LOSS"]
+            gw = sum(float(t.get("money_pnl", 0.0)) for t in wins)
+            gl = abs(sum(float(t.get("money_pnl", 0.0)) for t in losses))
+            pf = (gw / gl) if gl > 0 else (99.0 if gw > 0 else 0.0)
+            avg_r = float(np.mean([float(t.get("r_multiple", 0.0)) for t in trades]))
+            net = float(sum(t.get("money_pnl", 0.0) for t in trades))
+            wr = (len(wins) / len(trades)) * 100.0
+            return {
+                "trades": len(trades),
+                "win_rate": round(wr, 1),
+                "pf": round(pf, 2),
+                "avg_r": round(avg_r, 3),
+                "net": round(net, 2),
+            }
+
+        report["pairs"][sym] = {
+            "window_start": window_start_str,
+            "window_end": window_end_str,
+            "with_filters": _summary(baseline_trades),
+            "without_filters": _summary(filters_off_trades),
+        }
+        print(f"[FILTER-IMPACT] {sym}: done", flush=True)
+
+    out_file = os.path.join(_OUTPUT_DIR, "filter_impact.json")
+    os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, allow_nan=False, default=str)
+    print(f"[FILTER-IMPACT] saved {out_file}", flush=True)
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="US30")
@@ -2049,6 +2188,8 @@ async def main():
     parser.add_argument("--lab", action="store_true", default=False)
     parser.add_argument("--optimize", action="store_true", default=False,
                         help="Run the per-strategy settings optimizer and exit.")
+    parser.add_argument("--filter-impact", action="store_true", default=False,
+                        help="Reporting-only. Runs each requested pair twice (with and without the always-on filters) and writes backtest/output/filter_impact.json. No saved setting is changed.")
     args = parser.parse_args()
 
     if args.symbols:
@@ -2059,6 +2200,17 @@ async def main():
     if args.optimize:
         code = run_settings_optimizer_cli(symbols_list)
         sys.exit(code)
+
+    if args.filter_impact:
+        target = symbols_list if symbols_list else ["EURUSD", "GBPUSD", "USDJPY"]
+        try:
+            await run_filter_impact(target, days=args.days)
+        except Exception as e:
+            print(f"[FILTER-IMPACT] failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        sys.exit(0)
 
     client = CTraderClient()
     pair_settings = load_pair_settings()
@@ -2174,9 +2326,6 @@ async def main():
     except Exception as pe:
         print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
 
-    # PROPOSED (2026-10-12): combined profile replay across every pair,
-    # using the same R:R 1:3 BE off combo everywhere so the matrix is a
-    # real portfolio simulation, not a mix of different setups.
     try:
         _combined_label = "Adaptive · BE off · R:R 1:3"
         _combined_trades: List[Dict[str, Any]] = []

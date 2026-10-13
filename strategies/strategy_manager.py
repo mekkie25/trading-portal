@@ -132,7 +132,7 @@ class StrategyManager:
                 pass
 
         # 3. Spread-in-R ceiling (global value, unchanged in Step 2).
-        max_spr = float(getattr(GLOBAL_PARAMS, "max_spread_in_r", 0.0) or 0.0)
+        max_spr = float(getattr(GLOBAL_PARAMS, "max_spread_in_r", 0.0) or 0.30)
         if max_spr > 0.0:
             try:
                 spread = _SPREADS.get(signal.symbol, 0.0)
