@@ -146,7 +146,7 @@ class TradeSimulator:
             return self._eurusd_prices[idx]
         return None
 
-    def skip_summary(self) -> Dict[str, Any]:
+        def skip_summary(self) -> Dict[str, Any]:
         by_reason_candles: Dict[str, int] = {}
         by_reason_setups: Dict[str, set] = {}
         by_strategy: Dict[str, int] = {}
@@ -174,10 +174,45 @@ class TradeSimulator:
                 "unique_setups": len(by_reason_setups.get(r, set()))
             }
 
+        # STEP 1 (2026-10-13): SPREAD_IN_R diagnostic distribution.
+        # Diagnostics-only: nothing reads these percentiles for a decision.
+        spread_in_r_values: List[float] = []
+        for s in self.skipped:
+            if s.get("reason") != "SPREAD_IN_R":
+                continue
+            v = s.get("spread_in_r_value")
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv >= 0.0:
+                spread_in_r_values.append(fv)
+
+        if spread_in_r_values:
+            arr = np.asarray(spread_in_r_values, dtype=float)
+            spread_in_r_distribution: Dict[str, Any] = {
+                "count": int(arr.size),
+                "median": round(float(np.median(arr)), 6),
+                "p75": round(float(np.percentile(arr, 75)), 6),
+                "p90": round(float(np.percentile(arr, 90)), 6),
+                "max": round(float(arr.max()), 6),
+            }
+        else:
+            spread_in_r_distribution = {
+                "count": 0,
+                "median": None,
+                "p75": None,
+                "p90": None,
+                "max": None,
+            }
+
         return {
             "by_reason": by_reason_detail,
             "by_strategy": by_strategy,
-            "by_hour_sast": by_hour_sast
+            "by_hour_sast": by_hour_sast,
+            "spread_in_r_distribution": spread_in_r_distribution,
         }
 
     def _record_skip(self, current_time: datetime, symbol: str, strategy: str, reason: str, direction: str = "UNKNOWN") -> bool:
