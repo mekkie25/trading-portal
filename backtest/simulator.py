@@ -4,19 +4,14 @@ Replicates the live single-order position management of engine/matrix.py.
 
 CHANGES 2026-10-13
 ------------------
-- open_trade() loads the asset config (pip_size, contract_size, spread)
-  before it manipulates the stop, so a pip-calculator floor can be applied
-  in price terms.
-- Pip-calculator floor wired in: the stop is never tighter than
-  min_sl_pips_for(symbol, strategy) from config/pip_calculator.json.
-  The file is written by backtest/pip_calculator.py at the end of each
-  pair's matrix run. On a cold first run the file is missing and the
-  floor is a no-op. On every subsequent run the floor from the previous
-  run is applied. This is the intended behaviour: the floor is a
-  dataset-derived value, not a live-tunable one.
-- stop_distance_multiplier step is labelled and now defaults to 1.0 in
-  core/session_config.py. It used to widen every stop 50% in the
-  backtest while the live bot did not, which was a parity break.
+- open_trade() applies the combined min stop floor:
+      max( GLOBAL_PARAMS.min_stop_pips[symbol],
+           pip_calculator.min_sl_pips[symbol][strategy] )
+  The hardcoded part fixes FX stops that were inside the noise band.
+  The data-driven part is a self-tuning suggestion from the previous run.
+- stop_distance_multiplier is 1.0 by default in core/session_config.py.
+  It used to widen every stop 50% in the backtest while the live bot did
+  not, which was a parity break.
 """
 
 import sys
@@ -39,7 +34,7 @@ from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
 from core.spread_config import load_spreads
-from core.pip_calculator import load_pip_calculator, min_sl_pips_for
+from core.pip_calculator import load_pip_calculator, effective_min_stop_pips
 
 POST_SL_CAP_MULTIPLE = 2.0
 POST_TP_CAP_MULTIPLE = 3.0
@@ -94,9 +89,6 @@ class TradeSimulator:
         self.strategy_daily_counts: Dict[Tuple[str, str], int] = {}
         self._trade_counter: int = 0
 
-        # Pip-calculator floor. Loaded once per TradeSimulator instance.
-        # The file is written by backtest/pip_calculator.py at the end of
-        # the previous run's matrix for this symbol. Missing file -> no-op.
         try:
             self._pip_calc = load_pip_calculator()
         except Exception:
@@ -275,36 +267,30 @@ class TradeSimulator:
             if strat_count >= int(max_daily_override):
                 return self._record_skip(current_time, symbol, strategy, "STRATEGY_DAILY_CAP", direction)
 
-        # Asset config loaded first so pip_size is available for the floor.
         cfg = ASSETS.get(symbol, {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.0001})
         contract_size = cfg["contract_size"]
         pip_size = cfg["pip_size"]
         spread_pts = cfg["spread"]
 
-        # 1. stop_distance_multiplier (default 1.0 in core/session_config.py).
-        #    Widens every structural stop by this factor. See the module
-        #    docstring in core/session_config.py for the rationale and for
-        #    the live-parity warning.
+        # 1. stop_distance_multiplier (default 1.0).
         _widen = float(getattr(GLOBAL_PARAMS, "stop_distance_multiplier", 1.0) or 1.0)
         if _widen != 1.0:
             sl_dist = sl_dist * _widen
             sl = (entry_price - sl_dist) if direction == "BUY" else (entry_price + sl_dist)
 
-        # 2. Pip-calculator floor. Stop is never tighter than the
-        #    strategy-specific floor derived from the previous backtest's
-        #    post-SL R analysis. See backtest/pip_calculator.py.
-        _pip_floor_pips = None
+        # 2. Combined min stop floor: max(hardcoded config, pip_calc).
+        #    Applied identically in engine/matrix.py::process_signal.
+        _floor_pips = 0.0
         try:
-            _pip_floor_pips = min_sl_pips_for(self._pip_calc, symbol, strategy)
+            _floor_pips = effective_min_stop_pips(symbol, strategy, self._pip_calc)
         except Exception:
-            _pip_floor_pips = None
-        if _pip_floor_pips and _pip_floor_pips > 0 and pip_size > 0:
-            _floor_price_dist = _pip_floor_pips * pip_size
+            _floor_pips = 0.0
+        if _floor_pips > 0 and pip_size > 0:
+            _floor_price_dist = _floor_pips * pip_size
             if sl_dist < _floor_price_dist:
                 sl_dist = _floor_price_dist
                 sl = (entry_price - sl_dist) if direction == "BUY" else (entry_price + sl_dist)
 
-        # Target is computed from the (possibly widened/floored) stop.
         _sig_for_target = copy.copy(signal)
         _sig_for_target.stop_loss = sl
 

@@ -4,9 +4,15 @@
 NEXUS MATRIX QUANTITATIVE ENGINE (CTRADER OPEN API / FUSION MARKETS)
 ================================================================================
 BRIEF CHANGES (2026-10-12):
-- check_breakeven_trigger now uses GLOBAL_PARAMS.breakeven_trigger_r (1.5R)
-  instead of a fraction of the TP distance. This matches backtest/simulator.py
-  so live and backtest fire BE at exactly the same R.
+- check_breakeven_trigger uses GLOBAL_PARAMS.breakeven_trigger_r (1.5R).
+
+CHANGES 2026-10-13:
+- CloudExecutionEngine now applies the same min stop floor as the backtest.
+  The effective floor is max( GLOBAL_PARAMS.min_stop_pips[symbol],
+  pip_calculator.min_sl_pips[symbol][strategy] ).
+  Applied in process_signal, immediately before compute_fixed_target, so the
+  fixed R:R target is derived from the floored stop. This keeps live and
+  backtest placing identical stops.
 ================================================================================
 """
 
@@ -43,6 +49,10 @@ from core.indicators import calculate_supertrend, get_session_volume_profile
 from core.fx import get_fx_rate_to_account, FX_CONVERSION_ALIASES
 from core.volatility_engine import volatility_engine
 from core.targets import compute_fixed_target
+from core.pip_calculator import (
+    load_pip_calculator,
+    effective_min_stop_pips,
+)
 from core.pair_settings import (
     load_pair_settings,
     get_strategy_settings,
@@ -107,16 +117,13 @@ def _compute_session_volume_profile(
     return get_session_volume_profile(m5_df)
 
 
-# ==============================================================================
-# 1. ADVANCED INSTITUTIONAL LOGGING
-# ==============================================================================
-
 class InstitutionalFormatter(logging.Formatter):
     fmt = "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-20s | %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
     def format(self, record):
         return logging.Formatter(self.fmt, datefmt=self.datefmt).format(record)
+
 
 def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_ctrader.log", level=logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -139,11 +146,9 @@ def setup_logger(name: str = "NexusMatrix", log_file: str = "matrix_ctrader.log"
 
     return logger
 
+
 log = setup_logger()
 
-# ==============================================================================
-# 2. WHATSAPP NOTIFICATION ENGINE
-# ==============================================================================
 
 class WhatsAppNotifier:
     def __init__(self):
@@ -176,9 +181,6 @@ class WhatsAppNotifier:
 
 whatsapp = WhatsAppNotifier()
 
-# ==============================================================================
-# 3. TELEMETRY & CACHING HELPERS
-# ==============================================================================
 
 def write_telemetry(balance: float, equity: float, regime: str, active_setup: str, ai_verdict: str, open_positions_list: list = None) -> None:
     data = {
@@ -199,6 +201,7 @@ def write_telemetry(balance: float, equity: float, regime: str, active_setup: st
     except Exception as e:
         log.error(f"Failed to write telemetry atomically: {e}")
 
+
 def read_ui_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
         return {}
@@ -215,6 +218,7 @@ def read_ui_config() -> dict:
     except Exception as e:
         log.exception(f"CRITICAL: Failed reading {CONFIG_FILE}: {e}")
         return {}
+
 
 def read_trade_history() -> List[dict]:
     if not os.path.exists(TRADES_DB_FILE):
@@ -233,6 +237,7 @@ def read_trade_history() -> List[dict]:
         log.exception(f"CRITICAL: Failed reading {TRADES_DB_FILE}: {e}")
         return []
 
+
 def save_trade_record(trade_data: dict) -> None:
     try:
         trades = read_trade_history()
@@ -250,6 +255,7 @@ def save_trade_record(trade_data: dict) -> None:
         os.replace(tmp_path, TRADES_DB_FILE)
     except Exception as e:
         log.exception(f"CRITICAL: Failed to record trade atomically to {TRADES_DB_FILE}: {e}")
+
 
 def update_candle_cache(symbol: str, df: pd.DataFrame) -> None:
     if df.empty:
@@ -284,9 +290,6 @@ def update_candle_cache(symbol: str, df: pd.DataFrame) -> None:
     except Exception as e:
         log.debug(f"Candle cache write error: {e}")
 
-# ==============================================================================
-# 4. CONFIGURATION & ASSET METRICS
-# ==============================================================================
 
 class CTraderTrendbarPeriod(Enum):
     M1 = 1
@@ -295,6 +298,7 @@ class CTraderTrendbarPeriod(Enum):
     H1 = 9
     H4 = 10
     D1 = 12
+
 
 @dataclass
 class AssetConfig:
@@ -307,6 +311,7 @@ class AssetConfig:
     max_lots: float
     lot_step: float
     sector: str
+
 
 class ConfigManager:
     CLIENT_ID: str = os.getenv("CTRADER_CLIENT_ID", "").strip()
@@ -344,9 +349,6 @@ class ConfigManager:
         "GBPUSD": AssetConfig("GBPUSD", "GBP / USD", "USD", 0.0001, 100000.0, 0.01, 50.0, 0.01, "FOREX_MAJORS"),
     }
 
-# ==============================================================================
-# 5. CTRADER CLIENT WITH RECONCILIATION & AUTO-RECONNECT
-# ==============================================================================
 
 class CTraderClient:
     def __init__(self):
@@ -1036,9 +1038,6 @@ class CTraderClient:
         }, timeout=8.0)
         return bool(res and res.get("payloadType") == 2126)
 
-# ==============================================================================
-# 6. ORDER FLOW & VOLUME PROFILE ANALYZER
-# ==============================================================================
 
 @dataclass
 class VolumeProfileNode:
@@ -1046,6 +1045,7 @@ class VolumeProfileNode:
     value_area_high: float
     value_area_low: float
     cum_delta: float
+
 
 class OrderFlowAnalyzer:
     @staticmethod
@@ -1097,9 +1097,6 @@ class OrderFlowAnalyzer:
 
         return VolumeProfileNode(poc_price, vah, val, cum_delta)
 
-# ==============================================================================
-# 7. INSTITUTIONAL RISK ENGINE
-# ==============================================================================
 
 class InstitutionalRiskEngine:
     def __init__(self, config_file: str = CONFIG_FILE):
@@ -1222,12 +1219,6 @@ class InstitutionalRiskEngine:
                 return False, f"Gold Stop ({pips:.1f} pips) outside spec [12-60 pips]"
         return True, "Stop size valid"
 
-    # ==========================================================================
-    # BRIEF: check_breakeven_trigger now uses GLOBAL_PARAMS.breakeven_trigger_r
-    # (default 1.5R) instead of a fraction of the TP distance. This matches
-    # backtest/simulator.py exactly, so live and backtest fire BE at the
-    # same R multiple regardless of the pair's target R:R.
-    # ==========================================================================
     def check_breakeven_trigger(self, entry: float, sl: float, tp: float, current_price: float, direction: str) -> bool:
         sl_distance = abs(entry - sl)
         if sl_distance <= 0:
@@ -1425,9 +1416,6 @@ class InstitutionalRiskEngine:
         }
         return True, "Approved", blueprint
 
-# ==============================================================================
-# 8. GEMINI AI OVERSEER
-# ==============================================================================
 
 class AIOverseer:
     def __init__(self):
@@ -1492,9 +1480,6 @@ class AIOverseer:
 
         return True, 1.0, "Approved by Quantitative Edge"
 
-# ==============================================================================
-# 9. EXECUTION ENGINE
-# ==============================================================================
 
 class CloudExecutionEngine:
     FAILED_ORDER_COOLDOWN_SECONDS: float = 600.0
@@ -1505,6 +1490,13 @@ class CloudExecutionEngine:
         self.risk = risk_mgr
         self.ai_overseer = AIOverseer()
         self._failed_order_cooldowns: Dict[str, Dict[str, float]] = {}
+
+        # 2026-10-13 CHANGE: load the pip calculator once so the live path
+        # uses the same data-driven floor the simulator applies.
+        try:
+            self._pip_calc = load_pip_calculator()
+        except Exception:
+            self._pip_calc = None
 
     async def process_signal(self, signal: Any, current_balance: float, current_equity: float, candle_stats: dict, use_breakeven_override: Optional[bool] = None) -> bool:
         symbol = getattr(signal, 'symbol')
@@ -1530,6 +1522,36 @@ class CloudExecutionEngine:
         strategy_name = getattr(signal, 'strategy', getattr(signal, 'setup_type', 'QUANT_SETUP'))
         if isinstance(strategy_name, Enum):
             strategy_name = strategy_name.value
+
+        # 2026-10-13 CHANGE: apply the same min stop floor the simulator
+        # applies. Matches backtest/simulator.py::open_trade exactly.
+        # effective_floor_pips = max( GLOBAL_PARAMS.min_stop_pips[symbol],
+        #                             pip_calculator.min_sl_pips[symbol][strategy] )
+        try:
+            cfg_asset = ConfigManager.ASSETS.get(symbol)
+            pip_size_live = cfg_asset.pip_size if cfg_asset else 0.0
+        except Exception:
+            pip_size_live = 0.0
+
+        if pip_size_live > 0:
+            try:
+                _floor_pips = effective_min_stop_pips(symbol, strategy_name, self._pip_calc)
+            except Exception:
+                _floor_pips = 0.0
+            if _floor_pips > 0:
+                _floor_price_dist = _floor_pips * pip_size_live
+                _sl_dist_now = abs(float(entry) - float(sl))
+                if _sl_dist_now < _floor_price_dist:
+                    sl = (float(entry) - _floor_price_dist) if direction.upper() == "BUY" else (float(entry) + _floor_price_dist)
+                    try:
+                        signal.stop_loss = sl
+                    except Exception:
+                        pass
+                    log.info(
+                        f"[MIN_STOP_FLOOR] {symbol} {strategy_name}: "
+                        f"widened stop from {_sl_dist_now / pip_size_live:.1f} pips "
+                        f"to {_floor_pips:.1f} pips"
+                    )
 
         fixed_tp = compute_fixed_target(signal, GLOBAL_PARAMS.target_rr)
         if fixed_tp is None:
@@ -1667,9 +1689,6 @@ class CloudExecutionEngine:
         )
         return False
 
-# ==============================================================================
-# 10. MASTER ORCHESTRATOR
-# ==============================================================================
 
 class MatrixEngineMaster:
     def __init__(self):
@@ -2136,9 +2155,6 @@ class MatrixEngineMaster:
                 log.error(f"Scan loop error: {e}")
                 await asyncio.sleep(5)
 
-# ==============================================================================
-# 11. ENTRY POINT
-# ==============================================================================
 
 def start_bot() -> None:
     master = MatrixEngineMaster()
@@ -2146,6 +2162,7 @@ def start_bot() -> None:
         asyncio.run(master.start())
     except KeyboardInterrupt:
         log.info("Shutdown signal received. Stopping Nexus Matrix.")
+
 
 if __name__ == "__main__":
     start_bot()
