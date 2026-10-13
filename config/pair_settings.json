@@ -1,21 +1,116 @@
-"EURUSD": {
-  "live_enabled": true,
-  "risk_pct": null,
-  "max_spread_in_r": 0.30,
-  "blocked_hours_sast": null,
-  ...
-},
-"GBPUSD": {
-  "live_enabled": true,
-  "risk_pct": null,
-  "max_spread_in_r": 0.30,
-  "blocked_hours_sast": null,
-  ...
-},
-"USDJPY": {
-  "live_enabled": true,
-  "risk_pct": null,
-  "max_spread_in_r": 0.30,
-  "blocked_hours_sast": null,
-  ...
+{
+  "pairs": {
+    "US30": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": null,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    },
+    "GOLD": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": null,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    },
+    "NAS100": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": null,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    },
+    "GERMAN30": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": null,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    },
+    "EURUSD": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": 0.15,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    },
+    "GBPUSD": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": 0.15,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    },
+    "USDJPY": {
+      "live_enabled": true,
+      "risk_pct": null,
+      "max_spread_in_r": 0.15,
+      "blocked_hours_sast": null,
+      "strategies": {
+        "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_LIQUIDITY_SWEEP":       {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "AVWAP_200EMA_CONTINUATION": {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "PDH_PDL_FAILED_BREAKOUT":   {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "EMA_9_25_CROSS":            {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "ORB_CRACKER":               {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
+        "OES_4H_ORDER_BLOCK":        {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null}
+      }
+    }
+  }
 }
