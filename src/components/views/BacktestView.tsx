@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { motion } from 'motion/react';
 import {
   TrendingUp, RefreshCw, Play, Lightbulb, Trash2,
-  Layers, Square, Copy, Check, Database, Clock, ShieldCheck, Download, Printer,
+  Layers, Square, Copy, Check, Database, Clock, ShieldCheck, Download, Printer, Sliders,
   FileText, Activity, Network, Info, FlaskConical, Wand2,
   DollarSign, Calculator, Save, RotateCcw, Globe
 } from 'lucide-react';
