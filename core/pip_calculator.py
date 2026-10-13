@@ -18,6 +18,12 @@ simulator widens the SL to the floor. If the structural SL is already
 wider, it is kept. TP is then derived from the (possibly widened) SL
 by the normal fixed R:R logic. This preserves structural stops while
 fixing the "SL too tight on noise" problem measured in §16.
+
+CHANGES 2026-10-13
+------------------
+- Added effective_min_stop_pips(), the combined min-stop floor used by
+  both backtest/simulator.py and engine/matrix.py so the live bot and the
+  backtest place identical stops.
 """
 
 import os
@@ -191,3 +197,50 @@ def min_sl_pips_for(payload: Optional[Dict[str, Any]], pair: str, strategy: str)
     except Exception:
         return None
     return None
+
+
+def effective_min_stop_pips(
+    symbol: str,
+    strategy: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> float:
+    """
+    Combined minimum stop floor in pips. This is what backtest/simulator.py
+    and engine/matrix.py both call so the live bot and the backtest place
+    identical stops.
+
+    Returns max of:
+      - GLOBAL_PARAMS.min_stop_pips[symbol]                 (hardcoded floor)
+      - min_sl_pips_for(payload, symbol, strategy)          (data-driven floor
+                                                             from the last
+                                                             backtest via
+                                                             config/pip_calculator.json)
+
+    If no floor is available from either source, returns 0.0, which means
+    "no floor" and the caller leaves the structural stop untouched.
+    """
+    # Lazy import avoids a circular dependency at module load time
+    # (session_config imports nothing from here, but the simulator imports
+    # this module before session_config has fully initialized in some paths).
+    try:
+        from core.session_config import GLOBAL_PARAMS
+    except Exception:
+        GLOBAL_PARAMS = None
+
+    hardcoded = 0.0
+    if GLOBAL_PARAMS is not None:
+        try:
+            table = getattr(GLOBAL_PARAMS, "min_stop_pips", {}) or {}
+            hardcoded = float(table.get(str(symbol).upper(), 0.0) or 0.0)
+        except Exception:
+            hardcoded = 0.0
+
+    data_driven = 0.0
+    try:
+        v = min_sl_pips_for(payload, symbol, strategy)
+        if v is not None:
+            data_driven = float(v)
+    except Exception:
+        data_driven = 0.0
+
+    return max(hardcoded, data_driven)
