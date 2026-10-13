@@ -99,184 +99,194 @@ export const LiveFeedView: React.FC<LiveFeedViewProps> = ({
     const container = chartContainerRef.current;
     container.innerHTML = '';
 
-    const isLight = themeMode !== 'dark';
+    // SAFE FIX: Wrap chart creation in try/catch to prevent app crash
+    try {
+      const isLight = themeMode !== 'dark';
 
-    const chart = createChart(container, {
-      width: container.clientWidth,
-      height: container.clientHeight || 560,
-      layout: {
-        background: { type: ColorType.Solid, color: isLight ? '#ffffff' : '#07090e' },
-        textColor: isLight ? '#334155' : '#94a3b8',
-      },
-      grid: {
-        vertLines: { color: isLight ? '#f1f5f9' : '#141a26' },
-        horzLines: { color: isLight ? '#f1f5f9' : '#141a26' },
-      },
-      crosshair: { mode: 1 },
-      rightPriceScale: { borderColor: isLight ? '#cbd5e1' : '#212838' },
-      timeScale: {
-        borderColor: isLight ? '#cbd5e1' : '#212838',
-        timeVisible: true,
-        secondsVisible: false,
-      },
-    });
+      const chart = createChart(container, {
+        width: container.clientWidth,
+        height: container.clientHeight || 560,
+        layout: {
+          background: { type: ColorType.Solid, color: isLight ? '#ffffff' : '#07090e' },
+          textColor: isLight ? '#334155' : '#94a3b8',
+        },
+        grid: {
+          vertLines: { color: isLight ? '#f1f5f9' : '#141a26' },
+          horzLines: { color: isLight ? '#f1f5f9' : '#141a26' },
+        },
+        crosshair: { mode: 1 },
+        rightPriceScale: { borderColor: isLight ? '#cbd5e1' : '#212838' },
+        timeScale: {
+          borderColor: isLight ? '#cbd5e1' : '#212838',
+          timeVisible: true,
+          secondsVisible: false,
+        },
+      });
 
-    chartApiRef.current = chart;
+      chartApiRef.current = chart;
 
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: '#10b981',
-      downColor: '#ef4444',
-      borderUpColor: '#10b981',
-      borderDownColor: '#ef4444',
-      wickUpColor: '#10b981',
-      wickDownColor: '#ef4444',
-      priceFormat: {
-        type: 'price',
-        precision: selectedAsset.decimals,
-        minMove: 1 / Math.pow(10, selectedAsset.decimals),
-      },
-    });
-    candleSeriesRef.current = candleSeries;
+      const candleSeries = chart.addCandlestickSeries({
+        upColor: '#10b981',
+        downColor: '#ef4444',
+        borderUpColor: '#10b981',
+        borderDownColor: '#ef4444',
+        wickUpColor: '#10b981',
+        wickDownColor: '#ef4444',
+        priceFormat: {
+          type: 'price',
+          precision: selectedAsset.decimals,
+          minMove: 1 / Math.pow(10, selectedAsset.decimals),
+        },
+      });
+      candleSeriesRef.current = candleSeries;
 
-    const volumeSeries = chart.addHistogramSeries({
-      priceFormat: { type: 'volume' },
-      priceScaleId: '',
-    });
-    volumeSeries.priceScale().applyOptions({
-      scaleMargins: { top: 0.82, bottom: 0 },
-    });
+      const volumeSeries = chart.addHistogramSeries({
+        priceFormat: { type: 'volume' },
+        priceScaleId: '',
+      });
+      volumeSeries.priceScale().applyOptions({
+        scaleMargins: { top: 0.82, bottom: 0 },
+      });
 
-    const ema20Series = chart.addLineSeries({ color: '#06b6d4', lineWidth: 1.5, title: 'EMA 20' });
-    const ema50Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, title: 'EMA 50' });
-    const ema200Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 2, title: 'EMA 200' });
+      const ema20Series = chart.addLineSeries({ color: '#06b6d4', lineWidth: 1.5, title: 'EMA 20' });
+      const ema50Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, title: 'EMA 50' });
+      const ema200Series = chart.addLineSeries({ color: '#a855f7', lineWidth: 2, title: 'EMA 200' });
 
-    const loadRealData = async () => {
-      setIsLoading(true);
-      try {
-        const res = await fetch(`/api/market/candles?symbol=${encodeURIComponent(selectedAsset.symbol)}`);
-        if (!res.ok) return;
+      const loadRealData = async () => {
+        setIsLoading(true);
+        try {
+          const res = await fetch(`/api/market/candles?symbol=${encodeURIComponent(selectedAsset.symbol)}`);
+          if (!res.ok) return;
 
-        const json = await res.json();
-        const rawCandles = json.data || [];
+          const json = await res.json();
+          const rawCandles = json.data || [];
 
-        if (rawCandles.length === 0) return;
+          if (rawCandles.length === 0) return;
 
-        const seen = new Set<number>();
-        const formattedCandles: any[] = [];
-        const formattedVolume: any[] = [];
+          const seen = new Set<number>();
+          const formattedCandles: any[] = [];
+          const formattedVolume: any[] = [];
 
-        rawCandles.forEach((c: any) => {
-          const t = Number(c.time);
-          if (!seen.has(t) && !isNaN(t)) {
-            seen.add(t);
-            formattedCandles.push({
-              time: t as UTCTimestamp,
-              open: Number(c.open),
-              high: Number(c.high),
-              low: Number(c.low),
-              close: Number(c.close),
-            });
-            formattedVolume.push({
-              time: t as UTCTimestamp,
-              value: Number(c.volume || 100),
-              color: Number(c.close) >= Number(c.open) ? 'rgba(16, 185, 129, 0.35)' : 'rgba(239, 68, 68, 0.35)',
-            });
-          }
-        });
-
-        formattedCandles.sort((a, b) => (a.time as number) - (b.time as number));
-        formattedVolume.sort((a, b) => (a.time as number) - (b.time as number));
-
-        candleSeries.setData(formattedCandles);
-        if (showVolume) volumeSeries.setData(formattedVolume);
-
-        if (formattedCandles.length > 0) {
-          setLastPrice(formattedCandles[formattedCandles.length - 1].close);
-        }
-
-        if (showEma20) ema20Series.setData(calculateEMASeries(formattedCandles, 20));
-        if (showEma50) ema50Series.setData(calculateEMASeries(formattedCandles, 50));
-        if (showEma200) ema200Series.setData(calculateEMASeries(formattedCandles, 200));
-
-        if (showAsiaLevels && formattedCandles.length > 20) {
-          const recent = formattedCandles.slice(-40);
-          const maxHigh = Math.max(...recent.map(c => c.high));
-          const minLow = Math.min(...recent.map(c => c.low));
-          const eqPrice = Number(((maxHigh + minLow) / 2).toFixed(selectedAsset.decimals));
-
-          candleSeries.createPriceLine({
-            price: maxHigh,
-            color: '#3b82f6',
-            lineWidth: 1,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'ASIA HIGH',
-          });
-
-          candleSeries.createPriceLine({
-            price: minLow,
-            color: '#3b82f6',
-            lineWidth: 1,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'ASIA LOW',
-          });
-
-          candleSeries.createPriceLine({
-            price: eqPrice,
-            color: '#f59e0b',
-            lineWidth: 2,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: 'DAILY EQ (50%)',
-          });
-        }
-
-        if (activeTrades.length > 0) {
-          const markers: any[] = [];
-          activeTrades.forEach(tr => {
-            if (tr.asset.toUpperCase().includes(selectedAsset.symbol)) {
-              const tradeTimestamp = Math.floor(new Date(tr.openTime).getTime() / 1000);
-              markers.push({
-                time: tradeTimestamp as UTCTimestamp,
-                position: tr.type === 'BUY' ? 'belowBar' : 'aboveBar',
-                color: tr.type === 'BUY' ? '#10b981' : '#ef4444',
-                shape: tr.type === 'BUY' ? 'arrowUp' : 'arrowDown',
-                text: `${tr.type} ${selectedAsset.symbol} | ${tr.strategy || 'BOT'}`,
+          rawCandles.forEach((c: any) => {
+            const t = Number(c.time);
+            if (!seen.has(t) && !isNaN(t)) {
+              seen.add(t);
+              formattedCandles.push({
+                time: t as UTCTimestamp,
+                open: Number(c.open),
+                high: Number(c.high),
+                low: Number(c.low),
+                close: Number(c.close),
+              });
+              formattedVolume.push({
+                time: t as UTCTimestamp,
+                value: Number(c.volume || 100),
+                color: Number(c.close) >= Number(c.open) ? 'rgba(16, 185, 129, 0.35)' : 'rgba(239, 68, 68, 0.35)',
               });
             }
           });
-          if (markers.length > 0) {
-            markers.sort((a, b) => (a.time as number) - (b.time as number));
-            candleSeries.setMarkers(markers);
+
+          formattedCandles.sort((a, b) => (a.time as number) - (b.time as number));
+          formattedVolume.sort((a, b) => (a.time as number) - (b.time as number));
+
+          candleSeries.setData(formattedCandles);
+          if (showVolume) volumeSeries.setData(formattedVolume);
+
+          if (formattedCandles.length > 0) {
+            setLastPrice(formattedCandles[formattedCandles.length - 1].close);
           }
+
+          if (showEma20) ema20Series.setData(calculateEMASeries(formattedCandles, 20));
+          if (showEma50) ema50Series.setData(calculateEMASeries(formattedCandles, 50));
+          if (showEma200) ema200Series.setData(calculateEMASeries(formattedCandles, 200));
+
+          if (showAsiaLevels && formattedCandles.length > 20) {
+            const recent = formattedCandles.slice(-40);
+            const maxHigh = Math.max(...recent.map(c => c.high));
+            const minLow = Math.min(...recent.map(c => c.low));
+            const eqPrice = Number(((maxHigh + minLow) / 2).toFixed(selectedAsset.decimals));
+
+            candleSeries.createPriceLine({
+              price: maxHigh,
+              color: '#3b82f6',
+              lineWidth: 1,
+              lineStyle: LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: 'ASIA HIGH',
+            });
+
+            candleSeries.createPriceLine({
+              price: minLow,
+              color: '#3b82f6',
+              lineWidth: 1,
+              lineStyle: LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: 'ASIA LOW',
+            });
+
+            candleSeries.createPriceLine({
+              price: eqPrice,
+              color: '#f59e0b',
+              lineWidth: 2,
+              lineStyle: LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: 'DAILY EQ (50%)',
+            });
+          }
+
+          if (activeTrades.length > 0) {
+            const markers: any[] = [];
+            activeTrades.forEach(tr => {
+              if (tr.asset && tr.asset.toUpperCase().includes(selectedAsset.symbol)) {
+                const tradeTimestamp = Math.floor(new Date(tr.openTime || Date.now()).getTime() / 1000);
+                markers.push({
+                  time: tradeTimestamp as UTCTimestamp,
+                  position: tr.type === 'BUY' ? 'belowBar' : 'aboveBar',
+                  color: tr.type === 'BUY' ? '#10b981' : '#ef4444',
+                  shape: tr.type === 'BUY' ? 'arrowUp' : 'arrowDown',
+                  text: `${tr.type} ${selectedAsset.symbol} | ${tr.strategy || 'BOT'}`,
+                });
+              }
+            });
+            if (markers.length > 0) {
+              markers.sort((a, b) => (a.time as number) - (b.time as number));
+              candleSeries.setMarkers(markers);
+            }
+          }
+        } catch (err) {
+          console.warn('Candle feed poll error:', err);
+        } finally {
+          setIsLoading(false);
         }
-      } catch (err) {
-        console.warn('Candle feed poll error:', err);
-      } finally {
-        setIsLoading(false);
+      };
+
+      loadRealData();
+      const intervalId = window.setInterval(loadRealData, 4000);
+
+      const handleResize = () => {
+        if (chart && container) {
+          chart.applyOptions({
+            width: container.clientWidth,
+            height: container.clientHeight || 560,
+          });
+        }
+      };
+      window.addEventListener('resize', handleResize);
+
+      return () => {
+        window.clearInterval(intervalId);
+        window.removeEventListener('resize', handleResize);
+        chart.remove();
+        chartApiRef.current = null;
+      };
+    } catch (error) {
+      console.warn("Chart failed to initialize, likely due to browser restrictions:", error);
+      // Optionally show a fallback UI here
+      if (container) {
+        container.innerHTML = '<div class="flex items-center justify-center h-full text-slate-500 text-xs font-mono">Charting library blocked by browser or failed to load.</div>';
       }
-    };
-
-    loadRealData();
-    const intervalId = window.setInterval(loadRealData, 4000);
-
-    const handleResize = () => {
-      if (chart && container) {
-        chart.applyOptions({
-          width: container.clientWidth,
-          height: container.clientHeight || 560,
-        });
-      }
-    };
-    window.addEventListener('resize', handleResize);
-
-    return () => {
-      window.clearInterval(intervalId);
-      window.removeEventListener('resize', handleResize);
-      chart.remove();
-      chartApiRef.current = null;
-    };
+      return () => {}; // Return empty cleanup function
+    }
   }, [selectedAsset.symbol, selectedInterval, themeMode, showEma20, showEma50, showEma200, showVolume, showAsiaLevels]);
 
   return (

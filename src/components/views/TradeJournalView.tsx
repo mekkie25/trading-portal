@@ -89,10 +89,17 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
 
   const filteredTrades = useMemo(() => {
     let list = trades.filter((tr) => {
+      // SAFE FIX: Check if fields exist before calling toLowerCase
+      const ticketStr = (tr.ticket || '').toLowerCase();
+      const assetStr = (tr.asset || '').toLowerCase();
+      const strategyStr = (tr.strategy || '').toLowerCase();
+      const query = searchQuery.toLowerCase();
+
       const matchSearch =
-        tr.ticket.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        tr.asset.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (tr.strategy && tr.strategy.toLowerCase().includes(searchQuery.toLowerCase()));
+        ticketStr.includes(query) ||
+        assetStr.includes(query) ||
+        strategyStr.includes(query);
+        
       const matchAsset = assetFilter === 'ALL' || tr.asset === assetFilter;
       const matchStatus = statusFilter === 'ALL' || tr.status === statusFilter;
       return matchSearch && matchAsset && matchStatus;
@@ -126,10 +133,10 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
     const totalCount = filteredTrades.length;
     const wins = filteredTrades.filter((t) => t.status === 'WIN');
     const losses = filteredTrades.filter((t) => t.status === 'LOSS');
-    const totalPnL = filteredTrades.reduce((acc, curr) => acc + curr.pnl, 0);
+    const totalPnL = filteredTrades.reduce((acc, curr) => acc + (curr.pnl || 0), 0);
     const winRate = totalCount > 0 ? (wins.length / totalCount) * 100 : 0;
-    const grossProfit = wins.reduce((acc, curr) => acc + curr.pnl, 0);
-    const grossLoss = Math.abs(losses.reduce((acc, curr) => acc + curr.pnl, 0));
+    const grossProfit = wins.reduce((acc, curr) => acc + (curr.pnl || 0), 0);
+    const grossLoss = Math.abs(losses.reduce((acc, curr) => acc + (curr.pnl || 0), 0));
     const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : '∞';
 
     return {
@@ -143,7 +150,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
   }, [filteredTrades]);
 
   const uniqueAssets = useMemo(() => {
-    return Array.from(new Set(trades.map((t) => t.asset)));
+    return Array.from(new Set(trades.map((t) => t.asset).filter(Boolean)));
   }, [trades]);
 
   const handleSyncSheets = () => {
@@ -164,18 +171,18 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
 
     const rowsHtml = filteredTrades.map((t) => `
       <tr style="border-bottom: 1px solid #e2e8f0;">
-        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.ticket}</td>
-        <td style="padding: 8px; font-size: 11px; font-weight: bold;">${t.asset}</td>
+        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.ticket || ''}</td>
+        <td style="padding: 8px; font-size: 11px; font-weight: bold;">${t.asset || ''}</td>
         <td style="padding: 8px; font-size: 11px; font-weight: bold; color: #2563eb;">${t.strategy || 'MANUAL'}</td>
-        <td style="padding: 8px; font-size: 11px; color: ${t.type === 'BUY' ? '#16a34a' : '#dc2626'};">${t.type}</td>
-        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.lots}</td>
-        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.openPrice.toFixed(2)}</td>
-        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.closePrice.toFixed(2)}</td>
-        <td style="padding: 8px; font-family: monospace; font-size: 11px; font-weight: bold; color: ${t.pnl >= 0 ? '#16a34a' : '#dc2626'};">
-          ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}
+        <td style="padding: 8px; font-size: 11px; color: ${t.type === 'BUY' ? '#16a34a' : '#dc2626'};">${t.type || ''}</td>
+        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${t.lots || 0}</td>
+        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${(t.openPrice || 0).toFixed(2)}</td>
+        <td style="padding: 8px; font-family: monospace; font-size: 11px;">${(t.closePrice || 0).toFixed(2)}</td>
+        <td style="padding: 8px; font-family: monospace; font-size: 11px; font-weight: bold; color: ${(t.pnl || 0) >= 0 ? '#16a34a' : '#dc2626'};">
+          ${(t.pnl || 0) >= 0 ? '+' : ''}$${(t.pnl || 0).toFixed(2)}
         </td>
-        <td style="padding: 8px; font-size: 10px; color: #64748b;">${t.closeTime}</td>
-        <td style="padding: 8px; font-size: 11px; font-weight: bold;">${t.status}</td>
+        <td style="padding: 8px; font-size: 10px; color: #64748b;">${t.closeTime || ''}</td>
+        <td style="padding: 8px; font-size: 11px; font-weight: bold;">${t.status || ''}</td>
       </tr>
     `).join('');
 
@@ -511,7 +518,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                   <tr key={trade.id} className="hover:bg-slate-50 dark:hover:bg-[#121520] transition-colors">
                     <td className="py-3.5 px-5 font-mono text-black dark:text-slate-400">
                       <div className="flex items-center gap-1.5">
-                        <span>{trade.ticket}</span>
+                        <span>{trade.ticket || '--'}</span>
                         {trade.isSimulated && (
                           <span className="text-[9px] px-1.5 py-0.2 rounded font-mono font-bold bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/20">
                             SIMULATED
@@ -520,7 +527,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                       </div>
                     </td>
                     <td className="py-3.5 px-4 font-semibold text-black dark:text-white">
-                      {trade.asset}
+                      {trade.asset || '--'}
                     </td>
                     <td className="py-3.5 px-4">
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
@@ -534,19 +541,19 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                           : 'bg-rose-500/10 text-rose-600 border border-rose-500/20'
                       }`}>
                         {trade.type === 'BUY' ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-                        {trade.type}
+                        {trade.type || '--'}
                       </span>
                     </td>
                     <td className="py-3.5 px-4 font-mono text-black dark:text-slate-300">
-                      {trade.openPrice?.toFixed(2)} → {trade.closePrice?.toFixed(2)}
+                      {(trade.openPrice || 0).toFixed(2)} → {(trade.closePrice || 0).toFixed(2)}
                     </td>
                     <td className="py-3.5 px-4 font-mono font-bold">
-                      <span className={trade.pnl >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600'}>
-                        {formatCurrency(trade.pnl, brokerConfig.currency)}
+                      <span className={(trade.pnl || 0) >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600'}>
+                        {formatCurrency(trade.pnl || 0, brokerConfig.currency)}
                       </span>
                     </td>
                     <td className="py-3.5 px-4 text-black dark:text-slate-400 text-[11px] font-mono">
-                      {trade.closeTime}
+                      {trade.closeTime || '--'}
                     </td>
                     <td className="py-3.5 px-4 text-center">
                       <span className={`font-mono text-[10px] font-bold px-2.5 py-1 rounded-full ${
@@ -556,7 +563,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                           ? 'bg-rose-500/15 text-rose-600 border border-rose-500/30'
                           : 'bg-slate-200 dark:bg-slate-800 text-black dark:text-slate-300'
                       }`}>
-                        {trade.status}
+                        {trade.status || '--'}
                       </span>
                     </td>
                     <td className="py-3.5 px-4 text-right">
@@ -564,7 +571,7 @@ export const TradeJournalView: React.FC<TradeJournalViewProps> = ({
                         <button
                           type="button"
                           onClick={() => {
-                            if (window.confirm(`Delete trade ${trade.ticket}? This will recalculate your Dashboard P&L and Win Rate.`)) {
+                            if (window.confirm(`Delete trade ${trade.ticket || trade.id}? This will recalculate your Dashboard P&L and Win Rate.`)) {
                               onDeleteTrade(trade.id);
                             }
                           }}
