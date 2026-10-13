@@ -1,18 +1,22 @@
 """
 backtest/simulator.py
-Replicates the exact single-order live position management of engine/matrix.py.
+Replicates the live single-order position management of engine/matrix.py.
 
-CHANGE 2026-10-12 (a):
-- ASSETS dict now reads per-symbol spread from config/spread_config.json
-  via core.spread_config.load_spreads(). Falls back to hardcoded values
-  if the JSON is missing.
-
-CHANGE 2026-10-12 (b):
-- Every open position records min_lot_cash_risk_usd and sl_pips_at_entry.
-- Every completed trade carries those two fields plus pip_size forward.
-- These three fields are what allow backtest/profile_replay.py to replay
-  the trade list across all risk profiles with zero additional candle
-  processing. Nothing else in the simulator changes.
+CHANGES 2026-10-13
+------------------
+- open_trade() loads the asset config (pip_size, contract_size, spread)
+  before it manipulates the stop, so a pip-calculator floor can be applied
+  in price terms.
+- Pip-calculator floor wired in: the stop is never tighter than
+  min_sl_pips_for(symbol, strategy) from config/pip_calculator.json.
+  The file is written by backtest/pip_calculator.py at the end of each
+  pair's matrix run. On a cold first run the file is missing and the
+  floor is a no-op. On every subsequent run the floor from the previous
+  run is applied. This is the intended behaviour: the floor is a
+  dataset-derived value, not a live-tunable one.
+- stop_distance_multiplier step is labelled and now defaults to 1.0 in
+  core/session_config.py. It used to widen every stop 50% in the
+  backtest while the live bot did not, which was a parity break.
 """
 
 import sys
@@ -35,6 +39,7 @@ from core.indicators import calculate_supertrend
 from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
 from core.spread_config import load_spreads
+from core.pip_calculator import load_pip_calculator, min_sl_pips_for
 
 POST_SL_CAP_MULTIPLE = 2.0
 POST_TP_CAP_MULTIPLE = 3.0
@@ -44,7 +49,6 @@ ALT_TIMEOUT_FLAG_KEY = "alt_timeout"
 ALT_TARGET_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
 
 
-# Spread values come from config/spread_config.json.
 _LOADED_SPREADS = load_spreads()
 
 
@@ -89,6 +93,14 @@ class TradeSimulator:
         self.daily_trade_counts: Dict[str, int] = {}
         self.strategy_daily_counts: Dict[Tuple[str, str], int] = {}
         self._trade_counter: int = 0
+
+        # Pip-calculator floor. Loaded once per TradeSimulator instance.
+        # The file is written by backtest/pip_calculator.py at the end of
+        # the previous run's matrix for this symbol. Missing file -> no-op.
+        try:
+            self._pip_calc = load_pip_calculator()
+        except Exception:
+            self._pip_calc = None
 
         self._eurusd_times: List[float] = []
         self._eurusd_prices: List[float] = []
@@ -174,8 +186,6 @@ class TradeSimulator:
                 "unique_setups": len(by_reason_setups.get(r, set()))
             }
 
-        # STEP 1 (2026-10-13): SPREAD_IN_R diagnostic distribution.
-        # Diagnostics-only: nothing reads these percentiles for a decision.
         spread_in_r_values: List[float] = []
         for s in self.skipped:
             if s.get("reason") != "SPREAD_IN_R":
@@ -265,24 +275,42 @@ class TradeSimulator:
             if strat_count >= int(max_daily_override):
                 return self._record_skip(current_time, symbol, strategy, "STRATEGY_DAILY_CAP", direction)
 
-        _widen = float(getattr(GLOBAL_PARAMS, "stop_distance_multiplier", 1.0) or 1.0)
-        if _widen != 1.0:
-            _widened_dist = sl_dist * _widen
-            sl = (entry_price - _widened_dist) if direction == "BUY" else (entry_price + _widened_dist)
-            sl_dist = _widened_dist
-            _sig_for_target = copy.copy(signal)
-            _sig_for_target.stop_loss = sl
-        else:
-            _sig_for_target = signal
-
-        fixed_tp = compute_fixed_target(_sig_for_target, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
-        if fixed_tp is None:
-            return self._record_skip(current_time, symbol, strategy, "NO_ROOM", direction)
-
+        # Asset config loaded first so pip_size is available for the floor.
         cfg = ASSETS.get(symbol, {"pip_size": 0.0001, "contract_size": 100000.0, "min_lots": 0.01, "lot_step": 0.01, "spread": 0.0001})
         contract_size = cfg["contract_size"]
         pip_size = cfg["pip_size"]
         spread_pts = cfg["spread"]
+
+        # 1. stop_distance_multiplier (default 1.0 in core/session_config.py).
+        #    Widens every structural stop by this factor. See the module
+        #    docstring in core/session_config.py for the rationale and for
+        #    the live-parity warning.
+        _widen = float(getattr(GLOBAL_PARAMS, "stop_distance_multiplier", 1.0) or 1.0)
+        if _widen != 1.0:
+            sl_dist = sl_dist * _widen
+            sl = (entry_price - sl_dist) if direction == "BUY" else (entry_price + sl_dist)
+
+        # 2. Pip-calculator floor. Stop is never tighter than the
+        #    strategy-specific floor derived from the previous backtest's
+        #    post-SL R analysis. See backtest/pip_calculator.py.
+        _pip_floor_pips = None
+        try:
+            _pip_floor_pips = min_sl_pips_for(self._pip_calc, symbol, strategy)
+        except Exception:
+            _pip_floor_pips = None
+        if _pip_floor_pips and _pip_floor_pips > 0 and pip_size > 0:
+            _floor_price_dist = _pip_floor_pips * pip_size
+            if sl_dist < _floor_price_dist:
+                sl_dist = _floor_price_dist
+                sl = (entry_price - sl_dist) if direction == "BUY" else (entry_price + sl_dist)
+
+        # Target is computed from the (possibly widened/floored) stop.
+        _sig_for_target = copy.copy(signal)
+        _sig_for_target.stop_loss = sl
+
+        fixed_tp = compute_fixed_target(_sig_for_target, GLOBAL_PARAMS.target_rr, use_final_target=GLOBAL_PARAMS.adaptive_mode)
+        if fixed_tp is None:
+            return self._record_skip(current_time, symbol, strategy, "NO_ROOM", direction)
 
         actual_entry = (entry_price + (spread_pts / 2.0)) if direction == "BUY" else (entry_price - (spread_pts / 2.0))
 
@@ -343,10 +371,6 @@ class TradeSimulator:
 
         effective_be = use_breakeven_override if use_breakeven_override is not None else bool(GLOBAL_PARAMS.use_breakeven)
 
-        # PROPOSED (2026-10-12 b): record the two sizing fields the profile
-        # replay needs. min_lot_cash_risk_usd is the dollar cost of a
-        # min-lot stop for this exact trade. sl_pips_at_entry is the
-        # stop distance in pips. Both are pure data — no behaviour change.
         _min_lot_cash_risk_usd = round(min_lots * risk_per_lot, 4)
         _sl_pips_at_entry = round(sl_dist / pip_size, 2) if pip_size > 0 else 0.0
 
@@ -808,9 +832,6 @@ class TradeSimulator:
 
         sast_date = pos["open_time"].astimezone(TZ_SAST).strftime("%Y-%m-%d")
 
-        # PROPOSED (2026-10-12 b): carry the two sizing fields and the
-        # pip_size forward so profile_replay can use them without
-        # re-reading price action.
         record = {
             "trade_id": pos["trade_id"],
             "date": pos["open_time"].strftime("%Y-%m-%d"),

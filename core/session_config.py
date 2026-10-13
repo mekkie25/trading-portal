@@ -7,6 +7,26 @@ CHANGES 2026-10-12
 ------------------
 - US30 blocked_hours_sast trimmed from [0,6,7,10,11,15,23] to [0,23].
 - All other pairs already used [0,23] (rollover only) and are unchanged.
+
+CHANGES 2026-10-13
+------------------
+- stop_distance_multiplier default changed from 1.5 to 1.0.
+
+  Historical context: the simulator (backtest/simulator.py) reads this value
+  and widens every structural stop by it before computing the R:R target.
+  With 1.5, GRUBBER_KICK's fixed 35-point stop became 52.5 points in every
+  backtest, AVWAP's swing stop was 50% wider, and every strategy's stop was
+  wider than what the live bot actually places. The live bot does not apply
+  this multiplier: engine/matrix.py sends stop_loss straight from
+  adapt_signal. That is a live-vs-backtest parity break.
+
+  Decision: set to 1.0 so both sides use the same stop distance. If you ever
+  want to re-enable this buffer, you must:
+    (a) re-enable it here,
+    (b) apply the same widening in engine/matrix.py at the same pipeline
+        position (after adapt_signal, before compute_fixed_target),
+    (c) note it in the AI brief and re-baseline every combination.
+  Until (b) is done, keep this at 1.0.
 """
 
 import sys
@@ -118,7 +138,8 @@ class StrategyParameters:
 
     max_spread_in_r: float = 0.05
 
-    stop_distance_multiplier: float = 1.5
+    # See module docstring. Keep at 1.0 unless you also patch engine/matrix.py.
+    stop_distance_multiplier: float = 1.0
     trail_after_1r_enabled: bool = False
 
     strat_always_htf_targets: List[str] = field(default_factory=lambda: [
