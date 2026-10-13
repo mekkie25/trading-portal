@@ -2,17 +2,17 @@
 trading-portal/strategies/strategy_manager.py
 Orchestrates institutional quantitative strategies across the 7 whitelisted assets,
 passing multi-timeframe market feeds (M5, H1, H4, D1) and selecting the highest-confidence
-setup among all permitted strategies (eliminating first-match short-circuiting).
+setup among all permitted strategies.
 
-BRIEF CHANGES (2026-10-12):
-- Added _apply_always_on_filters. Runs on every signal, live or backtest.
-  It enforces:
-    (a) SAST rollover/hour blackout per pair (blocked_hours_sast)
-    (b) HTF daily alignment for strat_always_htf_targets
-        (STRATEGY_513 and EMA_9_25_CROSS)
-    (c) A spread-in-R ceiling of max_spread_in_r for every strategy
-- The existing backtest-only post-filters (session window, min stop ATR,
-  disabled list, forced HTF, spread cap) are unchanged.
+STEP 1 (2026-10-13, diagnostics only):
+- _record_filter_skip records spread_in_r_value, sl_dist_at_reject,
+  structural_sl_pips on SPREAD_IN_R skips. Every other reason leaves them None.
+
+STEP 2 (2026-10-13, no behaviour change):
+- _SPREADS now loaded from config/spread_config.json through
+  core.spread_config.load_spreads(). The "filter_spread" field in the JSON
+  holds exactly the values this module used to hard-code, so decisions are
+  unchanged on the shipped config.
 """
 
 import os
@@ -37,24 +37,19 @@ try:
 except ImportError:
     from core.session_config import GLOBAL_PARAMS, TZ_SAST
 
-# MarketSessionManager is not exported by the virtual 'config.strategy_params'
-# alias, so it must come from core.session_config directly.
 from core.session_config import MarketSessionManager
+
+# STEP 1: pip sizes for the SPREAD_IN_R diagnostic.
+from core.pip_sizes import PIP_SIZES
+
+# STEP 2: single source of truth for spreads. Loads filter_spread (or spread)
+# from config/spread_config.json.
+from core.spread_config import load_spreads as _load_spreads
 
 log = logging.getLogger("StrategyManager")
 CONFIG_FILE = "bot_config.json"
 
-# Mirror of the spread table used by the simulator, so this module never has to
-# import from backtest.simulator (which would create a circular dependency).
-_SPREADS: Dict[str, float] = {
-    "GOLD": 0.30,
-    "US30": 2.50,
-    "NAS100": 1.50,
-    "GERMAN30": 1.80,
-    "EURUSD": 0.00010,
-    "USDJPY": 0.012,
-    "GBPUSD": 0.00014,
-}
+_SPREADS: Dict[str, float] = _load_spreads()
 
 
 class StrategyManager:
@@ -81,8 +76,6 @@ class StrategyManager:
 
     def __init__(self):
         self.error_count = 0
-        # One-row-per-candle list of signals blocked by filters. The runner
-        # drains this into the simulator's skipped list after every call.
         self.filter_skips: List[Dict[str, Any]] = []
         self.strategies = [
             GrubberKick(),
@@ -105,11 +98,6 @@ class StrategyManager:
         except Exception:
             return {}
 
-    # ------------------------------------------------------------------
-    # BRIEF item 6 + rollover blackout + spread ceiling.
-    # Runs on every signal, live AND backtest. Never skipped.
-    # ------------------------------------------------------------------
-
     def _apply_always_on_filters(
         self,
         signal: StrategySignal,
@@ -117,27 +105,20 @@ class StrategyManager:
         data_d1: pd.DataFrame,
         current_time: Any = None,
     ) -> Optional[str]:
-        """
-        Returns a skip-reason string when the signal must be dropped, or None
-        when it passes. This filter path never gets bypassed.
-        """
-        # 1. SAST rollover / hour blackout per pair.
+        # 1. Blocked hours (global map, unchanged in Step 2).
         try:
-            blocked, reason = MarketSessionManager.is_blocked_hour(
-                signal.symbol, current_time
-            )
+            blocked, reason = MarketSessionManager.is_blocked_hour(signal.symbol, current_time)
             if blocked:
                 return reason
         except Exception:
             pass
 
-        # 2. HTF alignment for the brief's two target strategies.
+        # 2. HTF alignment (global target list, unchanged in Step 2).
         htf_targets = set(getattr(GLOBAL_PARAMS, "strat_always_htf_targets", []) or [])
         if signal.strategy in htf_targets:
             try:
                 if data_d1 is not None and len(data_d1) >= 21:
                     closes = data_d1["close"].astype(float)
-                    # Drop the currently forming bar; use only closed bars.
                     closed = closes.iloc[:-1] if len(closes) > 20 else closes
                     if len(closed) >= 20:
                         ema20 = float(closed.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -150,7 +131,7 @@ class StrategyManager:
             except Exception:
                 pass
 
-        # 3. Spread-in-R ceiling for every strategy.
+        # 3. Spread-in-R ceiling (global value, unchanged in Step 2).
         max_spr = float(getattr(GLOBAL_PARAMS, "max_spread_in_r", 0.0) or 0.0)
         if max_spr > 0.0:
             try:
@@ -163,10 +144,6 @@ class StrategyManager:
 
         return None
 
-    # ------------------------------------------------------------------
-    # Backtest-only post-filters
-    # ------------------------------------------------------------------
-
     def _apply_post_filters(
         self,
         signal: StrategySignal,
@@ -174,20 +151,13 @@ class StrategyManager:
         data_d1: pd.DataFrame,
         current_time: Any = None,
     ) -> Optional[str]:
-        """
-        Backtest-only. Only runs for strategies listed in
-        GLOBAL_PARAMS.strat_filter_targets. Never runs unless the caller
-        explicitly requested filters (apply_strat_filters=True).
-        """
         targets = set(getattr(GLOBAL_PARAMS, "strat_filter_targets", []) or [])
         if signal.strategy not in targets:
             return None
 
-        # 1. Disabled list
         if signal.strategy in set(getattr(GLOBAL_PARAMS, "strat_disabled", []) or []):
             return "FILTER_DISABLED"
 
-        # 2. SAST session window
         window = getattr(GLOBAL_PARAMS, "strat_session_window_sast", None)
         if window:
             try:
@@ -205,7 +175,6 @@ class StrategyManager:
             except Exception:
                 pass
 
-        # 3. HTF trend filter (D1 close vs its 20 EMA, closed candles only)
         if bool(getattr(GLOBAL_PARAMS, "strat_htf_trend_filter", False)):
             try:
                 if data_d1 is not None and len(data_d1) >= 21:
@@ -222,7 +191,6 @@ class StrategyManager:
             except Exception:
                 pass
 
-        # 4. Minimum stop distance in ATR14(m5) units
         min_stop_atr = float(getattr(GLOBAL_PARAMS, "strat_min_stop_atr", 0.0) or 0.0)
         if min_stop_atr > 0.0 and data_5m is not None and len(data_5m) >= 15:
             try:
@@ -242,7 +210,6 @@ class StrategyManager:
             except Exception:
                 pass
 
-        # 5. Cost filter: spread / stop distance above threshold
         max_spread_r = float(getattr(GLOBAL_PARAMS, "strat_max_spread_in_r", 0.0) or 0.0)
         if max_spread_r > 0.0:
             try:
@@ -256,6 +223,28 @@ class StrategyManager:
         return None
 
     def _record_filter_skip(self, reason: str, signal: StrategySignal, current_time: Any) -> None:
+        """
+        STEP 1 (2026-10-13): on SPREAD_IN_R skips, capture
+            spread_in_r_value, sl_dist_at_reject, structural_sl_pips.
+        Every other reason leaves them None. Diagnostics-only.
+        """
+        spread_in_r_value: Optional[float] = None
+        sl_dist_at_reject: Optional[float] = None
+        structural_sl_pips: Optional[float] = None
+
+        if reason == "SPREAD_IN_R":
+            try:
+                spread = float(_SPREADS.get(signal.symbol, 0.0))
+                sl_dist = abs(float(signal.entry_price) - float(signal.stop_loss))
+                if sl_dist > 0.0:
+                    spread_in_r_value = round(spread / sl_dist, 6)
+                    sl_dist_at_reject = round(sl_dist, 6)
+                    pip = float(PIP_SIZES.get(signal.symbol, 0.0))
+                    if pip > 0.0:
+                        structural_sl_pips = round(sl_dist / pip, 2)
+            except Exception:
+                pass
+
         try:
             ts = pd.Timestamp(current_time if current_time is not None else pd.Timestamp.utcnow())
             if ts.tzinfo is None:
@@ -269,6 +258,9 @@ class StrategyManager:
                 "direction": signal.direction.upper(),
                 "reason": reason,
                 "hour_sast": int(sast.hour),
+                "spread_in_r_value": spread_in_r_value,
+                "sl_dist_at_reject": sl_dist_at_reject,
+                "structural_sl_pips": structural_sl_pips,
             })
         except Exception:
             pass
@@ -277,10 +269,6 @@ class StrategyManager:
         out = self.filter_skips
         self.filter_skips = []
         return out
-
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
 
     def evaluate_all(
         self,
@@ -317,12 +305,10 @@ class StrategyManager:
                 signal = strat.evaluate(symbol, data_5m, **kwargs)
 
                 if signal:
-                    # 1. Enforce strict asset boundary
                     permitted = self.STRATEGY_PERMITTED_ASSETS.get(signal.strategy, set())
                     if signal.symbol not in permitted:
                         continue
 
-                    # 2. Enforce 3-Way Mode Switch (LIVE | DRY_RUN | OFF)
                     mode = strategy_modes.get(signal.strategy, "LIVE")
                     if mode == "OFF":
                         continue
@@ -332,8 +318,6 @@ class StrategyManager:
                     else:
                         setattr(signal, "is_dry_run", False)
 
-                    # 3. Always-on filters (live + backtest): rollover, HTF,
-                    #    spread-in-R ceiling.
                     always_reason = self._apply_always_on_filters(
                         signal, data_5m, data_d1, current_time
                     )
@@ -341,7 +325,6 @@ class StrategyManager:
                         self._record_filter_skip(always_reason, signal, current_time)
                         continue
 
-                    # 4. Backtest-only post-filters
                     if apply_strat_filters and bool(getattr(GLOBAL_PARAMS, "strat_filters_backtest_only", True)):
                         reason = self._apply_post_filters(signal, data_5m, data_d1, current_time)
                         if reason is not None:
