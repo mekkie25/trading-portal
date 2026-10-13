@@ -1,285 +1,292 @@
 """
-core/pip_calculator.py
+trading-portal/core/session_config.py
+Institutional Quantitative Strategy Parameters, Session Timing & DST Management.
+Single Source of Truth for all quantitative parameters.
 
-Self-tuning per-(pair, strategy) minimum stop floor.
-
-Produces config/pip_calculator.json. Read by backtest/simulator.py and
-engine/matrix.py. The effective floor at runtime is:
-
-    effective_min_stop_pips = max(
-        GLOBAL_PARAMS.min_stop_pips[pair],
-        pip_calculator.min_sl_pips[pair][strategy],
-    )
-
-ALGORITHM (v2.0)
-
-  For each pair and strategy with >= MIN_TRADES trades:
-    base_sl_pips      = median of the actual stop distances (in pips)
-    post_sl_pips_med  = median of post_sl_cont_pips across losing trades
-    raw_floor         = max(base_sl_pips, FLOOR_FRACTION * post_sl_pips_med)
-    min_sl_pips       = min(raw_floor, MAX_FLOOR_MULTIPLE * base_sl_pips)
-
-  Where:
-    FLOOR_FRACTION     = 0.5  (only half the noise band, to be conservative)
-    MAX_FLOOR_MULTIPLE = 1.5  (never widen a stop by more than 50%)
-
-  Strategies under MIN_TRADES fall back to the pair-level value.
-  Pairs under MIN_TRADES are omitted entirely.
-
-WHY THIS VERSION IS STABLE
-
-  The previous formula used:
-    sl_factor = 1.0 + min(post_sl_R, MAX_WIDENING)
-    min_sl = base_sl * sl_factor
-  where post_sl_R = post_sl_cont_pips / base_sl_pips.
-
-  Expanding: min_sl = base_sl + post_sl_cont_pips.
-
-  That LOOKS stable, but the input post_sl_cont_pips is measured on trades
-  whose stops were set by the PREVIOUS run. Widening the stop changes the
-  sample, which changes post_sl_cont_pips, which changes min_sl again. On
-  the next run it widens further. This is the runaway behaviour observed in
-  the previous two runs.
-
-  v2.0 breaks the loop in two ways:
-    1. Uses raw pips, not R units, so the two inputs are dimensionally
-       independent.
-    2. Hard caps the widening at 1.5x. Even if the sample misbehaves, the
-       floor can only ever double-and-a-half the stop.
-
-  The formula_version field in the payload causes any stale v1.x payload
-  to be silently ignored by load_pip_calculator().
+CHANGES 2026-10-13
+------------------
+- stop_distance_multiplier default is 1.0 (was 1.5). Live and backtest now
+  place identical stops.
+- Added min_stop_pips: per-pair hardcoded minimum stop distance in pips.
+  Fixes FX stops that were inside the noise band. Combined with the
+  data-driven pip_calculator floor via core.pip_calculator.effective_min_stop_pips.
 """
 
-import os
-import json
-import statistics
-from typing import Dict, Any, List, Optional
+import sys
+import types
+from datetime import datetime, timezone, time
+from zoneinfo import ZoneInfo
+from typing import Tuple, Dict, Any, List, Optional
+from dataclasses import dataclass, field
 
 
-PIP_CALC_FORMULA_VERSION = "2.0"
-MIN_TRADES = 30
-FLOOR_FRACTION = 0.5
-MAX_FLOOR_MULTIPLE = 1.5
-OUTPUT_FILE = "pip_calculator.json"
+@dataclass
+class StrategyParameters:
+    adaptive_mode: bool = False
+    target_rr: float = 2.5
+    use_breakeven: bool = False
+    use_supertrend_trail: bool = True
+
+    base_risk_per_trade_pct: float = 1.0
+    max_risk_per_trade_pct: float = 2.0
+    consecutive_loss_threshold: int = 3
+    consecutive_loss_risk_pct: float = 0.5
+    max_daily_trades: int = 2
+    max_daily_loss_pct: float = 5.0
+    max_weekly_loss_pct: float = 10.0
+    max_monthly_loss_pct: float = 15.0
+    micro_account_mode: bool = False
+    micro_account_risk_pct: float = 25.0
+    require_cvd_absorption: bool = False
+    enable_sector_limit: bool = False
+    ai_overseer_enabled: bool = False
+    require_dxy_alignment: bool = True
+    daily_reset_hour_sast: int = 0
+
+    max_daily_loss_usd: float = 0.0
+    max_weekly_loss_usd: float = 0.0
+    max_monthly_loss_usd: float = 0.0
+
+    min_rr: float = 1.0
+    max_spread_to_sl_ratio: float = 0.30
+    min_risk_multiplier_floor: float = 0.25
+    min_lot_risk_tolerance: float = 1.5
+    adr_sl_ratios: dict = field(default_factory=lambda: {
+        "GOLD": (0.08, 0.20, 0.33),
+        "NAS100": (0.15, 0.22, 0.28),
+        "US30": (0.10, 0.15, 0.18),
+        "GERMAN30": (0.12, 0.20, 0.25),
+        "EURUSD": (0.15, 0.22, 0.30),
+        "GBPUSD": (0.15, 0.22, 0.30),
+        "USDJPY": (0.15, 0.22, 0.30),
+    })
+
+    nas100_stop_range: tuple = (35.0, 50.0, 60.0)
+    us30_stop_range: tuple = (30.0, 50.0, 50.0)
+    gold_stop_range_pips: tuple = (12.0, 40.0, 60.0)
+    spy_stop_range: tuple = (4.0, 5.0, 5.0)
+
+    asia_start_sast: str = "01:00"
+    asia_end_sast: str = "06:00"
+    london_open_hour_local: int = 8
+    ny_open_hour_local: int = 9
+    ny_open_minute_local: int = 30
+    opening_range_minutes: int = 15
+    cracker_or_minutes: int = 5
+
+    value_area_pct: float = 0.75
+    supertrend_atr_period: int = 10
+    supertrend_factor: float = 1.6
+    ema_fast_9: int = 9
+    ema_slow_25: int = 25
+    ema_fast_5: int = 5
+    ema_slow_13: int = 13
+    ema_trend_200: int = 200
+
+    skip_monday_trading: bool = False
+    reduce_friday_risk: bool = False
+    friday_risk_multiplier: float = 1.0
+
+    grubber_kick_fixed_sl: float = 35.0
+    pdh_pdl_liquidity_buffer_pts: float = 15.0
+    breakeven_trigger_ratio: float = 0.80
+    breakeven_trigger_r: float = 1.5
+
+    news_blackout_schedule: List[str] = field(default_factory=lambda: [
+        "2026-10-02 12:30",
+        "2026-10-14 12:30",
+        "2026-11-04 18:00",
+    ])
+
+    blocked_hours_sast: Dict[str, List[int]] = field(default_factory=lambda: {
+        "US30":     [0, 23],
+        "GOLD":     [0, 23],
+        "NAS100":   [0, 23],
+        "GERMAN30": [0, 23],
+        "EURUSD":   [0, 23],
+        "GBPUSD":   [0, 23],
+        "USDJPY":   [0, 23],
+    })
+
+    blocked_weekdays: Dict[str, List[int]] = field(default_factory=lambda: {
+        "US30":     [],
+        "GOLD":     [],
+        "NAS100":   [],
+        "GERMAN30": [],
+        "EURUSD":   [],
+        "GBPUSD":   [],
+        "USDJPY":   [],
+    })
+
+    max_spread_in_r: float = 0.05
+
+    stop_distance_multiplier: float = 1.0
+    trail_after_1r_enabled: bool = False
+
+    min_stop_pips: Dict[str, float] = field(default_factory=lambda: {
+        "GOLD":     1500.0,
+        "US30":     40.0,
+        "NAS100":   180.0,
+        "GERMAN30": 250.0,
+        "EURUSD":   20.0,
+        "GBPUSD":   25.0,
+        "USDJPY":   25.0,
+    })
+
+    strat_always_htf_targets: List[str] = field(default_factory=lambda: [
+        "STRATEGY_513",
+        "EMA_9_25_CROSS",
+    ])
+
+    strat_filters_backtest_only: bool = True
+    strat_filter_targets: List[str] = field(default_factory=lambda: [
+        "STRATEGY_513",
+        "AVWAP_200EMA_CONTINUATION",
+    ])
+    strat_disabled: List[str] = field(default_factory=list)
+    strat_session_window_sast: Optional[Tuple[int, int]] = None
+    strat_htf_trend_filter: bool = False
+    strat_min_stop_atr: float = 0.0
+    strat_max_spread_in_r: float = 0.0
 
 
-def _config_path() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.abspath(os.path.join(here, ".."))
-    return os.path.join(root, "config", OUTPUT_FILE)
+GLOBAL_PARAMS = StrategyParameters()
+
+if 'config' not in sys.modules:
+    _cfg = types.ModuleType('config')
+    _sp = types.ModuleType('config.strategy_params')
+    _sp.GLOBAL_PARAMS = GLOBAL_PARAMS
+    _sp.StrategyParameters = StrategyParameters
+    _cfg.strategy_params = _sp
+    sys.modules['config'] = _cfg
+    sys.modules['config.strategy_params'] = _sp
 
 
-def _safe_median(values: List[float]) -> Optional[float]:
-    vals = [v for v in values if v is not None and v > 0]
-    if not vals:
-        return None
-    try:
-        return float(statistics.median(vals))
-    except Exception:
-        return None
+TZ_SAST = ZoneInfo("Africa/Johannesburg")
+TZ_LONDON = ZoneInfo("Europe/London")
+TZ_NEWYORK = ZoneInfo("America/New_York")
+TZ_UTC = ZoneInfo("UTC")
 
 
-def _sl_pips(trade: Dict[str, Any]) -> Optional[float]:
-    """Structural stop distance of the trade, in pips."""
-    try:
-        entry = float(trade.get("entry_price", 0.0))
-        sl = float(trade.get("sl", 0.0))
-        pip = float(trade.get("pip_size", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return None
-    if pip <= 0 or entry <= 0:
-        return None
-    dist = abs(entry - sl)
-    if dist <= 0:
-        return None
-    return dist / pip
+class MarketSessionManager:
+    @staticmethod
+    def get_current_times(dt_utc: datetime = None) -> Dict[str, datetime]:
+        if dt_utc is None:
+            dt_utc = datetime.now(timezone.utc)
+        elif dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        return {
+            "UTC": dt_utc,
+            "SAST": dt_utc.astimezone(TZ_SAST),
+            "LONDON": dt_utc.astimezone(TZ_LONDON),
+            "NEWYORK": dt_utc.astimezone(TZ_NEWYORK),
+        }
 
+    @classmethod
+    def is_in_asia_session(cls, dt_utc: datetime = None) -> bool:
+        times = cls.get_current_times(dt_utc)
+        t_sast = times["SAST"].time()
+        return time(1, 0) <= t_sast < time(6, 0)
 
-def _post_sl_pips(trade: Dict[str, Any]) -> Optional[float]:
-    """Post-stop continuation distance, in pips. Only meaningful on losses."""
-    if trade.get("result") != "LOSS":
-        return None
-    cont = trade.get("post_sl_cont_pips")
-    if cont is None:
-        return None
-    try:
-        v = float(cont)
-    except (TypeError, ValueError):
-        return None
-    return v if v >= 0 else None
+    @classmethod
+    def is_in_london_open(cls, dt_utc: datetime = None) -> bool:
+        times = cls.get_current_times(dt_utc)
+        t_london = times["LONDON"].time()
+        return time(8, 0) <= t_london <= time(10, 0)
 
+    @classmethod
+    def is_in_london_fix(cls, dt_utc: datetime = None) -> bool:
+        times = cls.get_current_times(dt_utc)
+        t_london = times["LONDON"].time()
+        return time(10, 25) <= t_london <= time(10, 45)
 
-def _compute_for_group(trades: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
-    sl_list: List[float] = []
-    post_sl_pips_list: List[float] = []
+    @classmethod
+    def is_in_ny_open(cls, dt_utc: datetime = None) -> bool:
+        times = cls.get_current_times(dt_utc)
+        t_ny = times["NEWYORK"].time()
+        return time(9, 30) <= t_ny <= time(11, 0)
 
-    for t in trades:
-        slp = _sl_pips(t)
-        if slp is not None:
-            sl_list.append(slp)
-        cont = _post_sl_pips(t)
-        if cont is not None:
-            post_sl_pips_list.append(cont)
+    @classmethod
+    def is_in_ny_cracker_window(cls, dt_utc: datetime = None) -> bool:
+        times = cls.get_current_times(dt_utc)
+        t_ny = times["NEWYORK"].time()
+        return time(9, 30) <= t_ny <= time(10, 30)
 
-    base_sl = _safe_median(sl_list)
-    if base_sl is None or base_sl <= 0:
-        return None
+    @classmethod
+    def is_post_asia_grubber_window(cls, dt_utc: datetime = None) -> bool:
+        times = cls.get_current_times(dt_utc)
+        t_sast = times["SAST"].time()
+        return time(6, 0) <= t_sast < time(21, 0)
 
-    post_sl_pips_med = _safe_median(post_sl_pips_list) or 0.0
+    @classmethod
+    def is_blackout_active(cls, dt_utc: datetime = None, blackout_minutes: int = 15) -> Tuple[bool, str]:
+        if dt_utc is None:
+            dt_utc = datetime.now(timezone.utc)
+        elif dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
 
-    raw_floor = max(base_sl, FLOOR_FRACTION * post_sl_pips_med)
-    capped_floor = min(raw_floor, MAX_FLOOR_MULTIPLE * base_sl)
+        for ts_str in GLOBAL_PARAMS.news_blackout_schedule:
+            try:
+                target_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                delta_sec = abs((dt_utc - target_dt).total_seconds())
+                if delta_sec <= (blackout_minutes * 60):
+                    return True, f"Scheduled Macro Blackout: {ts_str} UTC"
+            except Exception:
+                continue
 
-    # Kept for the UI. post_sl_R is a diagnostic ratio; sl_factor is the
-    # actual widening factor applied.
-    post_sl_R = (post_sl_pips_med / base_sl) if base_sl > 0 else 0.0
-    sl_factor = (capped_floor / base_sl) if base_sl > 0 else 1.0
+        weekday = dt_utc.weekday()
+        day = dt_utc.day
+        hour = dt_utc.hour
+        minute = dt_utc.minute
 
-    return {
-        "base_sl_pips": round(base_sl, 2),
-        "post_sl_R": round(post_sl_R, 3),
-        "post_sl_cont_pips_median": round(post_sl_pips_med, 2),
-        "sl_factor": round(sl_factor, 3),
-        "min_sl_pips": round(capped_floor, 2),
-        "sample_trades": len(trades),
-    }
+        if weekday == 4 and day <= 7:
+            if hour == 12 and 20 <= minute <= 45:
+                return True, "NFP First-Friday Macro Blackout (12:30 UTC)"
 
+        if 10 <= day <= 16 and weekday in (1, 2, 3, 4):
+            if hour == 12 and 20 <= minute <= 45:
+                return True, "US CPI Release Macro Blackout (12:30 UTC)"
 
-def build_pip_calculator(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    trades: a flat list of every trade from every pair, each with symbol,
-    strategy, result, entry_price, sl, pip_size, post_sl_cont_pips.
-    """
-    by_pair: Dict[str, List[Dict[str, Any]]] = {}
-    by_pair_strat: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        if weekday == 2 and ((hour == 17 and minute >= 50) or (hour == 18 and minute <= 20)):
+            return True, "FOMC Interest Rate Decision Blackout (18:00 UTC)"
 
-    for t in trades:
-        if not isinstance(t, dict):
-            continue
-        pair = str(t.get("symbol", "")).upper()
-        strat = str(t.get("strategy", "UNKNOWN"))
-        if not pair:
-            continue
-        by_pair.setdefault(pair, []).append(t)
-        by_pair_strat.setdefault(pair, {}).setdefault(strat, []).append(t)
+        return False, ""
 
-    out: Dict[str, Any] = {
-        "formula_version": PIP_CALC_FORMULA_VERSION,
-        "floor_fraction": FLOOR_FRACTION,
-        "max_floor_multiple": MAX_FLOOR_MULTIPLE,
-        "min_trades": MIN_TRADES,
-        "pairs": {},
-    }
+    @classmethod
+    def get_day_of_week_policy(cls, dt_utc: datetime = None) -> Tuple[bool, float, str]:
+        times = cls.get_current_times(dt_utc)
+        wd = times["SAST"].weekday()
 
-    for pair, pair_trades in by_pair.items():
-        pair_level = _compute_for_group(pair_trades)
-        pair_entry: Dict[str, Any] = {"pair_level": pair_level, "strategies": {}}
+        if wd == 0:
+            if GLOBAL_PARAMS.skip_monday_trading:
+                return False, 0.0, "Monday Trading Blocked via Policy"
+            return True, 0.5, "Monday Reduced Risk (50% Size)"
+        if wd == 1:
+            return True, 1.0, "Tuesday Normal Trading"
+        if wd == 2:
+            return True, 1.0, "Wednesday Normal Trading"
+        if wd == 3:
+            return True, 0.5, "Thursday Reduced Risk (50% Size)"
+        if wd == 4:
+            return True, 1.0, "Friday Normal Trading"
+        return True, 1.0, "Weekend"
 
-        for strat, s_trades in by_pair_strat[pair].items():
-            if len(s_trades) >= MIN_TRADES:
-                entry = _compute_for_group(s_trades)
-                if entry:
-                    entry["source"] = "per_strategy"
-                    pair_entry["strategies"][strat] = entry
-            else:
-                if pair_level:
-                    fallback = dict(pair_level)
-                    fallback["source"] = "pair_fallback"
-                    fallback["strategy_sample_trades"] = len(s_trades)
-                    pair_entry["strategies"][strat] = fallback
+    @classmethod
+    def is_blocked_hour(cls, symbol: str, dt_utc: datetime = None) -> Tuple[bool, str]:
+        times = cls.get_current_times(dt_utc)
+        hour_sast = times["SAST"].hour
+        blocked = getattr(GLOBAL_PARAMS, "blocked_hours_sast", {}) or {}
+        hours = blocked.get(symbol.upper(), [])
+        if hour_sast in hours:
+            return True, f"BLOCKED_HOUR_{hour_sast:02d}_SAST"
+        return False, ""
 
-        if pair_level or pair_entry["strategies"]:
-            out["pairs"][pair] = pair_entry
-
-    return out
-
-
-def write_pip_calculator(trades: List[Dict[str, Any]]) -> bool:
-    try:
-        payload = build_pip_calculator(trades)
-        path = _config_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, path)
-        return True
-    except Exception as e:
-        print(f"[pip_calculator] write failed: {e}", flush=True)
-        return False
-
-
-def load_pip_calculator() -> Optional[Dict[str, Any]]:
-    """
-    Returns the payload only if it matches the current formula version.
-    A stale v1.x payload is silently ignored (returns None), so a
-    transition deploy will not apply the old unstable floors.
-    """
-    path = _config_path()
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception:
-        return None
-    if payload.get("formula_version") != PIP_CALC_FORMULA_VERSION:
-        print(
-            f"[pip_calculator] ignoring stale payload "
-            f"(found {payload.get('formula_version')}, "
-            f"expected {PIP_CALC_FORMULA_VERSION})",
-            flush=True,
-        )
-        return None
-    return payload
-
-
-def min_sl_pips_for(
-    payload: Optional[Dict[str, Any]],
-    pair: str,
-    strategy: str,
-) -> Optional[float]:
-    if not payload:
-        return None
-    if payload.get("formula_version") != PIP_CALC_FORMULA_VERSION:
-        return None
-    try:
-        pair_block = (payload.get("pairs") or {}).get(pair.upper())
-        if not pair_block:
-            return None
-        strat_block = (pair_block.get("strategies") or {}).get(strategy)
-        if strat_block and strat_block.get("min_sl_pips"):
-            return float(strat_block["min_sl_pips"])
-        pl = pair_block.get("pair_level")
-        if pl and pl.get("min_sl_pips"):
-            return float(pl["min_sl_pips"])
-    except Exception:
-        return None
-    return None
-
-
-def effective_min_stop_pips(
-    symbol: str,
-    strategy: str,
-    pip_calc_payload: Optional[Dict[str, Any]] = None,
-) -> float:
-    """
-    Combined floor used by both the simulator and the live execution engine:
-
-        max( GLOBAL_PARAMS.min_stop_pips[symbol], pip_calc.min_sl_pips )
-
-    Returns 0.0 when neither source provides a value.
-    """
-    hardcoded = 0.0
-    try:
-        from core.session_config import GLOBAL_PARAMS
-        hardcoded = float(
-            (getattr(GLOBAL_PARAMS, "min_stop_pips", {}) or {})
-            .get(symbol.upper(), 0.0) or 0.0
-        )
-    except Exception:
-        hardcoded = 0.0
-
-    data_driven = min_sl_pips_for(pip_calc_payload, symbol, strategy) or 0.0
-    return max(hardcoded, data_driven)
+    @classmethod
+    def is_blocked_weekday(cls, symbol: str, dt_utc: datetime = None) -> Tuple[bool, str]:
+        times = cls.get_current_times(dt_utc)
+        wd = times["SAST"].weekday()
+        blocked = getattr(GLOBAL_PARAMS, "blocked_weekdays", {}) or {}
+        days = blocked.get(symbol.upper(), [])
+        if wd in days:
+            return True, f"BLOCKED_WEEKDAY_{wd}"
+        return False, ""
