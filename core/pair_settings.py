@@ -2,15 +2,21 @@
 core/pair_settings.py
 Per-pair, per-strategy settings: loader and applier.
 
-Defaults reproduce today's behaviour exactly: every strategy enabled, no
-time window, no weekday filter, no stop-size bounds, no spread cap, no R:R
-override, no break-even override, no daily-cap override.
+Defaults reproduce today's behaviour exactly. Missing or null fields fall
+back to the globals in GLOBAL_PARAMS.
 
-Nothing in this file is part of the backtest signal cache hash. The JSON
-file it reads is also not part of the hash, so editing the settings does
-not cold-start the cache.
-
-PROPOSED.
+STEP 3 (2026-10-13):
+- Pair-level: max_spread_in_r, blocked_hours_sast.
+- Strategy-level: always_htf_enabled.
+- Resolution priority:
+    max_spread_in_r    : strategy > pair > GLOBAL_PARAMS.max_spread_in_r
+    always_htf_enabled : strategy value if not None, else membership in
+                         GLOBAL_PARAMS.strat_always_htf_targets
+    blocked_hours_sast : pair value if not None, else
+                         GLOBAL_PARAMS.blocked_hours_sast[pair]
+- Live (engine/matrix.py) and backtest (backtest/runner.py) both call these
+  resolvers through StrategyManager.evaluate_all, so tuned values apply
+  identically in both.
 """
 
 import os
@@ -19,10 +25,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 try:
-    from core.session_config import TZ_SAST
+    from core.session_config import TZ_SAST, GLOBAL_PARAMS
 except ImportError:
     from zoneinfo import ZoneInfo
     TZ_SAST = ZoneInfo("Africa/Johannesburg")
+    GLOBAL_PARAMS = None
 
 
 WHITELIST_PAIRS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"]
@@ -38,7 +45,6 @@ STRATEGY_NAMES = [
     "OES_4H_ORDER_BLOCK",
 ]
 
-# Half-open [start_hour, end_hour) on the SAST clock.
 SESSION_BLOCKS: Dict[str, Tuple[int, int]] = {
     "ASIA":         (1, 6),
     "LONDON":       (8, 15),
@@ -57,6 +63,7 @@ DEFAULT_STRATEGY_SETTINGS: Dict[str, Any] = {
     "rr": None,
     "be_enabled": None,
     "max_daily_trades": None,
+    "always_htf_enabled": None,
 }
 
 
@@ -68,6 +75,8 @@ def _blank_pair_settings() -> Dict[str, Any]:
     return {
         "live_enabled": True,
         "risk_pct": None,
+        "max_spread_in_r": None,
+        "blocked_hours_sast": None,
         "strategies": {s: _blank_strategy_settings() for s in STRATEGY_NAMES},
     }
 
@@ -94,6 +103,8 @@ def _merge_pair(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     out = {
         "live_enabled": override.get("live_enabled", base["live_enabled"]),
         "risk_pct": override.get("risk_pct", base["risk_pct"]),
+        "max_spread_in_r": override.get("max_spread_in_r", base["max_spread_in_r"]),
+        "blocked_hours_sast": override.get("blocked_hours_sast", base["blocked_hours_sast"]),
         "strategies": {},
     }
     strat_overrides = override.get("strategies") or {}
@@ -114,7 +125,6 @@ def normalise_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def load_pair_settings(path: Optional[str] = None) -> Dict[str, Any]:
-    """Reads config/pair_settings.json. Missing/unreadable => defaults."""
     if path is None:
         path = _settings_path()
     if not os.path.exists(path):
@@ -171,6 +181,75 @@ def get_pair_settings(settings: Dict[str, Any], pair: str) -> Dict[str, Any]:
     return block
 
 
+def resolve_max_spread_in_r(
+    settings: Dict[str, Any],
+    pair: str,
+    strategy: str,
+    global_default: Optional[float],
+) -> Optional[float]:
+    """
+    Priority: strategy-level > pair-level > global_default.
+    Returns global_default if all three are None.
+    """
+    strat_s = get_strategy_settings(settings, pair, strategy)
+    v = strat_s.get("max_spread_in_r")
+    if v is not None:
+        try:
+            fv = float(v)
+            return fv if fv > 0 else None
+        except (TypeError, ValueError):
+            pass
+    pair_s = get_pair_settings(settings, pair)
+    v = pair_s.get("max_spread_in_r")
+    if v is not None:
+        try:
+            fv = float(v)
+            return fv if fv > 0 else None
+        except (TypeError, ValueError):
+            pass
+    return global_default
+
+
+def resolve_always_htf_enabled(
+    settings: Dict[str, Any],
+    pair: str,
+    strategy: str,
+    global_targets: Optional[list],
+) -> bool:
+    """
+    If strategy-level always_htf_enabled is not None, it wins.
+    Otherwise: true iff strategy is in global_targets.
+    """
+    strat_s = get_strategy_settings(settings, pair, strategy)
+    v = strat_s.get("always_htf_enabled")
+    if v is not None:
+        return bool(v)
+    if global_targets is None:
+        return False
+    return strategy in set(global_targets)
+
+
+def resolve_blocked_hours(
+    settings: Dict[str, Any],
+    pair: str,
+    global_map: Optional[Dict[str, list]],
+) -> list:
+    """
+    Pair-level blocked_hours_sast overrides the global map when not None.
+    Empty list means no hours blocked for that pair.
+    """
+    pair_s = get_pair_settings(settings, pair)
+    v = pair_s.get("blocked_hours_sast")
+    if v is not None:
+        try:
+            return [int(h) for h in v]
+        except (TypeError, ValueError):
+            return []
+    if global_map is None:
+        return []
+    return list(global_map.get(pair.upper(), []))
+
+
 def _resolve_session_hours(window: Any) -> Optional[Tuple[int, int]]:
     if window is None:
         return None
@@ -196,10 +275,6 @@ def passes_signal_filters(
     atr14: float,
     spread: float,
 ) -> Tuple[bool, str]:
-    """
-    Returns (True, "") if the signal may open, (False, reason) if not.
-    Never raises.
-    """
     try:
         if not bool(strategy_settings.get("enabled", True)):
             return False, "SETTING_DISABLED"
@@ -288,7 +363,7 @@ def get_effective_be(strategy_settings: Dict[str, Any], default_be: bool) -> boo
 def get_effective_max_daily(strategy_settings: Dict[str, Any], default_max: int) -> Optional[int]:
     v = strategy_settings.get("max_daily_trades")
     if v is None:
-        return None  # caller uses its own default
+        return None
     try:
         return int(v)
     except (TypeError, ValueError):

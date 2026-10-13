@@ -1,18 +1,13 @@
 """
 trading-portal/strategies/strategy_manager.py
-Orchestrates institutional quantitative strategies across the 7 whitelisted assets,
-passing multi-timeframe market feeds (M5, H1, H4, D1) and selecting the highest-confidence
-setup among all permitted strategies.
+Orchestrates strategies across the 7 whitelisted assets.
 
-STEP 1 (2026-10-13, diagnostics only):
-- _record_filter_skip records spread_in_r_value, sl_dist_at_reject,
-  structural_sl_pips on SPREAD_IN_R skips. Every other reason leaves them None.
+STEP 1: diagnostics on SPREAD_IN_R skips.
+STEP 2: spreads loaded from config/spread_config.json.
+STEP 3: per-pair and per-strategy overrides via core.pair_settings.
 
-STEP 2 (2026-10-13, no behaviour change):
-- _SPREADS now loaded from config/spread_config.json through
-  core.spread_config.load_spreads(). The "filter_spread" field in the JSON
-  holds exactly the values this module used to hard-code, so decisions are
-  unchanged on the shipped config.
+Live (engine/matrix.py) and backtest (backtest/runner.py) both call
+StrategyManager.evaluate_all, so tuned values apply identically.
 """
 
 import os
@@ -38,13 +33,15 @@ except ImportError:
     from core.session_config import GLOBAL_PARAMS, TZ_SAST
 
 from core.session_config import MarketSessionManager
-
-# STEP 1: pip sizes for the SPREAD_IN_R diagnostic.
 from core.pip_sizes import PIP_SIZES
-
-# STEP 2: single source of truth for spreads. Loads filter_spread (or spread)
-# from config/spread_config.json.
 from core.spread_config import load_spreads as _load_spreads
+
+from core.pair_settings import (
+    load_pair_settings as _load_pair_settings,
+    resolve_max_spread_in_r as _resolve_max_spread_in_r,
+    resolve_always_htf_enabled as _resolve_always_htf_enabled,
+    resolve_blocked_hours as _resolve_blocked_hours,
+)
 
 log = logging.getLogger("StrategyManager")
 CONFIG_FILE = "bot_config.json"
@@ -77,6 +74,10 @@ class StrategyManager:
     def __init__(self):
         self.error_count = 0
         self.filter_skips: List[Dict[str, Any]] = []
+        try:
+            self._pair_settings_cache: Dict[str, Any] = _load_pair_settings()
+        except Exception:
+            self._pair_settings_cache = {"pairs": {}}
         self.strategies = [
             GrubberKick(),
             Strategy513(),
@@ -105,17 +106,37 @@ class StrategyManager:
         data_d1: pd.DataFrame,
         current_time: Any = None,
     ) -> Optional[str]:
-        # 1. Blocked hours (global map, unchanged in Step 2).
+        # 1. Blocked hours, per pair.
         try:
-            blocked, reason = MarketSessionManager.is_blocked_hour(signal.symbol, current_time)
-            if blocked:
-                return reason
+            blocked_hours = _resolve_blocked_hours(
+                self._pair_settings_cache,
+                signal.symbol,
+                getattr(GLOBAL_PARAMS, "blocked_hours_sast", None),
+            )
+            if current_time is not None:
+                ts = pd.Timestamp(current_time)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                sast_hour = ts.tz_convert(TZ_SAST).hour
+                if sast_hour in blocked_hours:
+                    return f"BLOCKED_HOUR_{sast_hour:02d}_SAST"
         except Exception:
             pass
 
-        # 2. HTF alignment (global target list, unchanged in Step 2).
-        htf_targets = set(getattr(GLOBAL_PARAMS, "strat_always_htf_targets", []) or [])
-        if signal.strategy in htf_targets:
+        # 2. HTF alignment.
+        try:
+            global_targets = getattr(GLOBAL_PARAMS, "strat_always_htf_targets", None)
+            htf_on = _resolve_always_htf_enabled(
+                self._pair_settings_cache,
+                signal.symbol,
+                signal.strategy,
+                global_targets,
+            )
+        except Exception:
+            htf_on = signal.strategy in set(
+                getattr(GLOBAL_PARAMS, "strat_always_htf_targets", []) or []
+            )
+        if htf_on:
             try:
                 if data_d1 is not None and len(data_d1) >= 21:
                     closes = data_d1["close"].astype(float)
@@ -131,9 +152,17 @@ class StrategyManager:
             except Exception:
                 pass
 
-        # 3. Spread-in-R ceiling (global value, unchanged in Step 2).
-        max_spr = float(getattr(GLOBAL_PARAMS, "max_spread_in_r", 0.0) or 0.30)
-        if max_spr > 0.0:
+        # 3. Spread-in-R ceiling.
+        try:
+            max_spr = _resolve_max_spread_in_r(
+                self._pair_settings_cache,
+                signal.symbol,
+                signal.strategy,
+                getattr(GLOBAL_PARAMS, "max_spread_in_r", None),
+            )
+        except Exception:
+            max_spr = getattr(GLOBAL_PARAMS, "max_spread_in_r", None)
+        if max_spr is not None and max_spr > 0.0:
             try:
                 spread = _SPREADS.get(signal.symbol, 0.0)
                 sl_dist = abs(float(signal.entry_price) - float(signal.stop_loss))
@@ -223,11 +252,6 @@ class StrategyManager:
         return None
 
     def _record_filter_skip(self, reason: str, signal: StrategySignal, current_time: Any) -> None:
-        """
-        STEP 1 (2026-10-13): on SPREAD_IN_R skips, capture
-            spread_in_r_value, sl_dist_at_reject, structural_sl_pips.
-        Every other reason leaves them None. Diagnostics-only.
-        """
         spread_in_r_value: Optional[float] = None
         sl_dist_at_reject: Optional[float] = None
         structural_sl_pips: Optional[float] = None
