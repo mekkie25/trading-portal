@@ -8,15 +8,9 @@ import { spawn, ChildProcess } from 'child_process';
 import { METRIC_DESCRIPTIONS, describe } from './shared/metricDescriptions';
 
 // =============================================================================
-// AI-FRIENDLY EXPORT (2026-10-12)
-// -----------------------------------------------------------------------------
-// Default sample size per pair for backtest_sample.csv. Overridable via
-// GET /api/backtest/export-zip?sample=N or /api/backtest/export.txt?sample=N.
-// Setting it to 0 falls back to the full ledger dump.
+// AI-FRIENDLY EXPORT
 // =============================================================================
 const SAMPLE_TRADES_PER_PAIR = 30;
-
-// A pair summary older than this is marked [STALE] in the export.
 const STALE_SUMMARY_HOURS = 24;
 
 interface BotGatewayConfig {
@@ -110,6 +104,9 @@ const OPTIMIZER_STATUS_FILE = path.join(BACKTEST_DATA_DIR, 'optimizer_status.jso
 const OPTIMIZER_SUMMARY_TXT = path.join(BACKTEST_OUTPUT_DIR, 'optimizer_summary.txt');
 const OPTIMIZER_SUMMARY_JSON = path.join(BACKTEST_OUTPUT_DIR, 'optimizer_summary.json');
 
+// -----------------------------------------------------------------------------
+// STRATEGY RESEARCH state (existing mode, untouched)
+// -----------------------------------------------------------------------------
 let backtestRunning = false;
 let backtestProgress = '';
 let backtestLastError: string | null = null;
@@ -133,6 +130,22 @@ let optimizerRunning = false;
 let optimizerProgress = '';
 let optimizerLastError: string | null = null;
 let optimizerProcess: ChildProcess | null = null;
+
+// -----------------------------------------------------------------------------
+// LIVE BOT REPLAY state (new mode)
+// -----------------------------------------------------------------------------
+let liveSimRunning = false;
+let liveSimProgress = '';
+let liveSimLastError: string | null = null;
+let liveSimProcess: ChildProcess | null = null;
+let liveSimLastParams: {
+  symbols: string[];
+  days: number;
+  balance: number;
+  currency: string;
+  zarRate: number;
+  profile: string;
+} | null = null;
 
 let activeBotConfig: BotGatewayConfig = {
   masterExecution: true, riskPerTradePct: 1.0, minRr: 3.0, adaptiveMode: false,
@@ -1230,6 +1243,9 @@ async function startServer() {
     next();
   });
 
+  // ---------------------------------------------------------------------------
+  // MARKET / POSITION endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.get('/api/market/candles', (req, res) => {
     try {
       const symbol = String(req.query.symbol || 'US30').toUpperCase();
@@ -1245,6 +1261,9 @@ async function startServer() {
     catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
+  // ---------------------------------------------------------------------------
+  // STRATEGY RESEARCH endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.get('/api/backtest/descriptions', (_req, res) => res.status(200).json({ status: 'success', data: METRIC_DESCRIPTIONS }));
   app.get('/api/backtest/export-data', (_req, res) => {
     try { res.status(200).json({ status: 'success', data: generateExportDataPayload() }); }
@@ -1425,6 +1444,9 @@ async function startServer() {
     res.status(200).json({ status: 'success', message: 'Strategy Lab started.' });
   });
 
+  // ---------------------------------------------------------------------------
+  // OPTIMIZER endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.post('/api/backtest/optimize', (req, res) => {
     if (optimizerRunning) return res.status(409).json({ status: 'error', message: 'Optimizer already running.' });
     if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is running. Wait for it to finish before starting the optimizer.' });
@@ -1491,6 +1513,9 @@ async function startServer() {
     res.status(200).json({ status: 'success', message: 'Optimizer stopped.' });
   });
 
+  // ---------------------------------------------------------------------------
+  // COMPARE endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.post('/api/backtest/compare', (req, res) => {
     if (compareRunning) return res.status(409).json({ error: 'Comparison already running.' });
     if (backtestRunning) return res.status(409).json({ error: 'A backtest is running. Wait for it to finish.' });
@@ -1544,6 +1569,9 @@ async function startServer() {
     res.status(200).json({ status: 'success' });
   });
 
+  // ---------------------------------------------------------------------------
+  // STRATEGY RESEARCH run endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.post('/api/backtest/run', (req, res) => {
     if (backtestRunning) return res.status(409).json({ status: 'error', message: 'A backtest is already running.' });
     const memCheck = checkContainerMemory();
@@ -1553,7 +1581,6 @@ async function startServer() {
     if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
     const days = parseInt(req.body?.days || '60', 10);
 
-    // 2026-10-14: new starting-balance, currency, ZAR rate and profile params.
     const balanceRaw = parseFloat(String(req.body?.balance ?? '1000'));
     const currency = String(req.body?.currency || 'USD').toUpperCase();
     const zarRateRaw = parseFloat(String(req.body?.zarRate ?? '18'));
@@ -1660,6 +1687,9 @@ async function startServer() {
     res.status(200).json({ status: 'success' });
   });
 
+  // ---------------------------------------------------------------------------
+  // STORAGE endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.get('/api/backtest/storage', (_req, res) => {
     try {
       const volPath = storageBase || process.cwd();
@@ -1686,6 +1716,9 @@ async function startServer() {
     } catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
+  // ---------------------------------------------------------------------------
+  // JOURNAL / BOT / LIMITS / BROKER endpoints (untouched)
+  // ---------------------------------------------------------------------------
   app.get('/api/journal', async (_req, res) => {
     try { const diskTrades = loadTradesFromDisk(); activeBrokerTelemetry.trades = diskTrades; res.status(200).json(diskTrades); }
     catch { res.status(500).json({ error: "Failed to fetch journal entries" }); }
@@ -1725,6 +1758,9 @@ async function startServer() {
   app.get('/api/broker/telemetry', (_req, res) => { recomputeRiskState(); res.json({ status: 'success', data: activeBrokerTelemetry }); });
   app.post('/api/broker/telemetry', (req, res) => { activeBrokerTelemetry = { ...activeBrokerTelemetry, ...req.body, lastHeartbeat: new Date().toISOString() }; res.json({ status: 'success', data: activeBrokerTelemetry, activeBotConfig }); });
 
+  // ---------------------------------------------------------------------------
+  // Python bot launcher (untouched)
+  // ---------------------------------------------------------------------------
   function launchPythonBot() {
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
     const bot = spawn(pythonCmd, ['engine/matrix.py'], { env: { ...process.env, PYTHONPATH: process.cwd() }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -1770,6 +1806,9 @@ async function startServer() {
   }
   launchPythonBot();
 
+  // ---------------------------------------------------------------------------
+  // SPREAD CONFIG (untouched)
+  // ---------------------------------------------------------------------------
   const SPREAD_CONFIG_FILE = path.join(process.cwd(), 'config', 'spread_config.json');
 
   app.get('/api/backtest/spread-config', (_req, res) => {
@@ -1839,10 +1878,181 @@ async function startServer() {
     }
   });
 
+  // ===========================================================================
+  // LIVE BOT REPLAY endpoints (NEW)
+  // ===========================================================================
+  // POST /api/backtest/live-sim          — spawn the Python replay
+  // GET  /api/backtest/live-sim/status   — poll progress
+  // GET  /api/backtest/live-sim/report   — fetch the JSON report
+  // POST /api/backtest/live-sim/stop     — kill the process
+  // ===========================================================================
+
+  app.post('/api/backtest/live-sim', (req, res) => {
+    if (liveSimRunning) {
+      return res.status(409).json({ status: 'error', message: 'A live bot replay is already running.' });
+    }
+    if (backtestRunning) {
+      return res.status(409).json({
+        status: 'error',
+        message: 'A Strategy Research backtest is running. Wait for it to finish, or let it complete so the precompute caches exist.',
+      });
+    }
+    const memCheck = checkContainerMemory();
+    if (!memCheck.ok) {
+      return res.status(503).json({ status: 'error', message: memCheck.reason });
+    }
+
+    const requested: any = req.body?.symbols ?? req.body?.symbol ?? WHITELIST_ASSETS;
+    const symbolsArray: string[] = Array.isArray(requested)
+      ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean)
+      : String(requested).toUpperCase() === 'ALL'
+        ? [...WHITELIST_ASSETS]
+        : [String(requested).toUpperCase()];
+    if (symbolsArray.length === 0) {
+      return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
+    }
+
+    const days = parseInt(String(req.body?.days ?? '365'), 10);
+    const safeDays = Number.isFinite(days) && days > 0 ? days : 365;
+
+    const balanceRaw = parseFloat(String(req.body?.balance ?? '170'));
+    const safeBalance = Number.isFinite(balanceRaw) && balanceRaw >= 1 ? balanceRaw : 170;
+
+    const currency = String(req.body?.currency || 'USD').toUpperCase();
+    const safeCurrency = (currency === 'ZAR') ? 'ZAR' : 'USD';
+
+    const zarRateRaw = parseFloat(String(req.body?.zarRate ?? '18'));
+    const safeZarRate = Number.isFinite(zarRateRaw) && zarRateRaw > 0 ? zarRateRaw : 18;
+
+    const profile = String(req.body?.profile || 'Max Growth');
+
+    liveSimLastParams = {
+      symbols: symbolsArray,
+      days: safeDays,
+      balance: safeBalance,
+      currency: safeCurrency,
+      zarRate: safeZarRate,
+      profile,
+    };
+
+    liveSimRunning = true;
+    liveSimProgress = `Launching live bot replay for ${symbolsArray.join(', ')}...`;
+    liveSimLastError = null;
+
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const args = [
+      'backtest/live_sim_runner.py',
+      '--symbols', symbolsArray.join(','),
+      '--days', String(safeDays),
+      '--balance', String(safeBalance),
+      '--currency', safeCurrency,
+      '--zar-rate', String(safeZarRate),
+      '--profile', profile,
+    ];
+
+    const proc = spawn(pythonCmd, args, {
+      env: { ...process.env, PYTHONPATH: process.cwd() },
+    });
+    liveSimProcess = proc;
+
+    let stdoutBuf = '';
+    proc.stdout.on('data', data => {
+      stdoutBuf += data.toString();
+      const lines = stdoutBuf.split('\n');
+      stdoutBuf = lines.pop() ?? '';
+      for (const raw of lines) {
+        const l = raw.trim();
+        if (!l) continue;
+        if (l.startsWith('[live-sim]')) {
+          liveSimProgress = l.replace('[live-sim]', '').trim();
+          console.log(l);
+        }
+      }
+    });
+
+    let stderrBuf = '';
+    proc.stderr.on('data', data => {
+      stderrBuf += data.toString();
+      const lines = stderrBuf.split('\n');
+      stderrBuf = lines.pop() ?? '';
+      for (const raw of lines) {
+        const l = raw.trimEnd();
+        if (!l) continue;
+        console.error(`[live-sim:ERR] ${l}`);
+      }
+    });
+
+    proc.on('exit', code => {
+      liveSimRunning = false;
+      liveSimProcess = null;
+      if (code === 0) {
+        liveSimProgress = 'Live bot replay complete.';
+      } else {
+        liveSimLastError = `Exited with code ${code}`;
+        liveSimProgress = `Live bot replay failed: ${liveSimLastError}`;
+      }
+    });
+
+    proc.on('error', err => {
+      liveSimRunning = false;
+      liveSimProcess = null;
+      liveSimLastError = `spawn error: ${err.message}`;
+      liveSimProgress = `Live bot replay failed: ${liveSimLastError}`;
+    });
+
+    res.status(200).json({
+      status: 'success',
+      message: `Live bot replay started for ${symbolsArray.join(', ')}.`,
+      params: liveSimLastParams,
+    });
+  });
+
+  app.get('/api/backtest/live-sim/status', (_req, res) => {
+    res.status(200).json({
+      status: 'success',
+      isRunning: liveSimRunning,
+      progress: liveSimProgress,
+      lastError: liveSimLastError,
+      params: liveSimLastParams,
+    });
+  });
+
+  app.get('/api/backtest/live-sim/report', (_req, res) => {
+    try {
+      const reportFile = path.resolve(BACKTEST_OUTPUT_DIR, 'live_sim_report.json');
+      if (!fs.existsSync(reportFile)) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'No live sim report yet. Run a Live Bot Replay first.',
+        });
+      }
+      const data = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+      res.status(200).json({ status: 'success', data });
+    } catch (err: any) {
+      res.status(500).json({ status: 'error', message: err?.message });
+    }
+  });
+
+  app.post('/api/backtest/live-sim/stop', (_req, res) => {
+    if (liveSimProcess) {
+      try { liveSimProcess.kill(); } catch {}
+    }
+    liveSimProcess = null;
+    liveSimRunning = false;
+    liveSimProgress = 'Live bot replay cancelled.';
+    res.status(200).json({ status: 'success', message: 'Live bot replay stopped.' });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 404 for /api/*
+  // ---------------------------------------------------------------------------
   app.use('/api', (req, res) => {
     res.status(404).json({ error: `Unknown API route: ${req.method} ${req.originalUrl}` });
   });
 
+  // ---------------------------------------------------------------------------
+  // Frontend
+  // ---------------------------------------------------------------------------
   const distPath = path.join(process.cwd(), 'dist');
   if (fs.existsSync(path.join(distPath, 'index.html'))) {
     app.use(express.static(distPath));
