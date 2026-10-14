@@ -1215,6 +1215,127 @@ function renderTxtContent(data: any): string {
   return lines.join('\n');
 }
 
+// -----------------------------------------------------------------------------
+// LIVE BOT REPLAY — compact AI-friendly text renderer (NEW)
+// -----------------------------------------------------------------------------
+function renderLiveSimTxt(report: any): string {
+  const lines: string[] = [];
+  const combos: any[] = Array.isArray(report?.combos) ? report.combos : [];
+
+  lines.push('LIVE BOT REPLAY — AI SUMMARY');
+  lines.push('='.repeat(72));
+  lines.push(`Generated: ${report?.generated_at ?? 'n/a'}`);
+  lines.push(`Days: ${report?.days ?? 'n/a'}`);
+  lines.push(`Pairs: ${(report?.symbols || []).join(', ') || 'n/a'}`);
+  lines.push(`Starting balance: ${report?.starting_balance_input ?? '?'} ${report?.currency ?? ''} (≈ $${report?.starting_balance_usd ?? '?'} USD)`);
+  lines.push(`Risk profile: ${report?.profile_name ?? 'n/a'}`);
+  lines.push(`Wall clock: ${report?.total_seconds ?? 'n/a'}s`);
+  lines.push('');
+  lines.push('This replay simulates ONE account across all selected pairs.');
+  lines.push('Every combo below is a separate full-account run. Read the combo');
+  lines.push('KPIs first, then the per-pair table to see which pairs helped or hurt.');
+  lines.push('Full trade lists are NOT in this file — they live in the full JSON.');
+  lines.push('');
+
+  for (let i = 0; i < combos.length; i++) {
+    const c = combos[i];
+    lines.push('='.repeat(72));
+    lines.push(`COMBO ${i + 1}/${combos.length}: ${c?.combo_label ?? 'Unknown'}`);
+    lines.push('='.repeat(72));
+
+    if (c?.error) {
+      lines.push(`ERROR: ${c.error}`);
+      lines.push('');
+      continue;
+    }
+
+    lines.push(`Final equity:      $${c.final_equity}`);
+    lines.push(`Starting equity:   $${c.starting_balance_usd}`);
+    lines.push(`Net P&L:           ${c.net_pnl >= 0 ? '+' : ''}$${c.net_pnl} (${c.net_pnl_pct}%)`);
+    lines.push(`Peak drawdown:     $${c.peak_drawdown}`);
+    lines.push(`Max loss streak:   ${c.max_consecutive_losses}`);
+    lines.push(`Trades:            ${c.total_trades}  (W ${c.wins} / L ${c.losses} / BE ${c.breakeven})`);
+    lines.push(`Win rate:          ${c.win_rate}%`);
+    lines.push(`Profit factor:     ${c.profit_factor}`);
+    lines.push(`Expectancy:        ${c.expectancy_r}R`);
+    if (c.run_seconds != null) lines.push(`Run time:          ${c.run_seconds}s`);
+    lines.push('');
+
+    const perPair = Object.entries<any>(c.per_pair || {})
+      .filter(([, r]) => (r?.trades || 0) > 0)
+      .sort((a, b) => (b[1].net_pnl || 0) - (a[1].net_pnl || 0));
+
+    if (perPair.length > 0) {
+      lines.push('Per-pair (sorted by net P&L, best first):');
+      lines.push('  Pair      | Trades | W   | L   | WR%   | PF    | Net P&L');
+      lines.push('  ----------|--------|-----|-----|-------|-------|---------');
+      for (const [sym, r] of perPair) {
+        lines.push(
+          `  ${String(sym).padEnd(9)} | ` +
+          `${String(r.trades).padStart(6)} | ` +
+          `${String(r.wins).padStart(3)} | ` +
+          `${String(r.losses).padStart(3)} | ` +
+          `${String(r.win_rate).padStart(5)} | ` +
+          `${String(r.profit_factor).padStart(5)} | ` +
+          `${r.net_pnl >= 0 ? '+' : ''}$${Number(r.net_pnl).toFixed(2)}`
+        );
+      }
+      lines.push('');
+    }
+
+    const skip = c.skip_summary || {};
+    if ((skip.total || 0) > 0) {
+      lines.push(`Skipped signals: ${skip.total} total`);
+      const reasons = Object.entries<any>(skip.by_reason || {})
+        .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+        .slice(0, 10);
+      for (const [r, v] of reasons) {
+        lines.push(`  ${r}: ${v}`);
+      }
+      lines.push('');
+    }
+
+    const trades = Array.isArray(c.all_trades) ? c.all_trades : [];
+    if (trades.length > 0) {
+      const byPnl = [...trades].sort(
+        (a, b) => (b.money_pnl || 0) - (a.money_pnl || 0)
+      );
+      const top = byPnl.slice(0, 5);
+      const bot = byPnl.slice(-5).reverse();
+      const fmtTrade = (t: any) =>
+        `  ${String(t.date_sast || '').padEnd(10)} ${String(t.symbol || '').padEnd(9)} ` +
+        `${String(t.direction || '').padEnd(4)} ${String(t.strategy || '').padEnd(28).slice(0, 28)} ` +
+        `${String(t.r_multiple ?? '').padStart(5)}R  $${Number(t.money_pnl || 0).toFixed(2)}`;
+
+      lines.push('Top 5 winning trades (this combo):');
+      for (const t of top) lines.push(fmtTrade(t));
+      lines.push('');
+      lines.push('Top 5 losing trades (this combo):');
+      for (const t of bot) lines.push(fmtTrade(t));
+      lines.push('');
+    }
+  }
+
+  lines.push('='.repeat(72));
+  lines.push('CROSS-COMBO COMPARISON');
+  lines.push('='.repeat(72));
+  lines.push('Combo                              | Trades | WR%   | PF    | Net P&L    | Peak DD');
+  lines.push('-----------------------------------|--------|-------|-------|------------|--------');
+  for (const c of combos) {
+    if (c?.error) continue;
+    const label = String(c.combo_label || '').padEnd(34).slice(0, 34);
+    const pnlStr = `${c.net_pnl >= 0 ? '+' : ''}$${Number(c.net_pnl).toFixed(2)}`;
+    lines.push(
+      `  ${label} | ${String(c.total_trades).padStart(6)} | ` +
+      `${String(c.win_rate).padStart(5)} | ${String(c.profit_factor).padStart(5)} | ` +
+      `${pnlStr.padStart(10)} | -$${Number(c.peak_drawdown).toFixed(2)}`
+    );
+  }
+  lines.push('');
+  lines.push('END OF SUMMARY');
+  return lines.join('\n');
+}
+
 function checkContainerMemory(): { ok: boolean; reason?: string } {
   if (process.platform !== 'linux') return { ok: true };
   try {
@@ -1881,10 +2002,12 @@ async function startServer() {
   // ===========================================================================
   // LIVE BOT REPLAY endpoints (NEW)
   // ===========================================================================
-  // POST /api/backtest/live-sim          — spawn the Python replay
-  // GET  /api/backtest/live-sim/status   — poll progress
-  // GET  /api/backtest/live-sim/report   — fetch the JSON report
-  // POST /api/backtest/live-sim/stop     — kill the process
+  // POST /api/backtest/live-sim            — spawn the Python replay
+  // GET  /api/backtest/live-sim/status     — poll progress
+  // GET  /api/backtest/live-sim/report     — fetch the JSON report
+  // POST /api/backtest/live-sim/stop       — kill the process
+  // GET  /api/backtest/live-sim/export.txt — compact AI-friendly text
+  // GET  /api/backtest/live-sim/export.zip — text + three small CSVs
   // ===========================================================================
 
   app.post('/api/backtest/live-sim', (req, res) => {
@@ -2041,6 +2164,131 @@ async function startServer() {
     liveSimRunning = false;
     liveSimProgress = 'Live bot replay cancelled.';
     res.status(200).json({ status: 'success', message: 'Live bot replay stopped.' });
+  });
+
+  // NEW: compact AI-friendly TXT export
+  app.get('/api/backtest/live-sim/export.txt', (_req, res) => {
+    try {
+      const reportFile = path.resolve(BACKTEST_OUTPUT_DIR, 'live_sim_report.json');
+      if (!fs.existsSync(reportFile)) {
+        return res.status(404).json({ status: 'error', message: 'No live sim report yet. Run a Live Bot Replay first.' });
+      }
+      const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+      const txt = renderLiveSimTxt(report);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="live_sim_ai_${dateStr}.txt"`);
+      res.status(200).send(txt);
+    } catch (err: any) {
+      res.status(500).send(`Export error: ${err?.message}`);
+    }
+  });
+
+  // NEW: ZIP with compact TXT plus three small CSVs
+  app.get('/api/backtest/live-sim/export.zip', (_req, res) => {
+    try {
+      const reportFile = path.resolve(BACKTEST_OUTPUT_DIR, 'live_sim_report.json');
+      if (!fs.existsSync(reportFile)) {
+        return res.status(404).json({ status: 'error', message: 'No live sim report yet. Run a Live Bot Replay first.' });
+      }
+      const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+      const txt = renderLiveSimTxt(report);
+
+      // Combo-level CSV: one row per combo.
+      const comboCols = ['combo','trades','wins','losses','be','win_rate','pf','expectancy_r','net_pnl','net_pnl_pct','peak_dd','max_loss_streak','final_equity','run_seconds'];
+      const comboRows: string[] = [comboCols.join(',')];
+      for (const c of (report.combos || [])) {
+        if (c?.error) continue;
+        comboRows.push([
+          `"${String(c.combo_label || '').replace(/"/g, '""')}"`,
+          c.total_trades ?? 0, c.wins ?? 0, c.losses ?? 0, c.breakeven ?? 0,
+          c.win_rate ?? 0, c.profit_factor ?? 0, c.expectancy_r ?? 0,
+          c.net_pnl ?? 0, c.net_pnl_pct ?? 0, c.peak_drawdown ?? 0,
+          c.max_consecutive_losses ?? 0, c.final_equity ?? 0, c.run_seconds ?? '',
+        ].join(','));
+      }
+
+      // Per-pair CSV: one row per (combo, pair).
+      const pairCols = ['combo','pair','trades','wins','losses','be','win_rate','pf','net_pnl'];
+      const pairRows: string[] = [pairCols.join(',')];
+      for (const c of (report.combos || [])) {
+        if (c?.error) continue;
+        for (const [sym, r] of Object.entries<any>(c.per_pair || {})) {
+          if ((r?.trades || 0) === 0) continue;
+          pairRows.push([
+            `"${String(c.combo_label || '').replace(/"/g, '""')}"`,
+            sym, r.trades, r.wins, r.losses, r.breakeven,
+            r.win_rate, r.profit_factor, r.net_pnl,
+          ].join(','));
+        }
+      }
+
+      // Sample CSV: 30 stratified trades per combo, 12 columns.
+      const sampleCols = ['combo','pair','strategy','dir','entry_sast','exit_reason','r','pnl','mfe_r','mae_r','regime','duration_min'];
+      const sampleRows: string[] = [sampleCols.join(',')];
+      const SAMPLE = 30;
+      const csvEsc = (v: any) => {
+        if (v === null || v === undefined) return '';
+        const s = String(v);
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      };
+      for (const c of (report.combos || [])) {
+        if (c?.error) continue;
+        const trades: any[] = Array.isArray(c.all_trades) ? c.all_trades : [];
+        if (trades.length === 0) continue;
+        const sorted = [...trades].sort((a, b) =>
+          String(a?.signal_time_utc || '').localeCompare(String(b?.signal_time_utc || ''))
+        );
+        let picked: any[] = [];
+        if (trades.length <= SAMPLE) {
+          picked = sorted;
+        } else {
+          const third = Math.floor(SAMPLE / 3);
+          const byR = [...sorted].sort((a, b) => (b.r_multiple || 0) - (a.r_multiple || 0));
+          const topWins = byR.slice(0, third);
+          const topLosses = byR.slice(-third).reverse();
+          const spreadCount = SAMPLE - topWins.length - topLosses.length;
+          const step = Math.max(1, Math.floor(sorted.length / Math.max(1, spreadCount)));
+          const spread: any[] = [];
+          for (let i = 0; i < sorted.length && spread.length < spreadCount; i += step) {
+            spread.push(sorted[i]);
+          }
+          const seen = new Set<string>();
+          for (const t of [...topWins, ...topLosses, ...spread]) {
+            const k = String(t?.trade_id || `${t?.symbol}_${t?.signal_time_utc}_${t?.strategy}`);
+            if (seen.has(k)) continue;
+            seen.add(k);
+            picked.push(t);
+          }
+        }
+        for (const t of picked) {
+          sampleRows.push([
+            csvEsc(c.combo_label), csvEsc(t.symbol), csvEsc(t.strategy), csvEsc(t.direction),
+            csvEsc((t.signal_time_sast || '').slice(0, 16)), csvEsc(t.exit_reason),
+            csvEsc(t.r_multiple), csvEsc(t.money_pnl), csvEsc(t.mfe_r), csvEsc(t.mae_r),
+            csvEsc(t.regime), csvEsc(t.duration_minutes),
+          ].join(','));
+        }
+      }
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="live_sim_${dateStr}.zip"`);
+      const archive = archiver('zip', { zlib: { level: 9 } });
+      archive.on('error', (err: any) => {
+        console.error('Archive error:', err);
+        try { res.status(500).end(`Archive error: ${err?.message}`); } catch {}
+      });
+      archive.pipe(res);
+      archive.append(txt, { name: 'live_sim_ai.txt' });
+      archive.append(comboRows.join('\n'), { name: 'live_sim_combos.csv' });
+      archive.append(pairRows.join('\n'), { name: 'live_sim_per_pair.csv' });
+      archive.append(sampleRows.join('\n'), { name: 'live_sim_sample.csv' });
+      archive.finalize();
+    } catch (err: any) {
+      if (!res.headersSent) res.status(500).send(`Export error: ${err?.message}`);
+    }
   });
 
   // ---------------------------------------------------------------------------
