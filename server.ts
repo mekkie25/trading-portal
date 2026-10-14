@@ -119,6 +119,9 @@ let backtestResults: Array<{ symbol: string; status: 'OK' | 'FAILED'; message: s
 
 let lastRunWallClockSeconds: number | null = null;
 let lastRunConcurrentProcesses: number | null = null;
+let lastRunStartingBalance: number | null = null;
+let lastRunCurrency: string | null = null;
+let lastRunProfile: string | null = null;
 
 let compareRunning = false;
 let compareProgress = '';
@@ -132,11 +135,12 @@ let optimizerLastError: string | null = null;
 let optimizerProcess: ChildProcess | null = null;
 
 let activeBotConfig: BotGatewayConfig = {
-  masterExecution: true, riskPerTradePct: 1.0, minRr: 2.5, adaptiveMode: false,
+  masterExecution: true, riskPerTradePct: 1.0, minRr: 3.0, adaptiveMode: false,
   stopOnDailyGoalReached: false, dailyGoalTarget: 5.0, weeklyGoalTarget: 20.0,
   monthlyGoalTarget: 50.0, weeklyDepositBaseline: 10.0, maxDailyTrades: 4,
   trailingStopActive: true, autoBreakevenPips: 15, currency: 'USD',
   updatedAt: new Date().toISOString(), version: 1,
+  riskProfile: null,
 };
 
 let riskLimits: RiskLimitsConfig = {
@@ -380,6 +384,10 @@ function generateExportDataPayload(): any {
     total_run_seconds: null,
     wall_clock_seconds: lastRunWallClockSeconds,
     concurrent_processes: lastRunConcurrentProcesses,
+    starting_balance_input: lastRunStartingBalance,
+    starting_balance_currency: lastRunCurrency,
+    starting_balance_usd: null,
+    profile_name: lastRunProfile,
     combinations_rollup: {}, pairs: [],
     portfolio_suggestions: [], what_to_test_next: [], portfolio_correlation: null,
     spec_coverage: SPEC_COVERAGE, descriptions: METRIC_DESCRIPTIONS,
@@ -400,6 +408,11 @@ function generateExportDataPayload(): any {
     try {
       const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'));
       result.days = summary.days || result.days;
+      if (summary.starting_balance_usd != null) result.starting_balance_usd = summary.starting_balance_usd;
+      if (summary.profile_name) result.profile_name = summary.profile_name;
+      if (summary.currency) result.starting_balance_currency = summary.currency;
+      if (summary.starting_balance_input != null) result.starting_balance_input = summary.starting_balance_input;
+
       const pairSeconds = typeof summary.total_seconds === 'number' && summary.total_seconds > 0 ? summary.total_seconds : null;
       if (pairSeconds !== null) { totalTime += pairSeconds; hasValidTimes = true; }
       const combos: any[] = summary.combinations || [];
@@ -430,6 +443,10 @@ function generateExportDataPayload(): any {
         precompute_s: typeof summary.precompute_s === 'number' ? summary.precompute_s : null,
         cache_built_at: summary.cache_built_at || null,
         cache_build_seconds: typeof summary.cache_build_seconds === 'number' ? summary.cache_build_seconds : null,
+        starting_balance_usd: summary.starting_balance_usd ?? null,
+        starting_balance_input: summary.starting_balance_input ?? null,
+        starting_balance_currency: summary.currency ?? null,
+        profile_name: summary.profile_name ?? null,
         generated_at: summary.generated_at || null,
         combinations: combos, lab: labPayload || null,
         best_combination: {
@@ -490,9 +507,6 @@ function csvEscape(v: any): string {
   return s;
 }
 
-// =============================================================================
-// AI-FRIENDLY SUMMARY CSV
-// =============================================================================
 function renderSummaryCsv(pairs: any[]): string {
   const cols = [
     'pair','combo','trades','win_rate','avg_r','expectancy','profit_factor',
@@ -526,9 +540,6 @@ function renderSummaryCsv(pairs: any[]): string {
   return out.join('\n');
 }
 
-// =============================================================================
-// AI-FRIENDLY SAMPLE CSV
-// =============================================================================
 function renderSampleCsv(pairs: any[], samplePerPair: number = SAMPLE_TRADES_PER_PAIR): string {
   const cols = [
     'pair','strategy','dir','entry_sast','exit_reason','r','pnl',
@@ -868,6 +879,8 @@ function renderConsistencyChecks(pairs: any[]): string[] {
     if (p.engine_line) lines.push(p.engine_line);
     if (p.precompute_s != null) lines.push(`precompute this run: ${p.precompute_s}s`);
     if (p.cache_built_at && p.cache_build_seconds != null) lines.push(`cache built in ${Math.round(p.cache_build_seconds)}s on ${String(p.cache_built_at).slice(0,10)}`);
+    if (p.starting_balance_usd != null) lines.push(`starting balance: $${p.starting_balance_usd} USD (input ${p.starting_balance_input ?? '?'} ${p.starting_balance_currency ?? ''})`);
+    if (p.profile_name) lines.push(`profile: ${p.profile_name}`);
     if (lines.length === 0) continue;
     out.push(`  ${p.symbol}:`);
     for (const l of lines) out.push(`    ${l}`);
@@ -996,6 +1009,9 @@ function renderTxtContent(data: any): string {
   lines.push('  Diagnostics sections use §N labels that match the Blueprint.');
   lines.push('  Any bucket or row with fewer than 30 trades is tagged INCONCLUSIVE.');
   lines.push(`RUN: ${data.generated_at.slice(0, 10)} | Days ${data.days} | Wall clock ${wallStr} (${concurrentStr} concurrent) | Sum of this-run pair times ${totalTimeStr}`);
+  if (data.starting_balance_input != null) {
+    lines.push(`STARTING BALANCE: ${data.starting_balance_input} ${data.starting_balance_currency || 'USD'} (USD-equivalent $${fmt(data.starting_balance_usd, 2)}) | Profile: ${data.profile_name || 'None'}`);
+  }
   lines.push('');
 
   lines.push('ACTIVE SETTINGS DIFFERING FROM DEFAULT:');
@@ -1235,19 +1251,6 @@ async function startServer() {
     catch (err: any) { res.status(500).json({ status: 'error', message: err?.message }); }
   });
 
-  // AI-FRIENDLY TXT EXPORT (2026-10-12)
-  // -------------------------------------------------------------------------
-  // Single plain-text file with three sections:
-  //   PART 1: AI brief + all diagnostics (same as the old export.txt)
-  //   PART 2: backtest_summary.csv content (one row per pair x combo)
-  //   PART 3: backtest_sample.csv content (30 stratified trades per pair)
-  //
-  // Query params:
-  //   ?sample=N    override the per-pair sample size (default 30, max 200)
-  //   ?sample=0    fall back to the full ledger
-  //
-  // This is what the "Export for AI (.txt)" button hits. The ZIP route still
-  // exists for anyone who prefers separate files.
   app.get('/api/backtest/export.txt', (req, res) => {
     try {
       const sampleRaw = parseInt(String(req.query.sample ?? ''), 10);
@@ -1297,9 +1300,6 @@ async function startServer() {
     } catch (err: any) { res.status(500).send(`Export error: ${err?.message}`); }
   });
 
-  // ===========================================================================
-  // AI-FRIENDLY ZIP EXPORT
-  // ===========================================================================
   app.get('/api/backtest/export-zip', (req, res) => {
     try {
       const sampleRaw = parseInt(String(req.query.sample ?? ''), 10);
@@ -1552,11 +1552,24 @@ async function startServer() {
     const symbolsArray: string[] = Array.isArray(requested) ? requested.map((s: string) => String(s).toUpperCase()).filter(Boolean) : String(requested).toUpperCase() === 'ALL' ? [...WHITELIST_ASSETS] : [String(requested).toUpperCase()];
     if (symbolsArray.length === 0) return res.status(400).json({ status: 'error', message: 'No symbols supplied.' });
     const days = parseInt(req.body?.days || '60', 10);
+
+    // 2026-10-14: new starting-balance, currency, ZAR rate and profile params.
+    const balanceRaw = parseFloat(String(req.body?.balance ?? '1000'));
+    const currency = String(req.body?.currency || 'USD').toUpperCase();
+    const zarRateRaw = parseFloat(String(req.body?.zarRate ?? '18'));
+    const profile = String(req.body?.profile || 'Max Growth');
+    const safeBalance = Number.isFinite(balanceRaw) && balanceRaw >= 1 ? balanceRaw : 1000;
+    const safeZarRate = Number.isFinite(zarRateRaw) && zarRateRaw > 0 ? zarRateRaw : 18;
+
+    lastRunStartingBalance = safeBalance;
+    lastRunCurrency = currency;
+    lastRunProfile = profile;
+    lastRunWallClockSeconds = null;
+
     backtestResults = []; activeBacktestProcesses = []; backtestRunning = true;
     backtestProgress = `Initiating backtest matrix for ${symbolsArray.join(', ')}...`;
     backtestLastError = null; backtestExitCode = null;
     const runStartedAt = Date.now();
-    lastRunWallClockSeconds = null;
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
     const CONCURRENT_PAIRS = 2;
     lastRunConcurrentProcesses = CONCURRENT_PAIRS;
@@ -1565,7 +1578,13 @@ async function startServer() {
       async function runWorker(sym: string): Promise<void> {
         let symTiming = ''; const stderrTail: string[] = [];
         let engineLine = ''; let wrongEngine = false;
-        const args = ['backtest/runner.py', '--symbol', sym, '--days', String(days)];
+        const args = [
+          'backtest/runner.py', '--symbol', sym, '--days', String(days),
+          '--balance', String(safeBalance),
+          '--currency', currency,
+          '--zar-rate', String(safeZarRate),
+          '--profile', profile,
+        ];
         await new Promise<void>((resolve) => {
           const proc = spawn(pythonCmd, args, { env: { ...process.env, PYTHONPATH: process.cwd(), BACKTEST_CONCURRENT_WORKERS: String(CONCURRENT_PAIRS) } });
           activeBacktestProcesses.push(proc);
@@ -1631,6 +1650,8 @@ async function startServer() {
       status: 'success', isRunning: backtestRunning, progress: backtestProgress,
       lastError: backtestLastError, exitCode: backtestExitCode, results: backtestResults,
       wall_clock_seconds: lastRunWallClockSeconds, concurrent_processes: lastRunConcurrentProcesses,
+      starting_balance_input: lastRunStartingBalance, starting_balance_currency: lastRunCurrency,
+      profile_name: lastRunProfile,
     });
   });
   app.post('/api/backtest/stop', (_req, res) => {
@@ -1749,9 +1770,6 @@ async function startServer() {
   }
   launchPythonBot();
 
-    // ---------------------------------------------------------------------------
-  // PROPOSED (2026-10-12): spread config editor
-  // ---------------------------------------------------------------------------
   const SPREAD_CONFIG_FILE = path.join(process.cwd(), 'config', 'spread_config.json');
 
   app.get('/api/backtest/spread-config', (_req, res) => {
@@ -1784,9 +1802,6 @@ async function startServer() {
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // PROPOSED (2026-10-12): profile replay matrix
-  // ---------------------------------------------------------------------------
   app.get('/api/backtest/profiles/:symbol', (req, res) => {
     try {
       const sym = String(req.params.symbol || '').toUpperCase();
@@ -1812,9 +1827,6 @@ async function startServer() {
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // PROPOSED (2026-10-12): pip calculator reader
-  // ---------------------------------------------------------------------------
   app.get('/api/backtest/pip-calculator', (_req, res) => {
     try {
       const file = path.join(process.cwd(), 'config', 'pip_calculator.json');

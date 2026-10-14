@@ -31,6 +31,8 @@ interface SymbolSummaryPayload {
   symbol: string; days: number; target_rr?: number | null;
   rr_values?: number[]; generated_at: string;
   total_seconds?: number; phase_seconds?: any; cache?: any;
+  starting_balance_usd?: number; starting_balance_input?: number;
+  currency?: string; zar_per_usd?: number; profile_name?: string;
   combinations: SummaryCombination[];
 }
 
@@ -41,6 +43,7 @@ interface StorageInfo {
 
 interface RunResultItem {
   symbol: string; status: 'OK' | 'FAILED'; message: string; timing?: string;
+  engine_line?: string; wrong_engine?: boolean;
 }
 
 interface LabVariantRow {
@@ -105,7 +108,6 @@ interface PipCalculatorPayload {
 
 const WHITELIST_ASSETS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"];
 
-// Mirror of backtest/profile_replay.py
 const PROFILE_BANDS_ZAR = [500, 2000, 10000, 50000];
 const PROFILE_NAMES = ["None", "Steady", "Balanced", "Aggressive", "Max Growth"] as const;
 const PROFILE_RISK_BY_BAND: Record<string, number[] | null> = {
@@ -285,6 +287,10 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>(['US30']);
   const [testDays, setTestDays] = useState<number>(365);
 
+  // 2026-10-14: starting balance, currency, ZAR rate and risk profile controls.
+  const [startingBalance, setStartingBalance] = useState<string>('1000');
+  const [backtestProfile, setBacktestProfile] = useState<string>('Max Growth');
+
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -321,7 +327,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [optimizerCopyStatus, setOptimizerCopyStatus] = useState<'idle' | 'copied'>('idle');
   const [showOptimizerSummary, setShowOptimizerSummary] = useState<boolean>(false);
 
-  // ----- New state for spread editor / profiles / pip calc -----
   const [spreadConfig, setSpreadConfig] = useState<SpreadConfig | null>(null);
   const [spreadDraft, setSpreadDraft] = useState<Record<string, string>>({});
   const [spreadSaveStatus, setSpreadSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
@@ -419,7 +424,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   useEffect(() => { if (activeSubTab === 'portfolio') fetchPortfolio(); }, [activeSubTab, fetchPortfolio]);
 
-  // Spreads fetcher
   const fetchSpreadConfig = useCallback(async () => {
     try {
       const res = await fetch('/api/backtest/spread-config');
@@ -440,7 +444,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
 
   useEffect(() => { fetchSpreadConfig(); }, [fetchSpreadConfig]);
 
-  // Pip calculator fetcher
   const fetchPipCalculator = useCallback(async () => {
     setPipCalcError(null);
     try {
@@ -565,15 +568,25 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     } finally { setIsCleaning(false); }
   };
 
+  const buildRunBody = (symbolsPayload: string | string[]) => ({
+    symbol: symbolsPayload,
+    days: testDays,
+    balance: parseFloat(startingBalance) || 1000,
+    currency: accountCurrency,
+    zarRate: zarPerUsd,
+    profile: backtestProfile,
+  });
+
   const handleRunSelected = async () => {
     if (isRunning || selectedSymbols.length === 0) return;
     setIsRunning(true); setRunResults([]);
     setProgressText(`Preparing matrix for ${selectedSymbols.join(', ')}...`);
     try {
+      const payload = selectedSymbols.length === 1 ? selectedSymbols[0] : selectedSymbols;
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: selectedSymbols.length === 1 ? selectedSymbols[0] : selectedSymbols, days: testDays }),
+        body: JSON.stringify(buildRunBody(payload)),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -594,7 +607,7 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
       const res = await fetch('/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: 'ALL', days: testDays }),
+        body: JSON.stringify(buildRunBody('ALL')),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -741,7 +754,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
       if (!res.ok) throw new Error('Could not fetch export data.');
       const json = await res.json();
       const exp = json.data;
-      // PDF export is unchanged for now; the txt export covers the new sections.
       const txt = JSON.stringify(exp, null, 2);
       const blob = new Blob([txt], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -780,7 +792,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const exportPairCount = reportFiles.filter(f => f.endsWith('_summary.json') && !f.startsWith('.')).length;
   const anyJobRunning = isRunning || labRunning || optimizerRunning || optimizerServerRunning;
 
-  // ---- Client-side profile replay over the currently loaded report ----
   const profileBalances = useMemo(() => {
     const arr = [...DEFAULT_BALANCES];
     const custom = parseFloat(customBalance);
@@ -806,6 +817,14 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
     return out;
   }, [reportData, profileBalances, zarPerUsd]);
 
+  const usdEquivalent = useMemo(() => {
+    const bal = parseFloat(startingBalance) || 1000;
+    if (accountCurrency === 'ZAR' && zarPerUsd > 0) {
+      return bal / zarPerUsd;
+    }
+    return bal;
+  }, [startingBalance, accountCurrency, zarPerUsd]);
+
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
       <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-300 dark:border-[#1a2030]">
@@ -817,12 +836,11 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             </span>
           </h1>
           <p className="text-sm text-black dark:text-slate-400 mt-1">
-            Adaptive only. BE off/on × R:R 1:2, 1:2.5, 1:3. Profiles, spreads, pip distances all in one place.
+            Adaptive only. BE off/on × R:R 1:2, 1:2.5, 1:3. Any starting balance. Live-identical profile sizing.
           </p>
         </div>
       </motion.div>
 
-      {/* Control panel */}
       <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}
         className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-4 space-y-3">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -859,7 +877,37 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             <option value={365}>365 Days</option>
           </select>
 
-          {/* Currency toggle */}
+          {/* 2026-10-14: starting balance input */}
+          <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-[#1a2030] bg-white dark:bg-[#08090d]">
+            <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Start</span>
+            <input
+              type="number"
+              step="any"
+              min="1"
+              value={startingBalance}
+              onChange={(e) => setStartingBalance(e.target.value)}
+              disabled={anyJobRunning}
+              placeholder="1000"
+              className="w-20 px-1.5 py-0.5 text-xs font-mono text-black dark:text-white bg-transparent focus:outline-none"
+              title="Starting balance. Values >= 1."
+            />
+          </div>
+
+          {/* 2026-10-14: risk profile dropdown */}
+          <select
+            value={backtestProfile}
+            onChange={(e) => setBacktestProfile(e.target.value)}
+            disabled={anyJobRunning}
+            className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs font-mono font-bold text-black dark:text-white cursor-pointer focus:outline-none border border-slate-300 dark:border-[#1a2030]"
+            title="Risk profile used for position sizing. Same profiles as the live bot."
+          >
+            <option value="Max Growth">Max Growth (35%)</option>
+            <option value="Aggressive">Aggressive (30%)</option>
+            <option value="Balanced">Balanced (10%)</option>
+            <option value="Steady">Steady (5%)</option>
+            <option value="None">None (flat 1%)</option>
+          </select>
+
           <div className="flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-300 dark:border-[#1a2030] bg-white dark:bg-[#08090d]">
             <Globe className="w-3.5 h-3.5 text-blue-500" />
             <select value={accountCurrency} onChange={(e) => setAccountCurrency(e.target.value as 'USD' | 'ZAR')}
@@ -871,9 +919,15 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
               <input type="number" step="0.1" value={zarPerUsd}
                 onChange={(e) => setZarPerUsd(parseFloat(e.target.value) || 18.0)}
                 className="w-16 px-1.5 py-0.5 text-xs font-mono text-black dark:text-white bg-transparent border-l border-slate-300 dark:border-[#1a2030] focus:outline-none"
-                title="ZAR per USD for the profile replay" />
+                title="ZAR per USD for the profile replay and profile bands" />
             )}
           </div>
+
+          {accountCurrency === 'ZAR' && (
+            <span className="text-[10px] font-mono text-slate-500 px-1">
+              ≈ ${usdEquivalent.toFixed(2)} USD
+            </span>
+          )}
 
           {!isRunning ? (
             <>
@@ -903,7 +957,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       </motion.div>
 
-      {/* Optimizer block */}
       {(optimizerRunning || optimizerServerRunning || optimizerError || optimizerSummaryText) && (
         <div className="p-4 rounded-2xl bg-white dark:bg-[#0f1118] border border-purple-500/40 shadow-xs space-y-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
@@ -953,12 +1006,16 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Export bar */}
       <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}
         className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs">
         <div className="flex items-center gap-2 text-[11px] font-mono text-slate-600 dark:text-slate-300">
           <FileText className="w-3.5 h-3.5 text-blue-500" />
           <span>Exporting <strong className="text-black dark:text-white">{exportPairCount}</strong> pair{exportPairCount === 1 ? '' : 's'}</span>
+          {startingBalance && (
+            <span className="text-slate-400">
+              · start {startingBalance} {accountCurrency} · {backtestProfile}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           <a href="/api/backtest/export.txt" download className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs">
@@ -1035,10 +1092,16 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Combination table */}
       {summaryData?.combinations && summaryData.combinations.length > 0 && (
         <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs p-5 space-y-3">
-          <h3 className="text-sm font-bold text-black dark:text-white">Results by Combination ({summaryData.symbol} · {summaryData.days} Days)</h3>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h3 className="text-sm font-bold text-black dark:text-white">Results by Combination ({summaryData.symbol} · {summaryData.days} Days)</h3>
+            {summaryData.starting_balance_usd != null && (
+              <span className="text-[10px] font-mono text-slate-500">
+                start {summaryData.starting_balance_input ?? '?'} {summaryData.currency ?? 'USD'} (≈ ${summaryData.starting_balance_usd}) · profile {summaryData.profile_name ?? 'None'}
+              </span>
+            )}
+          </div>
           <HowToRead metricKey="sec_combinations" />
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs font-mono">
@@ -1086,7 +1149,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* Sub-tabs */}
       <div className="flex flex-wrap gap-2 border-b border-slate-200 dark:border-[#1a2030] pb-2">
         {([
           ['summary', 'Summary', TrendingUp],
@@ -1106,7 +1168,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         ))}
       </div>
 
-      {/* ----- Summary ----- */}
       {activeSubTab === 'summary' && (
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
@@ -1204,7 +1265,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Profiles ----- */}
       {activeSubTab === 'profiles' && (
         <div className="space-y-4">
           <div className="p-5 rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] shadow-xs space-y-4">
@@ -1279,7 +1339,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Diagnostics ----- */}
       {activeSubTab === 'diagnostics' && reportData?.diagnostics && (
         <div className="space-y-4">
           <HowToRead metricKey="sec_diagnostics" />
@@ -1360,7 +1419,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Portfolio ----- */}
       {activeSubTab === 'portfolio' && (
         <div className="space-y-4">
           {isLoadingPortfolio ? (
@@ -1406,7 +1464,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Lab ----- */}
       {activeSubTab === 'lab' && (
         <div className="space-y-4">
           {labPayloadBySymbol[testSymbol] ? (
@@ -1465,7 +1522,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Spreads editor ----- */}
       {activeSubTab === 'spreads' && (
         <div className="space-y-4">
           <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] p-5 space-y-4">
@@ -1509,7 +1565,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Pip Calculator ----- */}
       {activeSubTab === 'pipcalc' && (
         <div className="space-y-4">
           {pipCalcError ? (
@@ -1589,7 +1644,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Tips ----- */}
       {activeSubTab === 'tips' && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {activeTips.map((tip) => (
@@ -1610,7 +1664,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
         </div>
       )}
 
-      {/* ----- Ledger ----- */}
       {activeSubTab === 'ledger' && (
         <div className="rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] overflow-hidden">
           <div className="overflow-x-auto">

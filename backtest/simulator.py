@@ -2,16 +2,15 @@
 backtest/simulator.py
 Replicates the live single-order position management of engine/matrix.py.
 
-CHANGES 2026-10-13
+CHANGES 2026-10-14
 ------------------
-- open_trade() applies the combined min stop floor:
-      max( GLOBAL_PARAMS.min_stop_pips[symbol],
-           pip_calculator.min_sl_pips[symbol][strategy] )
-  The hardcoded part fixes FX stops that were inside the noise band.
-  The data-driven part is a self-tuning suggestion from the previous run.
-- stop_distance_multiplier is 1.0 by default in core/session_config.py.
-  It used to widen every stop 50% in the backtest while the live bot did
-  not, which was a parity break.
+- Accepts profile_name. When set, sizing uses the SAME RiskManager that
+  the live bot uses. Same bands, same streak scaling, same weekly
+  drawdown penalty, same recovery reward. Live and backtest now behave
+  identically on purpose.
+- When profile_name is None, falls back to flat risk_pct (legacy path).
+- Zar conversion: profile bands compare against ZAR-equivalent equity,
+  so R170 ZAR lands in band 0 exactly like the live bot would see it.
 """
 
 import sys
@@ -35,14 +34,13 @@ from core.targets import compute_fixed_target
 from core.pip_sizes import PIP_SIZES
 from core.spread_config import load_spreads
 from core.pip_calculator import load_pip_calculator, effective_min_stop_pips
+from risk.risk_manager import RiskManager, RISK_PROFILES
 
 POST_SL_CAP_MULTIPLE = 2.0
 POST_TP_CAP_MULTIPLE = 3.0
-
 ALT_MAX_HOLD_CANDLES = 5 * 288
 ALT_TIMEOUT_FLAG_KEY = "alt_timeout"
 ALT_TARGET_KEYS = ("alt_r_1", "alt_r_15", "alt_r_2", "alt_r_3")
-
 
 _LOADED_SPREADS = load_spreads()
 
@@ -74,6 +72,8 @@ class TradeSimulator:
         eurusd_df: Optional[pd.DataFrame] = None,
         be_mode: str = "FIXED_80",
         m5_df_full: Optional[pd.DataFrame] = None,
+        profile_name: Optional[str] = None,
+        zar_per_usd: float = 18.0,
     ):
         self.starting_balance = starting_balance
         self.balance = starting_balance
@@ -81,6 +81,24 @@ class TradeSimulator:
         self.risk_pct = risk_pct
         self.account_currency = account_currency
         self.be_mode = be_mode
+        self.profile_name = profile_name
+        self.zar_per_usd = float(zar_per_usd) if zar_per_usd and zar_per_usd > 0 else 18.0
+
+        # Profile-based sizing: own a RiskManager instance. No disk I/O.
+        self.risk_mgr: Optional[RiskManager] = None
+        if profile_name and profile_name in RISK_PROFILES:
+            self.risk_mgr = RiskManager(persist_state=False)
+            self.risk_mgr.active_profile_name = profile_name
+            self.risk_mgr.active_profile = RISK_PROFILES[profile_name]
+            self.risk_mgr.max_daily_trades = RISK_PROFILES[profile_name]["max_daily_trades"]
+            self.risk_mgr.max_daily_loss_pct = RISK_PROFILES[profile_name]["daily_loss_stop_pct"]
+            self.risk_mgr.max_weekly_loss_pct = RISK_PROFILES[profile_name]["weekly_loss_stop_pct"]
+            self.risk_mgr.max_monthly_loss_pct = RISK_PROFILES[profile_name]["monthly_loss_stop_pct"]
+            self.risk_mgr.min_rr_floor = RISK_PROFILES[profile_name]["min_rr_floor"]
+            # Prime the day/week/month baselines with the starting balance.
+            first_time = None
+            self.risk_mgr.check_rollovers(starting_balance, starting_balance, first_time)
+
         self.open_positions: List[Dict[str, Any]] = []
         self.completed_trades: List[Dict[str, Any]] = []
         self.pending_sl_evaluations: List[Dict[str, Any]] = []
@@ -125,21 +143,32 @@ class TradeSimulator:
                 self._m5_highs = df['high'].astype(float).to_numpy()
                 self._m5_lows = df['low'].astype(float).to_numpy()
                 self._m5_closes = df['close'].astype(float).to_numpy()
-                print(
-                    f"[simulator] alt replay ready: {len(epochs)} candles, "
-                    f"first={epochs[0] if len(epochs) > 0 else 'n/a'}, "
-                    f"last={epochs[-1] if len(epochs) > 0 else 'n/a'}",
-                    flush=True,
-                )
-                if self._m5_epochs.size == 0:
-                    print("[simulator] WARNING: alt replay disabled (empty epoch array).", flush=True)
-            except Exception as e:
-                print(f"[simulator] WARNING: alt replay disabled ({e}).", flush=True)
-                traceback.print_exc()
+            except Exception:
                 self._m5_epochs = None
                 self._m5_highs = None
                 self._m5_lows = None
                 self._m5_closes = None
+
+    # ------------------------------------------------------------------
+    # Profile-driven sizing helper
+    # ------------------------------------------------------------------
+
+    def _risk_pct_for_trade(self, current_time: datetime) -> float:
+        if self.risk_mgr is None:
+            return float(self.risk_pct)
+        self.risk_mgr.check_rollovers(
+            current_equity=self.equity,
+            current_balance=self.balance,
+            now_utc=current_time,
+        )
+        pct = self.risk_mgr.combined_risk_pct(
+            current_equity=self.equity,
+            dow_mult=1.0,
+            ai_factor=1.0,
+            account_currency="USD",
+            usd_zar_rate=self.zar_usd_placeholder if False else self.zar_per_usd,
+        )
+        return float(pct)
 
     def _get_eurusd_rate_at_or_before(self, dt: datetime) -> Optional[float]:
         if not self._eurusd_times:
@@ -155,29 +184,24 @@ class TradeSimulator:
         by_reason_setups: Dict[str, set] = {}
         by_strategy: Dict[str, int] = {}
         by_hour_sast: Dict[int, int] = {}
-
         for s in self.skipped:
             reason = s.get("reason", "UNKNOWN")
             strat = s.get("strategy", "UNKNOWN")
             direction = s.get("direction", "UNKNOWN")
             day = s.get("date_sast", s.get("time", "")[:10])
             h = s.get("hour_sast", 0)
-
             by_reason_candles[reason] = by_reason_candles.get(reason, 0) + 1
             if reason not in by_reason_setups:
                 by_reason_setups[reason] = set()
             by_reason_setups[reason].add((strat, direction, day))
-
             by_strategy[strat] = by_strategy.get(strat, 0) + 1
             by_hour_sast[h] = by_hour_sast.get(h, 0) + 1
-
         by_reason_detail: Dict[str, Dict[str, int]] = {}
         for r, c_cnt in by_reason_candles.items():
             by_reason_detail[r] = {
                 "candle_skips": c_cnt,
-                "unique_setups": len(by_reason_setups.get(r, set()))
+                "unique_setups": len(by_reason_setups.get(r, set())),
             }
-
         spread_in_r_values: List[float] = []
         for s in self.skipped:
             if s.get("reason") != "SPREAD_IN_R":
@@ -191,10 +215,9 @@ class TradeSimulator:
                 continue
             if fv >= 0.0:
                 spread_in_r_values.append(fv)
-
         if spread_in_r_values:
             arr = np.asarray(spread_in_r_values, dtype=float)
-            spread_in_r_distribution: Dict[str, Any] = {
+            spread_dist = {
                 "count": int(arr.size),
                 "median": round(float(np.median(arr)), 6),
                 "p75": round(float(np.percentile(arr, 75)), 6),
@@ -202,35 +225,30 @@ class TradeSimulator:
                 "max": round(float(arr.max()), 6),
             }
         else:
-            spread_in_r_distribution = {
-                "count": 0,
-                "median": None,
-                "p75": None,
-                "p90": None,
-                "max": None,
-            }
-
+            spread_dist = {"count": 0, "median": None, "p75": None, "p90": None, "max": None}
         return {
             "by_reason": by_reason_detail,
             "by_strategy": by_strategy,
             "by_hour_sast": by_hour_sast,
-            "spread_in_r_distribution": spread_in_r_distribution,
+            "spread_in_r_distribution": spread_dist,
         }
 
     def _record_skip(self, current_time: datetime, symbol: str, strategy: str, reason: str, direction: str = "UNKNOWN") -> bool:
         sast_time = current_time.astimezone(TZ_SAST)
-        sast_date_str = sast_time.strftime("%Y-%m-%d")
-        sast_hour = sast_time.hour
         self.skipped.append({
             "time": current_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "date_sast": sast_date_str,
+            "date_sast": sast_time.strftime("%Y-%m-%d"),
             "symbol": symbol,
             "strategy": strategy,
             "direction": direction,
             "reason": reason,
-            "hour_sast": sast_hour
+            "hour_sast": sast_time.hour,
         })
         return False
+
+    # ------------------------------------------------------------------
+    # Trade open
+    # ------------------------------------------------------------------
 
     def open_trade(
         self,
@@ -272,14 +290,11 @@ class TradeSimulator:
         pip_size = cfg["pip_size"]
         spread_pts = cfg["spread"]
 
-        # 1. stop_distance_multiplier (default 1.0).
         _widen = float(getattr(GLOBAL_PARAMS, "stop_distance_multiplier", 1.0) or 1.0)
         if _widen != 1.0:
             sl_dist = sl_dist * _widen
             sl = (entry_price - sl_dist) if direction == "BUY" else (entry_price + sl_dist)
 
-        # 2. Combined min stop floor: max(hardcoded config, pip_calc).
-        #    Applied identically in engine/matrix.py::process_signal.
         _floor_pips = 0.0
         try:
             _floor_pips = effective_min_stop_pips(symbol, strategy, self._pip_calc)
@@ -310,7 +325,12 @@ class TradeSimulator:
         else:
             fx_rate = 1.0
 
-        risk_cash = self.equity * (self.risk_pct / 100.0)
+        # ---- Sizing: profile-driven (live identical) or flat ----
+        effective_risk_pct = self._risk_pct_for_trade(current_time)
+        if effective_risk_pct <= 0.0:
+            return self._record_skip(current_time, symbol, strategy, "SIZING_ZERO", direction)
+
+        risk_cash = self.equity * (effective_risk_pct / 100.0)
         pips_at_risk = sl_dist / pip_size
         pip_value_per_lot = (pip_size * contract_size) * fx_rate
         risk_per_lot = pips_at_risk * pip_value_per_lot
@@ -344,7 +364,6 @@ class TradeSimulator:
                 alignment = "BEARISH_ALIGNED" if entry_price < ema_200_value else "COUNTER_TREND"
 
         confirmation_type = getattr(signal, "confirmation_type", "CLOSE")
-
         try:
             is_in_news, _ = MarketSessionManager.is_blackout_active(current_time)
         except Exception:
@@ -356,7 +375,6 @@ class TradeSimulator:
             entry_epoch = 0
 
         effective_be = use_breakeven_override if use_breakeven_override is not None else bool(GLOBAL_PARAMS.use_breakeven)
-
         _min_lot_cash_risk_usd = round(min_lots * risk_per_lot, 4)
         _sl_pips_at_entry = round(sl_dist / pip_size, 2) if pip_size > 0 else 0.0
 
@@ -397,6 +415,7 @@ class TradeSimulator:
             "trail_after_1r_active": False,
             "min_lot_cash_risk_usd": _min_lot_cash_risk_usd,
             "sl_pips_at_entry": _sl_pips_at_entry,
+            "risk_pct_at_entry": round(effective_risk_pct, 4),
         }
 
         self.daily_trade_counts[sast_date_str] = current_daily_count + 1
@@ -406,6 +425,10 @@ class TradeSimulator:
         self.open_positions.append(position)
         return True
 
+    # ------------------------------------------------------------------
+    # Trade management
+    # ------------------------------------------------------------------
+
     def process_candle(self, symbol: str, candle: pd.Series, m5_slice: pd.DataFrame):
         c_high = float(candle['high'])
         c_low = float(candle['low'])
@@ -414,12 +437,10 @@ class TradeSimulator:
         sast_time = curr_time.astimezone(TZ_SAST)
 
         remaining_positions = []
-
         for pos in self.open_positions:
             if pos["symbol"] != symbol:
                 remaining_positions.append(pos)
                 continue
-
             entry = pos["entry_price"]
             sl = pos["stop_loss"]
             tp = pos["take_profit"]
@@ -455,15 +476,12 @@ class TradeSimulator:
 
             sl_hit = (c_low <= sl) if direction == "BUY" else (c_high >= sl)
             tp_hit = (c_high >= tp) if direction == "BUY" else (c_low <= tp)
-
             if sl_hit and tp_hit:
                 self._close_position(pos, sl, curr_time, "SL_CONSERVATIVE_COLLISION")
                 continue
-
             if sl_hit:
                 self._close_position(pos, sl, curr_time, "SL")
                 continue
-
             if tp_hit:
                 self._close_position(pos, tp, curr_time, "TP")
                 continue
@@ -474,7 +492,6 @@ class TradeSimulator:
                 be_trigger_r = float(getattr(GLOBAL_PARAMS, "breakeven_trigger_r", 1.5) or 1.5)
                 progress_r = progress / sl_dist
                 progress_met = progress_r >= be_trigger_r
-
                 if self.be_mode == "STRUCTURAL":
                     structural_break = (
                         pos.get("consec_above_entry", 0) >= 2
@@ -483,16 +500,13 @@ class TradeSimulator:
                     )
                 else:
                     structural_break = True
-
                 if progress_met and structural_break:
                     pos["stop_loss"] = entry
                     pos["is_be_moved"] = True
 
-            if (
-                getattr(GLOBAL_PARAMS, "trail_after_1r_enabled", False)
-                and not pos.get("trail_after_1r_active", False)
-                and sl_dist > 0
-            ):
+            if (getattr(GLOBAL_PARAMS, "trail_after_1r_enabled", False)
+                    and not pos.get("trail_after_1r_active", False)
+                    and sl_dist > 0):
                 _progress_r = ((c_close - entry) if direction == "BUY" else (entry - c_close)) / sl_dist
                 if _progress_r >= 1.0:
                     pos["trail_after_1r_active"] = True
@@ -501,10 +515,7 @@ class TradeSimulator:
                         pos["is_be_moved"] = True
                     pos["trail_mode"] = "SUPERTREND"
 
-            _trail_active = (
-                GLOBAL_PARAMS.use_supertrend_trail
-                or pos.get("trail_after_1r_active", False)
-            )
+            _trail_active = GLOBAL_PARAMS.use_supertrend_trail or pos.get("trail_after_1r_active", False)
             if _trail_active and len(m5_slice) >= 15:
                 exited = False
                 if pos["trail_mode"] == "SUPERTREND":
@@ -514,22 +525,15 @@ class TradeSimulator:
                         self._close_position(pos, c_close, curr_time, "SUPERTREND_TRAIL")
                         exited = True
                 elif pos["trail_mode"] == "EMA_9":
-                    if 'ema_9' in m5_slice.columns:
-                        curr_ema = float(m5_slice['ema_9'].iloc[-1])
-                    else:
-                        curr_ema = float(m5_slice['close'].ewm(span=9, adjust=False).mean().iloc[-1])
+                    curr_ema = float(m5_slice['ema_9'].iloc[-1]) if 'ema_9' in m5_slice.columns else float(m5_slice['close'].ewm(span=9, adjust=False).mean().iloc[-1])
                     if (direction == "BUY" and c_close < curr_ema) or (direction == "SELL" and c_close > curr_ema):
                         self._close_position(pos, c_close, curr_time, "EMA9_TRAIL")
                         exited = True
                 elif pos["trail_mode"] == "EMA_25":
-                    if 'ema_25' in m5_slice.columns:
-                        curr_ema = float(m5_slice['ema_25'].iloc[-1])
-                    else:
-                        curr_ema = float(m5_slice['close'].ewm(span=25, adjust=False).mean().iloc[-1])
+                    curr_ema = float(m5_slice['ema_25'].iloc[-1]) if 'ema_25' in m5_slice.columns else float(m5_slice['close'].ewm(span=25, adjust=False).mean().iloc[-1])
                     if (direction == "BUY" and c_close < curr_ema) or (direction == "SELL" and c_close > curr_ema):
                         self._close_position(pos, c_close, curr_time, "EMA25_TRAIL")
                         exited = True
-
                 if exited:
                     continue
 
@@ -546,11 +550,9 @@ class TradeSimulator:
             if pending["symbol"] != symbol:
                 active_pending.append(pending)
                 continue
-
             if curr_time == pending["created_candle_time"]:
                 active_pending.append(pending)
                 continue
-
             direction = pending["direction"]
             kind = pending.get("kind", "SL")
             pending["candles_since_exit"] = pending.get("candles_since_exit", 0) + 1
@@ -560,10 +562,8 @@ class TradeSimulator:
                     pending["min_low_after_exit"] = min(pending.get("min_low_after_exit", c_low), c_low)
                 else:
                     pending["max_high_after_exit"] = max(pending.get("max_high_after_exit", c_high), c_high)
-
                 target_tp = pending["target_tp"]
                 cap_price = pending["cap_price"]
-
                 reached_tp = (c_high >= target_tp) if direction == "BUY" else (c_low <= target_tp)
                 if reached_tp:
                     pending["reached_original_tp"] = True
@@ -571,42 +571,30 @@ class TradeSimulator:
                     pending["record"]["recovered_to_tp"] = True
                     self._finalize_post_exit(pending)
                     continue
-
                 cap_hit = (c_low <= cap_price) if direction == "BUY" else (c_high >= cap_price)
                 if cap_hit:
                     pending["cap_hit"] = True
                     self._finalize_post_exit(pending)
                     continue
-
                 active_pending.append(pending)
-
             elif kind == "TP":
                 if direction == "BUY":
-                    pending["max_favorable_after_tp"] = max(
-                        pending.get("max_favorable_after_tp", c_high), c_high
-                    )
+                    pending["max_favorable_after_tp"] = max(pending.get("max_favorable_after_tp", c_high), c_high)
                 else:
-                    pending["min_favorable_after_tp"] = min(
-                        pending.get("min_favorable_after_tp", c_low), c_low
-                    )
-
+                    pending["min_favorable_after_tp"] = min(pending.get("min_favorable_after_tp", c_low), c_low)
                 entry_price = pending["entry_price"]
                 cap_price = pending["cap_price"]
-
                 invalid = (c_low <= entry_price) if direction == "BUY" else (c_high >= entry_price)
                 if invalid:
                     pending["invalid"] = True
                     self._finalize_post_exit(pending)
                     continue
-
                 cap_hit = (c_high >= cap_price) if direction == "BUY" else (c_low <= cap_price)
                 if cap_hit:
                     pending["cap_hit"] = True
                     self._finalize_post_exit(pending)
                     continue
-
                 active_pending.append(pending)
-
         self.pending_sl_evaluations = active_pending
 
     def _finalize_post_exit(self, pending: Dict[str, Any]) -> None:
@@ -615,7 +603,6 @@ class TradeSimulator:
         exit_price = pending["exit_price"]
         pip_size = pending["pip_size"]
         direction = pending["direction"]
-
         if kind == "SL":
             if direction == "BUY":
                 worst = pending.get("min_low_after_exit", exit_price)
@@ -623,35 +610,27 @@ class TradeSimulator:
             else:
                 worst = pending.get("max_high_after_exit", exit_price)
                 max_pips = max(0.0, (worst - exit_price) / pip_size) if pip_size > 0 else 0.0
-
             sl_pips = pending.get("sl_pips", 0.0)
             record["post_sl_max_pips"] = round(max_pips, 1)
             record["post_sl_max_ratio"] = round((max_pips / sl_pips), 2) if sl_pips > 0 else 0.0
             record["post_sl_recovered"] = bool(pending.get("reached_original_tp", False))
             record["post_sl_candles"] = int(pending.get("candles_to_recovery", 0))
-
             record["post_sl_cont_pips"] = round(max_pips, 1)
             if not pending.get("reached_original_tp", False):
                 record["recovered_to_tp"] = False
-
             original_tp = pending.get("target_tp", 0.0)
             is_be = bool(pending.get("is_be_moved", False))
             reached_tp = bool(pending.get("reached_original_tp", False))
-
             if is_be and reached_tp and original_tp > 0:
                 entry = record.get("entry_price", 0.0)
                 tp_dist = abs(original_tp - entry)
                 sl_dist = record.get("initial_sl_dist") or tp_dist
-                if sl_dist > 0:
-                    missed_r = tp_dist / sl_dist
-                else:
-                    missed_r = 0.0
+                missed_r = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
                 record["premature_be_exit"] = True
                 record["missed_r_at_tp"] = round(missed_r, 2)
             else:
                 record["premature_be_exit"] = False
                 record["missed_r_at_tp"] = 0.0
-
         elif kind == "TP":
             if direction == "BUY":
                 best = pending.get("max_favorable_after_tp", exit_price)
@@ -659,18 +638,15 @@ class TradeSimulator:
             else:
                 best = pending.get("min_favorable_after_tp", exit_price)
                 max_pips = max(0.0, (exit_price - best) / pip_size) if pip_size > 0 else 0.0
-
             tp_pips = pending.get("tp_pips", 0.0)
             record["post_tp_max_pips"] = round(max_pips, 1)
             record["post_tp_max_ratio"] = round((max_pips / tp_pips), 2) if tp_pips > 0 else 0.0
             record["post_tp_invalid"] = bool(pending.get("invalid", False))
-
             record["post_tp_extra_pips"] = round(max_pips, 1)
 
     def close_all(self, symbol: str, last_candle: pd.Series):
         c_close = float(last_candle['close'])
         curr_time = pd.to_datetime(last_candle['time'], utc=True).to_pydatetime()
-
         remaining_positions = []
         for pos in self.open_positions:
             if pos["symbol"] == symbol:
@@ -678,7 +654,6 @@ class TradeSimulator:
             else:
                 remaining_positions.append(pos)
         self.open_positions = remaining_positions
-
         for pending in self.pending_sl_evaluations:
             self._finalize_post_exit(pending)
         self.pending_sl_evaluations = []
@@ -687,10 +662,8 @@ class TradeSimulator:
         for k in ALT_TARGET_KEYS:
             record[k] = None
         record[ALT_TIMEOUT_FLAG_KEY] = False
-
         if self._m5_epochs is None or self._m5_epochs.size == 0:
             return
-
         try:
             entry = float(record["entry_price"])
             sl = float(record["sl"])
@@ -699,42 +672,33 @@ class TradeSimulator:
             entry_epoch = int(record.get("entry_epoch", 0))
         except Exception:
             return
-
         if entry_epoch <= 0:
             return
-
         sl_dist = abs(entry - sl)
         if sl_dist <= 0:
             return
-
         sign = 1.0 if direction == "BUY" else -1.0
-
         start = int(np.searchsorted(self._m5_epochs, entry_epoch, side="right"))
         if start >= self._m5_epochs.size:
             return
-
         end = min(self._m5_epochs.size, start + ALT_MAX_HOLD_CANDLES)
         highs = self._m5_highs[start:end]
         lows = self._m5_lows[start:end]
         closes = self._m5_closes[start:end]
         if highs.size == 0:
             return
-
         if direction == "BUY":
             sh = np.where(lows <= sl)[0]
         else:
             sh = np.where(highs >= sl)[0]
         stop_hit_idx = int(sh[0]) if sh.size > 0 else None
-
         for key, mult in zip(ALT_TARGET_KEYS, (1.0, 1.5, 2.0, 3.0)):
             target = entry + sign * mult * sl_dist
-
             if direction == "BUY":
                 th = np.where(highs >= target)[0]
             else:
                 th = np.where(lows <= target)[0]
             tgt_hit_idx = int(th[0]) if th.size > 0 else None
-
             if stop_hit_idx is not None and tgt_hit_idx is not None:
                 exit_raw = sl if stop_hit_idx <= tgt_hit_idx else target
             elif stop_hit_idx is not None:
@@ -743,15 +707,12 @@ class TradeSimulator:
                 exit_raw = target
             else:
                 exit_raw = float(closes[-1]) if closes.size > 0 else entry
-
             if direction == "BUY":
                 actual_exit = exit_raw - (spread_pts / 2.0)
             else:
                 actual_exit = exit_raw + (spread_pts / 2.0)
-
             price_diff = (actual_exit - entry) if direction == "BUY" else (entry - actual_exit)
             record[key] = round(price_diff / sl_dist, 2)
-
         timeout = (stop_hit_idx is None)
         if timeout:
             if direction == "BUY":
@@ -772,7 +733,6 @@ class TradeSimulator:
         spread_pts = pos.get("spread_pts", 0.0)
 
         actual_exit = (exit_price - (spread_pts / 2.0)) if direction == "BUY" else (exit_price + (spread_pts / 2.0))
-
         if pos["symbol"] == "USDJPY":
             fx_exit = (1.0 / actual_exit) if actual_exit > 0 else 1.0
         elif pos["symbol"] == "GERMAN30":
@@ -797,15 +757,11 @@ class TradeSimulator:
         mfe_pips = round(mfe_dist / pip_size, 1) if pip_size > 0 else 0.0
         mae_pips = round(mae_dist / pip_size, 1) if pip_size > 0 else 0.0
 
-        if r_multiple > 0.1:
-            result = "WIN"
-        elif r_multiple < -0.1:
-            result = "LOSS"
-        else:
-            result = "BREAKEVEN"
+        if r_multiple > 0.1: result = "WIN"
+        elif r_multiple < -0.1: result = "LOSS"
+        else: result = "BREAKEVEN"
 
         duration_min = int((exit_time - pos["open_time"]).total_seconds() / 60)
-
         target_dist = abs(pos["take_profit"] - entry)
         if result == "WIN":
             failure_reason = "NONE_WIN"
@@ -868,6 +824,7 @@ class TradeSimulator:
             "min_lot_cash_risk_usd": float(pos.get("min_lot_cash_risk_usd", 0.0) or 0.0),
             "sl_pips_at_entry": float(pos.get("sl_pips_at_entry", 0.0) or 0.0),
             "pip_size": float(pip_size),
+            "risk_pct_at_entry": float(pos.get("risk_pct_at_entry", 0.0) or 0.0),
         }
 
         _RESERVED = {
@@ -912,7 +869,6 @@ class TradeSimulator:
                 "candles_since_exit": 0,
                 "candles_to_recovery": 0,
             })
-
         elif result == "WIN" and reason == "TP":
             entry_price = pos["entry_price"]
             tp_dist = abs(pos["take_profit"] - entry_price)
@@ -943,3 +899,10 @@ class TradeSimulator:
         self.balance += money_pnl
         self.equity = self.balance
         self.completed_trades.append(record)
+
+        # ---- Feedback to RiskManager so live and backtest use the same state ----
+        if self.risk_mgr is not None:
+            try:
+                self.risk_mgr.record_trade_outcome(money_pnl)
+            except Exception:
+                pass

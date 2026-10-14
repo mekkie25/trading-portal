@@ -2,25 +2,16 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 
-CHANGES (2026-10-12):
-- COMBINATIONS: R:R 1:1 and 1:2 dropped; new set = BE off/on x {1:2, 1:2.5, 1:3}.
-- LAB_VARIANTS: "Target R:R 1.5" removed; "Target R:R 2.0" and "Target R:R 3.0" kept.
-- run_lab_combination default target_rr raised from 1.0 to 2.5.
-- --rr CLI default raised from 1.0 to 2.5.
-
-FIX (2026-10-12):
-- precompute_market_pass now drains sm.drain_filter_skips() and returns
-  them as `filter_skips`. These are the always-on rejections
-  (SPREAD_IN_R, BLOCKED_HOUR_*, ALWAYS_HTF) that previously vanished.
-- run_cached_combination replays `filter_skips` into the simulator so
-  the skip summary in the report shows them.
-
-STEP 4 CHANGES (2026-10-13):
-- New CLI flag --filter-impact. Reporting only.
-- New function run_filter_impact() runs each pair twice on the same
-  precompute cache: once with the current filters, once with the
-  always-on filters disabled (via a passthrough StrategyManager subclass).
-- Writes backtest/output/filter_impact.json. No saved setting is changed.
+CHANGES 2026-10-14
+------------------
+- New CLI flags: --balance, --currency, --zar-rate, --profile.
+- ZAR starting balance is converted to USD-equivalent once, at the top of
+  run_symbol_matrix, and every downstream layer (simulator, diagnostics,
+  reports) sees the USD figure. All internal math stays in USD.
+- run_cached_combination accepts profile_name and zar_per_usd and passes
+  them to TradeSimulator, so sizing matches the live bot exactly.
+- report_payload now carries starting_balance_usd, profile_name and
+  zar_per_usd so the panel and the export can show them.
 """
 
 import sys
@@ -889,6 +880,8 @@ def run_cached_combination(
     history_days_before_window: float,
     balance: float = 1000.0,
     risk_pct: float = 1.0,
+    profile_name: Optional[str] = None,
+    zar_per_usd: float = 18.0,
     eurusd_df: Optional[pd.DataFrame] = None,
     be_mode: str = "FIXED_80",
     trail_override: Optional[str] = None,
@@ -932,6 +925,8 @@ def run_cached_combination(
         eurusd_df=eurusd_df,
         be_mode=be_mode,
         m5_df_full=(m5_df if is_analysis_combo else None),
+        profile_name=profile_name,
+        zar_per_usd=zar_per_usd,
     )
     cached_signals = precomputed["cached_signals"]
 
@@ -1187,6 +1182,7 @@ def run_cached_combination(
             f"adaptive_effective_pct: {adaptive_pct}%, "
             f"be_mode: {be_mode}, trail_override: {trail_override}, max_daily_override: {max_daily_override}, "
             f"rr_override: {rr_override}, "
+            f"starting_balance_usd: {round(balance, 2)}, profile_name: {profile_name}, zar_per_usd: {zar_per_usd}, "
             f"funnel: {json.dumps(funnel)}, "
             f"vol_block_reasons: {json.dumps(vol_block_reasons)}, "
             f"strategy_errors: {json.dumps(strategy_errors)}, "
@@ -1203,6 +1199,9 @@ def run_cached_combination(
             "window_start": window_start_str,
             "window_end": window_end_str,
             "history_days_before_window": history_days_before_window,
+            "starting_balance_usd": round(balance, 2),
+            "profile_name": profile_name,
+            "zar_per_usd": zar_per_usd,
             "adaptive_effective_pct": adaptive_pct,
             "run_settings": run_settings_text,
             "warnings": report_warnings,
@@ -1420,7 +1419,17 @@ async def run_symbol_matrix(
     eurusd_df: Optional[pd.DataFrame] = None,
     variants: bool = False,
     pair_settings: Optional[Dict[str, Any]] = None,
+    starting_balance: float = 1000.0,
+    currency: str = "USD",
+    zar_rate: float = 18.0,
+    profile_name: Optional[str] = "Max Growth",
 ) -> bool:
+    # Convert ZAR input to USD-equivalent. All internal math stays in USD.
+    if str(currency).upper() == "ZAR" and zar_rate > 0:
+        usd_balance = max(1.0, float(starting_balance) / float(zar_rate))
+    else:
+        usd_balance = max(1.0, float(starting_balance))
+
     orig_adaptive = GLOBAL_PARAMS.adaptive_mode
     orig_be = GLOBAL_PARAMS.use_breakeven
     orig_trail = GLOBAL_PARAMS.use_supertrend_trail
@@ -1531,6 +1540,9 @@ async def run_symbol_matrix(
                 window_start_str=window_start_str, window_end_str=window_end_str,
                 history_days_before_window=history_days_before_window,
                 eurusd_df=eurusd_df,
+                balance=usd_balance,
+                profile_name=profile_name,
+                zar_per_usd=zar_rate,
                 pair_settings=pair_settings,
             )
 
@@ -1583,6 +1595,9 @@ async def run_symbol_matrix(
                         max_daily_override=vcombo.get("max_daily_override"),
                         report_file_override=vcombo.get("report_file"),
                         pair_settings=pair_settings,
+                        balance=usd_balance,
+                        profile_name=profile_name,
+                        zar_per_usd=zar_rate,
                     )
                     v_k = v_res["kpis"]
                     v_timing = v_res.get("timing", {})
@@ -1648,6 +1663,11 @@ async def run_symbol_matrix(
             "symbol": symbol,
             "days": days_count,
             "target_rr": orig_rr,
+            "starting_balance_usd": round(usd_balance, 2),
+            "starting_balance_input": round(float(starting_balance), 2),
+            "currency": str(currency).upper(),
+            "zar_per_usd": float(zar_rate),
+            "profile_name": profile_name,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "total_seconds": total_pair_seconds,
             "phase_seconds": {
@@ -1793,6 +1813,8 @@ def run_lab_combination(
     sm_for_filters: StrategyManager,
     balance: float = 1000.0,
     risk_pct: float = 1.0,
+    profile_name: Optional[str] = None,
+    zar_per_usd: float = 18.0,
     eurusd_df: Optional[pd.DataFrame] = None,
 ) -> List[Dict[str, Any]]:
     saved = {
@@ -1828,6 +1850,8 @@ def run_lab_combination(
             risk_pct=risk_pct,
             eurusd_df=eurusd_df,
             be_mode="FIXED_80",
+            profile_name=profile_name,
+            zar_per_usd=zar_per_usd,
         )
         cached_signals = precomputed["cached_signals"]
         m5_times_list = m5_df['time'].tolist()
@@ -2026,30 +2050,14 @@ def run_settings_optimizer_cli(symbols_list: List[str]) -> int:
         return 1
 
 
-# =============================================================================
-# STEP 4 (2026-10-13): filter impact comparison. Reporting only.
-# =============================================================================
-
 async def run_filter_impact(
     symbols_list: List[str],
     days: int = 365,
 ) -> None:
-    """
-    Runs each pair twice on the same precompute cache:
-      1. current defaults (with filters)
-      2. always-on filters disabled (SPREAD_IN_R, ALWAYS_HTF, blocked hours)
-
-    Writes backtest/output/filter_impact.json with trades, win rate, PF,
-    average R and net P&L side by side. No saved setting is touched.
-    """
     import json
     from backtest.paths import OUTPUT_DIR as _OUTPUT_DIR
 
     class _PassthroughStrategyManager(StrategyManager):
-        """
-        Subclass used only for the "filters off" pass.
-        Bypasses the three always-on filters so we can measure their impact.
-        """
         def _apply_always_on_filters(self, signal, data_5m, data_d1, current_time=None):
             return None
 
@@ -2175,7 +2183,15 @@ async def main():
     parser.add_argument("--symbol", type=str, default="US30")
     parser.add_argument("--symbols", type=str, default=None)
     parser.add_argument("--days", type=int, default=60)
-    parser.add_argument("--rr", type=float, default=2.5)
+    parser.add_argument("--rr", type=float, default=3.0)
+    parser.add_argument("--balance", type=float, default=1000.0,
+                        help="Starting balance. Any value >= 1.0.")
+    parser.add_argument("--currency", type=str, default="USD",
+                        help="Balance currency: USD or ZAR.")
+    parser.add_argument("--zar-rate", type=float, default=18.0,
+                        help="ZAR per USD when --currency ZAR is used.")
+    parser.add_argument("--profile", type=str, default="Max Growth",
+                        help="Risk profile for sizing: Steady, Balanced, Aggressive, Max Growth, or None.")
     parser.add_argument("--mode", type=str, default=None)
     parser.add_argument("--adaptive", action="store_true", default=True)
     parser.add_argument("--breakeven", type=str, default="off")
@@ -2186,10 +2202,8 @@ async def main():
     parser.add_argument("--variants", action="store_true", default=False)
     parser.add_argument("--portfolio-only", action="store_true", default=False)
     parser.add_argument("--lab", action="store_true", default=False)
-    parser.add_argument("--optimize", action="store_true", default=False,
-                        help="Run the per-strategy settings optimizer and exit.")
-    parser.add_argument("--filter-impact", action="store_true", default=False,
-                        help="Reporting-only. Runs each requested pair twice (with and without the always-on filters) and writes backtest/output/filter_impact.json. No saved setting is changed.")
+    parser.add_argument("--optimize", action="store_true", default=False)
+    parser.add_argument("--filter-impact", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.symbols:
@@ -2317,6 +2331,10 @@ async def main():
                 eurusd_df=eurusd_df,
                 variants=args.variants,
                 pair_settings=pair_settings,
+                starting_balance=args.balance,
+                currency=args.currency,
+                zar_rate=args.zar_rate,
+                profile_name=args.profile,
             )
         if not success:
             all_ok = False
