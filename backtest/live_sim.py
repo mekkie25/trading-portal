@@ -9,26 +9,30 @@ One timeline. Trades advance together.
 This is the mode that answers: "What would the live bot have actually
 done over the last N days on a single starting balance?"
 
-Distinct from the Strategy Research mode, which runs each pair and each
-combo in isolation to compare setups and conditions.
+ARCHITECTURE (Option C — full separation)
+-----------------------------------------
+This file is self-contained. It does NOT import from backtest.runner and
+does NOT read the Strategy Research precompute cache.
 
-Design notes
-------------
-- One TradeSimulator instance shared by all pairs.
-  - self.equity is portfolio equity.
-  - self.daily_trade_counts is a portfolio-level counter.
-  - Profile-based sizing uses the shared equity, exactly like live.
-- One timeline: the union of every pair's M5 timestamps inside its
-  per-pair window. Sorting by (timestamp, pair) makes the walk
-  deterministic and identical between runs.
-- Per-pair precompute caches are reused (identical to Strategy Research).
-  No signal regeneration happens here. The cost is zero on a warm cache.
-- Signals are filtered exactly as live does: pair_settings first,
-  then adaptive volatility, then volatility filters, then open_trade.
-  Anything that survives all four is a trade the live bot would take.
-- Live behaviour for skips is preserved: pair-settings rejections, min
-  lot rejections, daily cap rejections and EOD lockdowns are all recorded
-  with reasons.
+It generates its own candidate signals by walking the M5 series bar by
+bar and calling StrategyManager.evaluate_all directly. The signals are
+cached in a separate file ({SYMBOL}_live_signals.pkl.gz) whose key
+includes the strategy sources, the current pair_settings.json, and the
+live-relevant GLOBAL_PARAMS. Change any of those and the cache rebuilds
+automatically.
+
+The candidate signals this file generates are the SAME candidates the
+live bot would see:
+  - always-on filters (SAST window, blocked hours, HTF alignment,
+    spread-in-R ceiling) are applied inside evaluate_all, because those
+    are live rules
+  - backtest-only post-filters are NOT applied, because those exist
+    only to let the research panel explore counterfactuals
+
+Per-trade decisions (pair-settings, adaptive volatility, volatility
+filters, sizing, daily cap, one-position-per-symbol) are made at replay
+time, against the shared equity, in strict chronological order. This is
+the behaviour that makes the live sim distinct from the research panel.
 
 Author: NEXUS Matrix
 """
@@ -39,6 +43,10 @@ import copy
 import math
 import json
 import time
+import gzip
+import pickle
+import hashlib
+import glob
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -51,6 +59,8 @@ if PROJECT_ROOT not in sys.path:
 
 from core.session_config import GLOBAL_PARAMS, TZ_SAST
 from core.volatility_engine import volatility_engine
+from core.indicators import get_session_volume_profile
+from core.session_levels import build_session_levels
 from core.pair_settings import (
     load_pair_settings,
     get_strategy_settings,
@@ -58,20 +68,519 @@ from core.pair_settings import (
     get_effective_rr,
     get_effective_be,
 )
+from strategies.strategy_manager import StrategyManager
+from backtest.bar_aggregator import ZeroLookAheadAggregator
 from backtest.simulator import TradeSimulator, ASSETS
 from backtest.paths import DATA_DIR, OUTPUT_DIR
 from backtest.report import calculate_kpis
-from backtest.runner import (
-    COMBINATIONS,
-    _try_load_precompute,
-    compute_121_window_emas,
-    compute_atr14_series,
-    sanitize_for_json,
-)
 
+
+# ---------------------------------------------------------------------------
+# Constants (local — no dependency on the research runner)
+# ---------------------------------------------------------------------------
 
 WHITELIST_PAIRS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "USDJPY"]
 
+MIN_SESSION_BARS = 20
+
+# Local copy of the combo matrix. Kept independent on purpose: a change to
+# the research runner's COMBINATIONS must never silently change what the
+# live sim tests. If you want them to stay in lockstep, edit both lists.
+LIVE_SIM_COMBINATIONS: List[Dict[str, Any]] = [
+    {"mode": "adaptive", "adaptive_mode": True, "be": "off", "use_be": False,
+     "trail": "off", "use_trail": False,
+     "label": "Adaptive · BE off · R:R 1:2.5", "rr_override": 2.5},
+    {"mode": "adaptive", "adaptive_mode": True, "be": "on", "use_be": True,
+     "trail": "off", "use_trail": False,
+     "label": "Adaptive · BE on · R:R 1:2.5", "rr_override": 2.5},
+    {"mode": "adaptive", "adaptive_mode": True, "be": "off", "use_be": False,
+     "trail": "off", "use_trail": False,
+     "label": "Adaptive · BE off · R:R 1:2", "rr_override": 2.0},
+    {"mode": "adaptive", "adaptive_mode": True, "be": "on", "use_be": True,
+     "trail": "off", "use_trail": False,
+     "label": "Adaptive · BE on · R:R 1:2", "rr_override": 2.0},
+    {"mode": "adaptive", "adaptive_mode": True, "be": "off", "use_be": False,
+     "trail": "off", "use_trail": False,
+     "label": "Adaptive · BE off · R:R 1:3", "rr_override": 3.0},
+    {"mode": "adaptive", "adaptive_mode": True, "be": "on", "use_be": True,
+     "trail": "off", "use_trail": False,
+     "label": "Adaptive · BE on · R:R 1:3", "rr_override": 3.0},
+]
+
+
+# ---------------------------------------------------------------------------
+# Small utilities (local copies — keep this file self-contained)
+# ---------------------------------------------------------------------------
+
+def sanitize_for_json(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [sanitize_for_json(v) for v in obj.tolist()]
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return sanitize_for_json(float(obj))
+    except Exception:
+        return str(obj)
+
+
+def compute_121_window_emas(df: pd.DataFrame) -> None:
+    close = df['close'].values.astype(np.float64)
+    n = len(close)
+    window_size = 121
+    for span in [5, 9, 13, 25, 200]:
+        col_name = f"ema_{span}"
+        if col_name in df.columns:
+            continue
+        alpha = 2.0 / (span + 1.0)
+        weights = np.empty(window_size, dtype=np.float64)
+        weights[0] = (1.0 - alpha) ** (window_size - 1)
+        for k in range(1, window_size):
+            weights[k] = alpha * ((1.0 - alpha) ** (window_size - 1 - k))
+        valid_vals = np.convolve(close, weights[::-1], mode='valid')
+        col_arr = np.empty(n, dtype=np.float64)
+        col_arr[:window_size - 1] = np.nan
+        col_arr[window_size - 1:] = valid_vals
+        df[col_name] = col_arr
+
+
+def compute_atr14_series(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    if "atr_14" in df.columns:
+        return
+    try:
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        df["atr_14"] = tr.rolling(14).mean()
+    except Exception as e:
+        print(f"[live-sim][atr14] failed: {e}", flush=True)
+
+
+def _session_start_utc(d1_view: pd.DataFrame) -> Optional[datetime]:
+    if d1_view is None or d1_view.empty:
+        return None
+    try:
+        last_bar = d1_view.iloc[-1]
+        t = pd.to_datetime(last_bar['time'], utc=True)
+        if hasattr(t, 'to_pydatetime'):
+            return t.to_pydatetime()
+        return t
+    except Exception:
+        return None
+
+
+def _compute_session_volume_profile(
+    m5_df: pd.DataFrame,
+    session_start: Optional[datetime],
+    min_bars: int = MIN_SESSION_BARS,
+) -> Dict[str, Any]:
+    if m5_df is None or m5_df.empty:
+        return get_session_volume_profile(m5_df)
+    if session_start is None:
+        return get_session_volume_profile(m5_df)
+    try:
+        if session_start.tzinfo is None:
+            session_start = session_start.replace(tzinfo=timezone.utc)
+        m5_times = pd.to_datetime(m5_df['time'], utc=True)
+        session_bars = m5_df[m5_times >= session_start]
+        if len(session_bars) >= min_bars:
+            return get_session_volume_profile(session_bars)
+    except Exception:
+        pass
+    return get_session_volume_profile(m5_df)
+
+
+# ---------------------------------------------------------------------------
+# Live signal cache (fully independent of the research precompute)
+# ---------------------------------------------------------------------------
+
+_LIVE_SIGNAL_STATIC_SOURCES = [
+    "core/session_config.py",
+    "core/session_levels.py",
+    "core/indicators.py",
+    "core/volatility_engine.py",
+    "core/targets.py",
+    "core/volume_profile.py",
+    "core/pair_settings.py",
+    "core/spread_config.py",
+    "core/pip_sizes.py",
+    "backtest/bar_aggregator.py",
+    "strategies/base.py",
+    "strategies/strategy_manager.py",
+]
+
+# GLOBAL_PARAMS that affect what evaluate_all returns. If any of these
+# change, the live signal cache must be rebuilt.
+_LIVE_SIGNAL_GLOBAL_KEYS = [
+    "target_rr",
+    "use_breakeven",
+    "use_supertrend_trail",
+    "adaptive_mode",
+    "trading_hours_sast_start",
+    "trading_hours_sast_end",
+    "blocked_hours_sast",
+    "blocked_weekdays",
+    "max_spread_in_r",
+    "strat_always_htf_targets",
+    "min_stop_pips",
+    "breakeven_trigger_r",
+]
+
+
+def _live_signal_source_hash() -> str:
+    h = hashlib.sha256()
+    for rel in _LIVE_SIGNAL_STATIC_SOURCES:
+        p = os.path.join(PROJECT_ROOT, rel)
+        try:
+            with open(p, "rb") as f:
+                h.update(rel.encode())
+                h.update(f.read())
+        except FileNotFoundError:
+            h.update(rel.encode())
+    for p in sorted(glob.glob(os.path.join(PROJECT_ROOT, "strategies", "*.py"))):
+        rel = os.path.relpath(p, PROJECT_ROOT).replace("\\", "/")
+        try:
+            with open(p, "rb") as f:
+                h.update(rel.encode())
+                h.update(f.read())
+        except OSError:
+            pass
+    for key in _LIVE_SIGNAL_GLOBAL_KEYS:
+        try:
+            val = getattr(GLOBAL_PARAMS, key, None)
+            h.update(f"{key}={repr(val)}".encode())
+        except Exception:
+            pass
+    return h.hexdigest()[:16]
+
+
+def _pair_settings_hash(pair_settings: Optional[Dict[str, Any]]) -> str:
+    try:
+        canonical = json.dumps(pair_settings or {}, sort_keys=True, default=str)
+        return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+    except Exception:
+        return "na"
+
+
+def _live_signal_cache_key(
+    symbol: str,
+    sim_start_idx: int,
+    total_bars: int,
+    pair_settings: Optional[Dict[str, Any]],
+) -> str:
+    src = _live_signal_source_hash()
+    ps = _pair_settings_hash(pair_settings)
+    return f"{symbol}|{sim_start_idx}|{total_bars}|{src}|{ps}"
+
+
+def _live_signal_cache_path(symbol: str) -> str:
+    return os.path.join(DATA_DIR, f"{symbol}_live_signals.pkl.gz")
+
+
+def _try_load_live_signal_cache(
+    symbol: str,
+    sim_start_idx: int,
+    total_bars: int,
+    pair_settings: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    path = _live_signal_cache_path(symbol)
+    if not os.path.exists(path):
+        return None, "missing"
+    try:
+        with gzip.open(path, "rb") as f:
+            payload = pickle.load(f)
+        if not isinstance(payload, dict):
+            return None, "malformed"
+        expected = _live_signal_cache_key(symbol, sim_start_idx, total_bars, pair_settings)
+        if payload.get("__key__") != expected:
+            return None, "settings changed"
+        signals = payload.get("signals")
+        if not isinstance(signals, dict):
+            return None, "malformed signals"
+        return payload, "hit"
+    except Exception as e:
+        return None, f"error: {e}"
+
+
+def _save_live_signal_cache(
+    symbol: str,
+    sim_start_idx: int,
+    total_bars: int,
+    pair_settings: Optional[Dict[str, Any]],
+    signals: Dict[int, Any],
+    build_seconds: float,
+) -> None:
+    path = _live_signal_cache_path(symbol)
+    payload = {
+        "__key__": _live_signal_cache_key(symbol, sim_start_idx, total_bars, pair_settings),
+        "__version__": "1.0",
+        "__built_at__": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "__build_seconds__": float(build_seconds),
+        "__count__": len(signals),
+        "__pair_settings_hash__": _pair_settings_hash(pair_settings),
+        "signals": signals,
+    }
+    tmp = path + ".tmp"
+    try:
+        with gzip.open(tmp, "wb", compresslevel=6) as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[live-sim] {symbol}: could not write signal cache: {e}", flush=True)
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Live signal generation (own pipeline, own entry confirmations)
+# ---------------------------------------------------------------------------
+
+def _build_live_signals_for_pair(
+    symbol: str,
+    m5_df: pd.DataFrame,
+    h1_df: pd.DataFrame,
+    h4_df: pd.DataFrame,
+    d1_df: pd.DataFrame,
+    sim_start_idx: int,
+    total_bars: int,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Walk the M5 window bar by bar, call StrategyManager.evaluate_all on
+    each, cache every raw signal keyed by epoch.
+
+    This is the live sim's OWN candidate set. It runs with
+    apply_strat_filters=False, so:
+      - always-on filters (SAST window, blocked hours, HTF alignment,
+        spread-in-R ceiling) run inside evaluate_all, exactly like the
+        live bot
+      - backtest-only post-filters do NOT run
+      - pair-settings, adaptive volatility, and volatility filters are
+        left for the replay loop, which applies them against the shared
+        equity and current state
+    """
+    aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
+    sm = StrategyManager()
+    frozen_orbs: Dict[Any, Any] = {}
+
+    last_d1_bar_count = -1
+    last_vol_date = None
+    vol_metrics: Dict[str, Any] = {"valid": False}
+    adr_val = None
+    regime = "NORMAL"
+
+    signals: Dict[int, Dict[str, Any]] = {}
+    m5_times_list = m5_df['time'].tolist()
+    total_sim_bars = max(1, total_bars - sim_start_idx)
+    next_progress_pct = 20
+
+    for i in range(sim_start_idx, total_bars):
+        curr_time = m5_times_list[i].to_pydatetime()
+        curr_bar = m5_df.iloc[i]
+        m5_slice = m5_df.iloc[max(0, i - 120):i + 1]
+
+        pct = int(((i - sim_start_idx) / total_sim_bars) * 100)
+        if pct >= next_progress_pct:
+            print(f"[live-sim] {symbol} precompute {next_progress_pct}% ...", flush=True)
+            next_progress_pct += 20
+
+        # Skip weekend bars. The live bot never sees them from the feed.
+        wkday = curr_time.weekday()
+        if wkday == 5 or (wkday == 6 and curr_time.hour < 21):
+            continue
+
+        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(m5_slice, curr_time)
+
+        curr_d1_len = len(d1_view)
+        curr_date = curr_time.date()
+        need_full_recalc = (
+            curr_d1_len != last_d1_bar_count
+            or curr_date != last_vol_date
+            or not vol_metrics.get("valid", False)
+        )
+
+        if need_full_recalc:
+            vol_metrics = volatility_engine.compute_symbol_volatility(
+                d1_df=d1_view,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                symbol=symbol,
+                as_of=curr_time,
+            )
+            if vol_metrics.get("valid", False):
+                adr_val = vol_metrics.get("adr")
+                regime = vol_metrics.get("regime", "NORMAL")
+            last_d1_bar_count = curr_d1_len
+            last_vol_date = curr_date
+
+        if vol_metrics.get("valid", False):
+            active_vol = volatility_engine.refresh_intraday(
+                vol_metrics=vol_metrics,
+                m5_df=m5_slice,
+                current_quote=float(curr_bar['close']),
+                d1_view=d1_view,
+                as_of=curr_time,
+            )
+        else:
+            active_vol = vol_metrics
+
+        session_start = _session_start_utc(d1_view)
+        vp = _compute_session_volume_profile(m5_slice, session_start)
+        session_levels = build_session_levels(
+            symbol=symbol,
+            m5_df=m5_slice,
+            d1_df=d1_view,
+            vp_node=vp,
+            frozen_orbs=frozen_orbs,
+            as_of=curr_time,
+            adr_val=adr_val,
+        )
+
+        # apply_strat_filters defaults to False — we want the live sim's
+        # own candidates, not the research panel's filtered set.
+        raw_signal = sm.evaluate_all(
+            symbol=symbol,
+            data_5m=m5_slice,
+            data_h4=h4_view,
+            data_d1=d1_view,
+            session_levels=session_levels,
+            data_h1=h1_view,
+        )
+
+        if raw_signal is not None:
+            try:
+                epoch = int(curr_time.timestamp())
+            except Exception:
+                continue
+            signals[epoch] = {
+                "raw_signal": raw_signal,
+                "active_vol": active_vol,
+                "session_levels": session_levels,
+                "adr_val": adr_val,
+                "regime": regime,
+            }
+
+    print(
+        f"[live-sim] {symbol} precompute 100% complete "
+        f"({len(signals)} signals)",
+        flush=True,
+    )
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Pair loader (own cache, own build)
+# ---------------------------------------------------------------------------
+
+def _load_pair_for_live_sim(
+    sym: str,
+    days_count: int,
+    pair_settings: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    m5_path = os.path.join(DATA_DIR, f"{sym}_M5.csv")
+    h1_path = os.path.join(DATA_DIR, f"{sym}_H1.csv")
+    h4_path = os.path.join(DATA_DIR, f"{sym}_H4.csv")
+    d1_path = os.path.join(DATA_DIR, f"{sym}_D1.csv")
+
+    if not all(os.path.exists(p) for p in [m5_path, h1_path, h4_path, d1_path]):
+        print(f"[live-sim] {sym}: missing market data files, skipping.", flush=True)
+        return None
+
+    try:
+        m5_df = pd.read_csv(m5_path)
+        h1_df = pd.read_csv(h1_path)
+        h4_df = pd.read_csv(h4_path)
+        d1_df = pd.read_csv(d1_path)
+        m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
+    except Exception as e:
+        print(f"[live-sim] {sym}: could not load market data ({e}).", flush=True)
+        return None
+
+    if m5_df.empty:
+        print(f"[live-sim] {sym}: M5 file is empty, skipping.", flush=True)
+        return None
+
+    compute_121_window_emas(m5_df)
+    compute_atr14_series(m5_df)
+
+    last_bar = m5_df['time'].iloc[-1]
+    cutoff = last_bar - pd.Timedelta(days=int(days_count))
+    mask = (m5_df['time'] >= cutoff).to_numpy()
+    if not mask.any():
+        print(f"[live-sim] {sym}: no bars in window, skipping.", flush=True)
+        return None
+    sim_start_idx = max(120, int(mask.argmax()))
+    total_bars = len(m5_df)
+
+    cached, reason = _try_load_live_signal_cache(
+        sym, sim_start_idx, total_bars, pair_settings,
+    )
+
+    if cached is not None:
+        built_at = cached.get("__built_at__", "?")
+        build_s = cached.get("__build_seconds__", 0.0)
+        count = cached.get("__count__", 0)
+        print(
+            f"[live-sim] {sym}: cache hit "
+            f"(built {built_at}, {int(build_s)}s, {count} signals)",
+            flush=True,
+        )
+        signals = cached.get("signals", {})
+    else:
+        print(f"[live-sim] {sym}: cache miss ({reason}), building now...", flush=True)
+        t0 = time.perf_counter()
+        signals = _build_live_signals_for_pair(
+            sym, m5_df, h1_df, h4_df, d1_df, sim_start_idx, total_bars,
+        )
+        build_seconds = time.perf_counter() - t0
+        _save_live_signal_cache(
+            sym, sim_start_idx, total_bars, pair_settings, signals, build_seconds,
+        )
+        print(
+            f"[live-sim] {sym}: cache built in {build_seconds:.1f}s "
+            f"({len(signals)} signals)",
+            flush=True,
+        )
+
+    return {
+        "m5_df": m5_df,
+        "sim_start_idx": sim_start_idx,
+        "total_bars": total_bars,
+        "signal_by_time": signals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Portfolio simulator (unchanged trading loop)
+# ---------------------------------------------------------------------------
 
 class LivePortfolioSimulator:
     """
@@ -103,7 +612,6 @@ class LivePortfolioSimulator:
         self.adaptive_mode = bool(combo.get('adaptive_mode', True))
         self.rr_override = combo.get('rr_override', None)
 
-        # One shared simulator for the entire portfolio.
         self.sim = TradeSimulator(
             starting_balance=self.balance_usd,
             risk_pct=1.0,
@@ -116,17 +624,7 @@ class LivePortfolioSimulator:
         self.timeline = self._build_timeline()
         self.pair_setting_skips: List[Dict[str, Any]] = []
 
-    # ------------------------------------------------------------------
-    # Timeline
-    # ------------------------------------------------------------------
-
     def _build_timeline(self) -> List[Tuple[pd.Timestamp, str, int]]:
-        """
-        Build the union timeline as a sorted list of (timestamp, symbol, idx).
-
-        Sort key is (timestamp, symbol). This makes the walk deterministic
-        and identical between runs, regardless of how dict ordering changes.
-        """
         events: List[Tuple[pd.Timestamp, str, int]] = []
         for sym, data in self.pair_data.items():
             m5 = data['m5_df']
@@ -137,10 +635,6 @@ class LivePortfolioSimulator:
                 events.append((t, sym, idx))
         events.sort(key=lambda x: (x[0], x[1]))
         return events
-
-    # ------------------------------------------------------------------
-    # Walk
-    # ------------------------------------------------------------------
 
     def run(self) -> Dict[str, Any]:
         orig_rr = GLOBAL_PARAMS.target_rr
@@ -170,7 +664,6 @@ class LivePortfolioSimulator:
     def _process_event(self, t: pd.Timestamp, sym: str, idx: int) -> None:
         m5 = self.pair_data[sym]['m5_df']
 
-        # 1. Advance any open positions on this pair with the current bar.
         has_on_sym = any(p['symbol'] == sym for p in self.sim.open_positions)
         has_pending = any(p.get('symbol') == sym for p in self.sim.pending_sl_evaluations)
         if has_on_sym or has_pending:
@@ -181,7 +674,6 @@ class LivePortfolioSimulator:
             except Exception as e:
                 print(f"[live-sim] process_candle error on {sym} at {t}: {e}", flush=True)
 
-        # 2. Look for a new signal on this pair at this bar.
         t_key = int(t.timestamp())
         signal_data = self.pair_data[sym]['signal_by_time'].get(t_key)
         if signal_data is None:
@@ -195,14 +687,12 @@ class LivePortfolioSimulator:
         t: pd.Timestamp,
         signal_data: Dict[str, Any],
     ) -> None:
-        # Live rule: at most one open position per symbol at a time.
         if any(p['symbol'] == sym for p in self.sim.open_positions):
             return
 
         sig = copy.deepcopy(signal_data['raw_signal'])
         m5 = self.pair_data[sym]['m5_df']
 
-        # 1. Pair-settings filter (applied live and here, identical code path).
         strat_rr = GLOBAL_PARAMS.target_rr
         strat_be = self.use_be
         if self.pair_settings:
@@ -244,7 +734,6 @@ class LivePortfolioSimulator:
             strat_rr = get_effective_rr(strat_s, GLOBAL_PARAMS.target_rr)
             strat_be = get_effective_be(strat_s, self.use_be)
 
-        # 2. Adaptive volatility adaptation (identical to live and to research).
         if self.adaptive_mode:
             active_vol = signal_data.get('active_vol') or {}
             if not active_vol.get('valid', False):
@@ -274,7 +763,6 @@ class LivePortfolioSimulator:
 
             sig = adapted
 
-        # 3. Open the trade. open_trade enforces the daily cap and min-lot checks.
         try:
             t_dt = t.to_pydatetime() if hasattr(t, 'to_pydatetime') else t
         except Exception:
@@ -297,17 +785,12 @@ class LivePortfolioSimulator:
                     self.sim.close_all(sym, last_bar)
                 except Exception as e:
                     print(f"[live-sim] close_all error on {sym}: {e}", flush=True)
-        # Any remaining pending post-exit trackers are finalised once.
         try:
             for pending in self.sim.pending_sl_evaluations:
                 self.sim._finalize_post_exit(pending)
         except Exception:
             pass
         self.sim.pending_sl_evaluations = []
-
-    # ------------------------------------------------------------------
-    # Report builders
-    # ------------------------------------------------------------------
 
     def _build_equity_curve(self) -> List[Dict[str, Any]]:
         curve = [{
@@ -361,13 +844,8 @@ class LivePortfolioSimulator:
             ]
             if not sym_trades:
                 per[sym] = {
-                    'trades': 0,
-                    'wins': 0,
-                    'losses': 0,
-                    'breakeven': 0,
-                    'net_pnl': 0.0,
-                    'win_rate': 0.0,
-                    'profit_factor': 0.0,
+                    'trades': 0, 'wins': 0, 'losses': 0, 'breakeven': 0,
+                    'net_pnl': 0.0, 'win_rate': 0.0, 'profit_factor': 0.0,
                 }
                 continue
 
@@ -420,7 +898,6 @@ class LivePortfolioSimulator:
 
         ordered = sorted(trades, key=lambda tr: str(tr.get('signal_time_utc', '')))
 
-        # Longest consecutive loss streak
         max_loss_streak = 0
         cur = 0
         for tr in ordered:
@@ -431,7 +908,6 @@ class LivePortfolioSimulator:
             else:
                 cur = 0
 
-        # Peak drawdown on the trade-level equity curve
         eq = self.balance_usd
         peak = eq
         max_dd = 0.0
@@ -481,80 +957,9 @@ class LivePortfolioSimulator:
         }
 
 
-# ----------------------------------------------------------------------
-# Data loading helper
-# ----------------------------------------------------------------------
-
-def _load_pair_for_live_sim(
-    sym: str,
-    days_count: int,
-) -> Optional[Dict[str, Any]]:
-    """
-    Load one pair's M5 data, compute indicators and fetch its precompute
-    cache. Returns None when data or cache is missing. Never raises.
-    """
-    m5_path = os.path.join(DATA_DIR, f"{sym}_M5.csv")
-    if not os.path.exists(m5_path):
-        print(f"[live-sim] {sym}: missing M5 file, skipping.", flush=True)
-        return None
-
-    try:
-        m5_df = pd.read_csv(m5_path)
-        m5_df['time'] = pd.to_datetime(m5_df['time'], utc=True)
-    except Exception as e:
-        print(f"[live-sim] {sym}: could not load M5 ({e}).", flush=True)
-        return None
-
-    if m5_df.empty:
-        print(f"[live-sim] {sym}: M5 file is empty, skipping.", flush=True)
-        return None
-
-    compute_121_window_emas(m5_df)
-    compute_atr14_series(m5_df)
-
-    last_bar = m5_df['time'].iloc[-1]
-    cutoff = last_bar - pd.Timedelta(days=int(days_count))
-    mask = (m5_df['time'] >= cutoff).to_numpy()
-    if not mask.any():
-        print(f"[live-sim] {sym}: no bars in window, skipping.", flush=True)
-        return None
-    sim_start_idx = max(120, int(mask.argmax()))
-
-    cached = _try_load_precompute(sym, sim_start_idx, len(m5_df))
-    if cached is None:
-        print(
-            f"[live-sim] {sym}: no precompute cache for this window. "
-            f"Run a Strategy Research backtest first (same number of days).",
-            flush=True,
-        )
-        return None
-
-    cached_signals = cached.get('cached_signals') or {}
-    signal_by_time: Dict[int, Dict[str, Any]] = {}
-    for i, sig_data in cached_signals.items():
-        try:
-            t = m5_df['time'].iloc[i]
-        except Exception:
-            continue
-        signal_by_time[int(t.timestamp())] = sig_data
-
-    print(
-        f"[live-sim] {sym}: loaded, {len(cached_signals)} signals in cache.",
-        flush=True,
-    )
-
-    return {
-        'm5_df': m5_df,
-        'sim_start_idx': sim_start_idx,
-        'cached_signals': cached_signals,
-        'signal_by_time': signal_by_time,
-        'total_bars': len(m5_df),
-    }
-
-
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Public entry point
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 async def run_live_portfolio_simulation(
     symbols_list: List[str],
@@ -582,26 +987,28 @@ async def run_live_portfolio_simulation(
         flush=True,
     )
 
+    # Pair settings are needed up front because they are part of the live
+    # signal cache key. Loaded once, reused for the whole run.
+    pair_settings = load_pair_settings()
+
     pair_data: Dict[str, Dict[str, Any]] = {}
     for sym in symbols_list:
-        loaded = _load_pair_for_live_sim(sym, days_count)
+        loaded = _load_pair_for_live_sim(sym, days_count, pair_settings)
         if loaded is not None:
             pair_data[sym] = loaded
 
     if not pair_data:
         print(
-            "[live-sim] No pairs available. Run a Strategy Research backtest first "
-            "with the same number of days.",
+            "[live-sim] No pairs available. Check that M5/H1/H4/D1 CSVs exist "
+            "for the requested symbols.",
             flush=True,
         )
         return False
 
-    pair_settings = load_pair_settings()
-
     combo_reports: List[Dict[str, Any]] = []
     run_started = time.perf_counter()
 
-    for combo in COMBINATIONS:
+    for combo in LIVE_SIM_COMBINATIONS:
         print(f"[live-sim] Running {combo['label']} ...", flush=True)
         combo_t0 = time.perf_counter()
         try:
