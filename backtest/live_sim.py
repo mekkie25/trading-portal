@@ -6,35 +6,19 @@ Simulates the LIVE bot as a single account. One TradeSimulator instance
 across all pairs. One equity. One set of daily caps. One risk profile.
 One timeline. Trades advance together.
 
-This is the mode that answers: "What would the live bot have actually
-done over the last N days on a single starting balance?"
-
 ARCHITECTURE (Option C — full separation)
 -----------------------------------------
 This file is self-contained. It does NOT import from backtest.runner and
-does NOT read the Strategy Research precompute cache.
+does NOT read the Strategy Research precompute cache. It generates its own
+candidate signals and caches them in {SYMBOL}_live_signals.pkl.gz.
 
-It generates its own candidate signals by walking the M5 series bar by
-bar and calling StrategyManager.evaluate_all directly. The signals are
-cached in a separate file ({SYMBOL}_live_signals.pkl.gz) whose key
-includes the strategy sources, the current pair_settings.json, and the
-live-relevant GLOBAL_PARAMS. Change any of those and the cache rebuilds
-automatically.
-
-The candidate signals this file generates are the SAME candidates the
-live bot would see:
-  - always-on filters (SAST window, blocked hours, HTF alignment,
-    spread-in-R ceiling) are applied inside evaluate_all, because those
-    are live rules
-  - backtest-only post-filters are NOT applied, because those exist
-    only to let the research panel explore counterfactuals
-
-Per-trade decisions (pair-settings, adaptive volatility, volatility
-filters, sizing, daily cap, one-position-per-symbol) are made at replay
-time, against the shared equity, in strict chronological order. This is
-the behaviour that makes the live sim distinct from the research panel.
-
-Author: NEXUS Matrix
+FIX 2026-10-14
+--------------
+- LivePortfolioSimulator now accepts an `eurusd_df` argument and forwards it
+  to TradeSimulator. GERMAN30 is quoted in EUR and needs the EURUSD series to
+  convert P&L back to USD. Without this, every GERMAN30 entry was rejected
+  with UNSUPPORTED_SYMBOL_NO_FX. run_live_portfolio_simulation loads
+  EURUSD_M5.csv once when GERMAN30 is in the symbols list.
 """
 
 import os
@@ -83,9 +67,6 @@ WHITELIST_PAIRS = ["US30", "GOLD", "NAS100", "GERMAN30", "EURUSD", "GBPUSD", "US
 
 MIN_SESSION_BARS = 20
 
-# Local copy of the combo matrix. Kept independent on purpose: a change to
-# the research runner's COMBINATIONS must never silently change what the
-# live sim tests. If you want them to stay in lockstep, edit both lists.
 LIVE_SIM_COMBINATIONS: List[Dict[str, Any]] = [
     {"mode": "adaptive", "adaptive_mode": True, "be": "off", "use_be": False,
      "trail": "off", "use_trail": False,
@@ -217,7 +198,7 @@ def _compute_session_volume_profile(
 
 
 # ---------------------------------------------------------------------------
-# Live signal cache (fully independent of the research precompute)
+# Live signal cache (independent of the research precompute)
 # ---------------------------------------------------------------------------
 
 _LIVE_SIGNAL_STATIC_SOURCES = [
@@ -235,8 +216,6 @@ _LIVE_SIGNAL_STATIC_SOURCES = [
     "strategies/strategy_manager.py",
 ]
 
-# GLOBAL_PARAMS that affect what evaluate_all returns. If any of these
-# change, the live signal cache must be rebuilt.
 _LIVE_SIGNAL_GLOBAL_KEYS = [
     "target_rr",
     "use_breakeven",
@@ -373,20 +352,6 @@ def _build_live_signals_for_pair(
     sim_start_idx: int,
     total_bars: int,
 ) -> Dict[int, Dict[str, Any]]:
-    """
-    Walk the M5 window bar by bar, call StrategyManager.evaluate_all on
-    each, cache every raw signal keyed by epoch.
-
-    This is the live sim's OWN candidate set. It runs with
-    apply_strat_filters=False, so:
-      - always-on filters (SAST window, blocked hours, HTF alignment,
-        spread-in-R ceiling) run inside evaluate_all, exactly like the
-        live bot
-      - backtest-only post-filters do NOT run
-      - pair-settings, adaptive volatility, and volatility filters are
-        left for the replay loop, which applies them against the shared
-        equity and current state
-    """
     aggregator = ZeroLookAheadAggregator(d1_df, h4_df, h1_df)
     sm = StrategyManager()
     frozen_orbs: Dict[Any, Any] = {}
@@ -412,7 +377,6 @@ def _build_live_signals_for_pair(
             print(f"[live-sim] {symbol} precompute {next_progress_pct}% ...", flush=True)
             next_progress_pct += 20
 
-        # Skip weekend bars. The live bot never sees them from the feed.
         wkday = curr_time.weekday()
         if wkday == 5 or (wkday == 6 and curr_time.hour < 21):
             continue
@@ -464,8 +428,6 @@ def _build_live_signals_for_pair(
             adr_val=adr_val,
         )
 
-        # apply_strat_filters defaults to False — we want the live sim's
-        # own candidates, not the research panel's filtered set.
         raw_signal = sm.evaluate_all(
             symbol=symbol,
             data_5m=m5_slice,
@@ -578,18 +540,39 @@ def _load_pair_for_live_sim(
     }
 
 
+def _load_eurusd_for_german30_fx() -> Optional[pd.DataFrame]:
+    """
+    Load EURUSD M5 once so GERMAN30 (quoted in EUR) can convert P&L to USD.
+    Returns None if the file is missing or unreadable.
+    """
+    eurusd_path = os.path.join(DATA_DIR, "EURUSD_M5.csv")
+    if not os.path.exists(eurusd_path):
+        print(
+            f"[live-sim] WARNING: EURUSD_M5.csv missing. GERMAN30 entries will be "
+            f"rejected with UNSUPPORTED_SYMBOL_NO_FX.",
+            flush=True,
+        )
+        return None
+    try:
+        eurusd_df = pd.read_csv(eurusd_path)
+        if 'time' in eurusd_df.columns:
+            eurusd_df['time'] = pd.to_datetime(eurusd_df['time'], utc=True)
+        print(
+            f"[live-sim] Loaded EURUSD history for GERMAN30 FX conversion "
+            f"({len(eurusd_df)} bars).",
+            flush=True,
+        )
+        return eurusd_df
+    except Exception as e:
+        print(f"[live-sim] WARNING: could not load EURUSD: {e}", flush=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Portfolio simulator (unchanged trading loop)
+# Portfolio simulator
 # ---------------------------------------------------------------------------
 
 class LivePortfolioSimulator:
-    """
-    Walk-forward single-account simulator for the live bot.
-
-    Instantiate once per combo. Call .run() to walk the timeline and
-    return a report dict.
-    """
-
     def __init__(
         self,
         combo: Dict[str, Any],
@@ -598,6 +581,7 @@ class LivePortfolioSimulator:
         pair_data: Dict[str, Dict[str, Any]],
         zar_per_usd: float = 18.0,
         pair_settings: Optional[Dict[str, Any]] = None,
+        eurusd_df: Optional[pd.DataFrame] = None,
     ):
         self.combo = combo
         self.balance_usd = float(balance_usd)
@@ -619,6 +603,7 @@ class LivePortfolioSimulator:
             m5_df_full=None,
             profile_name=profile_name,
             zar_per_usd=self.zar_per_usd,
+            eurusd_df=eurusd_df,
         )
 
         self.timeline = self._build_timeline()
@@ -969,12 +954,6 @@ async def run_live_portfolio_simulation(
     zar_rate: float,
     profile_name: str,
 ) -> bool:
-    """
-    Run the Live Bot Portfolio Replay across the given symbols and every
-    combination. Writes live_sim_report.json into OUTPUT_DIR.
-
-    Returns True on success, False on any fatal error.
-    """
     currency = (currency or 'USD').upper()
     if currency == 'ZAR' and zar_rate and zar_rate > 0:
         usd_balance = max(1.0, float(starting_balance_input) / float(zar_rate))
@@ -987,8 +966,6 @@ async def run_live_portfolio_simulation(
         flush=True,
     )
 
-    # Pair settings are needed up front because they are part of the live
-    # signal cache key. Loaded once, reused for the whole run.
     pair_settings = load_pair_settings()
 
     pair_data: Dict[str, Dict[str, Any]] = {}
@@ -1005,6 +982,11 @@ async def run_live_portfolio_simulation(
         )
         return False
 
+    # FIX 2026-10-14: load EURUSD once for GERMAN30 FX conversion.
+    eurusd_df: Optional[pd.DataFrame] = None
+    if 'GERMAN30' in pair_data:
+        eurusd_df = _load_eurusd_for_german30_fx()
+
     combo_reports: List[Dict[str, Any]] = []
     run_started = time.perf_counter()
 
@@ -1019,6 +1001,7 @@ async def run_live_portfolio_simulation(
                 pair_data=pair_data,
                 zar_per_usd=zar_rate,
                 pair_settings=pair_settings,
+                eurusd_df=eurusd_df,
             )
             report = sim.run()
             report['run_seconds'] = round(time.perf_counter() - combo_t0, 2)
