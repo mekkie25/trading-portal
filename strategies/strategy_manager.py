@@ -2,16 +2,19 @@
 trading-portal/strategies/strategy_manager.py
 Orchestrates strategies across the 7 whitelisted assets.
 
-CHANGES 2026-10-13 (round 2)
+CHANGES 2026-10-14 (round 3)
 ----------------------------
-- _apply_always_on_filters now also applies the global SAST entry session
-  window (GLOBAL_PARAMS.trading_hours_sast_start / _end). New signals are
-  dropped outside that window with reason BLOCKED_OUTSIDE_SESSION_HH_SAST.
-  Existing positions are untouched; this only gates entries.
+_apply_always_on_filters now calls three additional guards, in this order:
 
-STEP 1: diagnostics on SPREAD_IN_R skips.
-STEP 2: spreads loaded from config/spread_config.json.
-STEP 3: per-pair and per-strategy overrides via core.pair_settings.
+  0. Global SAST entry window   (trading_hours_sast_start / _end)
+  1. Blocked weekday per pair   (MarketSessionManager.is_blocked_weekday)
+  2. Blocked hours per pair     (via core.pair_settings.resolve_blocked_hours)
+  3. HTF alignment              (via core.pair_settings.resolve_always_htf_enabled)
+  4. Spread-in-R ceiling        (via core.pair_settings.resolve_max_spread_in_r)
+
+Before this change, is_blocked_weekday existed in session_config.py but
+was never called, and blocked_hours_sast was only read by the fast
+StrategyManager copy that the live engine does not use.
 """
 
 import os
@@ -110,8 +113,8 @@ class StrategyManager:
         data_d1: pd.DataFrame,
         current_time: Any = None,
     ) -> Optional[str]:
-        # 0. Global SAST entry window. Must run first so that every strategy
-        #    is gated identically and the reason is unambiguous.
+        # 0. Global SAST entry window. Must run first so every strategy is
+        #    gated identically and the reason is unambiguous.
         try:
             if current_time is not None:
                 ts_window = pd.Timestamp(current_time)
@@ -125,7 +128,22 @@ class StrategyManager:
         except Exception:
             pass
 
-        # 1. Blocked hours, per pair.
+        # 1. Blocked weekday, per pair. Driven by GLOBAL_PARAMS.blocked_weekdays.
+        #    US30 and NAS100 both lose money on Tuesday (-$844 and -$222 on
+        #    the 2026-10-14 run). This filter was never called before.
+        try:
+            ts_wd = pd.Timestamp(current_time) if current_time is not None else pd.Timestamp.utcnow()
+            if ts_wd.tzinfo is None:
+                ts_wd = ts_wd.tz_localize("UTC")
+            blocked_wd, wd_reason = MarketSessionManager.is_blocked_weekday(
+                signal.symbol, ts_wd.to_pydatetime()
+            )
+            if blocked_wd:
+                return wd_reason
+        except Exception:
+            pass
+
+        # 2. Blocked hours, per pair.
         try:
             blocked_hours = _resolve_blocked_hours(
                 self._pair_settings_cache,
@@ -142,7 +160,7 @@ class StrategyManager:
         except Exception:
             pass
 
-        # 2. HTF alignment.
+        # 3. HTF alignment.
         try:
             global_targets = getattr(GLOBAL_PARAMS, "strat_always_htf_targets", None)
             htf_on = _resolve_always_htf_enabled(
@@ -171,7 +189,7 @@ class StrategyManager:
             except Exception:
                 pass
 
-        # 3. Spread-in-R ceiling.
+        # 4. Spread-in-R ceiling.
         try:
             max_spr = _resolve_max_spread_in_r(
                 self._pair_settings_cache,

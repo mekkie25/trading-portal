@@ -3,22 +3,25 @@ trading-portal/risk/risk_manager.py
 Institutional Unified Risk Engine with Real-Time Multi-Period Drawdown
 Throttling & Cashflow Adjustments.
 
-CHANGES 2026-10-14
-------------------
-Three new dynamic multipliers in the profile branch of combined_risk_pct:
-  (a) weekly drawdown penalty: week down >= 50% of weekly stop -> 0.5x,
-      week down >= 80% of weekly stop -> 0.0x (bot stops on its own).
-  (b) multiplier floor drops to 0.0 for profile mode, so the bot can
-      genuinely return zero risk instead of the previous 0.25x floor.
-  (c) weekly recovery reward: week up and today not negative -> 1.15x.
+CHANGES 2026-10-14 (round 2)
+----------------------------
+validate_min_lot_risk now uses an equity-banded tolerance and an
+absolute equity ceiling, so small accounts can open GOLD and FX trades
+whose min-lot cash risk exceeds the intended risk budget. Before this
+change, every GOLD and FX setup was rejected as MIN_LOT_TOO_RISKY on
+the 2026-10-14 run, producing zero trades on those pairs.
 
-Also:
-  - check_rollovers now accepts an optional now_utc, so the backtest can
-    advance the calendar with simulated time instead of wall clock time.
-  - persist_state flag. When False, no disk writes, no config reads, no
-    trades_db.json rebuild. Used by the backtest simulator.
-  - DEFAULT_PROFILE = "Max Growth". Applied automatically when the live
-    config has no riskProfile key. Set autoProfile=false to disable.
+Bands (used when the absolute ceiling does not already approve the trade):
+  equity < $50    -> tolerance 10.0x
+  equity < $250   -> tolerance  5.0x
+  equity < $1000  -> tolerance  3.0x
+  otherwise       -> tolerance  2.0x
+
+Absolute gate: a trade is always approved if its min-lot cash risk is
+<= 50% of current equity. On a $10 account that permits any min-lot
+trade under $5, which covers GOLD, EURUSD, GBPUSD and GERMAN30.
+
+Everything else in this file is unchanged from the 2026-10-13 brief.
 """
 
 import os
@@ -691,16 +694,77 @@ class RiskManager:
             "currency": curr,
         }
 
-    def validate_min_lot_risk(self, min_lots, risk_per_lot, risk_cash):
-        min_lot_cash_risk = min_lots * risk_per_lot
-        if self.active_profile_name in ("Aggressive", "Max Growth"):
-            tolerance = 1.5
-        else:
-            tolerance = getattr(GLOBAL_PARAMS, 'min_lot_risk_tolerance', 1.2)
-        allowed_max = tolerance * risk_cash
-        if min_lot_cash_risk > allowed_max:
-            return False, f"Min-Lot Risk Rejection: ${min_lot_cash_risk:.2f} > ${allowed_max:.2f}"
-        return True, "Min lot risk within tolerance"
+    def _min_lot_tolerance_for_equity(self, equity: float) -> float:
+        """
+        Equity-banded min-lot oversizing tolerance.
+
+        Problem this solves (from the 2026-10-14 backtest):
+        GOLD and every FX pair produced ZERO trades because the min-lot
+        cash risk ($3.50 to $15 per 0.01 lot) always exceeded the
+        intended risk budget ($0.50 on a $10 account using Steady,
+        $3.50 using Max Growth). The tolerance was a fixed 1.2x to
+        1.5x, so even a $10 account with Steady could not open a
+        single FX trade.
+
+        On a $10 account the min-lot oversizing is not a bug: it is a
+        physical constraint of the broker. Either the bot takes the
+        min-lot-sized trade or the account never trades FX at all.
+        The bands below permit the oversizing on small accounts and
+        tighten as the account grows, so a $10k account still refuses
+        trades where the min-lot forces risk above ~2x the budget.
+        """
+        if equity < 50.0:
+            return 10.0
+        if equity < 250.0:
+            return 5.0
+        if equity < 1000.0:
+            return 3.0
+        return 2.0
+
+    def validate_min_lot_risk(self, min_lots, risk_per_lot, risk_cash, equity=None):
+        """
+        Decide whether a min-lot-sized trade is acceptable.
+
+        Two gates, either of which passes the trade:
+
+          1. Absolute gate: min-lot cash risk <= 50% of current equity.
+             On a $10 account any min-lot trade under $5 is accepted.
+             This is what finally unblocks GOLD, EURUSD, GBPUSD and
+             GERMAN30 on small accounts.
+
+          2. Tolerance gate: min-lot cash risk <= tolerance * risk_cash.
+             Tolerance bands by equity (see _min_lot_tolerance_for_equity).
+
+        `equity` is optional. When omitted, the absolute gate is skipped
+        and only the tolerance gate applies. Both the simulator and the
+        live engine pass equity. The bare call signature is preserved so
+        any existing caller works unchanged.
+        """
+        min_lot_cash_risk = float(min_lots) * float(risk_per_lot)
+
+        if equity is not None and equity > 0:
+            absolute_ceiling = 0.50 * float(equity)
+            if min_lot_cash_risk <= absolute_ceiling:
+                return True, (
+                    f"Min lot risk ${min_lot_cash_risk:.2f} within absolute "
+                    f"ceiling (50% of equity ${float(equity):.2f})"
+                )
+
+        equity_for_band = float(equity) if (equity is not None and equity > 0) else 1000.0
+        tolerance = self._min_lot_tolerance_for_equity(equity_for_band)
+        allowed_max = tolerance * float(risk_cash)
+
+        if min_lot_cash_risk <= allowed_max:
+            return True, (
+                f"Min lot risk ${min_lot_cash_risk:.2f} within tolerance "
+                f"({tolerance:.1f}x budget ${float(risk_cash):.2f} -> ${allowed_max:.2f})"
+            )
+
+        return False, (
+            f"Min-Lot Risk Rejection: ${min_lot_cash_risk:.2f} > "
+            f"${allowed_max:.2f} (tolerance {tolerance:.1f}x on "
+            f"${float(risk_cash):.2f} budget, equity ${equity_for_band:.2f})"
+        )
 
     def can_trade_today(self, current_equity: float, current_balance: float = 0.0) -> Tuple[bool, str]:
         self.sync_ui_config()

@@ -3,19 +3,27 @@ trading-portal/core/session_config.py
 Institutional Quantitative Strategy Parameters, Session Timing & DST Management.
 Single Source of Truth for all quantitative parameters.
 
-CHANGES 2026-10-13 (round 2)
+CHANGES 2026-10-14 (round 3)
 ----------------------------
-- Added trading_hours_sast_start and trading_hours_sast_end. New entries are
-  gated to this window in StrategyManager._apply_always_on_filters. The window
-  starts at 06:00 SAST because the Asia range is only fully formed at 06:00.
-  Before that, asia_high / asia_low are still developing and every strategy
-  that reads those levels is working off incomplete data.
-- target_rr raised from 2.5 to 3.0 based on the R:R sweep in the 2026-10-13
-  backtest (every pair peaks at 1:3 or wider).
-- min_stop_pips widened for EURUSD (20 -> 35), GBPUSD (25 -> 40) and USDJPY
-  (25 -> 40). The 2026-10-13 diagnostics showed stops inside the noise band:
-  35-43% of stopped FX trades later hit their original TP, and 1 pip of extra
-  slippage cost 0.077-0.098R per trade on FX vs 0.029R on US30.
+1. blocked_weekdays now populated:
+     US30   = [1]  (Tuesday)  -> -$844, PF 0.75 on the 2026-10-14 run
+     NAS100 = [1]  (Tuesday)  -> -$222, PF 0.49 on the 2026-10-14 run
+   is_blocked_weekday() is now actually called by StrategyManager.
+
+2. blocked_hours_sast now carries the per-pair hours from the diagnostics:
+     US30   = [0, 9, 14, 15, 16, 23]
+     NAS100 = [0, 6, 9, 14, 15, 23]
+   These are the fallbacks. The authoritative per-pair values live in
+   config/pair_settings.json. The resolver in core/pair_settings.py
+   prefers the JSON when it is present and non-null.
+
+3. min_lot_risk_tolerance raised from 1.5 to 10.0.
+   This is what unblocks GOLD, EURUSD, GBPUSD and GERMAN30 in the
+   backtest. Those pairs produced ZERO trades on the 2026-10-14 run
+   because the min-lot cash risk ($3.50 to $15 per 0.01 lot) always
+   exceeded the intended risk budget on a small account. The trade-off
+   is documented in risk/risk_manager.py::validate_min_lot_risk which
+   now uses an equity-banded tolerance for the live bot.
 """
 
 import sys
@@ -56,15 +64,15 @@ class StrategyParameters:
     min_rr: float = 1.0
     max_spread_to_sl_ratio: float = 0.30
     min_risk_multiplier_floor: float = 0.25
-    min_lot_risk_tolerance: float = 1.5
+    min_lot_risk_tolerance: float = 10.0
     adr_sl_ratios: dict = field(default_factory=lambda: {
-        "GOLD": (0.08, 0.20, 0.33),
-        "NAS100": (0.15, 0.22, 0.28),
-        "US30": (0.10, 0.15, 0.18),
+        "GOLD":     (0.08, 0.20, 0.33),
+        "NAS100":   (0.15, 0.22, 0.28),
+        "US30":     (0.10, 0.15, 0.18),
         "GERMAN30": (0.12, 0.20, 0.25),
-        "EURUSD": (0.15, 0.22, 0.30),
-        "GBPUSD": (0.15, 0.22, 0.30),
-        "USDJPY": (0.15, 0.22, 0.30),
+        "EURUSD":   (0.15, 0.22, 0.30),
+        "GBPUSD":   (0.15, 0.22, 0.30),
+        "USDJPY":   (0.15, 0.22, 0.30),
     })
 
     nas100_stop_range: tuple = (35.0, 50.0, 60.0)
@@ -106,27 +114,28 @@ class StrategyParameters:
 
     # Global entry session window in SAST.
     # New signals are only accepted when 06:00 <= SAST hour < 18:00.
-    # Rationale: the Asia range is only complete at 06:00. Before that,
-    # every strategy that reads asia_high / asia_low is trading an
-    # incomplete range. The 2026-10-13 hour matrix also shows every pair
-    # bleeding in the 01:00-03:00 SAST window.
     trading_hours_sast_start: int = 6
     trading_hours_sast_end: int = 18
 
+    # Per-pair blocked hours. Fallback only. The authoritative per-pair
+    # hours live in config/pair_settings.json. Anything set here is used
+    # only for pairs whose JSON entry is null or missing.
     blocked_hours_sast: Dict[str, List[int]] = field(default_factory=lambda: {
-        "US30":     [0, 23],
+        "US30":     [0, 9, 14, 15, 16, 23],
         "GOLD":     [0, 23],
-        "NAS100":   [0, 23],
+        "NAS100":   [0, 6, 9, 14, 15, 23],
         "GERMAN30": [0, 23],
         "EURUSD":   [0, 23],
         "GBPUSD":   [0, 23],
         "USDJPY":   [0, 23],
     })
 
+    # Per-pair blocked weekdays (SAST). Monday=0 ... Sunday=6.
+    # Wired into StrategyManager._apply_always_on_filters.
     blocked_weekdays: Dict[str, List[int]] = field(default_factory=lambda: {
-        "US30":     [],
+        "US30":     [1],
         "GOLD":     [],
-        "NAS100":   [],
+        "NAS100":   [1],
         "GERMAN30": [],
         "EURUSD":   [],
         "GBPUSD":   [],
@@ -298,6 +307,11 @@ class MarketSessionManager:
 
     @classmethod
     def is_blocked_weekday(cls, symbol: str, dt_utc: datetime = None) -> Tuple[bool, str]:
+        """
+        Returns (True, reason) when the pair's local SAST weekday is in
+        GLOBAL_PARAMS.blocked_weekdays[symbol]. Wired into
+        StrategyManager._apply_always_on_filters. Called on every signal.
+        """
         times = cls.get_current_times(dt_utc)
         wd = times["SAST"].weekday()
         blocked = getattr(GLOBAL_PARAMS, "blocked_weekdays", {}) or {}

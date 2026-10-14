@@ -2,16 +2,31 @@
 backtest/runner.py
 High-Performance Automated End-to-End Backtest Matrix Runner.
 
-CHANGES 2026-10-14
-------------------
-- New CLI flags: --balance, --currency, --zar-rate, --profile.
-- ZAR starting balance is converted to USD-equivalent once, at the top of
-  run_symbol_matrix, and every downstream layer (simulator, diagnostics,
-  reports) sees the USD figure. All internal math stays in USD.
-- run_cached_combination accepts profile_name and zar_per_usd and passes
-  them to TradeSimulator, so sizing matches the live bot exactly.
-- report_payload now carries starting_balance_usd, profile_name and
-  zar_per_usd so the panel and the export can show them.
+CHANGES 2026-10-14 (round 3)
+----------------------------
+COMBINATIONS replaced. The old list tested R:R 1:2, 1:2.5 and 1:3
+with BE off and on. The 2026-10-14 diagnostics showed:
+
+  - BE off was FLAT or FAILS on every pair. It is still kept for
+    reference but is no longer half the matrix.
+  - The §35 parameter sweep peaked at R:R 5.0 on US30, meaning the
+    MFE on US30 is much larger than 2.5R. R:R 3.5 and 4.0 are now
+    tested.
+
+New six:
+  1. Adaptive · BE on  · R:R 1:2.5
+  2. Adaptive · BE on  · R:R 1:3
+  3. Adaptive · BE on  · R:R 1:3.5
+  4. Adaptive · BE on  · R:R 1:4
+  5. Adaptive · BE off · R:R 1:3
+  6. Adaptive · BE off · R:R 1:4   (analysis_combo=True)
+
+The analysis_combo flag on the last row tells backtest/entry_analysis.py
+which report to pool for star-bucket analysis. It used to be the BE off
+1:2.5 row which produced almost no trades once the min-lot fix was
+applied. BE off 1:4 fires far more often.
+
+Nothing else in this file changed.
 """
 
 import sys
@@ -75,14 +90,6 @@ STORE_MAX_DAYS = 550
 COMBINATIONS = [
     {
         "mode": "adaptive", "adaptive_mode": True,
-        "be": "off", "use_be": False,
-        "trail": "off", "use_trail": False,
-        "label": "Adaptive · BE off · R:R 1:2.5",
-        "rr_override": 2.5,
-        "analysis_combo": True,
-    },
-    {
-        "mode": "adaptive", "adaptive_mode": True,
         "be": "on", "use_be": True,
         "trail": "off", "use_trail": False,
         "label": "Adaptive · BE on · R:R 1:2.5",
@@ -91,18 +98,26 @@ COMBINATIONS = [
     },
     {
         "mode": "adaptive", "adaptive_mode": True,
-        "be": "off", "use_be": False,
+        "be": "on", "use_be": True,
         "trail": "off", "use_trail": False,
-        "label": "Adaptive · BE off · R:R 1:2",
-        "rr_override": 2.0,
+        "label": "Adaptive · BE on · R:R 1:3",
+        "rr_override": 3.0,
         "analysis_combo": False,
     },
     {
         "mode": "adaptive", "adaptive_mode": True,
         "be": "on", "use_be": True,
         "trail": "off", "use_trail": False,
-        "label": "Adaptive · BE on · R:R 1:2",
-        "rr_override": 2.0,
+        "label": "Adaptive · BE on · R:R 1:3.5",
+        "rr_override": 3.5,
+        "analysis_combo": False,
+    },
+    {
+        "mode": "adaptive", "adaptive_mode": True,
+        "be": "on", "use_be": True,
+        "trail": "off", "use_trail": False,
+        "label": "Adaptive · BE on · R:R 1:4",
+        "rr_override": 4.0,
         "analysis_combo": False,
     },
     {
@@ -115,11 +130,11 @@ COMBINATIONS = [
     },
     {
         "mode": "adaptive", "adaptive_mode": True,
-        "be": "on", "use_be": True,
+        "be": "off", "use_be": False,
         "trail": "off", "use_trail": False,
-        "label": "Adaptive · BE on · R:R 1:3",
-        "rr_override": 3.0,
-        "analysis_combo": False,
+        "label": "Adaptive · BE off · R:R 1:4",
+        "rr_override": 4.0,
+        "analysis_combo": True,
     },
 ]
 
@@ -1424,7 +1439,6 @@ async def run_symbol_matrix(
     zar_rate: float = 18.0,
     profile_name: Optional[str] = "Max Growth",
 ) -> bool:
-    # Convert ZAR input to USD-equivalent. All internal math stays in USD.
     if str(currency).upper() == "ZAR" and zar_rate > 0:
         usd_balance = max(1.0, float(starting_balance) / float(zar_rate))
     else:
@@ -1696,7 +1710,7 @@ async def run_symbol_matrix(
             json.dump(safe_summary, f, separators=(",", ":"), allow_nan=False)
         tot_rep += time.perf_counter() - _t0
 
-        _chosen_label = "Adaptive · BE off · R:R 1:3"
+        _chosen_label = "Adaptive · BE off · R:R 1:4"
         _chosen_row = next((r for r in matrix_rows if r.get("label") == _chosen_label), None)
         if _chosen_row is None and matrix_rows:
             _chosen_row = matrix_rows[0]
@@ -2345,7 +2359,7 @@ async def main():
         print(f"WARNING: portfolio correlation refresh failed: {pe}", flush=True)
 
     try:
-        _combined_label = "Adaptive · BE off · R:R 1:3"
+        _combined_label = "Adaptive · BE off · R:R 1:4"
         _combined_trades: List[Dict[str, Any]] = []
         for _sym in symbols_list:
             _summary_file = os.path.join(OUTPUT_DIR, f"{_sym}_summary.json")

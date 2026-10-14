@@ -4,7 +4,7 @@
       "live_enabled": true,
       "risk_pct": null,
       "max_spread_in_r": null,
-      "blocked_hours_sast": null,
+      "blocked_hours_sast": [0, 9, 14, 15, 16, 23],
       "strategies": {
         "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
         "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
@@ -36,7 +36,7 @@
       "live_enabled": true,
       "risk_pct": null,
       "max_spread_in_r": null,
-      "blocked_hours_sast": null,
+      "blocked_hours_sast": [0, 6, 9, 14, 15, 23],
       "strategies": {
         "GRUBBER_KICK":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
         "STRATEGY_513":              {"enabled": true, "session_window_sast": null, "weekdays": null, "min_stop_atr": 0.0, "max_stop_atr": null, "max_spread_in_r": null, "rr": null, "be_enabled": null, "max_daily_trades": null, "always_htf_enabled": null},
