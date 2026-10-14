@@ -4,13 +4,11 @@
  * Live Bot Replay tab. Drives the single-account portfolio simulation and
  * renders the results.
  *
- * Controls:
- *   - Starting balance: any value >= 1.
- *   - Currency: USD or ZAR.
- *   - ZAR rate: shown only when ZAR is selected.
- *   - Days: 60 / 90 / 180 / 365 / 500.
- *   - Risk profile: Steady / Balanced / Aggressive / Max Growth / None.
- *   - Pairs: any subset of the seven whitelisted assets.
+ * Includes:
+ *   - Controls: balance, currency, ZAR rate, days, profile, pairs.
+ *   - Report: headline KPIs, per-pair contribution, equity curve, daily
+ *     equity, skip story, and a filterable Trading Journal.
+ *   - Export: JSON download and "Copy for AI" clipboard buttons.
  *
  * Backed by four endpoints on server.ts:
  *   POST /api/backtest/live-sim
@@ -24,7 +22,7 @@ import { motion } from 'motion/react';
 import {
   Play, Square, RefreshCw, TrendingUp, Activity,
   Wallet, Info, AlertCircle, ChevronDown, ChevronRight,
-  FileText, Users, BarChart3,
+  FileText, Users, BarChart3, Download, Copy, Check, Search,
 } from 'lucide-react';
 import { ThemeMode } from '../../types';
 
@@ -101,8 +99,13 @@ interface LiveSimStatus {
   params: any;
 }
 
+type JournalSort = 'date_desc' | 'date_asc' | 'pnl_desc' | 'pnl_asc' | 'r_desc' | 'r_asc';
+
 const WHITELIST_ASSETS = ['US30', 'GOLD', 'NAS100', 'GERMAN30', 'EURUSD', 'GBPUSD', 'USDJPY'];
 
+// --------------------------------------------------------------------------
+// Equity curve mini-chart
+// --------------------------------------------------------------------------
 const EquityCurveMini: React.FC<{
   data: Array<{ trade_n: number; equity: number; time: string }>;
   startingBalance: number;
@@ -151,6 +154,9 @@ const EquityCurveMini: React.FC<{
   );
 };
 
+// --------------------------------------------------------------------------
+// Component
+// --------------------------------------------------------------------------
 export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
   themeMode = 'dark',
   brokerCurrency = 'USD',
@@ -170,6 +176,14 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
   const [isLoadingReport, setIsLoadingReport] = useState<boolean>(false);
   const [selectedComboIdx, setSelectedComboIdx] = useState<number>(0);
   const [expandedSection, setExpandedSection] = useState<string>('equity');
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
+
+  // Journal filters
+  const [journalSearch, setJournalSearch] = useState<string>('');
+  const [journalPairFilter, setJournalPairFilter] = useState<string>('ALL');
+  const [journalResultFilter, setJournalResultFilter] = useState<string>('ALL');
+  const [journalSort, setJournalSort] = useState<JournalSort>('date_desc');
+  const [journalLimit, setJournalLimit] = useState<number>(100);
 
   // -------- Fetch report --------
   const fetchReport = useCallback(async () => {
@@ -230,21 +244,11 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
 
   const handleRun = async () => {
     if (isRunning) return;
-
-    if (selectedSymbols.length === 0) {
-      setError('Select at least one pair.');
-      return;
-    }
+    if (selectedSymbols.length === 0) { setError('Select at least one pair.'); return; }
     const bal = parseFloat(startingBalance);
-    if (!Number.isFinite(bal) || bal < 1) {
-      setError('Starting balance must be a number >= 1.');
-      return;
-    }
+    if (!Number.isFinite(bal) || bal < 1) { setError('Starting balance must be a number >= 1.'); return; }
     const rate = parseFloat(zarRate);
-    if (currency === 'ZAR' && (!Number.isFinite(rate) || rate <= 0)) {
-      setError('ZAR rate must be > 0.');
-      return;
-    }
+    if (currency === 'ZAR' && (!Number.isFinite(rate) || rate <= 0)) { setError('ZAR rate must be > 0.'); return; }
 
     setIsRunning(true);
     setError(null);
@@ -282,7 +286,120 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
     } catch {}
   };
 
+  const handleExportJson = () => {
+    if (!report) return;
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `live_sim_${report.days}d_${report.currency}_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleCopyForAI = async () => {
+    if (!report) return;
+    const lines: string[] = [];
+    lines.push(`LIVE BOT REPLAY REPORT`);
+    lines.push(`Generated: ${report.generated_at}`);
+    lines.push(`Days: ${report.days} | Pairs: ${report.symbols.join(', ')}`);
+    lines.push(`Starting balance: ${report.starting_balance_input} ${report.currency} (~$${report.starting_balance_usd} USD) | Profile: ${report.profile_name}`);
+    lines.push('');
+
+    for (const combo of report.combos) {
+      lines.push('='.repeat(72));
+      lines.push(`COMBO: ${combo.combo_label}`);
+      if (combo.error) { lines.push(`  ERROR: ${combo.error}`); lines.push(''); continue; }
+
+      lines.push(`  Final equity: $${combo.final_equity} (from $${combo.starting_balance_usd})`);
+      lines.push(`  Net P&L: $${combo.net_pnl} (${combo.net_pnl_pct}%)`);
+      lines.push(`  Peak DD: -$${combo.peak_drawdown} | Max loss streak: ${combo.max_consecutive_losses}`);
+      lines.push(`  Trades: ${combo.total_trades} | W/L/BE: ${combo.wins}/${combo.losses}/${combo.breakeven}`);
+      lines.push(`  Win rate: ${combo.win_rate}% | PF: ${combo.profit_factor} | Expectancy: ${combo.expectancy_r}R`);
+      lines.push('');
+      lines.push(`  Per-pair:`);
+      for (const [sym, row] of Object.entries(combo.per_pair)) {
+        if (row.trades === 0) continue;
+        lines.push(`    ${sym.padEnd(10)} TR ${String(row.trades).padStart(4)} | W ${String(row.wins).padStart(3)} | L ${String(row.losses).padStart(3)} | WR ${String(row.win_rate).padStart(5)}% | PF ${String(row.profit_factor).padStart(5)} | $${row.net_pnl}`);
+      }
+      lines.push('');
+      lines.push(`  Skip summary: ${combo.skip_summary.total} rejections`);
+      const byReason = Object.entries(combo.skip_summary.by_reason)
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
+        .slice(0, 10);
+      for (const [r, v] of byReason) lines.push(`    ${r}: ${v}`);
+      lines.push('');
+    }
+
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      setCopyStatus('copied');
+      setTimeout(() => setCopyStatus('idle'), 2500);
+    } catch {}
+  };
+
+  // -------- Journal derived --------
   const selectedCombo = report?.combos?.[selectedComboIdx] ?? null;
+
+  const journalTrades = useMemo(() => {
+    if (!selectedCombo || !Array.isArray(selectedCombo.all_trades)) return [];
+    let list = [...selectedCombo.all_trades];
+
+    if (journalPairFilter !== 'ALL') {
+      list = list.filter((t: any) => t.symbol === journalPairFilter);
+    }
+    if (journalResultFilter !== 'ALL') {
+      list = list.filter((t: any) => t.result === journalResultFilter);
+    }
+    if (journalSearch.trim()) {
+      const q = journalSearch.toLowerCase();
+      list = list.filter((t: any) =>
+        String(t.strategy || '').toLowerCase().includes(q) ||
+        String(t.symbol || '').toLowerCase().includes(q) ||
+        String(t.trade_id || '').toLowerCase().includes(q)
+      );
+    }
+
+    list.sort((a: any, b: any) => {
+      if (journalSort === 'date_desc') return String(b.signal_time_utc || '').localeCompare(String(a.signal_time_utc || ''));
+      if (journalSort === 'date_asc') return String(a.signal_time_utc || '').localeCompare(String(b.signal_time_utc || ''));
+      if (journalSort === 'pnl_desc') return (b.money_pnl || 0) - (a.money_pnl || 0);
+      if (journalSort === 'pnl_asc') return (a.money_pnl || 0) - (b.money_pnl || 0);
+      if (journalSort === 'r_desc') return (b.r_multiple || 0) - (a.r_multiple || 0);
+      if (journalSort === 'r_asc') return (a.r_multiple || 0) - (b.r_multiple || 0);
+      return 0;
+    });
+
+    return list;
+  }, [selectedCombo, journalPairFilter, journalResultFilter, journalSearch, journalSort]);
+
+  const journalStats = useMemo(() => {
+    if (journalTrades.length === 0) return { count: 0, wins: 0, losses: 0, be: 0, net: 0, win_rate: 0 };
+    let wins = 0, losses = 0, be = 0, net = 0;
+    for (const t of journalTrades) {
+      if (t.result === 'WIN') wins++;
+      else if (t.result === 'LOSS') losses++;
+      else be++;
+      net += Number(t.money_pnl || 0);
+    }
+    return {
+      count: journalTrades.length,
+      wins,
+      losses,
+      be,
+      net,
+      win_rate: (wins / journalTrades.length) * 100,
+    };
+  }, [journalTrades]);
+
+  const journalPairsAvailable = useMemo(() => {
+    if (!selectedCombo || !Array.isArray(selectedCombo.all_trades)) return [];
+    const s = new Set<string>();
+    for (const t of selectedCombo.all_trades) {
+      if (t.symbol) s.add(String(t.symbol));
+    }
+    return Array.from(s).sort();
+  }, [selectedCombo]);
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-8 space-y-6 max-w-7xl mx-auto">
@@ -425,7 +542,6 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
           </div>
         </div>
 
-        {/* Pairs */}
         <div className="space-y-1.5">
           <div className="flex items-center justify-between">
             <label className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">
@@ -496,14 +612,30 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
               <BarChart3 className="w-4 h-4 text-emerald-500" />
               Results
             </h3>
-            <div className="flex items-center gap-3 text-[10px] font-mono text-slate-500">
-              <span>{report.generated_at}</span>
-              <span>·</span>
-              <span>{report.days}d</span>
-              <span>·</span>
-              <span>start {report.starting_balance_input} {report.currency}</span>
-              <span>·</span>
-              <span>{report.profile_name}</span>
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-3 text-[10px] font-mono text-slate-500 mr-2">
+                <span>{report.generated_at}</span>
+                <span>·</span>
+                <span>{report.days}d</span>
+                <span>·</span>
+                <span>start {report.starting_balance_input} {report.currency}</span>
+                <span>·</span>
+                <span>{report.profile_name}</span>
+              </div>
+              <button
+                type="button" onClick={handleExportJson}
+                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Export JSON</span>
+              </button>
+              <button
+                type="button" onClick={handleCopyForAI}
+                className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+              >
+                {copyStatus === 'copied' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copyStatus === 'copied' ? 'Copied' : 'Copy for AI'}</span>
+              </button>
             </div>
           </div>
 
@@ -760,59 +892,177 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
                 )}
               </div>
 
-              {/* Ledger */}
+              {/* Trading Journal */}
               <div className="space-y-2">
                 <button
                   type="button"
-                  onClick={() => setExpandedSection(expandedSection === 'ledger' ? '' : 'ledger')}
+                  onClick={() => setExpandedSection(expandedSection === 'journal' ? '' : 'journal')}
                   className="flex items-center gap-2 text-xs font-bold text-black dark:text-white cursor-pointer"
                 >
-                  {expandedSection === 'ledger' ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                  {expandedSection === 'journal' ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
                   <FileText className="w-3.5 h-3.5 text-purple-500" />
-                  Trade Ledger ({selectedCombo.all_trades.length} trades)
+                  Trading Journal ({selectedCombo.all_trades.length} trades)
                 </button>
-                {expandedSection === 'ledger' && (
-                  <div className="rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] max-h-96 overflow-auto">
-                    <table className="w-full text-left text-[11px] font-mono">
-                      <thead className="sticky top-0 bg-slate-100 dark:bg-[#0f1118]">
-                        <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[9px] uppercase font-bold text-slate-500">
-                          <th className="py-1.5 px-2">Date</th>
-                          <th className="py-1.5 px-2">Pair</th>
-                          <th className="py-1.5 px-2">Strat</th>
-                          <th className="py-1.5 px-2">Dir</th>
-                          <th className="py-1.5 px-2 text-right">Entry</th>
-                          <th className="py-1.5 px-2 text-right">Exit</th>
-                          <th className="py-1.5 px-2 text-center">R</th>
-                          <th className="py-1.5 px-2 text-right">P&amp;L</th>
-                          <th className="py-1.5 px-2 text-center">Reason</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
-                        {selectedCombo.all_trades.map((tr: any, i: number) => (
-                          <tr key={i} className="hover:bg-slate-100 dark:hover:bg-[#121520]">
-                            <td className="py-1.5 px-2 text-slate-600 dark:text-slate-300">{tr.date_sast || ''}</td>
-                            <td className="py-1.5 px-2 font-bold text-black dark:text-white">{tr.symbol || ''}</td>
-                            <td className="py-1.5 px-2 text-slate-600 dark:text-slate-300">{tr.strategy || ''}</td>
-                            <td className={`py-1.5 px-2 font-bold ${tr.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
-                              {tr.direction}
-                            </td>
-                            <td className="py-1.5 px-2 text-right">{Number(tr.entry_price || 0).toFixed(2)}</td>
-                            <td className="py-1.5 px-2 text-right">{Number(tr.exit_price || 0).toFixed(2)}</td>
-                            <td className={`py-1.5 px-2 text-center font-bold ${
-                              (tr.r_multiple || 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
-                            }`}>
-                              {Number(tr.r_multiple || 0).toFixed(2)}
-                            </td>
-                            <td className={`py-1.5 px-2 text-right font-bold ${
-                              (tr.money_pnl || 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
-                            }`}>
-                              {Number(tr.money_pnl || 0).toFixed(2)}
-                            </td>
-                            <td className="py-1.5 px-2 text-center text-slate-600 dark:text-slate-300">{tr.exit_reason || ''}</td>
+
+                {expandedSection === 'journal' && (
+                  <div className="space-y-3">
+                    {/* Filter bar */}
+                    <div className="flex flex-col lg:flex-row lg:items-center gap-2 p-3 rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+                      <div className="relative flex-1">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={journalSearch}
+                          onChange={(e) => setJournalSearch(e.target.value)}
+                          placeholder="Search trade ID or strategy..."
+                          className="w-full pl-9 pr-3 py-1.5 rounded-lg bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono text-black dark:text-white focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                      <select
+                        value={journalPairFilter}
+                        onChange={(e) => setJournalPairFilter(e.target.value)}
+                        className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono text-black dark:text-white focus:outline-none focus:border-blue-500 cursor-pointer"
+                      >
+                        <option value="ALL">All Pairs</option>
+                        {journalPairsAvailable.map(p => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                      <select
+                        value={journalResultFilter}
+                        onChange={(e) => setJournalResultFilter(e.target.value)}
+                        className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono text-black dark:text-white focus:outline-none focus:border-blue-500 cursor-pointer"
+                      >
+                        <option value="ALL">All Results</option>
+                        <option value="WIN">Wins only</option>
+                        <option value="LOSS">Losses only</option>
+                        <option value="BREAKEVEN">Breakeven only</option>
+                      </select>
+                      <select
+                        value={journalSort}
+                        onChange={(e) => setJournalSort(e.target.value as JournalSort)}
+                        className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#0f1118] border border-slate-300 dark:border-[#1a2030] text-xs font-mono text-black dark:text-white focus:outline-none focus:border-blue-500 cursor-pointer"
+                      >
+                        <option value="date_desc">Newest first</option>
+                        <option value="date_asc">Oldest first</option>
+                        <option value="pnl_desc">P&amp;L: high → low</option>
+                        <option value="pnl_asc">P&L: low → high</option>
+                        <option value="r_desc">R: high → low</option>
+                        <option value="r_asc">R: low → high</option>
+                      </select>
+                    </div>
+
+                    {/* Journal summary strip */}
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px] font-mono">
+                      <div className="p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+                        <div className="text-[9px] uppercase text-slate-500">Matched</div>
+                        <div className="font-bold text-black dark:text-white">{journalStats.count}</div>
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+                        <div className="text-[9px] uppercase text-slate-500">Win Rate</div>
+                        <div className={`font-bold ${journalStats.win_rate >= 50 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                          {journalStats.win_rate.toFixed(1)}%
+                        </div>
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+                        <div className="text-[9px] uppercase text-slate-500">W / L / BE</div>
+                        <div className="font-bold text-black dark:text-white">
+                          {journalStats.wins}/{journalStats.losses}/{journalStats.be}
+                        </div>
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030]">
+                        <div className="text-[9px] uppercase text-slate-500">Net P&amp;L</div>
+                        <div className={`font-bold ${journalStats.net >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                          {journalStats.net >= 0 ? '+' : ''}${journalStats.net.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] flex items-center justify-between">
+                        <div>
+                          <div className="text-[9px] uppercase text-slate-500">Show</div>
+                          <select
+                            value={journalLimit}
+                            onChange={(e) => setJournalLimit(parseInt(e.target.value, 10))}
+                            className="bg-transparent text-xs font-mono font-bold text-black dark:text-white focus:outline-none cursor-pointer"
+                          >
+                            <option value={50}>50</option>
+                            <option value={100}>100</option>
+                            <option value={250}>250</option>
+                            <option value={500}>500</option>
+                            <option value={100000}>All</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Table */}
+                    <div className="rounded-xl bg-slate-50 dark:bg-[#08090d] border border-slate-300 dark:border-[#1a2030] max-h-96 overflow-auto">
+                      <table className="w-full text-left text-[11px] font-mono">
+                        <thead className="sticky top-0 bg-slate-100 dark:bg-[#0f1118] z-10">
+                          <tr className="border-b border-slate-200 dark:border-[#1a2030] text-[9px] uppercase font-bold text-slate-500">
+                            <th className="py-1.5 px-2">Date</th>
+                            <th className="py-1.5 px-2">Pair</th>
+                            <th className="py-1.5 px-2">Strategy</th>
+                            <th className="py-1.5 px-2">Dir</th>
+                            <th className="py-1.5 px-2 text-right">Entry</th>
+                            <th className="py-1.5 px-2 text-right">Exit</th>
+                            <th className="py-1.5 px-2 text-right">SL</th>
+                            <th className="py-1.5 px-2 text-right">TP</th>
+                            <th className="py-1.5 px-2 text-center">R</th>
+                            <th className="py-1.5 px-2 text-right">P&amp;L</th>
+                            <th className="py-1.5 px-2 text-center">Reason</th>
+                            <th className="py-1.5 px-2 text-center">Result</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 dark:divide-[#141a26]">
+                          {journalTrades.slice(0, journalLimit).map((tr: any, i: number) => (
+                            <tr key={i} className="hover:bg-slate-100 dark:hover:bg-[#121520]">
+                              <td className="py-1.5 px-2 text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                {tr.signal_time_sast ? String(tr.signal_time_sast).slice(0, 16) : (tr.date_sast || '')}
+                              </td>
+                              <td className="py-1.5 px-2 font-bold text-black dark:text-white">{tr.symbol || ''}</td>
+                              <td className="py-1.5 px-2 text-slate-600 dark:text-slate-300">{tr.strategy || ''}</td>
+                              <td className={`py-1.5 px-2 font-bold ${tr.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
+                                {tr.direction}
+                              </td>
+                              <td className="py-1.5 px-2 text-right">{Number(tr.entry_price || 0).toFixed(2)}</td>
+                              <td className="py-1.5 px-2 text-right">{Number(tr.exit_price || 0).toFixed(2)}</td>
+                              <td className="py-1.5 px-2 text-right text-rose-500">{Number(tr.sl || 0).toFixed(2)}</td>
+                              <td className="py-1.5 px-2 text-right text-emerald-500">{Number(tr.tp || 0).toFixed(2)}</td>
+                              <td className={`py-1.5 px-2 text-center font-bold ${
+                                (tr.r_multiple || 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                              }`}>
+                                {Number(tr.r_multiple || 0).toFixed(2)}
+                              </td>
+                              <td className={`py-1.5 px-2 text-right font-bold ${
+                                (tr.money_pnl || 0) >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                              }`}>
+                                {Number(tr.money_pnl || 0).toFixed(2)}
+                              </td>
+                              <td className="py-1.5 px-2 text-center text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                {tr.exit_reason || ''}
+                              </td>
+                              <td className="py-1.5 px-2 text-center">
+                                <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${
+                                  tr.result === 'WIN' ? 'bg-emerald-500/15 text-emerald-500'
+                                    : tr.result === 'LOSS' ? 'bg-rose-500/15 text-rose-500'
+                                    : 'bg-slate-500/15 text-slate-500'
+                                }`}>
+                                  {tr.result || ''}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {journalTrades.length > journalLimit && (
+                        <div className="text-center text-[10px] font-mono text-slate-500 py-2 border-t border-slate-200 dark:border-[#1a2030]">
+                          Showing {journalLimit} of {journalTrades.length}. Increase the "Show" limit above to see more.
+                        </div>
+                      )}
+                      {journalTrades.length === 0 && (
+                        <div className="text-center text-[11px] font-mono text-slate-500 py-6">
+                          No trades match the current filters.
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -829,8 +1079,7 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
           <div className="text-xs text-slate-500 max-w-xl mx-auto">
             Configure the parameters above and click <strong>Run Live Bot Replay</strong>.
             The bot will walk the last N days with a single account, one risk profile,
-            and all selected pairs sharing the same daily cap and equity. Sizes every
-            trade off current equity, updates on close, and reports one storyline.
+            and all selected pairs sharing the same daily cap and equity.
           </div>
         </div>
       )}
