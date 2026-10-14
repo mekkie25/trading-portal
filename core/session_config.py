@@ -3,13 +3,19 @@ trading-portal/core/session_config.py
 Institutional Quantitative Strategy Parameters, Session Timing & DST Management.
 Single Source of Truth for all quantitative parameters.
 
-CHANGES 2026-10-13
-------------------
-- stop_distance_multiplier default is 1.0 (was 1.5). Live and backtest now
-  place identical stops.
-- Added min_stop_pips: per-pair hardcoded minimum stop distance in pips.
-  Fixes FX stops that were inside the noise band. Combined with the
-  data-driven pip_calculator floor via core.pip_calculator.effective_min_stop_pips.
+CHANGES 2026-10-13 (round 2)
+----------------------------
+- Added trading_hours_sast_start and trading_hours_sast_end. New entries are
+  gated to this window in StrategyManager._apply_always_on_filters. The window
+  starts at 06:00 SAST because the Asia range is only fully formed at 06:00.
+  Before that, asia_high / asia_low are still developing and every strategy
+  that reads those levels is working off incomplete data.
+- target_rr raised from 2.5 to 3.0 based on the R:R sweep in the 2026-10-13
+  backtest (every pair peaks at 1:3 or wider).
+- min_stop_pips widened for EURUSD (20 -> 35), GBPUSD (25 -> 40) and USDJPY
+  (25 -> 40). The 2026-10-13 diagnostics showed stops inside the noise band:
+  35-43% of stopped FX trades later hit their original TP, and 1 pip of extra
+  slippage cost 0.077-0.098R per trade on FX vs 0.029R on US30.
 """
 
 import sys
@@ -23,7 +29,7 @@ from dataclasses import dataclass, field
 @dataclass
 class StrategyParameters:
     adaptive_mode: bool = False
-    target_rr: float = 2.5
+    target_rr: float = 3.0
     use_breakeven: bool = False
     use_supertrend_trail: bool = True
 
@@ -98,6 +104,15 @@ class StrategyParameters:
         "2026-11-04 18:00",
     ])
 
+    # Global entry session window in SAST.
+    # New signals are only accepted when 06:00 <= SAST hour < 18:00.
+    # Rationale: the Asia range is only complete at 06:00. Before that,
+    # every strategy that reads asia_high / asia_low is trading an
+    # incomplete range. The 2026-10-13 hour matrix also shows every pair
+    # bleeding in the 01:00-03:00 SAST window.
+    trading_hours_sast_start: int = 6
+    trading_hours_sast_end: int = 18
+
     blocked_hours_sast: Dict[str, List[int]] = field(default_factory=lambda: {
         "US30":     [0, 23],
         "GOLD":     [0, 23],
@@ -128,9 +143,9 @@ class StrategyParameters:
         "US30":     40.0,
         "NAS100":   180.0,
         "GERMAN30": 250.0,
-        "EURUSD":   20.0,
-        "GBPUSD":   25.0,
-        "USDJPY":   25.0,
+        "EURUSD":   35.0,
+        "GBPUSD":   40.0,
+        "USDJPY":   40.0,
     })
 
     strat_always_htf_targets: List[str] = field(default_factory=lambda: [
@@ -290,3 +305,30 @@ class MarketSessionManager:
         if wd in days:
             return True, f"BLOCKED_WEEKDAY_{wd}"
         return False, ""
+
+    @classmethod
+    def is_in_trading_window(cls, dt_utc: datetime = None) -> Tuple[bool, str]:
+        """
+        Global entry session window. New signals are only accepted when the
+        SAST wall-clock hour is in [trading_hours_sast_start, trading_hours_sast_end).
+        Existing positions are unaffected; this only gates new entries.
+        """
+        if dt_utc is None:
+            dt_utc = datetime.now(timezone.utc)
+        elif dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
+        start = getattr(GLOBAL_PARAMS, "trading_hours_sast_start", None)
+        end = getattr(GLOBAL_PARAMS, "trading_hours_sast_end", None)
+        if start is None or end is None:
+            return True, ""
+
+        hour_sast = dt_utc.astimezone(TZ_SAST).hour
+        if start <= end:
+            ok = start <= hour_sast < end
+        else:
+            ok = hour_sast >= start or hour_sast < end
+
+        if ok:
+            return True, ""
+        return False, f"BLOCKED_OUTSIDE_SESSION_{hour_sast:02d}_SAST"

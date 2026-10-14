@@ -2,12 +2,16 @@
 trading-portal/strategies/strategy_manager.py
 Orchestrates strategies across the 7 whitelisted assets.
 
+CHANGES 2026-10-13 (round 2)
+----------------------------
+- _apply_always_on_filters now also applies the global SAST entry session
+  window (GLOBAL_PARAMS.trading_hours_sast_start / _end). New signals are
+  dropped outside that window with reason BLOCKED_OUTSIDE_SESSION_HH_SAST.
+  Existing positions are untouched; this only gates entries.
+
 STEP 1: diagnostics on SPREAD_IN_R skips.
 STEP 2: spreads loaded from config/spread_config.json.
 STEP 3: per-pair and per-strategy overrides via core.pair_settings.
-
-Live (engine/matrix.py) and backtest (backtest/runner.py) both call
-StrategyManager.evaluate_all, so tuned values apply identically.
 """
 
 import os
@@ -106,6 +110,21 @@ class StrategyManager:
         data_d1: pd.DataFrame,
         current_time: Any = None,
     ) -> Optional[str]:
+        # 0. Global SAST entry window. Must run first so that every strategy
+        #    is gated identically and the reason is unambiguous.
+        try:
+            if current_time is not None:
+                ts_window = pd.Timestamp(current_time)
+                if ts_window.tzinfo is None:
+                    ts_window = ts_window.tz_localize("UTC")
+                in_window, window_reason = MarketSessionManager.is_in_trading_window(
+                    ts_window.to_pydatetime()
+                )
+                if not in_window:
+                    return window_reason
+        except Exception:
+            pass
+
         # 1. Blocked hours, per pair.
         try:
             blocked_hours = _resolve_blocked_hours(
