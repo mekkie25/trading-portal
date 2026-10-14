@@ -8,13 +8,17 @@
  *   - Controls: balance, currency, ZAR rate, days, profile, pairs.
  *   - Report: headline KPIs, per-pair contribution, equity curve, daily
  *     equity, skip story, and a filterable Trading Journal.
- *   - Export: JSON download and "Copy for AI" clipboard buttons.
+ *   - Export: "Export for AI" TXT (compact, ~15 KB), "Export for AI" ZIP
+ *     (TXT + three CSVs), "Copy for AI" (same as TXT to clipboard), and
+ *     "Full JSON (big)" for offline drill-down.
  *
- * Backed by four endpoints on server.ts:
+ * Backed by six endpoints on server.ts:
  *   POST /api/backtest/live-sim
  *   GET  /api/backtest/live-sim/status
  *   GET  /api/backtest/live-sim/report
  *   POST /api/backtest/live-sim/stop
+ *   GET  /api/backtest/live-sim/export.txt
+ *   GET  /api/backtest/live-sim/export.zip
  */
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
@@ -622,19 +626,46 @@ export const LiveSimReplay: React.FC<LiveSimReplayProps> = ({
                 <span>·</span>
                 <span>{report.profile_name}</span>
               </div>
-              <button
-                type="button" onClick={handleExportJson}
-                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+
+              {/* Compact AI-friendly export — recommended. */}
+              <a
+                href="/api/backtest/live-sim/export.txt"
+                download
+                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+                title="Compact text file, ~15 KB. This is what you give an AI."
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>Export JSON</span>
-              </button>
+                <span>Export for AI (.txt)</span>
+              </a>
+
+              <a
+                href="/api/backtest/live-sim/export.zip"
+                download
+                className="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 dark:bg-[#0f1118] dark:hover:bg-[#141722] border border-slate-300 dark:border-[#1a2030] text-[11px] font-bold text-black dark:text-slate-200 flex items-center gap-1.5 cursor-pointer"
+                title="Summary TXT plus three CSVs: combo KPIs, per-pair matrix, and a stratified 30-trade sample per combo."
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-500" />
+                <span>Export for AI (.zip)</span>
+              </a>
+
               <button
-                type="button" onClick={handleCopyForAI}
+                type="button"
+                onClick={handleCopyForAI}
                 className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-bold flex items-center gap-1.5 cursor-pointer"
+                title="Copy a short summary to clipboard. Same content as the .txt file."
               >
                 {copyStatus === 'copied' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copyStatus === 'copied' ? 'Copied' : 'Copy for AI'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleExportJson}
+                className="px-3 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 dark:bg-[#141722] dark:hover:bg-[#1a2030] border border-slate-300 dark:border-[#1a2030] text-[11px] font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5 cursor-pointer"
+                title="Full JSON with every trade, every equity point and every daily row. Big file — for offline drill-down only, not for feeding to an AI."
+              >
+                <Download className="w-3.5 h-3.5 text-amber-500" />
+                <span>Full JSON (big)</span>
               </button>
             </div>
           </div>
