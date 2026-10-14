@@ -273,7 +273,7 @@ function holdoutVerdictLocal(tune: any, val: any): string {
   return 'HOLDS';
 }
 
-export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', brokerCurrency = 'USD' }) => {
+export const BacktestResearchPanel: React.FC<BacktestViewProps> = ({ themeMode = 'dark', brokerCurrency = 'USD' }) => {
   const [reportFiles, setReportFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [reportData, setReportData] = useState<BacktestReportPayload | null>(null);
@@ -287,7 +287,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>(['US30']);
   const [testDays, setTestDays] = useState<number>(365);
 
-  // 2026-10-14: starting balance, currency, ZAR rate and risk profile controls.
   const [startingBalance, setStartingBalance] = useState<string>('1000');
   const [backtestProfile, setBacktestProfile] = useState<string>('Max Growth');
 
@@ -877,7 +876,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             <option value={365}>365 Days</option>
           </select>
 
-          {/* 2026-10-14: starting balance input */}
           <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-[#1a2030] bg-white dark:bg-[#08090d]">
             <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Start</span>
             <input
@@ -893,7 +891,6 @@ export const BacktestView: React.FC<BacktestViewProps> = ({ themeMode = 'dark', 
             />
           </div>
 
-          {/* 2026-10-14: risk profile dropdown */}
           <select
             value={backtestProfile}
             onChange={(e) => setBacktestProfile(e.target.value)}
